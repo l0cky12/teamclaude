@@ -29,6 +29,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
+import { logsAfter } from './event-log.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -611,6 +612,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // The account event log behind the dashboard's Logs page (event-log.js).
+      // Readable by anyone who may read /status — client keys included — which
+      // is why entries carry account names, never emails or tokens.
+      // `?after=<id>` returns only what is newer, so the page polls cheaply.
+      if (req.method === 'GET' && /^\/teamclaude\/logs(\?|$)/.test(req.url || '')) {
+        const page = accountManager.events?.since(logsAfter(req.url)) ?? { events: [], lastId: 0, capacity: 0 };
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(page));
+        return;
+      }
+
       // Tier-weighted fleet quota for lightweight consumers such as a shell or
       // Claude Code status line. Unlike /teamclaude/status this omits routing,
       // usage counters and server diagnostics, and never reaches upstream.
@@ -703,6 +715,11 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.log(`[TeamClaude] ${isPriority
             ? `Set priority of "${result.name}" to ${result.priority}`
             : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
+          accountManager.events?.add({
+            kind: 'control', type: isPriority ? 'priority' : (result.disabled ? 'disabled' : 'enabled'),
+            provider: result.provider ?? null, account: result.name,
+            message: isPriority ? `Priority set to ${result.priority}` : (result.disabled ? 'Disabled from the dashboard' : 'Enabled from the dashboard'),
+          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, ...result }));
         } catch (err) {
@@ -847,6 +864,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // the background-service deployment this endpoint exists for.
         console.log(`[TeamClaude] Switched to account "${name}" (manual)`
           + (eligible ? '' : ` — ${reason}, so rotation will not use it`));
+        accountManager.events?.add({
+          kind: 'control', type: 'switch', provider: providerOf(accountManager.accounts[index]), account: name,
+          reason: eligible ? 'manual' : reason, message: `Switched to by hand${eligible ? '' : `: ${reason}, so rotation will not use it`}`,
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, account: name, eligible, ...(reason ? { reason } : {}) }));
         return;
@@ -925,6 +946,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // that quietly retires an account would otherwise change nothing visible.
         console.log(`[TeamClaude] Switch threshold set to ${Math.round(saved * 1000) / 10}% (dashboard)`
           + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
+        accountManager.events?.add({ kind: 'control', type: 'threshold', message: `Switch threshold set to ${Math.round(saved * 1000) / 10}%` });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
         return;
@@ -1498,6 +1520,7 @@ export function clientSessionId(headers) {
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
+  hooks = withRequestEvents(hooks, accountManager);
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
@@ -1765,7 +1788,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      /** @type {Record<string, any>} */
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, inputTokens: 0, outputTokens: 0, onUsage: null, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // The request's own token count, for its event-log entry; the client
+      // and dimension counters still get every reading as before.
+      ctx.onUsage = (/** @type {number} */ input, /** @type {number} */ output) => {
+        ctx.inputTokens += input || 0;
+        ctx.outputTokens += output || 0;
+        usageRecorder.onUsage?.(input, output);
+      };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1821,7 +1852,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -1860,6 +1891,59 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       answerUnhandled(res);
     }
   };
+}
+
+/**
+ * The activity hooks, with every request that ends also recorded on the
+ * account manager's event log (the dashboard's Logs page). Layered here rather
+ * than added at each closing site, because every path that ends a request
+ * already ends it through onRequestEnd exactly once.
+ *
+ * The wrapper reads through to `hooks` (Object.create), so a hook the caller
+ * sets on its object afterwards — index.js wires reload and the account
+ * controls after the server exists — is still found.
+ *
+ * An activity row whose "account" is a parenthesised label — "(blocked)",
+ * "(too large)", an unknown pin — names no account, so the entry carries the
+ * label in its message and no account.
+ * @param {Record<string, any>} hooks
+ * @param {any} accountManager
+ * @returns {Record<string, any>}
+ */
+export function withRequestEvents(hooks, accountManager) {
+  const events = accountManager?.events;
+  if (!events) return hooks;
+  /** @type {Map<number, { started: number, account: string|null }>} */
+  const open = new Map();
+  const wrapped = Object.create(hooks);
+  wrapped.onRequestStart = (/** @type {number} */ id, /** @type {any} */ info) => {
+    open.set(id, { started: Date.now(), account: null });
+    return hooks.onRequestStart?.(id, info);
+  };
+  wrapped.onRequestRouted = (/** @type {number} */ id, /** @type {any} */ info) => {
+    const entry = open.get(id);
+    if (entry && info?.account) entry.account = info.account;
+    return hooks.onRequestRouted?.(id, info);
+  };
+  wrapped.onRequestEnd = (/** @type {number} */ id, /** @type {any} */ info = {}) => {
+    const entry = open.get(id);
+    open.delete(id);
+    const name = info.account || entry?.account || null;
+    const label = typeof name === 'string' && name.startsWith('(') ? name : null;
+    const account = label ? null : name;
+    const served = account ? accountManager.accounts?.find((/** @type {any} */ a) => a.name === account) : null;
+    const path = String(info.path || '').split('?')[0];
+    events.add({
+      kind: 'usage', type: 'request',
+      provider: info.provider ?? (served ? providerOf(served) : null),
+      account, model: info.model ?? null, status: info.status ?? null,
+      inputTokens: info.inputTokens ?? null, outputTokens: info.outputTokens ?? null,
+      ms: entry ? Date.now() - entry.started : null,
+      message: `${info.method || ''} ${path}${label ? ` ${label}` : ''}`.trim(),
+    });
+    return hooks.onRequestEnd?.(id, info);
+  };
+  return wrapped;
 }
 
 /**
@@ -3205,6 +3289,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
+      accountManager.events?.add({ kind: 'rotation', type: 'hold', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: holding the request, retry in ${Math.ceil(waitMs / 1000)}s` });
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
@@ -3218,6 +3303,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    accountManager.events?.add({ kind: 'rotation', type: 'exhausted', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: answered 429, retry after ${retryAfter}s` });
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),

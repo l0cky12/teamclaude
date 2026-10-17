@@ -5,6 +5,7 @@ import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pa
 import { ensureAccountIds } from './account-id.js';
 import { accountSwitchThreshold, accountAllowsExtraUsage, accountRouting } from './account-manager.js';
 import { localListener } from './upstream-proxy.js';
+import { providerOf } from './provider.js';
 
 /**
  * Sync accounts from disk config: add new accounts and refresh credentials
@@ -91,6 +92,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       console.log(cfgAcct
         ? `[TeamClaude] Re-admitting known account "${diskAcct.name}" from config`
         : `[TeamClaude] Picked up new account "${diskAcct.name}" from config`);
+      accountManager.events?.add({
+        kind: 'control', type: 'account_added', provider: providerOf(diskAcct), account: diskAcct.name,
+        message: cfgAcct ? 'Back in the pool from the config file' : 'Added to the pool from the config file',
+      });
       continue;
     }
 
@@ -221,6 +226,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (changed && !diskIsStaler) {
         accountManager.updateAccountTokens(mgr.index, freshCred);
         console.log(`[TeamClaude] Refreshed credentials for "${safeLine(mgr.name, 64)}"`);
+        // How a `teamclaude login` in another terminal reaches this server: it
+        // writes the config and asks for a reload.
+        accountManager.events?.add({ kind: 'signin', type: 'credentials_updated', provider: providerOf(mgr), account: mgr.name, message: 'New credentials from the config file' });
       }
     } else if (freshCred.apiKey && mgr.credential !== freshCred.apiKey) {
       mgr.credential = freshCred.apiKey;
@@ -257,6 +265,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (claimed.has(i) || pendingAdds.has(gone.id)) continue;
     const cfgIdx = configIndexFor(memConfig.accounts, accountManager.accounts, i);
     console.log(`[TeamClaude] Removed account "${safeLine(gone.name, 64)}": its config entry is gone from disk`);
+    accountManager.events?.add({ kind: 'control', type: 'account_removed', provider: providerOf(gone), account: gone.name, message: 'Removed: its config entry is gone' });
     accountManager.removeAccount(i);
     if (cfgIdx >= 0) memConfig.accounts.splice(cfgIdx, 1);
     dropped++;
