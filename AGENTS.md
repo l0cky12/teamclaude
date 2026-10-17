@@ -87,7 +87,9 @@ NixOS and Home Manager modules (`flake.nix`, `nix/`), and
    - 429: rotate, or pause, with at most one failover hop
    - 5xx or a broken stream: one hop
    - 401: force a token refresh
-   - 403: quarantine the account
+   - 403: fail over to another account for this request. Only an OAuth
+     account denied with `oauth_not_allowed_for_organization` is also kept
+     out of rotation for five minutes ([docs/routing.md](docs/routing.md#oauth-entitlement-denials))
    - every account exhausted: hold (`holdSeconds`) or return 429
 8. `streamResponse` does accounting and hooks while streaming.
 9. State is persisted to `teamclaude.state.json`.
@@ -138,18 +140,19 @@ new file must have zero.
   No sleeps, no hard-coded dates. Use `test-helpers/spawn-server.js`, clean up
   in `finally`, opt out of the upstream proxy, and clear proxy environment
   variables.
-- **Docs:** a user-visible change updates `docs/` or the README. A new
-  config key needs a row in `docs/configuration.md` and an entry in
+- **Docs:** a user-visible change updates the page under `docs/` that
+  covers it (the README as well, where relevant). A new config key needs a row in `docs/configuration.md` and an entry in
   `config.example.json`.
 - **Defaults are conservative:** anything that makes background calls or
   spends quota is off by default.
 - **Secrets:** never put tokens, account ids, emails or real config in code,
   tests, commits, PR bodies or logs.
 - **Commits and PR titles:** `type(scope): summary`, with the scope
-  optional. The types in use are `feat`, `fix`, `docs`, `test` and
+  optional. Release PRs are the one exception (see below). The types in use are `feat`, `fix`, `docs`, `test` and
   `chore(ci)`. PRs are squash-merged, so the PR title becomes the commit.
 - **Branches:** `<type>/<short-slug>`, e.g. `feat/backend-quota-tui`.
-- **Releases:** a separate `Bump to X.Y.Z` PR that changes only `package.json`.
+- **Releases:** a separate PR titled exactly `Bump to X.Y.Z` that changes
+  only the version in `package.json`.
   `publish.yml` publishes when the version changes.
 
 ## Gotchas
@@ -192,18 +195,21 @@ explicit instructions in the session, those override it.
 
 A change is **large** if any of these apply:
 
-- More than about 200 changed non-test lines, or more than about 5 source
-  files.
+- More than about 200 changed lines, or more than about 5 files, of source
+  code (`src/`, `scripts/`, `test-helpers/`). Tests and Markdown docs don't
+  count towards these numbers.
 - It touches the core request path: `server.js`, `account-manager.js`,
   `mitm.js`, `upstream-fetch.js`, `provider.js`, the auth and credential
   modules (`oauth`, `codex-auth`, `credential-sync`, `callback-auth`), or the
   body rewriters (`account-uuid-rewrite`, `*-sanitize`).
 - It adds or upgrades a dependency, changes the config schema, or changes
   CLI or other public behaviour.
-- It touches `.github/workflows/`, `package.json` or `nix/`.
+- It touches `.github/workflows/`, `nix/`, or `package.json` (other than a
+  version-only release bump).
 - It is a refactor across several modules.
 
-Everything else is **small**. Nothing is exempt: version bumps are small.
+Everything else is **small**, including docs-only changes and version-only
+release bumps. Nothing skips review.
 The implementer decides the classification and states it, with the reason,
 in the PR body. If unsure, treat the change as large.
 
