@@ -25,6 +25,7 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { signInEvent, thresholdEvent } from './event-log.js';
+import { signInGuard } from './web-login.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -120,6 +121,7 @@ import {
   setAccountDisabled,
   setAccountPriority,
   renameAccount,
+  freeNumberedName,
 } from './config-ops.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -339,23 +341,29 @@ async function serverCommand() {
   // An empty pool is a configuration error — unless this install is signed in
   // to callback.net, where the credential store may hold the accounts: a fresh
   // machine gets them from the first sync pass, which needs a running server.
+  // Or unless the operator said to start anyway (--allow-empty): a server in a
+  // container or on another machine has no terminal anyone uses, and its
+  // first account is signed in from the dashboard, which needs it running.
+  const allowEmpty = args.includes('--allow-empty') || envVar('ALLOW_EMPTY') === '1';
   const syncMayFill = config.accounts.length === 0 && !!(await loadCallbackToken().catch(() => null));
-  if (config.accounts.length === 0 && !syncMayFill) {
+  if (config.accounts.length === 0 && !syncMayFill && !allowEmpty) {
     console.error('No accounts configured.\n');
     console.error('Add an account first:');
     console.error('  teamclaude import           Import from Claude Code');
     console.error('  teamclaude login            OAuth login via browser');
     console.error('  teamclaude login --api      Add an API key (last resort by default; --priority <n>)');
     console.error('  teamclaude callback login   Sign in to callback.net and take the accounts of your other installs');
+    console.error('  teamclaude server --allow-empty   Start anyway, and sign in from the dashboard');
     process.exit(1);
   }
 
   const accounts = await resolveAccounts(config);
-  if (accounts.length === 0 && !syncMayFill) {
+  if (accounts.length === 0 && !syncMayFill && !allowEmpty) {
     console.error('No valid accounts after initialization');
     process.exit(1);
   }
   if (syncMayFill) console.log('[TeamClaude] No accounts configured; signed in to callback.net, so the credential store will be checked for them');
+  else if (accounts.length === 0) console.log('[TeamClaude] No usable accounts; starting empty (--allow-empty). Sign the first one in from the dashboard (/teamclaude/dashboard); requests are refused until then');
 
   // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
   // do the same job with glob matching, several accounts per rule and a bucket
@@ -872,6 +880,25 @@ async function serverCommand() {
     return result;
   };
 
+  // The dashboard's sign-in (POST /teamclaude/login/*, web-login.js): its flow
+  // ran in this server, and the tokens are stored with the same upserts
+  // `teamclaude login` and the TUI's login panel use, under the config lock.
+  // Two things differ. A new account given no name is numbered (account-N,
+  // codex-N) instead of named after the email the provider reported, because
+  // account names are shown to every holder of a client key (status, the event
+  // log). And signInGuard runs under the lock before the write, so a re-login
+  // that signed in as someone else, or a name another row took meanwhile, is
+  // refused with the file untouched. The routed account's own proxy carries
+  // its sign-in too; it is used, not written. The endpoint reloads afterwards.
+  hooks.saveWebSignIn = (/** @type {import('./web-login.js').WebSignIn} */ signIn) => {
+    const check = signInGuard(signIn);
+    const routing = signIn.target?.routing ?? null;
+    const name = signIn.name ?? undefined;
+    return signIn.provider === 'codex'
+      ? upsertCodexAccount(name, signIn.credentials, routing, false, { autoName: 'numbered', check })
+      : upsertOAuthAccount(name, signIn.credentials, 'login', routing, false, { fatal: false, notify: false, autoName: 'numbered', check });
+  };
+
   // Whether one of a Codex account's free rate-limit reset credits should be
   // spent to undo a spent weekly window. Wired as a hook rather than reached
   // from the request path directly: the forwarding path stays ignorant of a
@@ -1293,16 +1320,24 @@ async function loginCodexCommand() {
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
  * existing entry rather than given with --routing: used, never written. True
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
+ * @param {{ autoName?: 'email' | 'numbered', check?: ((accounts: Record<string, any>[], idx: number, incoming: Record<string, any>) => void) | null }} [opts]
+ *   `autoName`: what a login given no name is called — the email the id_token
+ *   carries (the CLI's way), or the first free `codex-N` (the dashboard's).
+ *   `check`: runs under the lock once the row is chosen (`idx`, -1 to add)
+ *   and before anything is written; throwing refuses the save (see
+ *   web-login.js signInGuard).
  * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
  */
-async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false) {
+async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false, { autoName = 'email', check = null } = {}) {
   /** @type {{ action: 'updated' | 'added', name: string }} */
   let outcome = { action: 'added', name: requestedName || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
   await atomicConfigUpdate(config => {
-    const name = requestedName || creds.email
-      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+    const counted = config.accounts.filter(a => a.provider === 'codex').length + 1;
+    const name = requestedName || (autoName === 'email'
+      ? (creds.email || `codex-${counted}`)
+      : freeNumberedName(config.accounts, 'codex-', counted));
 
     const account = {
       name,
@@ -1325,6 +1360,7 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     const idx = config.accounts.findIndex(a => (
       a.provider === 'codex' && (sameIdentity(a, account) || a.name === account.name)
     ));
+    check?.(config.accounts, idx, account);
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
@@ -2856,6 +2892,8 @@ Options:
   --log-to DIR        Log requests/responses to DIR (server, one file per request)
   --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
   --headless          Run the server without the interactive TUI (for backgrounding)
+  --allow-empty       (server) start with no accounts configured, and sign the
+                      first one in from the dashboard (/teamclaude/dashboard)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
                       of erroring out (bypasses the proxy: no rotation)
@@ -2873,6 +2911,8 @@ Environment:
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check
+  TEAMCLAUDE_ALLOW_EMPTY=1
+                      Same as server --allow-empty
   Every TEAMCLAUDE_* variable is also read as TEAMROUTER_*, which wins when
   both are set: the project is being renamed to TeamRouter, and 'teamrouter'
   already runs this same CLI. See github.com/KarpelesLab/teamclaude/issues/72.
@@ -2956,13 +2996,18 @@ function orgLabel(a) {
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
  * existing entry rather than given with --routing: used, never written. True
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
- * @param {{ fatal?: boolean, notify?: boolean }} [opts] The CLI exits on an
+ * @param {{ fatal?: boolean, notify?: boolean, autoName?: 'email' | 'numbered', check?: ((accounts: Record<string, any>[], idx: number, incoming: Record<string, any>) => void) | null }} [opts] The CLI exits on an
  *   unidentifiable account and pokes a running server afterwards. The TUI's
  *   login runs INSIDE that server: it must survive a failed login (`fatal:
  *   false` throws instead) and reloads itself rather than over HTTP.
+ *   `autoName`: what an account given no name is called — the profile's email
+ *   (the CLI's way, with " (org)" added when one email holds several orgs), or
+ *   the first free `account-N` (the dashboard's). `check`: runs under the lock
+ *   once the row is chosen (`idx`, -1 to add) and before anything is written;
+ *   throwing refuses the save (see web-login.js signInGuard).
  * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
  */
-async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false, { fatal = true, notify = true } = {}) {
+async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false, { fatal = true, notify = true, autoName = 'email', check = null } = {}) {
   // Fetch profile to auto-name and deduplicate by account+org identity. A
   // credentials file is routinely past its access token's hour while its
   // refresh token is still good, so a stale token is renewed first and the
@@ -2998,7 +3043,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   if (!profileOk) {
     console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
   }
-  if (!name && profile?.email) {
+  // The dashboard's sign-in numbers its accounts instead (see saveWebSignIn).
+  if (!name && autoName === 'email' && profile?.email) {
     name = profile.email;
     const tier = profile.hasClaudeMax ? 'Max' : profile.hasClaudePro ? 'Pro' : null;
     if (tier) console.log(`Detected Claude ${tier} account: ${profile.email}`);
@@ -3018,7 +3064,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   const config = await atomicConfigUpdate(config => {
     if (!name) {
       const n = config.accounts.filter(a => a.name.startsWith('account-')).length + 1;
-      name = `account-${n}`;
+      name = autoName === 'email' ? `account-${n}` : freeNumberedName(config.accounts, 'account-', n);
     }
 
     const account = {
@@ -3044,6 +3090,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
     // distinct account), then by name — but only where the name is not standing in
     // for a different account+org, which is exactly the multi-org case below.
     const idx = findUpsertTarget(config.accounts, account);
+    check?.(config.accounts, idx, account);
 
     if (idx >= 0) {
       // Same account+org: refresh credentials and org info, but keep the existing
@@ -3056,8 +3103,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
       // New org for this person: if another entry shares the accountUuid, the bare
-      // email name would collide — disambiguate both with " (org)".
-      if (!userNamed && account.accountUuid) {
+      // email name would collide — disambiguate both with " (org)". A numbered
+      // name collides with nothing, so nobody is renamed for it.
+      if (!userNamed && autoName === 'email' && account.accountUuid) {
         const collisions = config.accounts.filter(
           a => a.accountUuid === account.accountUuid && !sameIdentity(a, account)
         );

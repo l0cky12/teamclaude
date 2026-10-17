@@ -14,6 +14,8 @@ With accounts from two providers (Claude and Codex) and a terminal at least 127 
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
+The server will not start with no accounts configured. `--allow-empty` (or `TEAMCLAUDE_ALLOW_EMPTY=1`) starts it anyway, so the first account can be [signed in from the dashboard](accounts.md#signing-in-from-the-dashboard); until then every request is answered `429`, saying no accounts are configured yet.
+
 ### Running in a container
 
 A container image is published to GHCR on every version bump (`ghcr.io/karpeleslab/teamclaude`, tagged `latest`, `1`, `1.1` and the full version). It runs `server --headless` bound to `0.0.0.0` inside the container, so publish the port and bind-mount the config file:
@@ -28,6 +30,8 @@ docker exec -it teamclaude teamclaude status
 ```
 
 The entrypoint starts as root only long enough to match the runtime user to the owner of the mounted config (or of `/data` when the file does not exist yet), then drops privileges — so a file owned by your user stays writable without a `chown`. `TEAMCLAUDE_UID` (and optional `TEAMCLAUDE_GID`) override the detected owner. stderr is folded into stdout so `docker logs` shows one stream; set `TEAMCLAUDE_SPLIT_STDERR=1` to keep them apart. Auto-update is disabled in the image; pull a new tag to upgrade.
+
+To start the container before any account exists and add them from the dashboard instead, pass `-e TEAMCLAUDE_ALLOW_EMPTY=1` (see [Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)).
 
 The config is created on first start with a random `proxy.apiKey`. Anything reaching the proxy from outside the container is a non-loopback client and must present that key (see [proxy.host](configuration.md#fields)); only `teamclaude` commands run via `docker exec` are exempt.
 
@@ -106,7 +110,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. The exception is a request that presents a configured proxy key and whose `Origin` names the very host it was sent to: that is the dashboard opened at a plain-`http` address of another machine (a Tailscale or LAN IP), where browsers send `Origin` but no `Sec-Fetch-Site`. A page on another site cannot send the key, which the browser does not attach by itself. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`, `login/start`, `login/finish`, `login/cancel`) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. The exception is a request that presents a configured proxy key and whose `Origin` names the very host it was sent to: that is the dashboard opened at a plain-`http` address of another machine (a Tailscale or LAN IP), where browsers send `Origin` but no `Sec-Fetch-Site`. A page on another site cannot send the key, which the browser does not attach by itself. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -136,6 +140,14 @@ curl -X POST http://localhost:3456/teamclaude/priority \
 ```
 
 `POST /teamclaude/priority` takes `{"account", "place": "first" | "last"}` or `{"account", "priority": <integer>}`; `POST /teamclaude/disable` takes `{"account", "disabled": true | false}`. Both accept an optional `"org"` (name or uuid) for an email that holds accounts in several orgs — an ambiguous name is refused rather than guessed. Unlike `switch`, these are config **writes**: the change is saved to the config file under the same lock the TUI uses, and the server reloads itself afterwards, so it survives a restart. `place` is relative — `first` lands one below the lowest priority in the fleet, `last` one above the highest — and the reply carries the account as it now stands (`{"ok": true, "name": ..., "priority": ...}` or `{"ok": true, "name": ..., "disabled": ...}`), so a caller learns the number it did not choose. An unknown or ambiguous account, or a priority that is not an integer, is a `400` with the reason; a write that landed but whose reload failed is a `500` that says so, since the file did change. A request authenticated with a `proxy.clientKeys` entry is refused with `403`: a client key is for using the fleet, not for changing which accounts it contains. Use the shared proxy key, or call from the proxy's own machine.
+
+### Sign-in endpoints
+
+The dashboard's sign-in ([Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)) is three control endpoints. Each takes a JSON body and answers with `Cache-Control: no-store`. They are for the operator only: a `proxy.clientKeys` key gets `403` before its body is read, and with no key configured only the proxy's own machine is served (anyone else gets `403`, telling them to set `proxy.apiKey`). A server without the sign-in hook answers `501`. Errors carry `{"ok": false, "error": "<one line for people>"}`.
+
+- `POST /teamclaude/login/start` with `{"provider": "claude" | "codex", "account": "<name>", "name": "<new name>"}`, where `account` and `name` are optional. `account` signs that existing OAuth account of the provider in again. `name` names a new account; leave both out for a new account with a numbered name. The reply is `200 {"ok": true, "id", "provider", "url", "expiresAt"}`: `url` is the sign-in link, which works on any device, `id` names this sign-in in the calls below, and `expiresAt` is when it expires, in epoch milliseconds (five minutes on). A bad provider, an unusable name, or an account that is not an OAuth account of that provider is `400`. An unknown account is `404`. An account that reads its tokens from a file (`importFrom`), is not in the config file, or shares its name with another account of the provider is `409`. A fifth open sign-in is `429`.
+- `POST /teamclaude/login/finish` with `{"id", "input"}`, where `input` is the code (Claude) or the address the browser was sent to (Codex). Success is `200 {"ok": true, "account": "<name>", "action": "added" | "updated"}`. A paste that can't be used is `400` with `"retry": true`, and the sign-in stays open for another paste. An id that is unknown, expired, cancelled or finished is `404`, and a second finish while the first is still exchanging its code is `409`. Once a paste is taken the sign-in ends either way: a code the provider refuses is `502`; a re-login as a different account, or a chosen name another account took in the meantime, is `409` with nothing written; a save that failed is `500`; and a save whose reload failed is `500`, saying the account is on disk.
+- `POST /teamclaude/login/cancel` with `{"id"}` answers `200 {"ok": true}`, or `404` when that id is not open (finished, expired or already cancelled), which a page can treat as closed too. A sign-in whose code is being exchanged can no longer be cancelled (`409`).
 
 ### TUI keyboard shortcuts
 
@@ -218,7 +230,7 @@ This is an interactive-shell alias — it affects `claude` typed at a prompt, no
 ```bash
 teamclaude login             # Add an account via OAuth (--api for an API key)
 teamclaude import            # Import credentials from Claude Code
-teamclaude server            # Start the proxy (--headless for plain logs)
+teamclaude server            # Start the proxy (--headless for plain logs; --allow-empty with no accounts)
 teamclaude run               # Run Claude Code through the proxy
 teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
@@ -261,7 +273,7 @@ teamclaude help              # Show all commands
 
 ## Control routes under a second name
 
-Every `/teamclaude/…` route the server exposes — `status`, `quota`, `logs`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
+Every `/teamclaude/…` route the server exposes — `status`, `quota`, `logs`, `reload`, `switch`, `disable`, `priority`, `threshold`, `probe`, `login/start`, `login/finish`, `login/cancel`, `dashboard` and `mcp` — also answers at the same path under `/teamrouter/…`, with the same gates and the same replies. It is the first step of the [rename to TeamRouter](../README.md#renaming-to-teamrouter); scripts and dashboards written against `/teamclaude/…` keep working unchanged.
 
 ## Status dashboard (browser)
 
@@ -331,7 +343,7 @@ The Clients page has a table per client key and, with `proxy.usageDimensions` co
 
 ### Keys and access
 
-The page knows which controls to hide from `caller` in `/teamclaude/status`: `{ "kind": "operator" | "client", "client": <client-key name or null>, "refused": [<paths>] }`. `refused` lists the control endpoints this key would get a 403 from, read from the same table the server's check uses, so the page and the server cannot disagree; it is empty for the shared proxy key and for a key-less loopback caller.
+The page knows which controls to hide from `caller` in `/teamclaude/status`: `{ "kind": "operator" | "client", "client": <client-key name or null>, "refused": [<paths>], "signIn": true | false }`. `refused` lists the control endpoints this key would get a 403 from, read from the same table the server's check uses, so the page and the server cannot disagree; it is empty for the shared proxy key and for a key-less loopback caller. `signIn` says whether this caller may [sign accounts in](accounts.md#signing-in-from-the-dashboard) (`POST /teamclaude/login/*`). It takes more than the key: with no key configured, an operator calling from another machine is refused too, so `signIn` is `false` there while `refused` is empty.
 
 
 ```

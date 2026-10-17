@@ -403,6 +403,49 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
 }
 
 /**
+ * A name an account may take, trimmed, or a ConfigOpError saying why not.
+ *
+ * The rules `rename` has always applied, kept in one place so a name chosen
+ * anywhere else (the dashboard's sign-in names a new account) passes the same
+ * checks: no control characters, not blank, not all digits (a route reads that
+ * as an account index), and not a name or email that already resolves to
+ * another account, since every command looks accounts up that way.
+ *
+ * @param {any[]} others  the configured accounts the name must not collide with
+ * @param {unknown} newName
+ * @returns {string}
+ */
+export function checkNewAccountName(others, newName) {
+  if (typeof newName === 'string') refuseControlCharacters(newName, 'An account name');
+  const name = typeof newName === 'string' ? newName.trim() : '';
+  if (!name) throw new ConfigOpError('name the new account name');
+  if (/^\d+$/.test(name)) throw new ConfigOpError(`"${name}" is all digits, which a route reads as an account index`);
+  if (matchAccounts(others, name).length) throw new ConfigOpError(`"${name}" already names another account`);
+  return name;
+}
+
+/**
+ * `<prefix><n>` for the first n from `from` up that names no account, as a
+ * name or as an email (see matchAccounts).
+ *
+ * The CLI's automatic names count the accounts already carrying the prefix,
+ * which repeats a number once one in the middle was removed or renamed. A
+ * sign-in that relies on the name being new (the dashboard's) cannot take
+ * that risk: the upsert matches rows by name as a last resort, so a repeated
+ * name could land the tokens on whichever account already holds it.
+ *
+ * @param {any[]} accounts
+ * @param {string} prefix
+ * @param {number} from
+ * @returns {string}
+ */
+export function freeNumberedName(accounts, prefix, from) {
+  let n = Math.max(1, Math.floor(from) || 1);
+  while (matchAccounts(accounts, `${prefix}${n}`).length) n++;
+  return `${prefix}${n}`;
+}
+
+/**
  * Give an account a new name, and carry it into every route that lists the old one.
  *
  * A route names its accounts by exact name, so renaming the account alone would
@@ -419,12 +462,8 @@ export function setAccountDisabled(config, query, disabled, spec = {}) {
  */
 export function renameAccount(config, query, newName, spec = {}) {
   const account = resolveConfiguredAccount(config, query, spec.orgFilter);
-  if (typeof newName === 'string') refuseControlCharacters(newName, 'An account name');
-  const name = typeof newName === 'string' ? newName.trim() : '';
-  if (!name) throw new ConfigOpError('name the new account name');
-  if (/^\d+$/.test(name)) throw new ConfigOpError(`"${name}" is all digits, which a route reads as an account index`);
   const others = (config.accounts || []).filter((/** @type {any} */ a) => a !== account);
-  if (matchAccounts(others, name).length) throw new ConfigOpError(`"${name}" already names another account`);
+  const name = checkNewAccountName(others, newName);
 
   const from = account.name;
   account.name = name;

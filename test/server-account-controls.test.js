@@ -243,20 +243,27 @@ test('status reports the caller, and its refused list is what the gate refuses',
     const client = await status({ 'x-api-key': CLIENT_KEY });
     assert.equal(client.kind, 'client');
     assert.equal(client.client, 'ci');
-    assert.deepEqual([...client.refused].sort(), ['/teamclaude/disable', '/teamclaude/priority', '/teamclaude/threshold']);
+    assert.deepEqual([...client.refused].sort(), [
+      '/teamclaude/disable', '/teamclaude/login/cancel', '/teamclaude/login/finish', '/teamclaude/login/start',
+      '/teamclaude/priority', '/teamclaude/threshold',
+    ]);
+    assert.equal(client.signIn, false);
     for (const path of client.refused) {
       const res = await post(port, path, {}, { 'x-api-key': CLIENT_KEY });
       assert.equal(res.status, 403, path);
     }
 
-    assert.deepEqual(await status({ 'x-api-key': PROXY_KEY }), { kind: 'operator', client: null, refused: [] });
+    assert.deepEqual(await status({ 'x-api-key': PROXY_KEY }), { kind: 'operator', client: null, refused: [], signIn: true });
     // The key-less loopback caller is the operator too.
-    assert.deepEqual(await status({}), { kind: 'operator', client: null, refused: [] });
+    assert.deepEqual(await status({}), { kind: 'operator', client: null, refused: [], signIn: true });
   });
 });
 
 test('callerView', () => {
-  assert.deepEqual(callerView(null), { kind: 'operator', client: null, refused: [] });
-  assert.deepEqual(callerView(''), { kind: 'operator', client: null, refused: [] });
+  assert.deepEqual(callerView(null), { kind: 'operator', client: null, refused: [], signIn: true });
+  assert.deepEqual(callerView(''), { kind: 'operator', client: null, refused: [], signIn: true });
   assert.equal(callerView('ci').kind, 'client');
+  // The status route passes its own answer for sign-in; a client key never has it.
+  assert.equal(callerView(null, { signIn: false }).signIn, false);
+  assert.equal(callerView('ci', { signIn: true }).signIn, false);
 });
