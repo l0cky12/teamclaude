@@ -210,6 +210,7 @@ teamclaude rename <name> <new> # Rename an account (and the routes that list it)
 teamclaude route list        # Manage per-model routes (add/rm)
 teamclaude threshold 90      # Utilization at which rotation leaves an account
 teamclaude distribute on     # Spread new sessions across equal-priority accounts
+teamclaude distribute affinity  # Spend a 5-hour window about to reset first; conversations stay put until their account is out of usage
 teamclaude probe 300         # Enable background quota refresh (off by default)
 teamclaude warmup 600        # Enable keep-warm (off by default, spends quota)
 teamclaude warmup reset 15:30 --timezone Europe/Moscow

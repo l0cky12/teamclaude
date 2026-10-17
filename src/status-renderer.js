@@ -27,7 +27,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
 
   // Only adaptive distribution swaps the Active row for a Serving row and lets
   // the `>` marker follow the sessions; see formatActive for why the modes differ.
-  const adaptiveMode = status.sessions?.mode === 'adaptive';
+  const adaptiveMode = status.sessions?.mode === 'adaptive' || status.sessions?.mode === 'affinity';
 
   lines.push(paint.bold('TeamClaude status'));
   lines.push(`${paint.dim(activeLabel(adaptiveMode).padEnd(12))} ${formatActive(status, currentAccount, adaptiveMode, paint)}`);
@@ -567,6 +567,7 @@ function formatSessions(sessions, paint) {
   // different accounts for the same fleet, so an operator reading the line
   // needs to know which rule produced what they are looking at.
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
+  else if (sessions.mode === 'affinity') mode = paint.green('affinity');
   else if (sessions.distribute) mode = paint.green('distributing');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');

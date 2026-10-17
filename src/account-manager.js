@@ -30,6 +30,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *   'adaptive'     → 'adaptive' spend the least-remaining window down first,
  *                               tapering at the threshold and backing off when
  *                               the account is busy (see adaptive-distribution.js)
+ *   'affinity'     → 'affinity' adaptive, plus: a 5-hour window about to reset
+ *                               is spent first, the 5-hour window counts in the
+ *                               scoring, and a pinned conversation moves only
+ *                               when its account cannot serve it (see
+ *                               _pickNearReset and _selectForSession)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -43,16 +48,28 @@ export function distributionMode(setting) {
   if (typeof setting === 'string') {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
+    if (value === 'affinity') return 'affinity';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
     if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
       warnedDistributeValues.add(value);
-      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive")`);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "affinity")`);
     }
     return 'even';
   }
   if (!setting) return 'off';
   return 'even';
 }
+
+/**
+ * Defaults for the `affinity` config block, read by affinity mode only.
+ *   nearResetMinutes  a 5-hour window resetting within this many minutes is
+ *                     "use it or lose it": the account is placed first
+ *   weeklyHeadroom    how far below the weekly switch threshold the governing
+ *                     weekly must sit for that preference to apply; spending
+ *                     a weekly-bound account faster buys nothing at a 5-hour
+ *                     reset
+ */
+export const AFFINITY_DEFAULTS = Object.freeze({ nearResetMinutes: 15, weeklyHeadroom: 0.10 });
 
 // How long a status read reuses the last adaptive diagnostics. adaptiveStats
 // is a full selection pass over the fleet, and the TUI polls status once a
@@ -526,10 +543,11 @@ export class AccountManager {
    * @param {Object} [opts.adaptive]
    * @param {Object} [opts.sessionTracker]
    * @param {Object} [opts.expiryRouting]
+   * @param {Object} [opts.affinity]  the `affinity` config block (see AFFINITY_DEFAULTS)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -610,6 +628,10 @@ export class AccountManager {
     // takes a reading.
     this._obsGen = 0;
     this.setExpiryRouting(expiryRouting);
+    /** The `affinity` block as resolved by setAffinity (see AFFINITY_DEFAULTS).
+     *  @type {{ nearResetMinutes: number, weeklyHeadroom: number }} */
+    this.affinity = { ...AFFINITY_DEFAULTS };
+    this.setAffinity(affinity);
     // The rollover mechanism's whole state for the sticky current account: one
     // observation, { idx, windows: name → reset }, of the account traffic was
     // resting on when a request last arrived to find it there. Null while the
@@ -1712,6 +1734,11 @@ export class AccountManager {
       // while this account was out of reach is still there to be found when
       // traffic returns to it.
       if (!this._isAvailable(pinned, model, advisorModel) || exclude?.has(idx)) continue;
+      // Affinity mode: the pin holds for as long as the account can serve the
+      // request. Neither a rollover nor a higher-priority sibling moves it;
+      // every move is a prompt-cache miss, and the operator asked for the
+      // conversation to stay put until the account is out of usage.
+      if (this.distributionMode === 'affinity') return pinned;
       // Rollover preemption (expiry routing): this candidate rolled over its
       // governing window, so staying would burn the week it just gained while
       // sooner-expiring quota goes unspent — the only pressure-driven force on a
@@ -1721,7 +1748,7 @@ export class AccountManager {
       // that pressure picks the destination.
       if (this.expiryRouting.enabled && this.expiryRouting.preempt
           && this._pinRolledOver(sessionId, pinned, model)) {
-        const next = this._pickLeastLoaded(exclude, model, advisorModel);
+        const next = this._pickLeastLoaded(exclude, model, advisorModel, true);
         if (next && next.index !== idx) {
           // A fleet-wide rollover moves every session pinned to that account at
           // once, so the destination gets the same failover burst any other
@@ -1743,15 +1770,33 @@ export class AccountManager {
     }
     // No pin was usable, so this is a placement. Placing is aiming: it takes no
     // reading, and the next request to find the pin here takes it.
-    return this._pickLeastLoaded(exclude, model, advisorModel);
+    return this._pickLeastLoaded(exclude, model, advisorModel, true);
   }
 
   /** Where a new session goes, per the configured distribution mode. Adaptive
    * scores the tier by remaining credit and congestion; even (the original)
-   * spreads by active-session count. */
-  _pickLeastLoaded(exclude = null, model = null, advisorModel = null) {
-    if (this.distributionMode === 'adaptive') {
+   * spreads by active-session count; affinity puts a 5-hour window about to
+   * reset ahead of the adaptive score. `announce` logs the affinity reason: set
+   * by the placement paths and not by the status readout, which asks every
+   * second. */
+  _pickLeastLoaded(exclude = null, model = null, advisorModel = null, announce = false) {
+    if (this.distributionMode === 'affinity') {
+      const near = this._pickNearReset(exclude, model, advisorModel);
+      if (near) {
+        if (announce) {
+          const minutes = Math.max(0, Math.round((near.resetAt - Date.now()) / 60_000));
+          console.log(`[TeamClaude] Affinity: placing conversation on "${safeLine(near.account.name, 64)}" — 5h window resets in ${minutes}m`);
+        }
+        return near.account;
+      }
+    }
+    if (this.distributionMode === 'adaptive' || this.distributionMode === 'affinity') {
       const picked = this._pickAdaptive(exclude, model, advisorModel);
+      if (picked && announce && this.distributionMode === 'affinity') {
+        const window = this._adaptiveWindow(picked, model);
+        const used = Number.isFinite(window.utilization) ? `${Math.round(window.utilization * 100)}%` : 'unknown';
+        console.log(`[TeamClaude] Affinity: placing conversation on "${safeLine(picked.name, 64)}" — fullest (${window.bucket} ${used})`);
+      }
       // Adaptive can legitimately score every candidate at zero — the whole
       // tier is inside its reserve — and that is not a reason to refuse a
       // request. Fall through to the even walk, which still returns the least
@@ -1782,6 +1827,11 @@ export class AccountManager {
       const scoped = this._scopedWeekly(account, model);
       if (scoped) add(`scoped:${modelFamily(model)}`, scoped.utilization, scoped.resetAt);
     }
+    // Affinity mode spends the fullest window first whichever clock it runs on,
+    // so the 5-hour bucket competes too. Adaptive keeps its weekly-only view:
+    // the 5-hour window's short horizon would otherwise dominate a score meant
+    // to finish weekly windows off.
+    if (this.distributionMode === 'affinity') add('unified5h', q.unified5h, q.unified5hReset);
     if (!windows.length) return { bucket: requested, utilization: null, resetAt: null };
 
     windows.sort((a, b) => {
@@ -1812,6 +1862,71 @@ export class AccountManager {
    */
   _adaptiveLoad(account, now = Date.now()) {
     return this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0);
+  }
+
+  /** The threshold bucket a scored window tapers toward. A weekly window, shared
+   * or scoped, tapers toward the requested weekly bucket's threshold as it
+   * always has; the 5-hour window (affinity mode only) toward its own.
+   * @param {string} windowBucket
+   * @param {string} weeklyBucket */
+  _windowThresholdBucket(windowBucket, weeklyBucket) {
+    return windowBucket === 'unified5h' ? 'unified5h' : weeklyBucket;
+  }
+
+  /**
+   * Affinity mode's first tier: the account whose 5-hour window resets within
+   * `affinity.nearResetMinutes`, soonest first. Quota in that window is gone
+   * at the reset whether or not it was spent, so a conversation placed there
+   * now costs nothing that a later placement would still have. Two guards keep
+   * it honest: the account must have room in its governing weekly (at least
+   * `affinity.weeklyHeadroom` below that bucket's threshold), since the weekly
+   * is also metered and does not reset in minutes; and only the top priority
+   * tier of the admitted set competes, as in every other picker.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {{ account: any, resetAt: number }|null}
+   */
+  _pickNearReset(exclude = null, model = null, advisorModel = null) {
+    const now = Date.now();
+    const horizon = now + this.affinity.nearResetMinutes * 60_000;
+    const eligible = this._bandedCandidates(exclude, model, advisorModel);
+    if (eligible.length === 0) return null;
+    const topPriority = Math.min(...eligible.map(a => a.priority || 0));
+    const weeklyBucket = this._weeklyBucketFor(model);
+    /** @type {{ account: any, resetAt: number }|null} */
+    let best = null;
+    for (const account of eligible) {
+      if ((account.priority || 0) !== topPriority) continue;
+      const q = account.quota;
+      // _isAvailable (via _bandedCandidates) has already cleared an expired
+      // window, so a reset still on the account is in the future.
+      const resetAt = q.unified5hReset;
+      if (!Number.isFinite(resetAt) || resetAt > horizon || q.unified5h == null) continue;
+      // Unknown weekly is not a known-full weekly: it stays eligible, as the
+      // availability gate treats it.
+      const weekly = this._governingWeekly(account, model);
+      const ceiling = this.thresholdFor(weeklyBucket, account) - this.affinity.weeklyHeadroom;
+      if (weekly != null && weekly > ceiling) continue;
+      if (!best || resetAt < best.resetAt) best = { account, resetAt };
+    }
+    return best;
+  }
+
+  /** Apply the `affinity` config block; safe on every config reload. A value
+   * that is not a finite number in range takes the default rather than
+   * breaking placement, in the same spirit as setExpiryRouting.
+   * @param {unknown} cfg */
+  setAffinity(cfg) {
+    const c = /** @type {Record<string, unknown>} */ ((cfg && typeof cfg === 'object' && !Array.isArray(cfg)) ? cfg : {});
+    const minutes = c.nearResetMinutes;
+    const headroom = c.weeklyHeadroom;
+    this.affinity = {
+      nearResetMinutes: typeof minutes === 'number' && Number.isFinite(minutes) && minutes >= 0
+        ? minutes : AFFINITY_DEFAULTS.nearResetMinutes,
+      weeklyHeadroom: typeof headroom === 'number' && Number.isFinite(headroom) && headroom >= 0 && headroom <= 1
+        ? headroom : AFFINITY_DEFAULTS.weeklyHeadroom,
+    };
   }
 
   _pickAdaptive(exclude = null, model = null, advisorModel = null) {
@@ -1856,7 +1971,7 @@ export class AccountManager {
       account,
       index: account.index,
       utilization: windows[i].utilization,
-      threshold: this.thresholdFor(bucket, account),
+      threshold: this.thresholdFor(this._windowThresholdBucket(windows[i].bucket, bucket), account),
       capacity: usePlanWeights ? planWeights[i] : null,
       reserve: this.burnRateLearner.reserve(account.index, windows[i].bucket),
       load: this._adaptiveLoad(account, now),
@@ -2054,7 +2169,7 @@ export class AccountManager {
    * provider's draw alone.
    */
   adaptiveStats(model = null, provider = null) {
-    if (this.distributionMode !== 'adaptive') return [];
+    if (!this._scoresAdaptively()) return [];
     if (provider != null) return this._adaptiveStatsFor(model, provider, this.accounts);
     const rows = [];
     for (const p of new Set(this.accounts.map(a => providerOf(a)))) {
@@ -2070,12 +2185,18 @@ export class AccountManager {
    * first tick that could have shown it.
    */
   _adaptiveStatsCached(now = Date.now()) {
-    if (this.distributionMode !== 'adaptive') return [];
+    if (!this._scoresAdaptively()) return [];
     const cached = this._adaptiveStatsCache;
     if (cached && now >= cached.at && now - cached.at < ADAPTIVE_STATS_CACHE_MS) return cached.rows;
     const rows = this.adaptiveStats();
     this._adaptiveStatsCache = { at: now, rows };
     return rows;
+  }
+
+  /** Whether placement runs the adaptive score: adaptive mode, and affinity
+   * mode once no 5-hour window is about to reset. */
+  _scoresAdaptively() {
+    return this.distributionMode === 'adaptive' || this.distributionMode === 'affinity';
   }
 
   /** One provider's draw: the rows for `reported`, scored against the
@@ -2104,7 +2225,7 @@ export class AccountManager {
       const u = Number.isFinite(utilization) ? utilization : 0;
       // Per-account: an account with its own switchThreshold (#409) reports
       // headroom against ITS OWN wall, not the fleet's.
-      const threshold = this.thresholdFor(bucket, a);
+      const threshold = this.thresholdFor(this._windowThresholdBucket(window.bucket, bucket), a);
       const head = Math.max(0, threshold - u);
       const planWeight = planWeights.get(a.index);
       return {
@@ -5266,6 +5387,7 @@ export class AccountManager {
       // The knob as the server resolved it, defaults and clamps applied, so an
       // operator reading status sees the configuration the router is using.
       expiryRouting: { ...this.expiryRouting },
+      affinity: { ...this.affinity },
       // The mode, and the last advisor request it mattered to: how many of the
       // accounts that could serve the request could also serve its advisor.
       // Null when the last advisor request found no difference between them.
