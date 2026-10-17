@@ -12,6 +12,7 @@ import {
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
+  claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
 } from '../src/dashboard.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -50,6 +51,48 @@ test('scopedWeekly falls back to the dedicated fields, and never doubles a famil
   assert.equal(both[0].utilization, 0.5);
   assert.deepEqual(scopedWeeklyRows({}), []);
   assert.deepEqual(scopedWeeklyRows(null), []);
+});
+
+test('a card draws Fable first, then the five-hour session, then the shared weekly last', () => {
+  const rows = claudeQuotaRows({
+    unified5h: 0.2, unified5hReset: 1, unified7d: 0.4, unified7dReset: 2,
+    scopedWeekly: { fable: { utilization: 0.6, resetAt: 3 }, sonnet: { utilization: 0.1, resetAt: 4 } },
+  });
+  assert.deepEqual(rows.map(r => r.label), ['Fable', 'Sonnet', 'Session', 'Weekly']);
+  assert.deepEqual(rows[0], { label: 'Fable', utilization: 0.6, resetAt: 3 });
+  assert.deepEqual(rows[2], { label: 'Session', utilization: 0.2, resetAt: 1 });
+  assert.deepEqual(rows[3], { label: 'Weekly', utilization: 0.4, resetAt: 2 });
+  // Fable leads even when another family sorts ahead of it by name.
+  assert.deepEqual(claudeQuotaRows({ unified7d: 0.1, scopedWeekly: { fable: {}, apex: {} } }).map(r => r.label),
+    ['Fable', 'Apex', 'Session', 'Weekly']);
+});
+
+test('a card with no Fable bucket or no session window draws only what it has', () => {
+  assert.deepEqual(claudeQuotaRows({ unified5h: 0.2, unified7d: 0.4 }).map(r => r.label), ['Session', 'Weekly']);
+  // A plan that states no session window gets no Session bar (showSessionRow).
+  assert.deepEqual(claudeQuotaRows({ unified7d: 0.4, sessionWindowStated: false, unified7dFable: 0.5 }).map(r => r.label),
+    ['Fable', 'Weekly']);
+});
+
+test('a refresh button is offered only where the probe would read the account', () => {
+  assert.equal(canRefreshQuota({ name: 'a' }, { name: 'a', status: 'never' }), true);
+  assert.equal(canRefreshQuota({ name: 'a' }, { name: 'a', status: 'running' }), true);
+  assert.equal(canRefreshQuota({ name: 'a' }, { name: 'a', status: 'not-applicable' }), false);
+  assert.equal(canRefreshQuota({ name: 'a', disabled: true }, { name: 'a', status: 'ok' }), false);
+  assert.equal(canRefreshQuota({ name: 'a' }, null), false, 'no probe row, no button');
+});
+
+test('refreshQuotaRequest narrows the fleet probe to one account', () => {
+  const r = refreshQuotaRequest('me@example.com', 'k');
+  assert.equal(r.url, '/teamclaude/probe');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'k');
+  assert.deepEqual(JSON.parse(r.init.body), { account: 'me@example.com' });
+  assert.equal(refreshQuotaRequest('a', null).init.headers['x-api-key'], '');
+  assert.deepEqual(refreshQuotaOutcome({ ok: true, account: 'a', status: 'ok' }), { kind: 'ok', text: 'quota refreshed' });
+  assert.deepEqual(refreshQuotaOutcome({ ok: false, error: 'the account is disabled' }),
+    { kind: 'error', text: 'quota refresh failed: the account is disabled' });
+  assert.equal(refreshQuotaOutcome(null).kind, 'error');
 });
 
 test('account token total includes the cache fields', () => {
@@ -303,6 +346,78 @@ test('the probe control invokes the server hook', async () => {
     });
     assert.deepEqual(await res.json(), { ok: true });
     assert.equal(calls, 1);
+  } finally {
+    proxy.close();
+  }
+});
+
+test('the probe route refreshes one account when the body names it', async () => {
+  const am = new AccountManager([
+    { name: 'a', type: 'api_key', apiKey: 'sk-a' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  let fleet = 0;
+  const single = [];
+  const answers = {
+    a: { probed: true, status: { status: 'ok', error: null } },
+    b: { probed: false, reason: 'the account is disabled' },
+  };
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' }, {
+    probeQuota: async () => { fleet++; },
+    probeAccountQuota: async (account) => { single.push(account.name); return answers[account.name]; },
+  });
+  const port = await listen(proxy);
+  const post = body => fetch(`http://127.0.0.1:${port}/teamclaude/probe`, {
+    method: 'POST', headers: { 'x-api-key': 'secret', 'content-type': 'application/json' }, body,
+  });
+  try {
+    let res = await post(JSON.stringify({ account: 'a' }));
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, account: 'a', status: 'ok' });
+    assert.deepEqual(single, ['a']);
+    assert.equal(fleet, 0, 'a named account is not a fleet probe');
+
+    res = await post(JSON.stringify({ account: 'b' }));
+    assert.equal(res.status, 409);
+    assert.deepEqual(await res.json(), { ok: false, account: 'b', error: 'the account is disabled' });
+
+    answers.a = { probed: true, status: { status: 'error', error: 'usage endpoint said no' } };
+    res = await post(JSON.stringify({ account: 'a' }));
+    assert.equal(res.status, 502);
+    assert.deepEqual(await res.json(), { ok: false, account: 'a', status: 'error', error: 'usage endpoint said no' });
+
+    res = await post(JSON.stringify({ account: 'nobody' }));
+    assert.equal(res.status, 404);
+    assert.deepEqual((await res.json()).accounts, ['a', 'b']);
+
+    res = await post(JSON.stringify({ account: '  ' }));
+    assert.equal(res.status, 400);
+    res = await post('{not json');
+    assert.equal(res.status, 400);
+    assert.deepEqual(single, ['a', 'b', 'a'], 'nothing probed for a bad request');
+
+    // No body is still the fleet probe the CLI and the page-wide button send.
+    res = await post(undefined);
+    assert.deepEqual(await res.json(), { ok: true });
+    assert.equal(fleet, 1);
+  } finally {
+    proxy.close();
+  }
+});
+
+test('a server without a single-account probe says so rather than probing the fleet', async () => {
+  const am = new AccountManager([{ name: 'a', type: 'api_key', apiKey: 'sk-a' }], 0.98);
+  let fleet = 0;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' }, {
+    probeQuota: async () => { fleet++; },
+  });
+  const port = await listen(proxy);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/teamclaude/probe`, {
+      method: 'POST', headers: { 'x-api-key': 'secret' }, body: JSON.stringify({ account: 'a' }),
+    });
+    assert.equal(res.status, 501);
+    assert.equal(fleet, 0);
   } finally {
     proxy.close();
   }
@@ -673,7 +788,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -777,6 +892,22 @@ for (const status of [401, 403]) {
     assert.equal(page.store.size, 0);
   });
 }
+
+test('a card\'s refresh button probes that one account, then polls for the new bars', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [{ name: 'a', quota: { unified7d: 0.1 } }, { name: 'k', quota: {} }],
+    probe: { accounts: [{ name: 'a', status: 'never' }, { name: 'k', status: 'not-applicable' }] },
+  });
+  assert.equal(page.labelled('refresh'), 1, 'only the account the probe can read gets the button');
+  page.click('refresh');
+  const req = page.requests.shift();
+  assert.equal(req.url, '/teamclaude/probe');
+  assert.deepEqual(JSON.parse(req.init.body), { account: 'a' });
+  req.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'a', status: 'ok' }) });
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the poll after it shows the new bars');
+});
 
 test('a first poll that fails shows its error instead of a blank page', async () => {
   const page = bootPage();

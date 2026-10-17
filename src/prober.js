@@ -67,6 +67,10 @@ export class Prober {
     this.lastRunFinishedAt = null;
     this.nextRunAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
     this.accountStatus = new Map();
+    // One probe per account at a time, keyed by the account object: a card's
+    // refresh landing during a fleet cycle would otherwise refresh the token
+    // and read the endpoint twice for one answer.
+    this._inFlight = new Map();
   }
 
   start() {
@@ -154,7 +158,34 @@ export class Prober {
     return true;
   }
 
-  async probeAccount(account) {
+  /**
+   * Probe one account now: the dashboard card's refresh button. It applies the
+   * same two rules a fleet cycle does (the account has a quota to read, and is
+   * in rotation), so a single refresh never reaches an account the fleet
+   * probe would leave alone. A probe of this account already in flight, from a
+   * fleet cycle or an earlier click, is joined rather than doubled.
+   *
+   * @param {any} account
+   * @returns {Promise<{ probed: true, status: any } | { probed: false, reason: string }>}
+   */
+  async probeOne(account) {
+    if (!probeApplicable(account)) return { probed: false, reason: 'this account has no quota the probe can read' };
+    if (account.disabled) return { probed: false, reason: 'the account is disabled' };
+    if (!this._probeable(account)) return { probed: false, reason: 'upstream rejected its refresh token; sign in again' };
+    await this.probeAccount(account);
+    return { probed: true, status: this.accountStatus.get(account.name) };
+  }
+
+  /** @param {any} account */
+  probeAccount(account) {
+    const pending = this._inFlight.get(account);
+    if (pending) return pending;
+    const run = this._probeAccount(account).finally(() => this._inFlight.delete(account));
+    this._inFlight.set(account, run);
+    return run;
+  }
+
+  async _probeAccount(account) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     // A third-party backend has no Anthropic usage to read; it publishes its own

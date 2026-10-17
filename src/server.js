@@ -719,10 +719,64 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // One-shot quota probe — the web equivalent of the TUI's `p` key. It is
       // zero-spend and only available when the running server has a prober.
+      // With no body it refreshes the fleet; {"account": "<name|uuid>"} (the
+      // same identifiers /switch takes) refreshes that one account, which is
+      // what a dashboard card's refresh button sends.
       if (req.method === 'POST' && req.url === '/teamclaude/probe') {
         if (!hooks.probeQuota) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe not supported' }));
+          return;
+        }
+        let target;
+        try {
+          // `?.`: JSON.parse('null') is a value, and `.account` of it throws.
+          target = JSON.parse(await readControlBody(req) || '{}')?.account;
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (target !== undefined) {
+          if (!hooks.probeAccountQuota) {
+            res.writeHead(501, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'single-account quota probe not supported' }));
+            return;
+          }
+          const names = () => (accountManager.accounts || []).map((/** @type {any} */ a) => a.name);
+          if (typeof target !== 'string' || !target.trim()) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+            return;
+          }
+          const index = resolveAccountPin(accountManager, target);
+          if (index == null) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+            return;
+          }
+          const account = accountManager.accounts[index];
+          try {
+            const result = await hooks.probeAccountQuota(account);
+            // Not probed is the caller asking for something the probe will not
+            // do (an API-key account, a disabled one), so it is a 409 with the
+            // reason rather than a success that changed nothing.
+            if (!result.probed) {
+              res.writeHead(409, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, account: account.name, error: result.reason }));
+              return;
+            }
+            // The probe ran, but upstream may not have answered: that is a 502
+            // carrying the same status and error the probe records in /status.
+            const { status, error } = result.status || {};
+            res.writeHead(status === 'ok' ? 200 : 502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: status === 'ok', account: account.name, status: status || null, ...(error ? { error } : {}) }));
+          } catch (err) {
+            console.error('[TeamClaude] Quota probe failed:', /** @type {Error} */ (err).message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
+          }
           return;
         }
         try {

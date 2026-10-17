@@ -467,6 +467,65 @@ test('prober skips an account holding a rejected refresh token, until a new one 
   assert.equal(probes, probesAfterRejection + 1);
 });
 
+// ── probeOne: a dashboard card's refresh ─────────────────────
+
+test('probeOne refreshes only the account it is given', async () => {
+  const am = new AccountManager([oauth('a'), oauth('b')], 0.98);
+  const probed = [];
+  const probeFn = async cred => { probed.push(cred); return { fiveHour: { utilization: 0.3, resetAt: 1000 } }; };
+  const prober = new Prober(am, { intervalMs: 0, probeFn, log: () => {} });
+  const result = await prober.probeOne(am.accounts[1]);
+  assert.deepEqual(probed, ['t-b']);
+  assert.equal(result.probed, true);
+  assert.equal(result.status.status, 'ok');
+  assert.equal(am.accounts[1].quota.unified5h, 0.3);
+  assert.equal(am.accounts[0].quota.unified5h ?? null, null);
+});
+
+test('probeOne reports an upstream failure as the probe recorded it', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => ({ error: 'usage endpoint said no' }), log: () => {} });
+  const result = await prober.probeOne(am.accounts[0]);
+  assert.equal(result.probed, true);
+  assert.equal(result.status.status, 'error');
+  assert.equal(result.status.error, 'usage endpoint said no');
+});
+
+test('probeOne refuses what a fleet cycle would skip, and says why', async () => {
+  const am = new AccountManager([
+    { name: 'key', type: 'api_key', apiKey: 'sk-x' },
+    oauth('off'),
+  ], 0.98);
+  am.setDisabled(1, true);
+  let probes = 0;
+  const prober = new Prober(am, { intervalMs: 0, probeFn: async () => { probes++; return {}; }, log: () => {} });
+  const apiKey = await prober.probeOne(am.accounts[0]);
+  assert.equal(apiKey.probed, false);
+  assert.match(apiKey.reason, /no quota/);
+  const disabled = await prober.probeOne(am.accounts[1]);
+  assert.equal(disabled.probed, false);
+  assert.match(disabled.reason, /disabled/);
+  assert.equal(probes, 0);
+});
+
+test('probeOne joins a probe of the same account already in flight', async () => {
+  const am = new AccountManager([oauth('a')], 0.98);
+  let probes = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const probeFn = async () => { probes++; await gate; return { fiveHour: { utilization: 0.4, resetAt: 1000 } }; };
+  const prober = new Prober(am, { intervalMs: 0, probeFn, log: () => {} });
+  const cycle = prober.probeAll();
+  const single = prober.probeOne(am.accounts[0]);
+  release();
+  const [, result] = await Promise.all([cycle, single]);
+  assert.equal(probes, 1, 'one read of the endpoint for both callers');
+  assert.equal(result.status.status, 'ok');
+  // Once it settles, the next refresh is a fresh read rather than the old answer.
+  await prober.probeOne(am.accounts[0]);
+  assert.equal(probes, 2);
+});
+
 // setInterval coerces a delay above 2^31-1 ms to 1 ms, which would turn an
 // interval meant as "practically never" into a tight probing loop.
 test('prober clamps its interval so the timer cannot overflow', () => {
