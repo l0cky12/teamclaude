@@ -88,6 +88,19 @@ test('distribute affinity writes and reports the fourth mode', async () => {
   assert.match(read.stdout, /Session distribution: affinity/);
 });
 
+test('distribute drain writes and reports the fifth mode', async () => {
+  const configPath = await writeConfig();
+  const set = await runCli(configPath, ['distribute', 'drain']);
+  assert.equal(set.code, 0, set.stderr);
+  assert.equal(await readDistribute(configPath), 'drain');
+  assert.match(set.stdout, /Session distribution drain/);
+
+  const read = await runCli(configPath, ['distribute']);
+  assert.equal(read.code, 0, read.stderr);
+  assert.match(read.stdout, /Session distribution: drain/);
+  assert.match(read.stdout, /distribute <on\|off\|adaptive\|affinity\|drain>/);
+});
+
 test('distribute off says the running sessions drain', async () => {
   const configPath = await writeConfig(true);
   const res = await runCli(configPath, ['distribute', 'off']);

@@ -35,6 +35,11 @@ export { isFableModel, parseRequestModel, parseAdvisorModel } from './model.js';
  *                               scoring, and a pinned conversation moves only
  *                               when its account cannot serve it (see
  *                               _pickNearReset and _selectForSession)
+ *   'drain'        → 'drain'    NOT a distribution: sessions are handled
+ *                               exactly as under 'off' (one account at a
+ *                               time, no pins honoured), but the account is
+ *                               the one whose governing weekly resets soonest,
+ *                               used until it runs out (see _selectDrainMode)
  * An unrecognised string is treated as 'even' rather than rejected: it is
  * plainly a request to distribute, and refusing to distribute at all would be
  * the worse reading of a typo. It is still said once, naming the value: an
@@ -49,16 +54,34 @@ export function distributionMode(setting) {
     const value = setting.trim().toLowerCase();
     if (value === 'adaptive') return 'adaptive';
     if (value === 'affinity') return 'affinity';
+    if (value === 'drain') return 'drain';
     if (['off', 'false', 'no', '0'].includes(value)) return 'off';
     if (!EVEN_SPELLINGS.includes(value) && !warnedDistributeValues.has(value)) {
       warnedDistributeValues.add(value);
-      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "affinity")`);
+      console.warn(`[TeamClaude] distributeSessions: unrecognised value ${JSON.stringify(setting)}, distributing evenly (valid: true, false, "adaptive", "affinity", "drain")`);
     }
     return 'even';
   }
   if (!setting) return 'off';
   return 'even';
 }
+
+/**
+ * Whether a mode spreads sessions across accounts. 'drain' is a truthy string
+ * that is not a distribution: like 'off' it keeps every session on the one
+ * account the cursor names, so every "is distribution on" question asks this
+ * rather than testing the setting or comparing the mode with 'off'.
+ * @param {string} mode  a value distributionMode returns
+ * @returns {boolean}
+ */
+export function distributesSessions(mode) {
+  return mode !== 'off' && mode !== 'drain';
+}
+
+// Drain mode buckets weekly resets to the hour before comparing them, so two
+// accounts whose windows lapse minutes apart rank as tied and the order does
+// not churn on readings that differ by seconds (see _drainResetHour).
+const DRAIN_RESET_BUCKET_MS = 3_600_000;
 
 /**
  * Defaults for the `affinity` config block, read by affinity mode only.
@@ -566,11 +589,21 @@ export class AccountManager {
     // accounts by load instead of funnelling them all onto the current one.
     /** @type {SessionTracker} */
     this.sessionTracker = sessionTracker || new SessionTracker();
-    // 'off' | 'even' | 'adaptive'. `distributeSessions` stays a boolean beside
-    // it ("is distribution on at all") because the status readout, the TUI
-    // header and the remote dashboard all ask only that question.
+    // 'off' | 'even' | 'adaptive' | 'affinity' | 'drain'. `distributeSessions`
+    // stays a boolean beside it ("is distribution on at all") because the status
+    // readout, the TUI header and the remote dashboard all ask only that
+    // question. 'drain' answers no: it routes sessions as 'off' does.
     this.distributionMode = distributionMode(distributeSessions);
-    this.distributeSessions = this.distributionMode !== 'off';
+    this.distributeSessions = distributesSessions(this.distributionMode);
+    // Drain mode's per-scope resting place for requests that do not follow the
+    // shared cursor: a model family ranked on its own weekly window, or a
+    // request the current account cannot serve. Keyed like routeCursors
+    // (_cursorKey, so namespaced by provider) → account index. Kept apart from
+    // routeCursors because every selection path writes those, the session
+    // drain included, and a reload clears them; this one holds only what drain
+    // mode itself chose, so its no-flap rule has a stable incumbent to keep.
+    /** @type {Map<string, number>} */
+    this._drainHolders = new Map();
     // Adaptive burn rate and tolerated concurrency are inferred from live
     // traffic. Plan size is authoritative OAuth profile metadata, not a learned
     // estimate. Learners are constructed unconditionally so enabling adaptive
@@ -789,6 +822,8 @@ export class AccountManager {
    * The shared buckets (unified5h, unified7d) cap every request; a family bucket
    * caps only the family it meters, so a Fable cap stops Fable and leaves Opus
    * alone. Both apply: a Fable request is capped by whichever binds first.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
    */
   capExceeded(account, model = null) {
     // The money cap first: it is the budget the usage caps exist to protect, and
@@ -1580,6 +1615,21 @@ export class AccountManager {
     // through to normal best-available selection so requests keep flowing.
     const pinned = this._pinnedAccountForModel(model, advisorModel);
     if (pinned && this._isAvailable(pinned, model, advisorModel) && !exclude?.has(pinned.index)) return pinned;
+    // Drain mode has a walk of its own. It re-ranks on every request, so the
+    // requalification a newly learned weekly asks for is already done and the
+    // flag is only consumed; and expiry routing's rollover preemption does not
+    // apply, since drain ranks on the reset alone. What follows the walk — the
+    // soonest-reset resurrection in _selectNext, the probe, the fallback — is
+    // shared, so an exhausted fleet behaves the same in every mode.
+    if (this.distributionMode === 'drain') {
+      const cur = /** @type {Record<string, any>|undefined} */ (this.accounts[this.currentIndex]);
+      if (allowProbe && cur) cur.requalify = false;
+      const drained = this._selectDrainMode(exclude, model, advisorModel)
+        ?? this._selectNext(exclude, model, advisorModel);
+      if (drained) return drained;
+      if (!allowProbe) return null;
+      return this._selectProbe(exclude, model) ?? this._selectFallback(exclude, model);
+    }
     const current = this.accounts[this.currentIndex];
     // `model` scopes availability: an account whose Fable weekly bucket is spent
     // is still fully usable for other models, so it is only excluded when THIS
@@ -2430,6 +2480,13 @@ export class AccountManager {
     if (allowed(pinned) && this._isAvailable(pinned, model)) return pinned.index;
     const currentIndex = this._currentIndexForProvider(provider);
     const current = this.accounts[currentIndex];
+    // Drain mode's walk, read without moving anything: the scope's resting
+    // account while nothing displaces it, else the head of the drain order.
+    if (this.distributionMode === 'drain') {
+      const { incumbent } = this._drainIncumbent(current ?? null, excluded, model, null, provider);
+      if (incumbent && !this._drainDisplacement(incumbent, excluded, model, null)) return incumbent.index;
+      return this._pickBestAvailable(excluded, model)?.index ?? null;
+    }
     if (current && this._isAvailable(current, model)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
       // available account wins over a healthy current one; same tier stays put.
@@ -2771,6 +2828,13 @@ export class AccountManager {
     return paid ? { account: paid, paid: true } : null;
   }
 
+  /**
+   * Whether `account` can serve this request right now (see unavailableReason).
+   * @param {Record<string, any>|null|undefined} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {boolean}
+   */
   _isAvailable(account, model = null, advisorModel = null) {
     return this.unavailableReason(account, model, advisorModel) === null;
   }
@@ -2785,6 +2849,9 @@ export class AccountManager {
    * Returns one of: 'disabled', 'spend-capped', 'capped', 'throttled', 'error',
    * 'entitlement', 'exhausted', 'upstream-rejected', 'quota', 'route', 'routing',
    * 'credential', 'advisor-capped', 'advisor-quota', 'advisor-route'.
+   * @param {Record<string, any>|null|undefined} account
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
    */
   unavailableReason(account, model = null, advisorModel = null) {
     if (!account) return 'error';
@@ -2913,10 +2980,17 @@ export class AccountManager {
    *  their accounts, while new sessions route by plain rotation — affinity winds
    *  down as those sessions finish. Pass { drain: false } for an immediate cut.
    *
-   *  Turning it ON cancels any drain in progress. */
+   *  Turning it ON cancels any drain in progress.
+   *
+   *  'drain' mode counts as OFF here: it routes sessions the way 'off' does,
+   *  so switching to it from a distributing mode drains the pinned sessions
+   *  exactly as switching to 'off' would. */
   setDistributeSessions(enabled, { drain = true } = {}) {
     const mode = distributionMode(enabled);
-    if (mode !== 'off') {
+    // Drain mode's per-scope holders describe its own choices only; another
+    // mode, or a later return to drain, starts from the shared cursor again.
+    if (mode !== this.distributionMode) this._drainHolders.clear();
+    if (distributesSessions(mode)) {
       // Includes switching BETWEEN 'even' and 'adaptive'. Neither drains: both
       // keep a session pinned to its account, so only the choice made for the
       // NEXT new session changes and no running session loses its prompt cache.
@@ -2925,7 +2999,7 @@ export class AccountManager {
       this._drainingSessions = null;
       return;
     }
-    this.distributionMode = 'off';
+    this.distributionMode = mode;
     // Only a true → false transition drains; re-applying "off" (every config
     // reload while it is already off) must not resurrect affinity for sessions
     // that have since been routed by plain rotation.
@@ -3038,6 +3112,10 @@ export class AccountManager {
    * families it needs: it is diverted for the advisor's sake as often as the
    * executor's, and sharing a cursor with plain requests for the executor's
    * model would have each overwrite the other's and re-log the diversion.
+   * @param {string|null} model
+   * @param {string|null} [advisorModel]
+   * @param {string} [provider]
+   * @returns {string}
    */
   _cursorKey(model, advisorModel = null, provider = this._selectingProvider || DEFAULT_PROVIDER) {
     const own = this._routeForModel(model)?.name || (model ? this._weeklyBucketFor(model) : '');
@@ -4085,6 +4163,11 @@ export class AccountManager {
    * account's weekly limit and the account still has weekly quota to spend.
    */
   _switchOnSessionReset(candidates, model = null, exclude = null, advisorModel = null) {
+    // Drain mode re-ranks on every request (_selectDrainMode), and an account
+    // whose 5-hour window just reset is one that walk already sees. This rule
+    // compares raw resets rather than drain's hour buckets, so running it too
+    // would make moves drain's no-flap rule exists to refuse.
+    if (this.distributionMode === 'drain') return;
     const current = this.accounts[this.currentIndex];
     // Need a known weekly reset on the current account to compare against;
     // if it is unknown we are still probing it, so leave it alone. Read through
@@ -4171,6 +4254,13 @@ export class AccountManager {
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
   }
 
+  /**
+   * Whether `account` is at its switch threshold on any bucket that gates
+   * `model`: the 5-hour window, the governing weekly, or an API key's limits.
+   * @param {Record<string, any>} account
+   * @param {string|null} [model]
+   * @returns {boolean}
+   */
   _isNearQuota(account, model = null) {
     const q = account.quota;
     this._clearExpiredQuotas(account);
@@ -4218,8 +4308,18 @@ export class AccountManager {
    * highest pressure, and the two part only where a timestamp alone would rank a
    * nearly-drained account resetting in an hour over one holding 20x the quota
    * that expires in ten.
+   *
+   * Drain mode replaces this order with _drainOrder's.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {Record<string, any>|null}
    */
   _pickBestAvailable(exclude = null, model = null, advisorModel = null) {
+    // Drain mode replaces the order (see _drainOrder); every caller, the
+    // startup pick and the failover hop included, then agrees with it.
+    if (this.distributionMode === 'drain') return this._drainOrder(exclude, model, advisorModel)[0] ?? null;
+    /** @type {Record<string, any>|null} */
     let best = null;
     let bestPriority = Infinity;
     let bestPressure = Infinity;
@@ -4267,8 +4367,204 @@ export class AccountManager {
     const wk = best.quota.unified7d != null
       ? `${(best.quota.unified7d * 100).toFixed(1)}% weekly used`
       : 'weekly quota unknown';
-    console.log(`[TeamClaude] Starting on account "${best.name}" (priority ${best.priority || 0}, ${wk})`);
+    const why = this.distributionMode === 'drain' ? ' — drain mode: soonest weekly reset first' : '';
+    console.log(`[TeamClaude] Starting on account "${best.name}" (priority ${best.priority || 0}, ${wk})${why}`);
     return best;
+  }
+
+  // ── Drain mode ─────────────────────────────────────────────────────────────
+  // `distributeSessions: "drain"`. Not to be confused with the session DRAIN
+  // that follows turning distribution off (_drainingSessions and friends):
+  // this is a selection order. Sessions are routed as under 'off', all of them
+  // on the one account the cursor names; what changes is which account that is
+  // and when it moves. The account spent is the one whose governing weekly
+  // resets soonest, and it is used until it cannot serve, then the next.
+
+  /**
+   * The weekly reset `account` is ranked on for `model`, as an hour bucket:
+   * the governing window's reset (Fable's own for a Fable request), floored to
+   * the hour. -Infinity when no reset is known, so it ranks first, as
+   * `_rankedReset` ranks it: using an account is how its window is learned.
+   * @param {Record<string, any>} account
+   * @param {string|null} model
+   * @returns {number}
+   */
+  _drainResetHour(account, model) {
+    const reset = this._governingWeeklyReset(account, model);
+    return reset ? Math.floor(reset / DRAIN_RESET_BUCKET_MS) : -Infinity;
+  }
+
+  /**
+   * Every account that can serve this request, in drain order:
+   *   a. lowest `priority` value first
+   *   b. then the governing weekly reset, soonest hour first (unknown first)
+   *   c. then the most governing weekly remaining (lowest utilization; an
+   *      unknown utilization first, as an unknown reset is)
+   *   d. then array order
+   * The 5-hour window is not a key: it is the availability gate, so an
+   * account whose 5-hour window is used up is simply not in the list until it
+   * resets. Expiry pressure is not consulted either, nor the expiry band.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel]
+   * @returns {Array<Record<string, any>>}
+   */
+  _drainOrder(exclude = null, model = null, advisorModel = null) {
+    const ranked = this.accounts
+      .filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel))
+      .map(a => ({
+        account: a,
+        priority: a.priority || 0,
+        hour: this._drainResetHour(a, model),
+        used: this._governingWeekly(a, model) ?? -Infinity,
+      }));
+    // Spelled out rather than subtracted: -Infinity minus itself is NaN.
+    const cmp = (/** @type {number} */ x, /** @type {number} */ y) => (x === y ? 0 : x < y ? -1 : 1);
+    ranked.sort((x, y) => cmp(x.priority, y.priority) || cmp(x.hour, y.hour)
+      || cmp(x.used, y.used) || cmp(x.account.index, y.account.index));
+    return ranked.map(r => r.account);
+  }
+
+  /**
+   * Why `incumbent` should give way, or null when it holds: 'priority' when an
+   * account in a better priority tier can serve this request, 'reset' when one
+   * in the same tier has a KNOWN weekly reset in a strictly earlier hour.
+   *
+   * Deliberately narrower than _drainOrder. The remaining-quota tie-break is
+   * not a reason to move: two accounts resetting in the same hour would trade
+   * places as each was used, and every move costs the conversations on it a
+   * prompt-cache miss. Nor is an unknown reset: a weekly window that has just
+   * lapsed reads as unknown until the account is used again, and its new reset
+   * is the furthest out in the fleet, so moving there to find that out and
+   * straight back again buys nothing. Both still decide a pick that has to be
+   * made anyway (_drainOrder).
+   * @param {Record<string, any>} incumbent
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @returns {'priority'|'reset'|null}
+   */
+  _drainDisplacement(incumbent, exclude, model, advisorModel) {
+    const priority = incumbent.priority || 0;
+    const hour = this._drainResetHour(incumbent, model);
+    /** @type {'priority'|'reset'|null} */
+    let found = null;
+    for (const a of this.accounts) {
+      if (a === incumbent || exclude?.has(a.index) || (a.priority || 0) > priority) continue;
+      // Availability first: it clears a window whose reset has passed, which a
+      // reset read before it would still name as the soonest.
+      if (!this._isAvailable(a, model, advisorModel)) continue;
+      if ((a.priority || 0) < priority) return 'priority';
+      const h = this._drainResetHour(a, model);
+      if (h !== -Infinity && h < hour) found = 'reset';
+    }
+    return found;
+  }
+
+  /**
+   * The account this request's scope is resting on in drain mode, before any
+   * re-rank. Most requests follow the shared cursor (`current`). Two kinds
+   * rest apart from it, each on a holder of its own, the way a family
+   * diversion rests on its own route cursor (#276):
+   *   - a model with its own weekly bucket (Fable, Sonnet, a route's bucket)
+   *     is ranked on that bucket's reset, and moving the shared cursor on
+   *     that order would have the next shared-bucket request move it straight
+   *     back;
+   *   - a request the current account cannot serve while it still serves
+   *     everything else (a route, the advisor's family).
+   * Either falls back to the current account when its holder cannot serve.
+   * @param {Record<string, any>|null} current
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @param {string} [provider]
+   * @returns {{ incumbent: Record<string, any>|null, apart: boolean, key: string, held: Record<string, any>|null }}
+   */
+  _drainIncumbent(current, exclude, model, advisorModel, provider = this._selectingProvider || DEFAULT_PROVIDER) {
+    const serves = (/** @type {Record<string, any>|null} */ a) => !!a && !exclude?.has(a.index)
+      && this._isAvailable(a, model, advisorModel);
+    const family = this._weeklyBucketFor(model) !== 'unified7d';
+    const general = !!current && !exclude?.has(current.index) && this._isAvailable(current, null);
+    const apart = family || (general && !serves(current));
+    const key = this._cursorKey(model, advisorModel, provider);
+    if (!apart) return { incumbent: serves(current) ? current : null, apart, key, held: null };
+    const idx = this._drainHolders.get(key);
+    const held = idx != null ? (this.accounts[idx] ?? null) : null;
+    return { incumbent: serves(held) ? held : serves(current) ? current : null, apart, key, held };
+  }
+
+  /**
+   * Drain mode's selection: stay on the account this request's scope rests on
+   * until it cannot serve or something strictly better appears (a better
+   * priority tier, or a known weekly reset in an earlier hour), then take the
+   * head of _drainOrder. A move for the shared scope moves the cursor; a move
+   * for a scope that rests apart (see _drainIncumbent) moves only its holder.
+   * Each move is logged once, with its reason. Returns null when nothing can
+   * serve, leaving the exhausted-fleet handling to the caller.
+   * @param {Set<number>|null} exclude
+   * @param {string|null} model
+   * @param {string|null} advisorModel
+   * @returns {Record<string, any>|null}
+   */
+  _selectDrainMode(exclude, model, advisorModel) {
+    const current = this.accounts[this.currentIndex] ?? null;
+    const { incumbent, apart, key, held } = this._drainIncumbent(current, exclude, model, advisorModel);
+    const displaced = incumbent ? this._drainDisplacement(incumbent, exclude, model, advisorModel) : null;
+    if (incumbent && !displaced) {
+      if (apart) this._drainHolders.set(key, incumbent.index);
+      return incumbent;
+    }
+    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    if (!best) return null;
+    // What this request moved off, for the log. The shared slot can name
+    // another provider's account (a first request for this provider borrows
+    // it), which this request was never going to use, so it is not named.
+    /** @type {Record<string, any>|null} */
+    let from = incumbent ?? (apart ? held ?? current : current);
+    if (from && !canServeProvider(from, this._selectingProvider || DEFAULT_PROVIDER)) from = null;
+    if (apart) this._drainHolders.set(key, best.index);
+    else this._setCurrent(best);
+    // As _selectNext: a weekly still unknown is learned from the first reply.
+    best.probing = best.quota.unified7dReset == null;
+    if (!from || from.index !== best.index) {
+      this._beginRamp(best);
+      const name = (/** @type {Record<string, any>} */ a) => `"${safeLine(a.name, 64)}"`;
+      let why = '';
+      if (incumbent && displaced === 'priority') why = ` — higher priority than ${name(incumbent)}`;
+      else if (incumbent && this._drainResetHour(best, model) === -Infinity) {
+        why = ` — ${name(incumbent)} is outranked and ${name(best)}'s weekly reset is not known yet`;
+      } else if (incumbent) why = ` — its weekly quota resets sooner than ${name(incumbent)}'s`;
+      else if (from) why = ` — ${name(from)} cannot serve, and ${name(best)} resets soonest`;
+      else why = ' — first in drain order';
+      console.log(apart
+        ? `[TeamClaude] Drain: routing "${safeLine(model ?? 'this request', 64)}" to ${name(best)}${why}`
+        : `[TeamClaude] Drain: switched to account ${name(best)}${why}`);
+    }
+    return best;
+  }
+
+  /**
+   * Drain order per provider partition for a model-agnostic request, as the
+   * router will follow it: the account the cursor is draining comes first while
+   * nothing displaces it (_drainDisplacement), since the remaining-quota
+   * tie-break never moves it off. Only accounts that can serve right now.
+   * Account indexes, keyed by provider.
+   * @returns {Record<string, number[]>}
+   */
+  _drainQueue() {
+    /** @type {Record<string, number[]>} */
+    const queue = {};
+    for (const provider of new Set(this.accounts.map(a => providerOf(a)))) {
+      const excluded = this._excludeOtherProviders(null, provider);
+      let order = this._drainOrder(excluded, null, null);
+      const idx = this._currentIndexForProvider(provider);
+      const current = idx != null ? (this.accounts[idx] ?? null) : null;
+      if (current && order.includes(current) && !this._drainDisplacement(current, excluded, null, null)) {
+        order = [current, ...order.filter(a => a !== current)];
+      }
+      queue[provider] = order.map(a => a.index);
+    }
+    return queue;
   }
 
   _selectNext(exclude = null, model = null, advisorModel = null) {
@@ -5380,6 +5676,11 @@ export class AccountManager {
       if (idx === index) this.routeCursors.delete(name);
       else if (idx > index) this.routeCursors.set(name, idx - 1);
     }
+    // Drain mode's holders likewise (see _drainIncumbent).
+    for (const [key, idx] of [...this._drainHolders.entries()]) {
+      if (idx === index) this._drainHolders.delete(key);
+      else if (idx > index) this._drainHolders.set(key, idx - 1);
+    }
     // Session pins are positions in the same list and shift the same way, and so
     // are the rollover observations hanging off them and off the current account.
     const remap = idx => (idx === index ? null : idx > index ? idx - 1 : idx);
@@ -5504,6 +5805,21 @@ export class AccountManager {
       currentIndexes[provider] = index ?? null;
       defaultTargets[provider] = this._routeTarget(null, provider);
     }
+    // Drain mode's order, per provider, as the router will follow it (see
+    // _drainQueue); null in every other mode. Names for the payload, and each
+    // account's 1-based place in its own provider's queue for its row.
+    const drainIndexes = this.distributionMode === 'drain' ? this._drainQueue() : null;
+    /** @type {Record<string, string[]>|null} */
+    const drainQueue = drainIndexes ? {} : null;
+    if (drainIndexes && drainQueue) {
+      for (const [provider, order] of Object.entries(drainIndexes)) {
+        drainQueue[provider] = order.map(i => this.accounts[i].name);
+      }
+    }
+    const drainRank = (/** @type {Record<string, any>} */ a) => {
+      const at = drainIndexes?.[providerOf(a)]?.indexOf(a.index) ?? -1;
+      return at >= 0 ? at + 1 : null;
+    };
     return {
       currentAccount: this.accounts[this.currentIndex]?.name,
       currentAccounts,
@@ -5529,6 +5845,7 @@ export class AccountManager {
       advisorNarrowing: this._advisorNarrowing ? { ...this._advisorNarrowing } : null,
       routes: this.getRoutes(),
       sessions: { ...sessions, distribute: this.distributeSessions, mode: this.distributionMode, draining: this.drainingCount() },
+      drainQueue,
       // Empty outside adaptive mode, so the renderer needs no mode check of its
       // own and an older client simply sees nothing extra.
       adaptive: this._adaptiveStatsCached(),
@@ -5566,6 +5883,9 @@ export class AccountManager {
         // Distinguishes a local threshold decision from an upstream rejection —
         // without it the two are indistinguishable in status output (#166).
         unavailable: this.unavailableReason(a),
+        // This account's place in its provider's drainQueue, 1-based; null
+        // outside drain mode or when it cannot serve right now.
+        drainRank: drainRank(a),
         sessions: sessions.perAccount[a.index] || 0,
         knownSessions: sessions.knownPerAccount[a.index] || 0,
         // Shared-weekly pressure (model-agnostic), so the ordering the router

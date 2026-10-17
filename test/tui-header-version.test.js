@@ -135,3 +135,22 @@ test('a version label off the wire cannot put an escape sequence in the frame', 
   assert.doesNotMatch(rest, /[\x1b\x07\x9b]/);
   assert.match(rest, /v1/);
 });
+
+test('the header names drain mode, on the server and attached', () => {
+  const drain = (/** @type {Record<string, number>} */ stats) => ({
+    ...fakeAm(3), distributeSessions: false, distributionMode: 'drain',
+    sessionStats() { return stats; },
+  });
+  assert.match(header(makeTUI({ am: drain({ active: 3, known: 3 }) }), 100), /3 sess drain {2}Port 1/);
+  // Sessions pinned under a distributing mode, still draining after the switch.
+  assert.match(header(makeTUI({ am: drain({ active: 3, known: 3, draining: 2 }) }), 100), /3 sess drain 2 pinned {2}Port 1/);
+
+  const am = new RemoteAccountManager();
+  am.applyStatus({
+    currentAccount: 'a', switchThreshold: 0.98, routes: [],
+    sessions: { active: 3, known: 3, perAccount: {}, distribute: false, mode: 'drain' },
+    accounts: [{ name: 'a', type: 'oauth', status: 'active', usage: {}, quota: {} }],
+  });
+  assert.equal(am.distributionMode, 'drain');
+  assert.match(header(makeTUI({ am, remote: true, applySwitch: async () => {} }), 100), /3 sess drain {2}Port 1/);
+});

@@ -569,6 +569,8 @@ function formatSessions(sessions, paint) {
   if (sessions.mode === 'adaptive') mode = paint.green('adapting');
   else if (sessions.mode === 'affinity') mode = paint.green('affinity');
   else if (sessions.distribute) mode = paint.green('distributing');
+  // Drain mode is one account at a time, like off, but on a different rule.
+  else if (sessions.mode === 'drain') mode = paint.green('drain') + (draining ? paint.yellow(`, draining ${draining}`) : '');
   else if (draining) mode = paint.yellow(`draining ${draining}`);
   else mode = paint.dim('single-account');
   return `${active} active / ${known} known ${paint.dim('·')} ${mode}`;

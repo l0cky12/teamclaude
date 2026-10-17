@@ -2500,7 +2500,12 @@ export class TUI {
     const sessStr = (sess.active || sess.known)
       ? `${sess.active} sess${this.am.distributeSessions
         ? green(/** @type {Record<string, string>} */ ({ adaptive: ' adapt', affinity: ' affin' })[this.am.distributionMode] || ' dist')
-        : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
+        // Drain MODE is not a distribution, but it is a mode worth naming. The
+        // sessions it inherited pinned from a distributing mode are counted
+        // apart, since "drain N" already means those on its own.
+        : this.am.distributionMode === 'drain'
+          ? green(' drain') + (sess.draining ? yellow(` ${sess.draining} pinned`) : '')
+          : (sess.draining ? yellow(` drain ${sess.draining}`) : '')}  `
       : '';
     // ▼ marks a dashboard that lost contact with the server it polls (attach
     // mode): what is on screen is the last snapshot, not the current state.

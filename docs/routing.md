@@ -20,6 +20,8 @@ TeamClaude prefers to keep you on one account. It stays on the current one and o
 
 When it does have to pick, ranking is: lowest `priority` number first, then, among accounts of equal priority, the one whose governing weekly bucket resets soonest. Spending the account closest to its refresh preserves the ones whose window resets further out. A model with its own weekly bucket (Fable, Sonnet) is ranked by that bucket rather than the shared one. Set an explicit order with `teamclaude priority <name> <n>`, or `--first` / `--last`. `teamclaude login --api` adds a key at priority 100 — a metered key is a last resort behind the subscriptions unless you say otherwise ([API key](accounts.md#api-key)).
 
+[Drain mode](#drain-mode) is the opt-in variant that also moves off the current account before it runs out, whenever an account with an earlier weekly reset can serve.
+
 ## The two kinds of 429
 
 Reacting the wrong way to either one makes things worse, so they are handled separately.
@@ -238,6 +240,37 @@ Each placement is logged with its reason (`5h window resets in 9m`, or `fullest 
 **The pin holds until the account is out of usage.** A pinned conversation stays on its account for as long as that account can serve the request: a higher-priority sibling becoming available does not move it, and neither does a weekly rollover under `expiryRouting.preempt`. It moves when the account cannot serve it, for any reason `teamclaude status` names on its **Blocked** line: utilization at or above `switchThreshold` on the 5-hour or governing weekly bucket, a rate-limit hold with a `retry-after`, an upstream refusal, a credential problem. A short rate-limit pause is not one of those; the request waits in place, because moving the conversation for a pause of seconds costs a prompt-cache miss that is worse than the wait. So the [one failover hop](#one-failover-hop-on-a-rate-limit) a rate-limit 429 normally takes is not taken for a conversation affinity holds: the wait is absorbed inline on the pinned account, or the 429 goes back to the client with its `retry-after` when the wait is too long to absorb. An upstream 5xx still hops once, since that is the provider failing rather than the account, but the detour is that request's alone: the conversation is not re-pinned on the sibling, and its next request goes back to the account that holds its cache. When the pin does break the conversation is placed afresh by the two tiers above and **re-pins there**; it does not return to its old account when that account becomes usable again, since every move is a cache miss and the pin only ever breaks on exhaustion. Everything else that affects a pin is unchanged: a manual route pin and `TC_ACCT` still resolve ahead of affinity, a conversation idle for an hour is forgotten, and removing an account deletes the pins that named it.
 
 Affinity applies to the Claude and Codex pools, each within its own provider partition; Codex accounts report their 5-hour and weekly windows through the same fields. Third-party backend accounts have no reset windows and are placed by the adaptive score alone. Off by default; switching between even, adaptive and affinity does not drain, and turning distribution off drains as described above.
+
+### Drain mode
+
+Drain mode spends the account whose weekly quota resets soonest, and keeps using it until it runs out. Then it moves to the next account closest to its reset. Weekly quota left on an account when its window resets is lost, so spending the soonest-expiring window first wastes the least.
+
+```json
+"distributeSessions": "drain"
+```
+
+Or `teamclaude distribute drain`. It is opt-in; the default is still `false` (off).
+
+Despite the setting's name, drain mode does not distribute. Sessions are handled the way `off` handles them: every conversation goes to the one account the cursor names, and conversation pins are not honoured. Switching to drain from even, adaptive or affinity therefore drains the pinned conversations exactly as switching to `off` does.
+
+**Order.** When drain mode has to choose an account (at startup, or when the one in use can no longer serve), it ranks the accounts that can serve the request by:
+
+1. `priority`, lowest number first, as everywhere else.
+2. The reset of the weekly window that governs the request, soonest first, compared by the hour. A Fable request ranks on the Fable weekly reset, a Sonnet request on the Sonnet one, everything else on the shared weekly. An account whose weekly reset is not known yet ranks first, so its window gets learned.
+3. Within the same reset hour, the account with the most weekly quota left.
+4. Config order.
+
+**The 5-hour window is a gate, not a rank.** An account whose 5-hour window is at `switchThreshold` is skipped until that window resets. When it resets the account is available again, and if its weekly resets in an earlier hour than the account in use, the cursor goes back to it.
+
+**It moves for a better account, but not for a tie.** On every request, if another account that can serve it is in a better priority tier, or has a known weekly reset in a strictly earlier hour, the cursor moves there (an account coming back from its 5-hour gate or a rate-limit hold, for example). The remaining-quota tie-break never moves it: two accounts resetting in the same hour would otherwise swap places as each was used, and every move costs the moved conversations a prompt-cache miss. Nor does an account whose reset is unknown: a weekly window that has just lapsed reads as unknown until the account is next used, and its new reset is then the latest in the fleet. Each move is logged once with its reason, for example `Drain: switched to account "b" — its weekly quota resets sooner than "a"'s`.
+
+**Model families rank apart.** A Fable request ranks on the Fable weekly reset, which can order the accounts differently from the shared weekly. So Fable traffic gets its own resting account, the way a [family diversion](#model-aware-routing) does, and moving it does not move the shared cursor. Without that, a Fable request and the next Opus request would keep moving the cursor back and forth. The same holds for Sonnet and for a route with its own `bucket`.
+
+**The cost.** Every parallel conversation runs through one account at a time, so that account's 5-hour window is used up faster than it would be with the load spread out, and when the 5-hour window is the limit it hits, the cursor moves on until that window resets. When the cursor moves, every conversation that moves with it misses its prompt cache once on the new account.
+
+The Claude and Codex pools are ranked separately, each within its own provider partition. API-key and third-party backend accounts follow the same rules in whichever partition they belong to; an account that reports no weekly reset ranks as unknown, so give a metered key a higher `priority` number if it should only serve as a fallback. The [one failover hop](#one-failover-hop-on-a-rate-limit) after a 429 or 5xx works as before, and its target is picked in the same order. [Expiry-pressure routing](#expiry-pressure-routing) does not apply in drain mode: the order above replaces it.
+
+**Reading the result.** `teamclaude status` reads `drain` on its Sessions line, and the TUI header shows `drain`. `/teamclaude/status` adds `drainQueue`, the order per provider (`anthropic`, `codex`) for a request with no model-specific bucket, holding only accounts that can serve right now, with the account in use first. Each account row also gets `drainRank`, its 1-based place in its provider's queue. Both are `null` in every other mode.
 
 ## Expiry-pressure routing
 
