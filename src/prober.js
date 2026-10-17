@@ -67,6 +67,10 @@ export class Prober {
     this.lastRunFinishedAt = null;
     this.nextRunAt = this.intervalMs > 0 ? Date.now() + this.intervalMs : null;
     this.accountStatus = new Map();
+    // One probe per account at a time, keyed by the account object: a card's
+    // refresh landing during a fleet cycle would otherwise refresh the token
+    // and read the endpoint twice for one answer.
+    this._inFlight = new Map();
   }
 
   start() {
@@ -154,7 +158,36 @@ export class Prober {
     return true;
   }
 
-  async probeAccount(account) {
+  /**
+   * Probe one account now: the dashboard card's refresh button. It applies the
+   * same two rules a fleet cycle does (the account has a quota to read, and is
+   * in rotation), so a single refresh never reaches an account the fleet
+   * probe would leave alone. A probe of this account already in flight, from a
+   * fleet cycle or an earlier click, is joined rather than doubled.
+   *
+   * @param {any} account
+   * @returns {Promise<{ probed: true, status: any } | { probed: false, reason: string }>}
+   */
+  async probeOne(account) {
+    if (!probeApplicable(account)) return { probed: false, reason: 'this account has no quota the probe can read' };
+    if (account.disabled) return { probed: false, reason: 'the account is disabled' };
+    if (!this._probeable(account)) return { probed: false, reason: 'upstream rejected its refresh token; sign in again' };
+    // The probe's own record, not accountStatus: that map is keyed by name,
+    // and a namesake (a Claude and a Codex account on one email) probed at the
+    // same moment would overwrite it before this read.
+    return { probed: true, status: await this.probeAccount(account) };
+  }
+
+  /** @param {any} account */
+  probeAccount(account) {
+    const pending = this._inFlight.get(account);
+    if (pending) return pending;
+    const run = this._probeAccount(account).finally(() => this._inFlight.delete(account));
+    this._inFlight.set(account, run);
+    return run;
+  }
+
+  async _probeAccount(account) {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     // A third-party backend has no Anthropic usage to read; it publishes its own
@@ -172,14 +205,13 @@ export class Prober {
 
       if (!usage || usage.error) {
         const finishedAt = Date.now();
-        this._recordAccount(account, {
+        return this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
           error: usage?.error || 'probe timed out',
           startedAt,
           finishedAt,
           durationMs: finishedAt - startedAt,
         });
-        return;
       }
 
       this.am.applyUsageData(account.index, usage);
@@ -190,7 +222,7 @@ export class Prober {
         this.am.applyProfileData(account.index, profile);
       }
       const finishedAt = Date.now();
-      this._recordAccount(account, {
+      return this._recordAccount(account, {
         status: 'ok',
         error: null,
         startedAt,
@@ -199,7 +231,7 @@ export class Prober {
       });
     } catch (err) {
       const finishedAt = Date.now();
-      this._recordAccount(account, {
+      return this._recordAccount(account, {
         status: 'error',
         error: err?.message || String(err),
         startedAt,
@@ -219,15 +251,14 @@ export class Prober {
       }
       if (!usage || usage.error) {
         const finishedAt = Date.now();
-        this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
-        return;
+        return this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
       }
       this.am.applyCodexUsageData(account.index, usage);
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      return this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
     } catch (err) {
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      return this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
     }
   }
 
@@ -239,7 +270,7 @@ export class Prober {
     const failure = reading && 'error' in reading ? reading.error : null;
     const failed = !reading || !!failure;
     if (!failed) this.am.applyBackendQuota(account.index, reading);
-    this._recordAccount(account, {
+    return this._recordAccount(account, {
       status: failed ? 'error' : 'ok',
       error: failed ? (failure || 'no reading') : null,
       startedAt, finishedAt, durationMs: finishedAt - startedAt,
@@ -268,11 +299,11 @@ export class Prober {
     };
   }
 
+  /** Merge into the account's status row and return the row as it now stands. */
   _recordAccount(account, status) {
-    this.accountStatus.set(account.name, {
-      ...(this.accountStatus.get(account.name) || {}),
-      ...status,
-    });
+    const row = { ...(this.accountStatus.get(account.name) || {}), ...status };
+    this.accountStatus.set(account.name, row);
+    return row;
   }
 
   _withTimeout(promise) {

@@ -624,6 +624,8 @@ test('showSessionRow hides the row only for a plan with no session window and no
 test('the dashboard card draws its Session row by the same rule', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
-  assert.match(html, /if \(showSessionRow\(q\)\) card\.appendChild\(quotaRow\('Session'/);
-  assert.doesNotMatch(html, /^\s*card\.appendChild\(quotaRow\('Session'/m, 'no unconditional Session row is left');
+  // The card's bars come from claudeQuotaRows, which owns the Session row.
+  assert.match(html, /if \(showSessionRow\(q\)\) rows\.push\(\{ label: 'Session'/);
+  assert.doesNotMatch(html, /^\s*rows\.push\(\{ label: 'Session'/m, 'no unconditional Session row is left');
+  assert.doesNotMatch(html, /quotaRow\('Session'/, 'and no Session bar drawn outside it');
 });

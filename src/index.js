@@ -979,6 +979,8 @@ async function serverCommand() {
   // as the TUI's `p` key. Assigned after construction because the hook object
   // is already shared with the server created above.
   hooks.probeQuota = () => prober?.probeAll();
+  // A dashboard card's refresh button: the same probe, for one account.
+  hooks.probeAccountQuota = (/** @type {any} */ account) => prober.probeOne(account);
   prober.start();
   // A money cap (accounts[].maxSpend) is judged against the month-to-date
   // figure only the probe refreshes — a response carries none — so with the

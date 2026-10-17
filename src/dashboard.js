@@ -94,6 +94,57 @@ export function scopedWeeklyRows(quota) {
   return rows;
 }
 
+// The bars on a subscription account's card, top to bottom: Fable, any other
+// model-scoped weekly bucket, then Session (the five-hour window), then Weekly
+// last. Fable leads as the one bucket that alone decides whether a Fable
+// request is served; the shared weekly closes the card since it bounds the rest.
+// The Session row is left out on a plan with no session window (showSessionRow).
+/** @param {any} quota */
+export function claudeQuotaRows(quota) {
+  var q = quota || {};
+  var scoped = scopedWeeklyRows(q);
+  var rows = scoped.filter(function (r) { return r.family === 'fable'; })
+    .concat(scoped.filter(function (r) { return r.family !== 'fable'; }))
+    .map(function (r) { return { label: r.label, utilization: r.utilization, resetAt: r.resetAt }; });
+  if (showSessionRow(q)) rows.push({ label: 'Session', utilization: q.unified5h, resetAt: q.unified5hReset });
+  rows.push({ label: 'Weekly', utilization: q.unified7d, resetAt: q.unified7dReset });
+  return rows;
+}
+
+// Whether a card gets a refresh button: the probe has a quota to read for the
+// account and would probe it (the server applies the same rule and says why
+// when it refuses). `probeEntry` is the account's row in status.probe.accounts.
+/** @param {any} account @param {any} probeEntry */
+export function canRefreshQuota(account, probeEntry) {
+  if (!account || account.disabled) return false;
+  return !!probeEntry && probeEntry.status !== 'not-applicable';
+}
+
+// The POST a card's refresh button sends: the fleet probe, narrowed to one
+// account. Provider and org ride along because a name alone can belong to two
+// cards (one email with a Claude and a Codex login, or seats in two orgs).
+/** @param {any} account  one entry of status.accounts @param {string|null} key */
+export function refreshQuotaRequest(account, key) {
+  /** @type {{ account: any, provider?: any, org?: any }} */
+  var body = { account: account.name };
+  if (account.provider) body.provider = account.provider;
+  if (account.orgName) body.org = account.orgName;
+  return {
+    url: '/teamclaude/probe',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/** @param {any} res */
+export function refreshQuotaOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'quota refresh failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: 'quota refreshed' };
+}
+
 // The rows a third-party backend's own reading draws on its card (#530). The
 // probe stores it as `quota.backend` (backend-quota.js): per-window fractions
 // when the provider reports distinct windows, else one fraction, else text
@@ -727,6 +778,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -817,6 +869,8 @@ const PAGE = `<!doctype html>
   .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
   .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
   .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
+  /* Only the first control is pushed right; the rest sit beside it as a group. */
+  .act ~ .act { margin-left: 6px; }
   .act:hover { background: var(--accent); color: var(--bg); }
   .act:disabled { opacity: .5; cursor: default; }
   #note { font-size: 12px; margin: 8px 0; display: none; }
@@ -1011,7 +1065,7 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  // A "Model" row under Session: what this account is serving right now.
+  // A "Model" row under the quota bars: what this account is serving right now.
   function modelsRow(usage) {
     var labels = recentModelLabels(usage);
     if (!labels.length) return null;
@@ -1023,7 +1077,7 @@ ${SHARED_HELPERS}
     return row;
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller) {
+  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller, probeEntry) {
     var card = el('div', 'card');
     var head = el('div', 'row');
     head.appendChild(el('span', 'name', a.name));
@@ -1053,6 +1107,15 @@ ${SHARED_HELPERS}
       ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
       head.appendChild(ctlDisable);
     }
+    // Zero-spend, like the page-wide Probe quotas button, so a client key may
+    // use it too. Disabled while a probe of this account is in flight, whether
+    // this button or a fleet cycle started it.
+    if (canRefreshQuota(a, probeEntry)) {
+      var ctlRefresh = el('button', 'act', probeEntry.status === 'running' ? 'refreshing…' : 'refresh');
+      ctlRefresh.disabled = probeEntry.status === 'running';
+      ctlRefresh.addEventListener('click', function () { doRefreshQuota(a, cardNoteKey(a), ctlRefresh); });
+      head.appendChild(ctlRefresh);
+    }
     if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
       var ctlFirst = el('button', 'act', 'prioritize');
       ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
@@ -1066,15 +1129,10 @@ ${SHARED_HELPERS}
     var q = a.quota || {};
     var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
-      // No Session row for a plan with no session window (see showSessionRow).
-      if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
-      if (models) card.appendChild(models);
-      models = null;
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
-      // than declared, so hard-coding the two families that have dedicated
-      // fields drew an incomplete picture the moment upstream metered a third.
-      scopedWeeklyRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
+      // than declared, so the rows come from the payload, in claudeQuotaRows'
+      // order, rather than from a hard-coded list of families.
+      claudeQuotaRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
     } else if (q.tokensLimit != null && q.tokensRemaining != null) {
       card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
     } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
@@ -1404,10 +1462,14 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     var now = Date.now();
-    (s.accounts || []).forEach(function (a) {
+    var probeAccounts = probe.accounts || [];
+    (s.accounts || []).forEach(function (a, i) {
       var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
       if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+      // The probe's list is the fleet in the same order; the name check keeps a
+      // payload that ever differs from pairing a card with another account's row.
+      var pe = probeAccounts[i] && probeAccounts[i].name === a.name ? probeAccounts[i] : null;
+      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller, pe));
     });
     renderProblems(s);
     renderRoutes(s);
@@ -1483,6 +1545,26 @@ ${SHARED_HELPERS}
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
       .finally(function () { btn.disabled = false; });
+  }
+
+  // One account's quota, read now from the zero-spend usage endpoint. The
+  // request waits for the probe, so the poll after it shows the new bars.
+  function doRefreshQuota(account, noteKey, btn) {
+    btn.disabled = true;
+    btn.textContent = 'refreshing…';
+    var r = refreshQuotaRequest(account, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = refreshQuotaOutcome(json);
+        cardNote(noteKey, out.kind, out.text, false);
+        poll();
+      })
+      .catch(function (e) { cardNote(noteKey, 'error', 'quota refresh failed: ' + e.message, true); });
   }
 
   // The one control here that writes a setting rather than nudging the running

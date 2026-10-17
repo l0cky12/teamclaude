@@ -32,7 +32,15 @@ teamclaude probe off    # back to passive (default)
 teamclaude probe        # show current setting
 ```
 
-The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account.
+The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account. The browser dashboard has the same one-shot refresh for the whole fleet (**Probe quotas**) and for a single account (the **refresh** button on its card), and so does the control endpoint:
+
+```bash
+curl -X POST http://localhost:3456/teamclaude/probe                     # every account
+curl -X POST http://localhost:3456/teamclaude/probe \
+  -H 'content-type: application/json' -d '{"account": "me@example.com"}' # one account
+```
+
+A single-account refresh takes the same identifiers as `POST /teamclaude/switch` (display name, email, `accountUuid`, `orgUuid` or `accountUuid/orgUuid`), plus an optional `"provider"` (`anthropic`, `codex`, …) and `"org"` (name or uuid) for when one email holds a Claude and a Codex login, or seats in several orgs. A name that still matches more than one account is a `400` rather than a guess; the dashboard sends the card's provider and org, so its button always reads the account it sits on. The request waits for the read to finish. It answers `200` with `{"ok": true, "account", "status": "ok"}` once the new figures are in, `502` with the probe's `status` and `error` when the usage endpoint did not answer, `409` with the reason for an account the probe never reads (an API-key account, a disabled one, or one whose sign-in upstream has rejected), and `404` for an unknown name. A refresh of an account the background probe is reading at that moment shares that read rather than starting a second one.
 
 It reads each OAuth account's utilization from its provider's read-only usage endpoint, which reports quota **without consuming any message quota**. Anthropic accounts use `/api/oauth/usage`; Codex accounts use ChatGPT's internal `/backend-api/wham/usage` endpoint and require their `ChatGPT-Account-Id`. API-key and third-party accounts are skipped. The Codex endpoint is not part of the public OpenAI API and may change without notice. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 

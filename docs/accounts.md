@@ -516,7 +516,7 @@ past its expiry date is dropped from every surface, as is a reading more than
 
 The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
-it once.
+it once (a dashboard card's **refresh** button does the same for one account).
 
 ### Spending a Claude reset automatically
 
