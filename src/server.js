@@ -3142,8 +3142,13 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   ctx.account = account.name;
   // Pin this conversation to the serving account for the model's weekly bucket
   // (for affinity) and keep it "active" in the running-sessions readout. Passive
-  // when distribution is off.
-  accountManager.recordSession(ctx.pinKey, account.index, ctx.model);
+  // when distribution is off. Not when a hop detoured the request here while
+  // affinity distribution still holds the conversation on an account that can
+  // serve it: the detour is this request's alone, and the pin stays with the
+  // cache.
+  if (!(hopTo === account.index && accountManager.affinityPinnedElsewhere(ctx.pinKey, account.index, ctx.model, ctx.advisorModel))) {
+    accountManager.recordSession(ctx.pinKey, account.index, ctx.model);
+  }
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
@@ -3482,7 +3487,16 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // hop ctx.rateLimitHopped is set, this branch does not run again for this
       // request, and the sx fresh-IP retry and the inline wait take over —
       // which is the right response to an IP-scoped limit.
-      if (!ctx.rateLimitHopped && retryCount < maxRetries) {
+      // Affinity distribution holds a conversation on its account until that
+      // account is out of usage, and a pause is not that. A hop would land the
+      // conversation on the sibling and re-pin it there for good, so the
+      // request waits in place instead (the inline absorb below, or the 429
+      // with its retry-after back to the client when the wait is too long).
+      const affinityHeld = accountManager.affinityPinHolds(ctx.pinKey, account.index, ctx.model, ctx.advisorModel);
+      if (affinityHeld && !ctx.rateLimitHopped) {
+        console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — conversation is pinned there (affinity); not failing over`);
+      }
+      if (!ctx.rateLimitHopped && retryCount < maxRetries && !affinityHeld) {
         // ctx.rolledOff as well as tried: an account a rollover moved this
         // request off was never sent a request, so it is not in `tried`, and
         // hopping back onto it would reverse that decision one step later.

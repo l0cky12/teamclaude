@@ -1821,6 +1821,7 @@ export class AccountManager {
   _adaptiveWindow(account, model) {
     const requested = this._weeklyBucketFor(model);
     const q = account.quota;
+    /** @type {{ bucket: string, utilization: number, resetAt: number|null }[]} */
     const windows = [];
     const add = (bucket, utilization, resetAt) => {
       if (Number.isFinite(utilization)) windows.push({ bucket, utilization, resetAt: resetAt ?? null });
@@ -1840,6 +1841,21 @@ export class AccountManager {
     if (this.distributionMode === 'affinity') add('unified5h', q.unified5h, q.unified5hReset);
     if (!windows.length) return { bucket: requested, utilization: null, resetAt: null };
 
+    if (this.distributionMode === 'affinity') {
+      // The windows taper toward different walls once the threshold is a
+      // per-bucket table, so raw utilization can name the wrong one: 79% of a
+      // 5-hour window with an 80% threshold is tighter than 85% of a weekly
+      // with a 98% one. Rank by headroom to each window's own threshold.
+      /** @param {{ bucket: string, utilization: number }} w */
+      const headroom = w => this.thresholdFor(this._windowThresholdBucket(w.bucket, requested), account) - w.utilization;
+      windows.sort((a, b) => {
+        const ha = headroom(a);
+        const hb = headroom(b);
+        if (ha !== hb) return ha - hb;
+        return (a.resetAt ?? Infinity) - (b.resetAt ?? Infinity);
+      });
+      return windows[0];
+    }
     windows.sort((a, b) => {
       if (a.utilization !== b.utilization) return b.utilization - a.utilization;
       return (a.resetAt ?? Infinity) - (b.resetAt ?? Infinity);
@@ -1958,7 +1974,7 @@ export class AccountManager {
     for (const account of eligible) {
       if ((account.priority || 0) !== topPriority) continue;
       const window = this._adaptiveWindow(account, model);
-      const used = Number.isFinite(window.utilization) ? window.utilization : -1;
+      const used = typeof window.utilization === 'number' && Number.isFinite(window.utilization) ? window.utilization : -1;
       const reset = window.resetAt ?? this._governingWeeklyReset(account, model) ?? Infinity;
       if (used > bestUsed || (used === bestUsed && reset < bestReset)) {
         best = account;
@@ -1967,6 +1983,40 @@ export class AccountManager {
       }
     }
     return best;
+  }
+
+  /**
+   * Whether affinity mode is holding `pinKey` on account `accountIndex` for
+   * `model`: the conversation is pinned there and the account can still serve
+   * the request. The server asks this before a one-hop detour, because a hop
+   * lands the conversation on another account and re-pins it there, and the
+   * mode promised the conversation stays put until its account is out of usage.
+   * A 429 pause is not that: _isAvailable does not read the pause, so the
+   * request waits in place instead.
+   * @param {string|null|undefined} pinKey
+   * @param {number} accountIndex
+   * @param {*} [model]
+   * @param {*} [advisorModel] */
+  affinityPinHolds(pinKey, accountIndex, model = null, advisorModel = null) {
+    if (this.distributionMode !== 'affinity' || !pinKey) return false;
+    if (!this.sessionTracker.pinnedAccounts(pinKey).includes(accountIndex)) return false;
+    const account = this.accounts[accountIndex];
+    return !!account && this._isAvailable(account, model, advisorModel);
+  }
+
+  /**
+   * Whether affinity mode holds `pinKey` on some account OTHER than
+   * `accountIndex` that can still serve `model`. A request detoured onto
+   * `accountIndex` by a hop must not re-pin the conversation there while its
+   * own account is fine: the next request goes back where the cache is.
+   * @param {string|null|undefined} pinKey
+   * @param {number} accountIndex
+   * @param {*} [model]
+   * @param {*} [advisorModel] */
+  affinityPinnedElsewhere(pinKey, accountIndex, model = null, advisorModel = null) {
+    if (this.distributionMode !== 'affinity' || !pinKey) return false;
+    return this.sessionTracker.pinnedAccounts(pinKey)
+      .some(idx => idx !== accountIndex && this.affinityPinHolds(pinKey, idx, model, advisorModel));
   }
 
   /** Apply the `affinity` config block; safe on every config reload. A value
@@ -4920,19 +4970,21 @@ export class AccountManager {
     // empty-quota shape does not carry them. See CodexLearnedQuota.
     /** @type {typeof account.quota & CodexLearnedQuota} */
     const q = account.quota;
-    /** @type {string[]} */
-    const burnObserved = [];
+    // Only the 5-hour window is fed to the burn learner from here. The weekly
+    // never was, and starting now would teach adaptive mode a reserve it did
+    // not learn before from a reading it already had, changing picks that have
+    // nothing to do with affinity.
+    let fresh5h = false;
     if (usage.fiveHour) {
       q.unified5h = usage.fiveHour.utilization;
       q.unified5hReset = usage.fiveHour.resetAt ?? null;
       q.unified5hSeenAt = Date.now();
-      if (q.unified5h != null) burnObserved.push('unified5h');
+      fresh5h = q.unified5h != null;
     }
     if (usage.sevenDay) {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
       q.unified7dSeenAt = Date.now();
-      if (q.unified7d != null) burnObserved.push('unified7d');
       // A read-only reading, so it can close an idle interval (#475).
       if (q.unified7d != null) this._observeOutsideSpend(account, ['unified7d']);
     }
@@ -4949,12 +5001,9 @@ export class AccountManager {
       q.unified5hReset = null;
       q.unified5hSeenAt = null;
     }
-    // Fresh utilization points without spending quota, as the Anthropic probe
-    // already gives the learner; the 5-hour window included (affinity mode
-    // scores it). Fed after the clearing above, so a window the payload says
-    // the plan lacks is not observed from the null it just became.
-    const readings = /** @type {Record<string, unknown>} */ (q);
-    this._observeBurnRate(account, burnObserved.filter(b => readings[b] != null));
+    // Fed after the clearing above, so a window the payload says the plan lacks
+    // is not observed from the null it just became.
+    if (fresh5h && q.unified5h != null) this._observeBurnRate(account, ['unified5h']);
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the

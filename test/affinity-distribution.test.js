@@ -308,11 +308,13 @@ test('a fresh 5-hour reading feeds the burn learner on every ingestion path', ()
     'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 3600),
   }, 'gpt-5');
   assert.notEqual(learner.lastReadingAt(1, 'unified5h'), null);
-  // Codex usage probe.
+  // Codex usage probe: the 5-hour window only. Its weekly was never fed to the
+  // learner, and starting would change adaptive-mode picks from readings it
+  // already had.
   const am3 = mgr([oauth('codex', { provider: 'codex' })]);
   am3.applyCodexUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + H }, sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
   assert.notEqual(am3.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
-  assert.notEqual(am3.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
+  assert.equal(am3.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
   // A probe that says the plan has no session window observes nothing for it.
   const am4 = mgr([oauth('codex', { provider: 'codex' })]);
   am4.applyCodexUsageData(0, { sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
@@ -342,4 +344,52 @@ test('the all-reserved fallback takes the fullest window, not the fewest convers
   assert.equal(am._pickFullest(null, OPUS).name, 'a');
   // The even walk would have spilled to the emptier account.
   assert.equal(am._pickLeastLoadedEven(null, OPUS).name, 'b');
+});
+
+// ── Round-2 review fixes ────────────────────────────────────────────────────
+
+test('the scored window is the one with the least headroom to its own threshold', () => {
+  const thresholds = { default: 0.98, unified5h: 0.80 };
+  const am = new AccountManager([oauth('a'), oauth('b')], thresholds, { distributeSessions: 'affinity' });
+  // 'a' is 1% from its 5-hour wall but 13% from its weekly one. Raw utilization
+  // would score it on the weekly (85% > 79%) and skip the 5-hour taper.
+  session(am, 0, 0.79, 180); weekly(am, 0, 0.85);
+  session(am, 1, 0.50, 180); weekly(am, 1, 0.60);
+  assert.equal(am._adaptiveWindow(am.accounts[0], OPUS).bucket, 'unified5h');
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'b');
+  // Adaptive mode is unchanged: weekly only, by utilization.
+  const adaptive = new AccountManager([oauth('a'), oauth('b')], thresholds, { distributeSessions: 'adaptive' });
+  session(adaptive, 0, 0.79, 180); weekly(adaptive, 0, 0.85);
+  assert.equal(adaptive._adaptiveWindow(adaptive.accounts[0], OPUS).bucket, 'unified7d');
+});
+
+test('a Codex probe weekly reading leaves the adaptive reserve exactly as before', () => {
+  const am = mgr([oauth('a', { provider: 'codex' }), oauth('b', { provider: 'codex' })], { distributeSessions: 'adaptive' });
+  const before = am.burnRateLearner.reserve(0, 'unified7d');
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
+  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
+  assert.equal(am.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
+  assert.equal(am.burnRateLearner.reserve(0, 'unified7d'), before);
+});
+
+test('affinityPinHolds answers for the pinned, still-usable account only', () => {
+  const am = mgr(['a', 'b']);
+  session(am, 0, 0.70, 180); weekly(am, 0, 0.30);
+  session(am, 1, 0.20, 180); weekly(am, 1, 0.30);
+  assert.equal(am.affinityPinHolds('sess-1', 0, OPUS), false); // nothing pinned yet
+  am.recordSession('sess-1', 0, OPUS);
+  assert.equal(am.affinityPinHolds('sess-1', 0, OPUS), true);
+  assert.equal(am.affinityPinHolds('sess-1', 1, OPUS), false);
+  assert.equal(am.affinityPinnedElsewhere('sess-1', 1, OPUS), true);
+  assert.equal(am.affinityPinnedElsewhere('sess-1', 0, OPUS), false);
+  // A pause is not unavailability; the hold stands. Spent quota ends it.
+  am.pauseAccount(0, 5);
+  assert.equal(am.affinityPinHolds('sess-1', 0, OPUS), true);
+  session(am, 0, 0.99, 180);
+  assert.equal(am.affinityPinHolds('sess-1', 0, OPUS), false);
+  assert.equal(am.affinityPinnedElsewhere('sess-1', 1, OPUS), false);
+  // Other modes never hold.
+  const even = mgr(['a', 'b'], { distributeSessions: true });
+  even.recordSession('sess-1', 0, OPUS);
+  assert.equal(even.affinityPinHolds('sess-1', 0, OPUS), false);
 });
