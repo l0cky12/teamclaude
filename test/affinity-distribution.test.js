@@ -255,3 +255,91 @@ test('a placement logs its reason; a status read does not', () => {
   const status = captureLog(() => { am.getStatus(); am.adaptiveStats(OPUS); });
   assert.equal(status.filter(l => l.includes('Affinity: placing')).length, 0, status.join('\n'));
 });
+
+// ── Round-1 review fixes ────────────────────────────────────────────────────
+
+test('conversations already pinned to an account do not push a new one elsewhere', () => {
+  const am = mgr(['a', 'b']);
+  session(am, 0, 0.70, 180); weekly(am, 0, 0.30);
+  session(am, 1, 0.20, 180); weekly(am, 1, 0.30);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-0').name, 'a');
+  // Twenty conversations sit on 'a'. With nothing in flight, that is not load.
+  for (let i = 1; i <= 20; i++) am.recordSession(`sess-${i}`, 0, OPUS);
+  assert.equal(am.sessionTracker.activeCountFor(0), 20);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-new').name, 'a');
+  // A request in flight is load, and the status rows say so by the same rule.
+  am.accounts[0].inFlight = 3;
+  const rows = am.adaptiveStats(OPUS);
+  assert.equal(rows.find(r => r.name === 'a').load, 3);
+  assert.equal(rows.find(r => r.name === 'a').sessions, 20);
+});
+
+test('the near-reset tier is not narrowed by expiry-pressure banding', () => {
+  const am = mgr(['a', 'b'], { expiryRouting: { enabled: true, tolerance: 1.0, preempt: false } });
+  // 'a' has by far the higher weekly pressure (same headroom, resets in 2h),
+  // so strict banding admits it alone. 'b' resets its 5-hour window in nine
+  // minutes, which the band never looks at.
+  session(am, 0, 0.20, 180); weekly(am, 0, 0.30, 2);
+  session(am, 1, 0.20, 9); weekly(am, 1, 0.30, 100);
+  assert.deepEqual(am._bandedCandidates(null, OPUS).map(a => a.name), ['a']);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-1').name, 'b');
+  // Outside the near-reset horizon the band decides, as adaptive layers it.
+  session(am, 1, 0.20, 180);
+  assert.equal(am.getActiveAccount(null, OPUS, null, 'sess-2').name, 'a');
+});
+
+test('a fresh 5-hour reading feeds the burn learner on every ingestion path', () => {
+  const am = mgr(['a', 'codex'].map((n, i) => (i ? oauth(n, { provider: 'codex' }) : oauth(n))));
+  const learner = am.burnRateLearner;
+  // Anthropic response headers.
+  am.updateQuota(0, {
+    'anthropic-ratelimit-unified-5h-utilization': '0.41',
+    'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.now() / 1000) + 3600),
+  });
+  assert.notEqual(learner.lastReadingAt(0, 'unified5h'), null);
+  // Anthropic usage probe.
+  const am2 = mgr(['a']);
+  am2.applyUsageData(0, { fiveHour: { utilization: 0.2, resetAt: Date.now() + H } });
+  assert.notEqual(am2.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
+  // Codex response headers (primary window of 300 minutes is the 5-hour one).
+  am.updateQuota(1, {
+    'x-codex-primary-used-percent': '35',
+    'x-codex-primary-window-minutes': '300',
+    'x-codex-primary-reset-at': String(Math.floor(Date.now() / 1000) + 3600),
+  }, 'gpt-5');
+  assert.notEqual(learner.lastReadingAt(1, 'unified5h'), null);
+  // Codex usage probe.
+  const am3 = mgr([oauth('codex', { provider: 'codex' })]);
+  am3.applyCodexUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + H }, sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
+  assert.notEqual(am3.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
+  assert.notEqual(am3.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
+  // A probe that says the plan has no session window observes nothing for it.
+  const am4 = mgr([oauth('codex', { provider: 'codex' })]);
+  am4.applyCodexUsageData(0, { sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
+  assert.equal(am4.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
+});
+
+test('a 5-hour reserve is learned from the 5-hour burn rate', () => {
+  const am = mgr(['a']);
+  const learner = am.burnRateLearner;
+  const t0 = 1_000_000;
+  // 10% of the window in five minutes, far above the assumed initial rate, so
+  // the reserve the taper works across widens toward its cap.
+  learner.observeUtilization(0, 'unified5h', 0.10, t0);
+  learner.observeUtilization(0, 'unified5h', 0.20, t0 + 5 * M);
+  learner.observeUtilization(0, 'unified5h', 0.30, t0 + 10 * M);
+  const idle = mgr(['a']).burnRateLearner.reserve(0, 'unified5h');
+  assert.ok(learner.reserve(0, 'unified5h') > idle, `${learner.reserve(0, 'unified5h')} > ${idle}`);
+});
+
+test('the all-reserved fallback takes the fullest window, not the fewest conversations', () => {
+  const am = mgr(['a', 'b']);
+  session(am, 0, 0.70, 180); weekly(am, 0, 0.30);
+  session(am, 1, 0.20, 180); weekly(am, 1, 0.30);
+  for (let i = 0; i < 5; i++) am.recordSession(`sess-${i}`, 0, OPUS);
+  // Direct: the fallback is only reached when every adaptive score is zero,
+  // which the availability gate makes unreachable through the public walk.
+  assert.equal(am._pickFullest(null, OPUS).name, 'a');
+  // The even walk would have spilled to the emptier account.
+  assert.equal(am._pickLeastLoadedEven(null, OPUS).name, 'b');
+});

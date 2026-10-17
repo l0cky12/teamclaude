@@ -1797,6 +1797,12 @@ export class AccountManager {
         const used = Number.isFinite(window.utilization) ? `${Math.round(window.utilization * 100)}%` : 'unknown';
         console.log(`[TeamClaude] Affinity: placing conversation on "${safeLine(picked.name, 64)}" — fullest (${window.bucket} ${used})`);
       }
+      // The even walk ranks by active conversations, which affinity ignores:
+      // when every score is zero it takes the fullest window outright.
+      if (!picked && this.distributionMode === 'affinity') {
+        const fullest = this._pickFullest(exclude, model, advisorModel);
+        if (fullest) return fullest;
+      }
       // Adaptive can legitimately score every candidate at zero — the whole
       // tier is inside its reserve — and that is not a reason to refuse a
       // request. Fall through to the even walk, which still returns the least
@@ -1861,7 +1867,14 @@ export class AccountManager {
    * paces on the storm ramp, never on this.
    */
   _adaptiveLoad(account, now = Date.now()) {
-    return this.sessionTracker.activeCountFor(account.index, now) + (account.inFlight || 0);
+    const inFlight = account.inFlight || 0;
+    // Affinity mode ranks on quota alone: a pinned conversation is not work in
+    // progress, and counting pins would spill new conversations off the account
+    // the ranking chose. Only requests actually in flight count as load there.
+    // The concurrency learner is taught through this same function, so the cap
+    // it learns in affinity mode is in the unit this score compares it with.
+    if (this.distributionMode === 'affinity') return inFlight;
+    return this.sessionTracker.activeCountFor(account.index, now) + inFlight;
   }
 
   /** The threshold bucket a scored window tapers toward. A weekly window, shared
@@ -1890,7 +1903,11 @@ export class AccountManager {
   _pickNearReset(exclude = null, model = null, advisorModel = null) {
     const now = Date.now();
     const horizon = now + this.affinity.nearResetMinutes * 60_000;
-    const eligible = this._bandedCandidates(exclude, model, advisorModel);
+    // Every available account, NOT the expiry-pressure band: that band ranks
+    // weekly horizons, and a 5-hour window about to reset is urgent on a
+    // clock the band never looks at. Banding first would drop exactly the
+    // account this tier exists to find.
+    const eligible = this._availableCandidates(exclude, model, advisorModel);
     if (eligible.length === 0) return null;
     const topPriority = Math.min(...eligible.map(a => a.priority || 0));
     const weeklyBucket = this._weeklyBucketFor(model);
@@ -1902,13 +1919,52 @@ export class AccountManager {
       // _isAvailable (via _bandedCandidates) has already cleared an expired
       // window, so a reset still on the account is in the future.
       const resetAt = q.unified5hReset;
-      if (!Number.isFinite(resetAt) || resetAt > horizon || q.unified5h == null) continue;
+      if (typeof resetAt !== 'number' || !Number.isFinite(resetAt) || resetAt > horizon || q.unified5h == null) continue;
       // Unknown weekly is not a known-full weekly: it stays eligible, as the
       // availability gate treats it.
       const weekly = this._governingWeekly(account, model);
       const ceiling = this.thresholdFor(weeklyBucket, account) - this.affinity.weeklyHeadroom;
       if (weekly != null && weekly > ceiling) continue;
       if (!best || resetAt < best.resetAt) best = { account, resetAt };
+    }
+    return best;
+  }
+
+  /** The accounts a placement may choose from before any pressure banding:
+   * not excluded by this request, and able to serve it.
+   * @param {Set<number>|null} [exclude]
+   * @param {*} [model]
+   * @param {*} [advisorModel] */
+  _availableCandidates(exclude = null, model = null, advisorModel = null) {
+    return this.accounts.filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel));
+  }
+
+  /**
+   * Affinity mode's last resort, in place of the even walk: the top-priority
+   * account with the fullest scored window, soonest reset breaking ties and an
+   * unknown utilization sorting last. Reached only when the adaptive score is
+   * zero for every candidate.
+   * @param {Set<number>|null} [exclude]
+   * @param {string|null} [model]
+   * @param {string|null} [advisorModel] */
+  _pickFullest(exclude = null, model = null, advisorModel = null) {
+    const eligible = this._bandedCandidates(exclude, model, advisorModel);
+    if (eligible.length === 0) return null;
+    const topPriority = Math.min(...eligible.map(a => a.priority || 0));
+    /** @type {any} */
+    let best = null;
+    let bestUsed = -Infinity;
+    let bestReset = Infinity;
+    for (const account of eligible) {
+      if ((account.priority || 0) !== topPriority) continue;
+      const window = this._adaptiveWindow(account, model);
+      const used = Number.isFinite(window.utilization) ? window.utilization : -1;
+      const reset = window.resetAt ?? this._governingWeeklyReset(account, model) ?? Infinity;
+      if (used > bestUsed || (used === bestUsed && reset < bestReset)) {
+        best = account;
+        bestUsed = used;
+        bestReset = reset;
+      }
     }
     return best;
   }
@@ -2239,6 +2295,8 @@ export class AccountManager {
         competing: inTier.has(a.index),
         sessions: this.sessionTracker.activeCountFor(a.index, now),
         inFlight: a.inFlight || 0,
+        // The load the score sees, by the same definition the picker uses.
+        load: this._adaptiveLoad(a, now),
         utilization: Number.isFinite(utilization) ? utilization : null,
         // Distance to the operator's own switch threshold for this bucket, not
         // to 100%: the threshold is where the account leaves rotation, so it is
@@ -2264,7 +2322,7 @@ export class AccountManager {
         threshold: r.threshold,
         capacity: usePlanWeights ? r.planWeight : null,
         reserve: r.reserve,
-        load: r.sessions + r.inFlight,
+        load: r.load,
         concCap: r.concCap,
         maxRemaining,
       });
@@ -4268,9 +4326,11 @@ export class AccountManager {
       limits[key] = safeLine(active, 64);
     }
 
+    let fresh5h = false;
     if (parsed.unified5h != null) {
       account.quota.unified5h = parsed.unified5h;
       account.quota.unified5hSeenAt = Date.now();
+      fresh5h = true;
     }
     if (parsed.unified7d != null) {
       account.quota.unified7d = parsed.unified7d;
@@ -4325,7 +4385,7 @@ export class AccountManager {
       console.log(`[TeamClaude] Learned weekly quota for "${safeLine(account.name, 64)}", re-evaluating selection`);
     }
 
-    this._observeBurnRate(account, observed);
+    this._observeBurnRate(account, this._withSessionWindow(observed, fresh5h));
     this._observeOutsideSpend(account, observed);
 
     account.usage.totalRequests++;
@@ -4369,9 +4429,11 @@ export class AccountManager {
     // Unified rate limits (Claude Max)
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization']);
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization']);
+    let fresh5h = false;
     if (!isNaN(u5h)) {
       account.quota.unified5h = u5h;
       account.quota.unified5hSeenAt = Date.now();
+      fresh5h = true;
     }
     if (!isNaN(u7d)) {
       account.quota.unified7d = u7d;
@@ -4452,7 +4514,7 @@ export class AccountManager {
     const resetsAt = resetTimestamp(tokensReset) ?? resetTimestamp(requestsReset);
     if (resetsAt != null) account.quota.resetsAt = resetsAt;
 
-    this._observeBurnRate(account, observed);
+    this._observeBurnRate(account, this._withSessionWindow(observed, fresh5h));
     this._observeOutsideSpend(account, observed, { familyResets: false });
 
     account.usage.totalRequests++;
@@ -4627,8 +4689,19 @@ export class AccountManager {
     return out;
   }
 
+  /** The burn learner's bucket list for a reading: the weekly windows it
+   * refreshed, plus the 5-hour window when that was fresh too. Kept apart from
+   * `observed` itself, which the outside-spend tracker reads as weekly windows.
+   * @param {Set<string>} observed
+   * @param {boolean} fresh5h
+   * @returns {string[]} */
+  _withSessionWindow(observed, fresh5h) {
+    return fresh5h ? [...observed, 'unified5h'] : [...observed];
+  }
+
   /**
-   * Feed only weekly windows refreshed by this response to the burn learner.
+   * Feed the windows refreshed by this response to the burn learner: the
+   * weekly ones, and the 5-hour one when fresh, since affinity mode scores it.
    *
    * Called from all three paths that learn a utilization — response headers
    * (Anthropic and Codex) and the background usage probe — rather than from
@@ -4736,10 +4809,12 @@ export class AccountManager {
     const observed = new Set();
     const now = Date.now();
 
+    let fresh5h = false;
     if (usage.fiveHour) {
       if (usage.fiveHour.utilization != null) {
         q.unified5h = usage.fiveHour.utilization;
         q.unified5hSeenAt = now;
+        fresh5h = true;
       }
       if (usage.fiveHour.resetAt != null) q.unified5hReset = usage.fiveHour.resetAt;
     }
@@ -4802,7 +4877,7 @@ export class AccountManager {
     }
     // A probe provides fresh utilization points without spending quota itself.
     // Feed only the windows actually present in this payload.
-    this._observeBurnRate(account, observed);
+    this._observeBurnRate(account, this._withSessionWindow(observed, fresh5h));
     this._observeOutsideSpend(account, observed);
 
     // Banked usage-limit resets (issue #493), stamped exactly as the Codex
@@ -4845,15 +4920,19 @@ export class AccountManager {
     // empty-quota shape does not carry them. See CodexLearnedQuota.
     /** @type {typeof account.quota & CodexLearnedQuota} */
     const q = account.quota;
+    /** @type {string[]} */
+    const burnObserved = [];
     if (usage.fiveHour) {
       q.unified5h = usage.fiveHour.utilization;
       q.unified5hReset = usage.fiveHour.resetAt ?? null;
       q.unified5hSeenAt = Date.now();
+      if (q.unified5h != null) burnObserved.push('unified5h');
     }
     if (usage.sevenDay) {
       q.unified7d = usage.sevenDay.utilization;
       q.unified7dReset = usage.sevenDay.resetAt ?? null;
       q.unified7dSeenAt = Date.now();
+      if (q.unified7d != null) burnObserved.push('unified7d');
       // A read-only reading, so it can close an idle interval (#475).
       if (q.unified7d != null) this._observeOutsideSpend(account, ['unified7d']);
     }
@@ -4870,6 +4949,12 @@ export class AccountManager {
       q.unified5hReset = null;
       q.unified5hSeenAt = null;
     }
+    // Fresh utilization points without spending quota, as the Anthropic probe
+    // already gives the learner; the 5-hour window included (affinity mode
+    // scores it). Fed after the clearing above, so a window the payload says
+    // the plan lacks is not observed from the null it just became.
+    const readings = /** @type {Record<string, unknown>} */ (q);
+    this._observeBurnRate(account, burnObserved.filter(b => readings[b] != null));
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
