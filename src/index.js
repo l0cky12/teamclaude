@@ -148,7 +148,7 @@ const THRESHOLD_USAGE = [
   'server immediately.',
 ].join('\n');
 
-const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive>';
+const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off|adaptive|affinity>';
 
 const ROUTING_USAGE = [
   'Usage: teamclaude routing <account-name|email> [--check]      (show the account\'s routing; --check tests it)',
@@ -382,7 +382,7 @@ async function serverCommand() {
     console.error(`[TeamClaude] Bad adaptiveDistribution setting in ${getConfigPath()}: ${err.message}`);
     process.exit(1);
   }
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions, expiryRouting: config.expiryRouting, affinity: config.affinity, advisorEligibility: config.advisorEligibility, adaptive, listener: localListener(config) });
   // Names the activity log's session column from Claude Code's own on-disk
   // session titles. Built whether or not the TUI runs, so a reload has one
   // object to reconfigure.
@@ -594,6 +594,10 @@ async function serverCommand() {
     // Pick up expiry-routing edits the same way, so the knob hot-applies.
     config.expiryRouting = diskConfig.expiryRouting;
     accountManager.setExpiryRouting(config.expiryRouting);
+    // The affinity block is read on every decision off the manager, so
+    // assigning it is the whole application, as with expiryRouting.
+    config.affinity = diskConfig.affinity;
+    accountManager.setAffinity(config.affinity);
     // And the advisor mode: read off the manager on every selection, so the
     // setter is the whole application. Absent on disk means 'strict' again.
     config.advisorEligibility = diskConfig.advisorEligibility;
@@ -2289,11 +2293,13 @@ async function distributeCommand() {
 
   if (arg === undefined) {
     console.log(`Session distribution: ${current}`);
-    console.log('Set with: teamclaude distribute <on|off|adaptive>');
+    console.log('Set with: teamclaude distribute <on|off|adaptive|affinity>');
     console.log('On: each session stays on its account for cache reuse, and new sessions spread');
     console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
     console.log('Adaptive: spread by remaining weekly credit and load rather than evenly, so the');
     console.log('most-spent account is finished off first without being run into its threshold.');
+    console.log('Affinity: adaptive, plus a 5-hour window about to reset is spent first, and a');
+    console.log('conversation stays on its account until that account is out of usage.');
     return;
   }
 
@@ -2301,6 +2307,7 @@ async function distributeCommand() {
   if (['on', 'true', 'yes', '1'].includes(arg)) next = 'even';
   else if (['off', 'false', 'no', '0'].includes(arg)) next = 'off';
   else if (arg === 'adaptive') next = 'adaptive';
+  else if (arg === 'affinity') next = 'affinity';
   if (!next) {
     console.error(DISTRIBUTE_USAGE);
     process.exit(1);

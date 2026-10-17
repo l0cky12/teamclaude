@@ -45,6 +45,10 @@ export const DISTRIBUTE_MODES = {
     value: 'adaptive',
     said: 'Session distribution adaptive — new sessions concentrate on the account with the least remaining weekly credit, tapering off as it nears the switch threshold and backing off when it is busy.',
   },
+  affinity: {
+    value: 'affinity',
+    said: 'Session distribution affinity — a 5-hour window about to reset is spent first, then the fullest account; each conversation stays on its account until that account is out of usage.',
+  },
 };
 
 const BAD_PERCENT = 'A threshold is a percentage from 1 to 100.';
@@ -203,7 +207,7 @@ export function setBucketThresholds(config, pairs) {
  */
 export function setDistribution(config, mode) {
   if (typeof mode !== 'string' || !Object.hasOwn(DISTRIBUTE_MODES, mode)) {
-    throw new ConfigOpError('Session distribution is off, even or adaptive.');
+    throw new ConfigOpError('Session distribution is off, even, adaptive or affinity.');
   }
   // Compared as modes, not stored values: a hand-written `"on"` already means
   // even, and rewriting it would be a read-modify-write for nothing.

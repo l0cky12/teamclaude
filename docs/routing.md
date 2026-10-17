@@ -219,6 +219,26 @@ The `sess` in both lines is the display's short label and counts **conversations
 
 With `expiryRouting.preempt` on, a governing-window **rollover** also ends the drain for the conversation whose account rolled, and it rejoins normal rotation there and then. The drain trades expiring quota for a warm prompt cache, and that trade is priced on the window the account had when the drain started; once that window has gained a full week the account is the one the fleet should be spending last. Nothing else bounds it — a conversation making requests never idles out — so without this a long-lived one rides a rolled-over account for as long as it keeps talking.
 
+### Affinity distribution
+
+Adaptive mode scores the weekly windows, and a conversation's pin can still be moved by a higher-priority sibling or by a weekly rollover. Affinity mode is for the operator who wants two stricter things: spend quota that is about to vanish first, and never move a conversation while its account can still serve it.
+
+```json
+"distributeSessions": "affinity",
+"affinity": { "nearResetMinutes": 15, "weeklyHeadroom": 0.1 }
+```
+
+A **new** conversation is placed in two tiers, within the top priority tier of the eligible accounts (priority still wins, as everywhere else):
+
+1. **Near reset first.** An account whose 5-hour window resets within `nearResetMinutes` goes to the front, soonest reset first. Whatever is left in that window is gone at the reset whether it was spent or not, so a conversation placed there now costs nothing a later placement would still have. The preference applies only while the account's governing weekly utilization is at least `weeklyHeadroom` below the weekly switch threshold: the weekly window is metered too and does not reset in minutes, so a weekly-bound account gains nothing from a 5-hour reset and is ranked normally. An account whose weekly is not reported yet is treated as having room, as the availability gate treats it.
+2. **Fullest first.** Otherwise the [adaptive score](#adaptive-distribution) decides, with one change: the 5-hour window competes with the weekly ones for the window the account is scored on, so the tightest of the three supplies utilization and headroom. An account at 17% weekly but 80% through its 5-hour window is scored as 80% full. The taper, the plan weighting and the congestion term are unchanged, and the 5-hour window tapers toward its own `switchThreshold` bucket.
+
+Each placement is logged with its reason (`5h window resets in 9m`, or `fullest (unified5h 71%)`), so the activity log says why a conversation went where it did. `teamclaude status` shows the same `Adaptive` rows adaptive mode shows, and the header reads `affinity`.
+
+**The pin holds until the account is out of usage.** A pinned conversation stays on its account for as long as that account can serve the request: a higher-priority sibling becoming available does not move it, and neither does a weekly rollover under `expiryRouting.preempt`. It moves when the account cannot serve it, for any reason `teamclaude status` names on its **Blocked** line: utilization at or above `switchThreshold` on the 5-hour or governing weekly bucket, a rate-limit hold with a `retry-after`, an upstream refusal, a credential problem. A short rate-limit pause is not one of those; the request waits in place, because moving the conversation for a pause of seconds costs a prompt-cache miss that is worse than the wait. So the [one failover hop](#one-failover-hop-on-a-rate-limit) a rate-limit 429 normally takes is not taken for a conversation affinity holds: the wait is absorbed inline on the pinned account, or the 429 goes back to the client with its `retry-after` when the wait is too long to absorb. An upstream 5xx still hops once, since that is the provider failing rather than the account, but the detour is that request's alone: the conversation is not re-pinned on the sibling, and its next request goes back to the account that holds its cache. When the pin does break the conversation is placed afresh by the two tiers above and **re-pins there**; it does not return to its old account when that account becomes usable again, since every move is a cache miss and the pin only ever breaks on exhaustion. Everything else that affects a pin is unchanged: a manual route pin and `TC_ACCT` still resolve ahead of affinity, a conversation idle for an hour is forgotten, and removing an account deletes the pins that named it.
+
+Affinity applies to the Claude and Codex pools, each within its own provider partition; Codex accounts report their 5-hour and weekly windows through the same fields. Third-party backend accounts have no reset windows and are placed by the adaptive score alone. Off by default; switching between even, adaptive and affinity does not drain, and turning distribution off drains as described above.
+
 ## Expiry-pressure routing
 
 > **The config key `expiryRouting` is provisional.** [#176](https://github.com/KarpelesLab/teamclaude/issues/176) proposes a `routingStrategy` enum for the adjacent drain-concentration problem, and a strategy value such as `"expiry"` is a plausible home for this behaviour. The mechanism below is settled; only its spelling on disk is open, and it will follow whatever shape that discussion settles on.

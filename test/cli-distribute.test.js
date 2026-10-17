@@ -76,6 +76,18 @@ test('distribute adaptive writes and reports the third mode', async () => {
   assert.match(read.stdout, /Session distribution: adaptive/);
 });
 
+test('distribute affinity writes and reports the fourth mode', async () => {
+  const configPath = await writeConfig();
+  const set = await runCli(configPath, ['distribute', 'affinity']);
+  assert.equal(set.code, 0, set.stderr);
+  assert.equal(await readDistribute(configPath), 'affinity');
+  assert.match(set.stdout, /Session distribution affinity/);
+
+  const read = await runCli(configPath, ['distribute']);
+  assert.equal(read.code, 0, read.stderr);
+  assert.match(read.stdout, /Session distribution: affinity/);
+});
+
 test('distribute off says the running sessions drain', async () => {
   const configPath = await writeConfig(true);
   const res = await runCli(configPath, ['distribute', 'off']);
