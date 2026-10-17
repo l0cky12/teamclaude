@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, resolveAccountTarget } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
@@ -82,13 +82,16 @@ test('a refresh button is offered only where the probe would read the account', 
   assert.equal(canRefreshQuota({ name: 'a' }, null), false, 'no probe row, no button');
 });
 
-test('refreshQuotaRequest narrows the fleet probe to one account', () => {
-  const r = refreshQuotaRequest('me@example.com', 'k');
+test('refreshQuotaRequest names the card\'s account with its provider and org', () => {
+  const r = refreshQuotaRequest({ name: 'me@example.com', provider: 'codex', orgName: 'Acme' }, 'k');
   assert.equal(r.url, '/teamclaude/probe');
   assert.equal(r.init.method, 'POST');
   assert.equal(r.init.headers['x-api-key'], 'k');
-  assert.deepEqual(JSON.parse(r.init.body), { account: 'me@example.com' });
-  assert.equal(refreshQuotaRequest('a', null).init.headers['x-api-key'], '');
+  assert.deepEqual(JSON.parse(r.init.body), { account: 'me@example.com', provider: 'codex', org: 'Acme' });
+  // No org on the card, no org in the request: an empty one would match nothing.
+  assert.deepEqual(JSON.parse(refreshQuotaRequest({ name: 'a', provider: 'anthropic', orgName: null }, null).init.body),
+    { account: 'a', provider: 'anthropic' });
+  assert.equal(refreshQuotaRequest({ name: 'a' }, null).init.headers['x-api-key'], '');
   assert.deepEqual(refreshQuotaOutcome({ ok: true, account: 'a', status: 'ok' }), { kind: 'ok', text: 'quota refreshed' });
   assert.deepEqual(refreshQuotaOutcome({ ok: false, error: 'the account is disabled' }),
     { kind: 'error', text: 'quota refresh failed: the account is disabled' });
@@ -403,6 +406,51 @@ test('the probe route refreshes one account when the body names it', async () =>
   } finally {
     proxy.close();
   }
+});
+
+test('the probe route refreshes the namesake the card names, not the first match', async () => {
+  // One email holding a Claude and a Codex login: the same name on two cards.
+  const am = new AccountManager([
+    { name: 'me@example.com', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    { name: 'me@example.com', type: 'oauth', provider: 'codex', accountId: 'acct', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+  ], 0.98);
+  const probed = [];
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'secret' }, upstream: 'http://127.0.0.1:9' }, {
+    probeQuota: async () => {},
+    probeAccountQuota: async (account) => { probed.push(account); return { probed: true, status: { status: 'ok' } }; },
+  });
+  const port = await listen(proxy);
+  const post = body => fetch(`http://127.0.0.1:${port}/teamclaude/probe`, {
+    method: 'POST', headers: { 'x-api-key': 'secret', 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  try {
+    let res = await post({ account: 'me@example.com', provider: 'codex' });
+    assert.equal(res.status, 200);
+    assert.equal(probed.at(-1), am.accounts[1]);
+    res = await post({ account: 'me@example.com', provider: 'anthropic' });
+    assert.equal(res.status, 200);
+    assert.equal(probed.at(-1), am.accounts[0]);
+    // The name alone is refused rather than resolved to whichever comes first.
+    res = await post({ account: 'me@example.com' });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /more than one account/);
+    assert.equal(probed.length, 2);
+  } finally {
+    proxy.close();
+  }
+});
+
+test('resolveAccountTarget narrows by org, and by uuid without asking', () => {
+  const am = { accounts: [
+    { name: 'me@example.com (Acme)', orgName: 'Acme', orgUuid: 'org-1', accountUuid: 'u-1' },
+    { name: 'me@example.com (Beta)', orgName: 'Beta', orgUuid: 'org-2', accountUuid: 'u-1' },
+  ] };
+  assert.deepEqual(resolveAccountTarget(am, { account: 'me@example.com', org: 'beta' }), { index: 1 });
+  assert.deepEqual(resolveAccountTarget(am, { account: 'me@example.com', org: 'org-1' }), { index: 0 });
+  assert.deepEqual(resolveAccountTarget(am, { account: 'me@example.com' }), { ambiguous: true });
+  assert.deepEqual(resolveAccountTarget(am, { account: 'me@example.com (Beta)' }), { index: 1 });
+  assert.deepEqual(resolveAccountTarget(am, { account: 'u-1/org-2' }), { index: 1 });
+  assert.equal(resolveAccountTarget(am, { account: 'me@example.com', org: 'Gamma' }), null);
 });
 
 test('a server without a single-account probe says so rather than probing the fleet', async () => {
@@ -896,14 +944,14 @@ for (const status of [401, 403]) {
 test('a card\'s refresh button probes that one account, then polls for the new bars', async () => {
   const page = bootPage();
   await page.answer(200, {
-    accounts: [{ name: 'a', quota: { unified7d: 0.1 } }, { name: 'k', quota: {} }],
+    accounts: [{ name: 'a', provider: 'anthropic', quota: { unified7d: 0.1 } }, { name: 'k', quota: {} }],
     probe: { accounts: [{ name: 'a', status: 'never' }, { name: 'k', status: 'not-applicable' }] },
   });
   assert.equal(page.labelled('refresh'), 1, 'only the account the probe can read gets the button');
   page.click('refresh');
   const req = page.requests.shift();
   assert.equal(req.url, '/teamclaude/probe');
-  assert.deepEqual(JSON.parse(req.init.body), { account: 'a' });
+  assert.deepEqual(JSON.parse(req.init.body), { account: 'a', provider: 'anthropic' });
   req.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'a', status: 'ok' }) });
   await new Promise(r => setImmediate(r));
   assert.equal(page.requests[0].url, '/teamclaude/status', 'the poll after it shows the new bars');

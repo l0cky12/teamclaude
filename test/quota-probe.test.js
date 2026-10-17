@@ -526,6 +526,31 @@ test('probeOne joins a probe of the same account already in flight', async () =>
   assert.equal(probes, 2);
 });
 
+test('probeOne returns its own result when a namesake is probed at the same moment', async () => {
+  // One email, two logins: the status map is keyed by name, so a result read
+  // back from it would be whichever namesake finished last.
+  const am = new AccountManager([
+    oauth('me'),
+    oauth('me', { provider: 'codex', accountId: 'acct' }),
+  ], 0.98);
+  let releaseClaude;
+  const claudeGate = new Promise(resolve => { releaseClaude = resolve; });
+  const prober = new Prober(am, {
+    intervalMs: 0, log: () => {},
+    probeFn: async () => { await claudeGate; return { error: 'usage endpoint said no' }; },
+    codexProbeFn: async () => ({ fiveHour: { utilization: 0.2, resetAt: 1000 } }),
+  });
+  const claude = prober.probeOne(am.accounts[0]);
+  // The Codex probe records its row synchronously, so starting it in the same
+  // tick the Claude read is released puts it in the shared row first.
+  releaseClaude();
+  const codex = prober.probeOne(am.accounts[1]);
+  const [claudeResult, codexResult] = await Promise.all([claude, codex]);
+  assert.equal(codexResult.status.status, 'ok');
+  assert.equal(claudeResult.status.status, 'error');
+  assert.equal(claudeResult.status.error, 'usage endpoint said no');
+});
+
 // setInterval coerces a delay above 2^31-1 ms to 1 ms, which would turn an
 // interval meant as "practically never" into a tight probing loop.
 test('prober clamps its interval so the timer cannot overflow', () => {

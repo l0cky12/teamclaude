@@ -120,15 +120,21 @@ export function canRefreshQuota(account, probeEntry) {
   return !!probeEntry && probeEntry.status !== 'not-applicable';
 }
 
-// The POST a card's refresh button sends: the fleet probe, narrowed to one account.
-/** @param {any} name @param {string|null} key */
-export function refreshQuotaRequest(name, key) {
+// The POST a card's refresh button sends: the fleet probe, narrowed to one
+// account. Provider and org ride along because a name alone can belong to two
+// cards (one email with a Claude and a Codex login, or seats in two orgs).
+/** @param {any} account  one entry of status.accounts @param {string|null} key */
+export function refreshQuotaRequest(account, key) {
+  /** @type {{ account: any, provider?: any, org?: any }} */
+  var body = { account: account.name };
+  if (account.provider) body.provider = account.provider;
+  if (account.orgName) body.org = account.orgName;
   return {
     url: '/teamclaude/probe',
     init: {
       method: 'POST',
       headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
-      body: JSON.stringify({ account: name }),
+      body: JSON.stringify(body),
     },
   };
 }
@@ -1107,7 +1113,7 @@ ${SHARED_HELPERS}
     if (canRefreshQuota(a, probeEntry)) {
       var ctlRefresh = el('button', 'act', probeEntry.status === 'running' ? 'refreshing…' : 'refresh');
       ctlRefresh.disabled = probeEntry.status === 'running';
-      ctlRefresh.addEventListener('click', function () { doRefreshQuota(a.name, cardNoteKey(a), ctlRefresh); });
+      ctlRefresh.addEventListener('click', function () { doRefreshQuota(a, cardNoteKey(a), ctlRefresh); });
       head.appendChild(ctlRefresh);
     }
     if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
@@ -1543,10 +1549,10 @@ ${SHARED_HELPERS}
 
   // One account's quota, read now from the zero-spend usage endpoint. The
   // request waits for the probe, so the poll after it shows the new bars.
-  function doRefreshQuota(name, noteKey, btn) {
+  function doRefreshQuota(account, noteKey, btn) {
     btn.disabled = true;
     btn.textContent = 'refreshing…';
-    var r = refreshQuotaRequest(name, localStorage.getItem(KEY));
+    var r = refreshQuotaRequest(account, localStorage.getItem(KEY));
     fetch(r.url, r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }

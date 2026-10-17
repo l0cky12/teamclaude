@@ -172,8 +172,10 @@ export class Prober {
     if (!probeApplicable(account)) return { probed: false, reason: 'this account has no quota the probe can read' };
     if (account.disabled) return { probed: false, reason: 'the account is disabled' };
     if (!this._probeable(account)) return { probed: false, reason: 'upstream rejected its refresh token; sign in again' };
-    await this.probeAccount(account);
-    return { probed: true, status: this.accountStatus.get(account.name) };
+    // The probe's own record, not accountStatus: that map is keyed by name,
+    // and a namesake (a Claude and a Codex account on one email) probed at the
+    // same moment would overwrite it before this read.
+    return { probed: true, status: await this.probeAccount(account) };
   }
 
   /** @param {any} account */
@@ -203,14 +205,13 @@ export class Prober {
 
       if (!usage || usage.error) {
         const finishedAt = Date.now();
-        this._recordAccount(account, {
+        return this._recordAccount(account, {
           status: usage?.error ? 'error' : 'timeout',
           error: usage?.error || 'probe timed out',
           startedAt,
           finishedAt,
           durationMs: finishedAt - startedAt,
         });
-        return;
       }
 
       this.am.applyUsageData(account.index, usage);
@@ -221,7 +222,7 @@ export class Prober {
         this.am.applyProfileData(account.index, profile);
       }
       const finishedAt = Date.now();
-      this._recordAccount(account, {
+      return this._recordAccount(account, {
         status: 'ok',
         error: null,
         startedAt,
@@ -230,7 +231,7 @@ export class Prober {
       });
     } catch (err) {
       const finishedAt = Date.now();
-      this._recordAccount(account, {
+      return this._recordAccount(account, {
         status: 'error',
         error: err?.message || String(err),
         startedAt,
@@ -250,15 +251,14 @@ export class Prober {
       }
       if (!usage || usage.error) {
         const finishedAt = Date.now();
-        this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
-        return;
+        return this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
       }
       this.am.applyCodexUsageData(account.index, usage);
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      return this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
     } catch (err) {
       const finishedAt = Date.now();
-      this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      return this._recordAccount(account, { status: 'error', error: err?.message || String(err), startedAt, finishedAt, durationMs: finishedAt - startedAt });
     }
   }
 
@@ -270,7 +270,7 @@ export class Prober {
     const failure = reading && 'error' in reading ? reading.error : null;
     const failed = !reading || !!failure;
     if (!failed) this.am.applyBackendQuota(account.index, reading);
-    this._recordAccount(account, {
+    return this._recordAccount(account, {
       status: failed ? 'error' : 'ok',
       error: failed ? (failure || 'no reading') : null,
       startedAt, finishedAt, durationMs: finishedAt - startedAt,
@@ -299,11 +299,11 @@ export class Prober {
     };
   }
 
+  /** Merge into the account's status row and return the row as it now stands. */
   _recordAccount(account, status) {
-    this.accountStatus.set(account.name, {
-      ...(this.accountStatus.get(account.name) || {}),
-      ...status,
-    });
+    const row = { ...(this.accountStatus.get(account.name) || {}), ...status };
+    this.accountStatus.set(account.name, row);
+    return row;
   }
 
   _withTimeout(promise) {

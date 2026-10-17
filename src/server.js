@@ -720,24 +720,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // One-shot quota probe — the web equivalent of the TUI's `p` key. It is
       // zero-spend and only available when the running server has a prober.
       // With no body it refreshes the fleet; {"account": "<name|uuid>"} (the
-      // same identifiers /switch takes) refreshes that one account, which is
-      // what a dashboard card's refresh button sends.
+      // same identifiers /switch takes, plus optional "provider" and "org" to
+      // tell namesakes apart) refreshes that one account, which is what a
+      // dashboard card's refresh button sends.
       if (req.method === 'POST' && req.url === '/teamclaude/probe') {
         if (!hooks.probeQuota) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe not supported' }));
           return;
         }
-        let target;
+        let body;
         try {
-          // `?.`: JSON.parse('null') is a value, and `.account` of it throws.
-          target = JSON.parse(await readControlBody(req) || '{}')?.account;
+          // `?? {}`: JSON.parse('null') is a value, and `.account` of it throws.
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
         } catch (err) {
           const tooLarge = /** @type {Error} */ (err).message === 'body too large';
           res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
           return;
         }
+        const target = body.account;
         if (target !== undefined) {
           if (!hooks.probeAccountQuota) {
             res.writeHead(501, { 'Content-Type': 'application/json' });
@@ -750,13 +752,18 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
             return;
           }
-          const index = resolveAccountPin(accountManager, target);
-          if (index == null) {
+          const found = resolveAccountTarget(accountManager, { account: target, provider: body.provider, org: body.org });
+          if (found == null) {
             res.writeHead(404, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
             return;
           }
-          const account = accountManager.accounts[index];
+          if ('ambiguous' in found) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: `more than one account is named "${target}"; add "provider" or "org"` }));
+            return;
+          }
+          const account = accountManager.accounts[found.index];
           try {
             const result = await hooks.probeAccountQuota(account);
             // Not probed is the caller asking for something the probe will not
@@ -1188,6 +1195,39 @@ export function resolveAccountPin(accountManager, token) {
   ]) if (i >= 0) return i;
 
   return null;
+}
+
+/**
+ * The account a single-account control names, narrowed by provider and org.
+ *
+ * A name alone can name two accounts: one email can hold a Claude and a Codex
+ * login, or seats in two orgs. resolveAccountPin takes the first match, which
+ * for a refresh would read one account's quota and report it on the other's
+ * card. So the caller may say which provider and org it means, and a name that
+ * still matches more than one account is refused rather than guessed.
+ *
+ * @param {any} accountManager
+ * @param {{ account: string, provider?: unknown, org?: unknown }} query
+ * @returns {{ index: number } | { ambiguous: true } | null}
+ */
+export function resolveAccountTarget(accountManager, { account, provider, org }) {
+  const norm = (/** @type {any} */ s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
+  const wantProvider = norm(provider);
+  const wantOrg = norm(org);
+  /** @type {{ a: any, i: number }[]} */
+  const pool = (accountManager.accounts || [])
+    .map((/** @type {any} */ a, /** @type {number} */ i) => ({ a, i }))
+    .filter((/** @type {{ a: any, i: number }} */ { a }) => (!wantProvider || providerOf(a) === wantProvider)
+      && (!wantOrg || norm(a.orgName) === wantOrg || norm(a.orgUuid) === wantOrg));
+  const hit = resolveAccountPin({ accounts: pool.map(p => p.a) }, account);
+  if (hit == null) return null;
+  // The two name levels resolveAccountPin falls back to; a uuid match is unique.
+  const t = norm(account);
+  const exact = pool.filter(({ a }) => norm(a.name) === t);
+  const bare = pool.filter(({ a }) => norm((a.name || '').split(' (')[0]) === t);
+  const sameName = exact.length ? exact : bare;
+  if (sameName.length > 1 && sameName.includes(pool[hit])) return { ambiguous: true };
+  return { index: pool[hit].i };
 }
 
 /**
