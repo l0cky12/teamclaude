@@ -1,20 +1,20 @@
-// The project's mark, in one place. Three rounded bars on a blue tile: the
+// The project's mark, in one place. Three red bars on a dark red tile: the
 // accounts the proxy pools, each at its own level of quota. It lives here as
 // an SVG string rather than a file because the dashboard is one inline HTML
 // page with no asset routes and no build step, and `src/` is what ships.
-// Stroke and fill are fixed colours, not theme variables, so the same mark
+// Fills are fixed colours, not theme variables, so the same mark
 // works as a browser-tab icon, where no page CSS applies.
 
 /** The mark as a standalone SVG document, 64×64. */
 export const LOGO_SVG = [
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">',
   '<defs><linearGradient id="tr-logo-g" x1="0" y1="0" x2="1" y2="1">',
-  '<stop offset="0" stop-color="#5fbaff"/><stop offset="1" stop-color="#2b7fe6"/>',
+  '<stop offset="0" stop-color="#540c00"/><stop offset="1" stop-color="#380b00"/>',
   '</linearGradient></defs>',
   '<rect x="2" y="2" width="60" height="60" rx="15" fill="url(#tr-logo-g)"/>',
-  '<rect x="15" y="30" width="9" height="20" rx="4.5" fill="#fff" opacity=".55"/>',
-  '<rect x="27.5" y="16" width="9" height="34" rx="4.5" fill="#fff"/>',
-  '<rect x="40" y="24" width="9" height="26" rx="4.5" fill="#fff" opacity=".8"/>',
+  '<rect x="15" y="30" width="9" height="20" rx="4.5" fill="#ff1300" opacity=".55"/>',
+  '<rect x="27.5" y="16" width="9" height="34" rx="4.5" fill="#ff1300"/>',
+  '<rect x="40" y="24" width="9" height="26" rx="4.5" fill="#ff1300" opacity=".8"/>',
   '</svg>',
 ].join('');
 

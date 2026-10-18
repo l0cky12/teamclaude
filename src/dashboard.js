@@ -49,7 +49,7 @@ export function inlineScripts(html) {
  * only network the script may touch is this origin, for status and switch.
  * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
  * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
- * governed by CSP at all. `img-src data:` admits one image, the tab icon,
+ * governed by CSP at all. `img-src data:` admits embedded images for the tab icon,
  * which is the logo inlined as a `data:` URL in `<head>`: a `data:` image can
  * carry no script and reach no network, and nothing from `'self'` or any
  * other origin is allowed. `frame-ancestors 'none'` keeps the page out of
@@ -1028,7 +1028,7 @@ const PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TeamClaude</title>
+<title>TeamRouter</title>
 <link rel="icon" type="image/svg+xml" href="${logoDataUrl()}">
 <style>
   /* Dark is the default, and stays the default for a viewer whose system says
@@ -1061,7 +1061,7 @@ const PAGE = `<!doctype html>
   button { font: inherit; }
   .shell { display: grid; grid-template-columns: 228px minmax(0, 1fr); min-height: 100vh; }
   .side { background: var(--side); border-right: 1px solid var(--line); padding: 18px 12px; display: flex; flex-direction: column; gap: 2px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
-  .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 15px; padding: 0 10px 10px; }
+  .brand { display: flex; align-items: center; gap: 9px; color: #ff1300; font: 700 15px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; padding: 0 10px 10px; }
   .brand svg { width: 20px; height: 20px; flex: none; }
   #nav { display: flex; flex-direction: column; gap: 2px; }
   .navsec { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); padding: 14px 10px 4px; }
@@ -1222,14 +1222,14 @@ const PAGE = `<!doctype html>
 </head>
 <body>
 <div id="keybox">
-  <h1>TeamClaude</h1>
+  <h1>TeamRouter</h1>
   <p class="sub">Enter your proxy key to view status.</p>
   <input id="key" type="password" placeholder="tc-..." autocomplete="off">
   <br><button id="go">Connect</button>
 </div>
 <div id="app" class="shell" style="display:none">
   <aside class="side">
-    <div class="brand">${logoMarkup()}TeamClaude</div>
+    <div class="brand">${logoMarkup()}TeamRouter</div>
     <nav id="nav"></nav>
     <div class="sidefoot">
       <button id="theme" class="more" type="button" title="Switch between following the system, light and dark"></button>
