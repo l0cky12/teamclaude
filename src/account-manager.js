@@ -4481,15 +4481,24 @@ export class AccountManager {
 
   /**
    * The account this request's scope is resting on in drain mode, before any
-   * re-rank. Most requests follow the shared cursor (`current`). Two kinds
-   * rest apart from it, each on a holder of its own, the way a family
-   * diversion rests on its own route cursor (#276):
+   * re-rank. Most requests follow the shared cursor (`current`). Some rest
+   * apart from it, each on a holder of its own, the way a family diversion
+   * rests on its own route cursor (#276). A scope of its own always does:
    *   - a model with its own weekly bucket (Fable, Sonnet, a route's bucket)
    *     is ranked on that bucket's reset, and moving the shared cursor on
    *     that order would have the next shared-bucket request move it straight
    *     back;
-   *   - a request the current account cannot serve while it still serves
-   *     everything else (a route, the advisor's family).
+   *   - a model configuration restricts to some accounts (a route's
+   *     `accounts`, or the deprecated per-account `models` claim), and an
+   *     advisor request whose advisor needs another family: the account the
+   *     shared cursor names need not be one they can use.
+   * Whether the current account can serve such a scope comes and goes as the
+   * shared cursor moves and its account is gated, and a scope that followed
+   * the cursor while it could would be dragged off a healthy holder and back
+   * again. So it rests on its holder throughout, and never moves the cursor.
+   * Any other request rests apart only while the current account cannot serve
+   * it but still serves everything else (a weekly bucket upstream scopes to
+   * its family).
    * A scope with no holder yet starts from the current account. Once it has
    * one, a holder that cannot serve leaves no incumbent, so its replacement is
    * a full drain-order pick: the conversations on the holder miss their
@@ -4506,10 +4515,21 @@ export class AccountManager {
   _drainIncumbent(current, exclude, model, advisorModel, provider = this._selectingProvider || DEFAULT_PROVIDER) {
     const serves = (/** @type {Record<string, any>|null} */ a) => !!a && !exclude?.has(a.index)
       && this._isAvailable(a, model, advisorModel);
-    const family = this._weeklyBucketFor(model) !== 'unified7d';
+    const route = this._routeForModel(model);
+    // Restricted as _routeAllows restricts: a route's accounts, failing that
+    // the per-account `models` claim.
+    const restricted = route?.accounts.length ? true
+      : !!model && this.accounts.some(a => a.models?.some((/** @type {string} */ m) => modelMatches(m, model)));
+    let key = this._cursorKey(model, advisorModel, provider);
+    // An advisor that needs another family adds that family to the key.
+    const advised = key !== this._cursorKey(model, null, provider);
+    const scoped = this._weeklyBucketFor(model) !== 'unified7d' || restricted || advised;
+    // _cursorKey files a model with no route under its weekly bucket, a slot
+    // every unrestricted model on that bucket shares; a claimed model's holder
+    // gets one of its own.
+    if (restricted && !route) key += `\u0000${model}`;
     const general = !!current && !exclude?.has(current.index) && this._isAvailable(current, null);
-    const apart = family || (general && !serves(current));
-    const key = this._cursorKey(model, advisorModel, provider);
+    const apart = scoped || (general && !serves(current));
     if (!apart) return { incumbent: serves(current) ? current : null, apart, key, held: null };
     const idx = this._drainHolders.get(key);
     const held = idx != null ? (this.accounts[idx] ?? null) : null;

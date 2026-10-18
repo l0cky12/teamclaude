@@ -15,6 +15,7 @@ const H = 3600_000;
 const M = 60_000;
 const OPUS = 'claude-opus-5';
 const FABLE = 'claude-fable-5';
+const HAIKU = 'claude-haiku-5';
 const CODEX = 'gpt-5-codex';
 
 function oauth(name, extra = {}) {
@@ -421,6 +422,91 @@ test('the Claude and Codex pools are ranked independently', () => {
   am.accounts[3].quota.unified7d = 0.99;
   drainLog(() => assert.equal(pick(am, CODEX, 'codex'), 'c1'));
   assert.equal(pick(am, OPUS), 'a2');
+});
+
+test('a route keeps its own account while the shared account is gated and after it recovers', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const base = hourBase();
+  const am = mgr(['a', 'b', 'c'], { routes: [{ name: 'small', match: ['*haiku*'], accounts: ['b', 'c'] }] });
+  weekly(am, 0, 0.20, base + 12 * H);
+  // 'b' and 'c' reset in the same hour, 'b' with more left to begin with.
+  weekly(am, 1, 0.20, base + 24 * H + 5 * M);
+  weekly(am, 2, 0.30, base + 24 * H + 40 * M);
+  drainLog(() => {
+    assert.equal(pick(am, OPUS), 'a');
+    assert.equal(pick(am, HAIKU), 'b');
+  });
+  // The tie-break turns: 'c' now has more left. Nothing moves.
+  am.accounts[1].quota.unified7d = 0.60;
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+
+  // The shared account hits its 5-hour gate. The route never used it, and its
+  // own account can still serve: the route stays, and the shared cursor is
+  // not the route's to move.
+  session(am, 0, 0.99, Date.now() + 2 * H);
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+  assert.equal(am.currentIndex, 0);
+  // The shared scope has to move, and the drain order takes it to 'c'. The
+  // shared cursor now names an account the route may use; the route stays.
+  drainLog(() => assert.equal(pick(am, OPUS), 'c'));
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+  assert.equal(am.getStatus().routes.find(r => r.name === 'small').target, 'b');
+
+  // 'a' recovers and takes the shared cursor back with its earlier reset. The
+  // route is where it was throughout: no b → c → b.
+  t.mock.timers.tick(2 * H + 1);
+  drainLog(() => assert.equal(pick(am, OPUS), 'a'));
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+});
+
+test('a model only some accounts claim keeps its own account while the shared account is gated', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const base = hourBase();
+  const am = mgr(['a', oauth('b', { models: [HAIKU] }), oauth('c', { models: [HAIKU] })]);
+  weekly(am, 0, 0.20, base + 12 * H);
+  weekly(am, 1, 0.20, base + 24 * H + 5 * M);
+  weekly(am, 2, 0.30, base + 24 * H + 40 * M);
+  drainLog(() => {
+    assert.equal(pick(am, OPUS), 'a');
+    assert.equal(pick(am, HAIKU), 'b');
+  });
+  am.accounts[1].quota.unified7d = 0.60;
+  session(am, 0, 0.99, Date.now() + 2 * H);
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+  assert.equal(am.currentIndex, 0);
+  drainLog(() => assert.equal(pick(am, OPUS), 'c'));
+  assert.equal(pick(am, HAIKU), 'b');
+  t.mock.timers.tick(2 * H + 1);
+  drainLog(() => assert.equal(pick(am, OPUS), 'a'));
+  assert.equal(drainLog(() => assert.equal(pick(am, HAIKU), 'b')).length, 0);
+});
+
+test('an advisor request keeps its own account while the shared account is gated', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const base = hourBase();
+  const am = mgr(['a', 'b', 'c']);
+  const advised = () => am.getActiveAccount(null, OPUS, FABLE, null).name;
+  // 'a' cannot serve a Fable advisor: its Fable weekly is spent.
+  weekly(am, 0, 0.20, base + 12 * H);
+  fableWeekly(am, 0, 0.99, base + 100 * H);
+  weekly(am, 1, 0.20, base + 24 * H + 5 * M);
+  weekly(am, 2, 0.30, base + 24 * H + 40 * M);
+  drainLog(() => {
+    assert.equal(pick(am, OPUS), 'a');
+    assert.equal(advised(), 'b');
+  });
+  am.accounts[1].quota.unified7d = 0.60;
+  session(am, 0, 0.99, Date.now() + 2 * H);
+  assert.equal(drainLog(() => assert.equal(advised(), 'b')).length, 0);
+  assert.equal(am.currentIndex, 0);
+  drainLog(() => assert.equal(pick(am, OPUS), 'c'));
+  assert.equal(advised(), 'b');
+  t.mock.timers.tick(2 * H + 1);
+  // A 5-hour reset drops the family readings as stale; the next one says
+  // a's Fable weekly is still spent.
+  drainLog(() => assert.equal(pick(am, OPUS), 'a'));
+  fableWeekly(am, 0, 0.99, base + 100 * H);
+  assert.equal(drainLog(() => assert.equal(advised(), 'b')).length, 0);
 });
 
 test('a holder follows its account when an earlier account is removed', () => {
