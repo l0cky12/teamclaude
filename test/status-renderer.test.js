@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { renderStatus, showSessionRow } from '../src/status-renderer.js';
-import { renderDashboardHtml } from '../src/dashboard.js';
+import { renderDashboardHtml, accountMeters } from '../src/dashboard.js';
 
 const now = Date.parse('2026-07-03T12:00:00Z');
 
@@ -624,8 +624,10 @@ test('showSessionRow hides the row only for a plan with no session window and no
 test('the dashboard card draws its Session row by the same rule', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes(showSessionRow.toString()), 'the page carries the shared helper');
-  // The card's bars come from claudeQuotaRows, which owns the Session row.
-  assert.match(html, /if \(showSessionRow\(q\)\) rows\.push\(\{ label: 'Session'/);
-  assert.doesNotMatch(html, /^\s*rows\.push\(\{ label: 'Session'/m, 'no unconditional Session row is left');
-  assert.doesNotMatch(html, /quotaRow\('Session'/, 'and no Session bar drawn outside it');
+  // A row's meters come from accountMeters, which owns the 5-hour column.
+  assert.match(html, /showSessionRow\(q\)\) slots\[1\] = quotaMeter\('5-hour limit'/);
+  assert.equal(html.split("quotaMeter('5-hour limit'").length, 2, 'and no 5-hour meter drawn outside it');
+  const quota = { unified5h: null, unified7d: 0.4, sessionWindowStated: false };
+  assert.equal(accountMeters({ provider: 'anthropic', quota }).slots[1], null);
+  assert.ok(accountMeters({ provider: 'anthropic', quota: { ...quota, sessionWindowStated: true } }).slots[1]);
 });

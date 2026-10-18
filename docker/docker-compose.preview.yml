@@ -1,0 +1,32 @@
+# A second TeamClaude, built from this checkout, for trying a branch from
+# another machine on your tailnet while the proxy you use every day keeps
+# running untouched. It has its own config volume (nothing is read from or
+# written to ~/.config/teamclaude.json), listens on host port 3466 rather
+# than 3456, and is published on the Tailscale address only, so nothing on
+# the LAN or the internet can reach it. See docs/usage.md, "Previewing a
+# branch".
+#
+#   export TAILSCALE_IP=$(tailscale ip -4)
+#   docker compose -f docker/docker-compose.preview.yml build
+#   docker compose -f docker/docker-compose.preview.yml run --rm preview login
+#   docker compose -f docker/docker-compose.preview.yml up -d
+
+name: teamclaude-preview
+
+services:
+  preview:
+    build:
+      context: ..
+    image: teamclaude:preview
+    container_name: teamclaude-preview
+    command: ["server", "--headless"]
+    ports:
+      - "${TAILSCALE_IP:?set TAILSCALE_IP to this machine's Tailscale address (tailscale ip -4)}:3466:3456"
+    volumes:
+      - preview-data:/data
+    # A preview is started by hand and stopped by hand. Restarting on exit
+    # would turn a config mistake into a loop.
+    restart: "no"
+
+volumes:
+  preview-data:

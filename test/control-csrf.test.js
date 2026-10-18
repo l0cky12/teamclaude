@@ -220,6 +220,24 @@ test('a keyed cross-origin control-plane POST is still refused', async () => {
   });
 });
 
+// The dashboard opened at http://<tailscale-ip>:port: browsers send no fetch
+// metadata to a plain-http address that is not localhost, only Origin.
+test('the dashboard over plain http on another address may write with the proxy key', async () => {
+  await withServer(async (am, port) => {
+    const host = `127.0.0.1:${port}`;
+    const ok = await switchTo(port, 'bob@example.com', { Origin: `http://${host}`, 'x-api-key': 'tc-test' });
+    assert.equal(ok.status, 200, await ok.text());
+    assert.equal(am.currentIndex, 1);
+    // Without the key the same request is the page-from-anywhere case: refused.
+    const keyless = await switchTo(port, 'alice@example.com', { Origin: `http://${host}` });
+    assert.notEqual(keyless.status, 200);
+    // And a key on a request from another origin is still refused.
+    const elsewhere = await switchTo(port, 'alice@example.com', { Origin: 'http://100.64.0.9:3466', 'x-api-key': 'tc-test' });
+    assert.equal(elsewhere.status, 403);
+    assert.equal(am.currentIndex, 1);
+  });
+});
+
 test('isSameOriginControlRequest: Sec-Fetch-Site wins, Origin is the fallback', () => {
   const req = (headers) => ({ headers });
   // Explicit browser signal.
@@ -229,8 +247,14 @@ test('isSameOriginControlRequest: Sec-Fetch-Site wins, Origin is the fallback', 
   assert.equal(isSameOriginControlRequest(req({ 'sec-fetch-site': 'same-site' })), false);
   // A browser that sends Sec-Fetch-Site is trusted over a stale Origin.
   assert.equal(isSameOriginControlRequest(req({ 'sec-fetch-site': 'same-origin', origin: 'https://evil.example' })), true);
-  // Fallback: any Origin on a control POST means a page issued it.
+  // Fallback: any Origin on a control POST means a page issued it, unless the
+  // request presented the proxy key and its Origin is the Host it was sent to.
   assert.equal(isSameOriginControlRequest(req({ origin: 'https://evil.example' })), false);
+  assert.equal(isSameOriginControlRequest(req({ origin: 'http://100.64.0.1:3466', host: '100.64.0.1:3466' })), false, 'no key');
+  assert.equal(isSameOriginControlRequest(req({ origin: 'http://100.64.0.1:3466', host: '100.64.0.1:3466' }), { keyed: true }), true);
+  assert.equal(isSameOriginControlRequest(req({ origin: 'http://evil.example', host: '100.64.0.1:3466' }), { keyed: true }), false);
+  assert.equal(isSameOriginControlRequest(req({ origin: 'null', host: '100.64.0.1:3466' }), { keyed: true }), false);
+  assert.equal(isSameOriginControlRequest(req({ origin: 'http://100.64.0.1:3466' }), { keyed: true }), false, 'no Host');
   // curl and the CLI.
   assert.equal(isSameOriginControlRequest(req({})), true);
 });

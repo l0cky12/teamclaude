@@ -510,13 +510,13 @@ includes the reset block for a recent Claude Code client. The count shows up on
 the same surfaces as the
 [Codex reset credits](#free-rate-limit-reset-credits): `RC1` on the TUI row, a
 `Reset` line in `teamclaude status` with when the reset lapses
-(`expires 18d 23h`), and a badge with the date on the dashboard card. A reset
+(`expires 18d 23h`), and a badge with the date on the account's dashboard row. A reset
 past its expiry date is dropped from every surface, as is a reading more than
 7 days old.
 
 The probe is off by default, so the count is only as fresh as the last probe:
 `p` in the TUI, or `curl -X POST localhost:3456/teamclaude/probe`, refreshes
-it once (a dashboard card's **refresh** button does the same for one account).
+it once (the dashboard's **Refresh quota** button does the same for one account).
 
 ### Spending a Claude reset automatically
 

@@ -12,8 +12,11 @@ import {
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
-  claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
+  LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
 } from '../src/dashboard.js';
+import { EVENT_KINDS } from '../src/event-log.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
 function listen(server) {
@@ -53,25 +56,139 @@ test('scopedWeekly falls back to the dedicated fields, and never doubles a famil
   assert.deepEqual(scopedWeeklyRows(null), []);
 });
 
-test('a card draws Fable first, then the five-hour session, then the shared weekly last', () => {
-  const rows = claudeQuotaRows({
-    unified5h: 0.2, unified5hReset: 1, unified7d: 0.4, unified7dReset: 2,
-    scopedWeekly: { fable: { utilization: 0.6, resetAt: 3 }, sonnet: { utilization: 0.1, resetAt: 4 } },
-  });
-  assert.deepEqual(rows.map(r => r.label), ['Fable', 'Sonnet', 'Session', 'Weekly']);
-  assert.deepEqual(rows[0], { label: 'Fable', utilization: 0.6, resetAt: 3 });
-  assert.deepEqual(rows[2], { label: 'Session', utilization: 0.2, resetAt: 1 });
-  assert.deepEqual(rows[3], { label: 'Weekly', utilization: 0.4, resetAt: 2 });
-  // Fable leads even when another family sorts ahead of it by name.
-  assert.deepEqual(claudeQuotaRows({ unified7d: 0.1, scopedWeekly: { fable: {}, apex: {} } }).map(r => r.label),
-    ['Fable', 'Apex', 'Session', 'Weekly']);
+const labels = (/** @type {any} */ m) => m.slots.map((/** @type {any} */ x) => x && x.label);
+
+test('a Claude row reads Fable weekly, then the five-hour limit, then the shared weekly', () => {
+  const m = accountMeters({
+    provider: 'anthropic',
+    quota: {
+      unified5h: 0.2, unified5hReset: 1, unified7d: 0.4, unified7dReset: 2,
+      scopedWeekly: { fable: { utilization: 0.6, resetAt: 3 }, sonnet: { utilization: 0.1, resetAt: 4 } },
+    },
+  }, 'Fable 5.1');
+  assert.deepEqual(labels(m), ['7-day Fable 5.1', '5-hour limit', '7-day limit']);
+  assert.deepEqual(m.slots[0], { label: '7-day Fable 5.1', used: 0.6, left: 0.4, resetAt: 3, tone: 'ok' });
+  assert.equal(m.slots[1].resetAt, 1);
+  assert.equal(m.slots[2].resetAt, 2);
+  // Other model-scoped buckets wait behind the row's Show control.
+  assert.deepEqual(m.extra.map((/** @type {any} */ x) => x.label), ['7-day Sonnet']);
+  assert.equal(m.text, null);
 });
 
-test('a card with no Fable bucket or no session window draws only what it has', () => {
-  assert.deepEqual(claudeQuotaRows({ unified5h: 0.2, unified7d: 0.4 }).map(r => r.label), ['Session', 'Weekly']);
-  // A plan that states no session window gets no Session bar (showSessionRow).
-  assert.deepEqual(claudeQuotaRows({ unified7d: 0.4, sessionWindowStated: false, unified7dFable: 0.5 }).map(r => r.label),
-    ['Fable', 'Weekly']);
+test('a column the account has no window for stays empty, so the columns line up', () => {
+  // No Fable bucket reported yet.
+  assert.deepEqual(labels(accountMeters({ quota: { unified5h: 0.2, unified7d: 0.4 } })), [null, '5-hour limit', '7-day limit']);
+  // A plan that states no session window gets no five-hour column (showSessionRow).
+  assert.deepEqual(labels(accountMeters({ quota: { unified7d: 0.4, sessionWindowStated: false, unified7dFable: 0.5 } })),
+    ['7-day Fable', null, '7-day limit']);
+  // Codex has no Fable bucket at all, even if a field of that name turned up.
+  assert.deepEqual(labels(accountMeters({ provider: 'codex', quota: { unified5h: 0.1, unified7d: 0.3, unified7dFable: 0.9 } })),
+    [null, '5-hour limit', '7-day limit']);
+});
+
+test('an account metered another way fills from the left, or says why there is nothing', () => {
+  assert.deepEqual(labels(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } })), ['Tokens', null, null]);
+  assert.equal(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).slots[0].left, 0.25);
+  const backend = accountMeters({ quota: { backend: { label: 'Balance', text: '$4.20', utilization: null } } });
+  assert.deepEqual(labels(backend), [null, null, null]);
+  assert.equal(backend.text, 'Balance: $4.20');
+  assert.match(accountMeters({ quota: {} }).text, /quota unknown/);
+});
+
+test('a column\'s tone follows what is used: amber from 70%, red from 90%', () => {
+  assert.equal(meterTone(0.69), 'ok');
+  assert.equal(meterTone(0.7), 'warn');
+  assert.equal(meterTone(0.9), 'bad');
+  assert.equal(meterTone(null), 'unknown');
+  assert.deepEqual(quotaMeter('x', 1.4, null), { label: 'x', used: 1, left: 0, resetAt: null, tone: 'bad' });
+  assert.equal(quotaMeter('x', undefined, null).left, null);
+});
+
+test('the Fable column is named for the newest Fable model the fleet served', () => {
+  assert.equal(fableLabel([]), 'Fable');
+  assert.equal(fableLabel([
+    { usage: { recentModels: { 'claude-fable-5-0': 10, 'claude-opus-5-5': 50 } } },
+    { usage: { recentModels: { 'claude-fable-5-1': 20 } } },
+  ]), 'Fable 5.1');
+});
+
+test('a summary card pools one column across the enabled accounts that report it', () => {
+  const now = 1_000;
+  const pool = poolSummary([
+    { name: 'a', quota: { unified7d: 0.2, unified7dReset: now + 5_000 } },
+    { name: 'b', quota: { unified7d: 0.9, unified7dReset: now + 2_000 } },
+    { name: 'c', disabled: true, quota: { unified7d: 0 } },
+    { name: 'd', quota: { unified5h: 0.1 } },
+  ], 2, 'Fable', now);
+  assert.equal(pool.label, '7-day limit');
+  assert.equal(pool.count, 2);
+  assert.ok(Math.abs(pool.left - 0.9) < 1e-9);
+  assert.deepEqual(pool.segments.map((/** @type {any} */ x) => x.name), ['a', 'b']);
+  assert.deepEqual(pool.soonest, { name: 'b', resetAt: now + 2_000 });
+  // `d` has a weekly column with no reading: counted, not guessed.
+  assert.equal(pool.unknown, 1);
+  // A reset already past is not "the soonest".
+  assert.equal(poolSummary([{ name: 'a', quota: { unified7d: 0.1, unified7dReset: now - 1 } }], 2, 'Fable', now).soonest, null);
+});
+
+test('tabs list Claude, Codex, then each backend host, with counts', () => {
+  const tabs = providerTabs([
+    { provider: 'codex' }, { provider: 'anthropic' }, { provider: 'anthropic', backend: 'api.deepseek.com' },
+    { provider: 'anthropic' }, { provider: 'anthropic', backend: 'example.test' },
+  ]);
+  assert.deepEqual(tabs.map(t => [t.key, t.label, t.count]), [
+    ['all', 'All', 5], ['anthropic', 'Claude', 2], ['codex', 'Codex', 1],
+    ['backend:api.deepseek.com', 'DeepSeek', 1], ['backend:example.test', 'example.test', 1],
+  ]);
+  assert.equal(accountGroup({}), 'anthropic');
+  assert.equal(groupLabel('backend:__proto__'), '__proto__');
+});
+
+test('the Logs page offers a chip for every kind the proxy records', () => {
+  assert.equal(LOG_KINDS[0].key, 'all');
+  assert.deepEqual(LOG_KINDS.slice(1).map(k => k.key), [...EVENT_KINDS]);
+});
+
+test('log pages merge in order, skip what is held, and keep at most the cap', () => {
+  const a = mergeLogEvents(null, { generation: 'g1', events: [{ id: 1 }, { id: 2 }], lastId: 2 }, 10);
+  assert.deepEqual(a.events.map(e => e.id), [1, 2]);
+  assert.equal(a.generation, 'g1');
+  assert.equal(a.refetch, false);
+  const b = mergeLogEvents(a, { generation: 'g1', events: [{ id: 2 }, { id: 3 }], lastId: 3 }, 10);
+  assert.deepEqual(b.events.map(e => e.id), [1, 2, 3]);
+  assert.deepEqual(mergeLogEvents(b, { generation: 'g1', events: [{ id: 4 }, { id: 5 }], lastId: 5 }, 3).events.map(e => e.id), [3, 4, 5]);
+});
+
+test('a restarted server is a new log: what is held goes, and the page asks again from the start', () => {
+  const held = { generation: 'old', events: [{ id: 1 }, { id: 2 }] };
+  // The new process logged three events before the page polled again, so its
+  // counter is past the cursor: ids alone would keep 1-2 from the old log and
+  // never fetch the new 1-2. The generation says it is another log.
+  const next = mergeLogEvents(held, { generation: 'new', events: [{ id: 3 }], lastId: 3 }, 10);
+  assert.deepEqual(next, { generation: 'new', events: [], refetch: true });
+  // A server that names no generation: a lastId behind what is held is the same restart.
+  assert.equal(mergeLogEvents({ generation: null, events: [{ id: 5 }] }, { events: [], lastId: 1 }, 10).refetch, true);
+});
+
+test('log filters combine kind, provider and account', () => {
+  const events = [
+    { id: 1, kind: 'usage', provider: 'anthropic', account: 'a' },
+    { id: 2, kind: 'signin', provider: 'codex', account: 'b' },
+    { id: 3, kind: 'usage', provider: 'codex', account: 'b' },
+  ];
+  assert.deepEqual(filterLogEvents(events, { kind: 'usage' }).map(e => e.id), [1, 3]);
+  assert.deepEqual(filterLogEvents(events, { kind: 'all', provider: 'codex' }).map(e => e.id), [2, 3]);
+  assert.deepEqual(filterLogEvents(events, { kind: 'usage', account: 'b' }).map(e => e.id), [3]);
+});
+
+test('a log row\'s details say what a request carried, or the reason code', () => {
+  assert.equal(logEventDetail({ model: 'claude-fable-5-1', status: 200, inputTokens: 1500, outputTokens: 7, ms: 1234 }),
+    'Fable 5.1 \u00b7 200 \u00b7 1.5k in / 7 out \u00b7 1.2s');
+  assert.equal(logEventDetail({ reason: 'refresh_rejected' }), 'refresh_rejected');
+  assert.equal(logEventTone({ type: 'signed_out' }), 'bad');
+  assert.equal(logEventTone({ type: 'rate_limited' }), 'warn');
+  assert.equal(logEventTone({ type: 'request', status: 529 }), 'bad');
+  assert.equal(logEventTone({ type: 'request', status: 200 }), '');
 });
 
 test('a refresh button is offered only where the probe would read the account', () => {
@@ -836,7 +953,8 @@ test('the page ships the same helper implementations it is tested against', () =
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
-  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome]) {
+  for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -947,14 +1065,111 @@ test('a card\'s refresh button probes that one account, then polls for the new b
     accounts: [{ name: 'a', provider: 'anthropic', quota: { unified7d: 0.1 } }, { name: 'k', quota: {} }],
     probe: { accounts: [{ name: 'a', status: 'never' }, { name: 'k', status: 'not-applicable' }] },
   });
-  assert.equal(page.labelled('refresh'), 1, 'only the account the probe can read gets the button');
-  page.click('refresh');
+  assert.equal(page.labelled('Refresh quota'), 1, 'only the account the probe can read gets the button');
+  page.click('Refresh quota');
   const req = page.requests.shift();
   assert.equal(req.url, '/teamclaude/probe');
   assert.deepEqual(JSON.parse(req.init.body), { account: 'a', provider: 'anthropic' });
   req.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'a', status: 'ok' }) });
   await new Promise(r => setImmediate(r));
   assert.equal(page.requests[0].url, '/teamclaude/status', 'the poll after it shows the new bars');
+});
+
+test('the Logs page fetches the event log only while it is open, and from where it left off', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.requests.length, 0, 'the quota page asks for nothing but status');
+  page.click('Logs');
+  const first = page.requests.shift();
+  assert.equal(first.url, '/teamclaude/logs?after=0');
+  first.resolve({ status: 200, ok: true, json: async () => ({
+    lastId: 2, capacity: 2000,
+    events: [
+      { id: 1, at: new Date().toISOString(), kind: 'signin', type: 'signin_succeeded', provider: 'anthropic', account: 'work', message: 'Signed in (dashboard)' },
+      { id: 2, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
+    ],
+  }) });
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.byId('logCount').textContent, '2 of 2 events');
+  // Narrowing to one kind is a re-render, not a re-fetch.
+  page.click('Sign-in');
+  assert.equal(page.requests.length, 0);
+  assert.equal(page.byId('logCount').textContent, '1 of 2 events');
+  // The next status poll brings the log along, asking only for what is newer.
+  page.click('Logs');
+  assert.equal(page.requests.shift().url, '/teamclaude/logs?after=2');
+});
+
+test('the Logs page reads a restarted server\'s log again from its start', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Logs');
+  const at = new Date().toISOString();
+  const ev = (/** @type {number} */ id, /** @type {string} */ message) => ({ id, at, kind: 'control', type: 'switch', provider: null, account: null, message });
+  page.requests.shift().resolve({ status: 200, ok: true, json: async () => ({ generation: 'old', lastId: 2, capacity: 2000, events: [ev(1, 'old one'), ev(2, 'old two')] }) });
+  await new Promise(r => setImmediate(r));
+  page.click('Logs');
+  const resumed = page.requests.shift();
+  assert.equal(resumed.url, '/teamclaude/logs?after=2');
+  resumed.resolve({ status: 200, ok: true, json: async () => ({ generation: 'new', lastId: 3, capacity: 2000, events: [ev(3, 'new three')] }) });
+  await new Promise(r => setImmediate(r));
+  const again = page.requests.shift();
+  assert.equal(again?.url, '/teamclaude/logs?after=0', 'asked again from the start, without waiting for the next poll');
+  again.resolve({ status: 200, ok: true, json: async () => ({ generation: 'new', lastId: 3, capacity: 2000, events: [ev(1, 'new one'), ev(2, 'new two'), ev(3, 'new three')] }) });
+  await new Promise(r => setImmediate(r));
+  // Only the new log's three: the old process's two are gone.
+  assert.equal(page.byId('logCount').textContent, '3 of 3 events');
+});
+
+test('a provider tab narrows the quota page to that provider\'s accounts', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    currentAccounts: { anthropic: 'claude-one', codex: 'codex-one' },
+    accounts: [
+      { name: 'claude-one', provider: 'anthropic', quota: { unified7d: 0.1 } },
+      { name: 'codex-one', provider: 'codex', quota: { unified7d: 0.2 } },
+    ],
+  });
+  page.click('Codex');
+  // A quota row for the Codex account and none for Claude. Both names are
+  // still drawn twice elsewhere: the Accounts page lists every account, and
+  // the header names each provider's current account.
+  assert.equal(page.labelled('codex-one'), 3);
+  assert.equal(page.labelled('claude-one'), 2);
+  page.click('Claude');
+  assert.equal(page.labelled('claude-one'), 3);
+  assert.equal(page.labelled('codex-one'), 2);
+});
+
+test('a disabled account offers only Enable: no Switch to on its row or in the Accounts table', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    currentAccounts: { anthropic: 'a' },
+    accounts: [
+      { name: 'a', provider: 'anthropic', quota: { unified7d: 0.1 } },
+      { name: 'b', provider: 'anthropic', disabled: true, quota: { unified7d: 0.1 } },
+      { name: 'c', provider: 'anthropic', quota: { unified7d: 0.1 } },
+    ],
+  });
+  // Only c: a is current and b is disabled, on both the quota row and the table.
+  assert.equal(page.labelled('Switch to'), 2);
+  assert.equal(page.labelled('Enable'), 1);
+});
+
+test('drain mode\'s queue shows on the rows and the card when the server reports it', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    currentAccounts: { anthropic: 'a' },
+    sessions: { mode: 'drain' },
+    drainQueue: { anthropic: ['a', 'b'] },
+    accounts: [
+      { name: 'a', provider: 'anthropic', drainRank: 1, quota: { unified7d: 0.5 } },
+      { name: 'b', provider: 'anthropic', drainRank: 2, quota: { unified7d: 0.1 } },
+    ],
+  });
+  assert.equal(page.labelled('draining'), 1);
+  assert.equal(page.labelled('#2 in queue'), 1);
+  assert.equal(page.labelled('Draining: a'), 1);
 });
 
 test('a first poll that fails shows its error instead of a blank page', async () => {

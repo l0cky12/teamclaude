@@ -303,7 +303,7 @@ const WRITE_TOOLS = [
     required: ['account', 'priority'],
     write: true,
     run: (args, ctx) => changeAccount(ctx, args, (index, entry) => {
-      ctx.accountManager.accounts[index].priority = args.priority;
+      ctx.accountManager.setPriority(index, args.priority);
       if (entry) entry.priority = args.priority;
     }).then(outcome => ({ ...outcome, priority: args.priority })),
   },

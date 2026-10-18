@@ -29,6 +29,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
+import { logsAfter } from './event-log.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -409,6 +410,17 @@ export function resolveClientAuth(proxyConfig, presented) {
   return { ok: false, client: null };
 }
 
+/**
+ * Whether any proxy key is configured: the shared apiKey or a usable client
+ * key. Without one, resolveClientAuth admits everybody and a match proves
+ * nothing about the caller.
+ * @param {Record<string, any>|undefined} proxyConfig
+ */
+function hasConfiguredKey(proxyConfig) {
+  if (proxyConfig?.apiKey) return true;
+  return Array.isArray(proxyConfig?.clientKeys) && usableClientKeys(proxyConfig.clientKeys).length > 0;
+}
+
 // Control-plane writes that change the config file, with the refusal a
 // caller holding a client key (rather than the operator's proxy.apiKey) gets.
 // See the check in createProxyServer for why a tenant may not reach these.
@@ -529,7 +541,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // this costs legitimate callers nothing. Deliberately not a content-type
       // requirement, which would also close the hole but would break the
       // documented `curl -X POST .../teamclaude/reload` that sends no body.
-      const crossOrigin = !isSameOriginControlRequest(req);
+      // `keyed`: a configured key was presented and matched. resolveClientAuth
+      // also answers ok when no key is configured at all, which proves nothing.
+      const keyed = auth.ok && hasConfiguredKey(config.proxy);
+      const crossOrigin = !isSameOriginControlRequest(req, { keyed });
       if (crossOrigin && req.method === 'POST' && (req.url || '').startsWith('/teamclaude/')) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -608,6 +623,17 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
         res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        return;
+      }
+
+      // The account event log behind the dashboard's Logs page (event-log.js).
+      // Readable by anyone who may read /status — client keys included — which
+      // is why entries carry account names, never emails or tokens.
+      // `?after=<id>` returns only what is newer, so the page polls cheaply.
+      if (req.method === 'GET' && /^\/teamclaude\/logs(\?|$)/.test(req.url || '')) {
+        const page = accountManager.events?.since(logsAfter(req.url)) ?? { events: [], lastId: 0, capacity: 0 };
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(page));
         return;
       }
 
@@ -1084,19 +1110,45 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
  *     localhost / 127.0.0.1 / [::1] / a LAN address the caller used, so the
  *     Origin-only fallback admits no page at all.
  *
- * The dashboard's switch button is a browser-issued same-origin call and is
- * admitted by the Sec-Fetch-Site branch alone. A browser that sends Origin
- * without Sec-Fetch-Site (or a proxy that strips it) lands in the fallback
- * and is refused — deliberately: widening the fallback to guess our own host
- * is the trade this comment declines.
+ * The dashboard's buttons are browser-issued same-origin calls and are
+ * admitted by the Sec-Fetch-Site branch alone, where the browser sends it.
+ * Browsers send fetch metadata only to https and localhost, though, so the
+ * dashboard opened at a plain-http address of another machine (a Tailscale or
+ * LAN IP) sends Origin with no Sec-Fetch-Site. That request is admitted when
+ * `keyed` (it presented a configured proxy key) and its Origin names the very
+ * Host it was sent to. The key is what carries the trust: it is not a cookie
+ * the browser attaches by itself, and a page on another site has no way to
+ * read it out of the dashboard's storage, so a cross-site page cannot send
+ * it; the Origin match keeps even a keyed page on another origin out. A
+ * key-less (loopback-exempt) request with an Origin is still refused: that is
+ * the case this gate exists for.
  *
  * Non-browser callers (curl, the CLI, `teamclaude attach`) send neither and are
  * unaffected.
+ * @param {{ headers: Record<string, any> }} req
+ * @param {{ keyed?: boolean }} [opts]
  */
-export function isSameOriginControlRequest(req) {
+export function isSameOriginControlRequest(req, { keyed = false } = {}) {
   const site = req.headers['sec-fetch-site'];
   if (site) return site === 'same-origin' || site === 'none';
-  return !req.headers.origin;
+  if (!req.headers.origin) return true;
+  return keyed && originIsHost(req.headers.origin, req.headers.host);
+}
+
+/**
+ * Whether an Origin header names the same scheme-less host:port as the Host
+ * header the request was sent with.
+ * @param {unknown} origin
+ * @param {unknown} host
+ */
+function originIsHost(origin, host) {
+  if (typeof origin !== 'string' || typeof host !== 'string' || !host) return false;
+  try {
+    const u = new URL(origin);
+    return (u.protocol === 'http:' || u.protocol === 'https:') && u.host.toLowerCase() === host.trim().toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 // Names a browser can reach this machine by. `::ffff:127.0.0.1` is how a
@@ -1498,6 +1550,7 @@ export function clientSessionId(headers) {
  */
 export function createProxyRequestListener({ accountManager, upstream, logDir = null, hooks = {}, sx = null, holdMs = 0, config = {}, forcedPin = null, egress = null, clientUsage = null, forcedClient = null, dimensionUsage = null }) {
   let counter = 0;
+  hooks = withRequestEvents(hooks, accountManager);
   return async (req, res) => {
     // The activity entry this request opened, while it is still open. Every
     // consumer holds the row until it is told the request ended, so exactly one
@@ -1765,7 +1818,15 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // stripOverage and synthesizeQuota are sampled once here, at dispatch:
       // retries and holds of this request keep them, and a reload applies to
       // subsequent requests.
-      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, onUsage: usageRecorder.onUsage, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      /** @type {Record<string, any>} */
+      const ctx = { account: null, status: null, tried: new Set(), reauthed: new Set(), model, advisorModel, streamRequested: parseRequestStream(body), fleetMessageThreads: config?.messageThreads === true, pinnedIndex, provider, holdBudgetMs: holdMs, pinKey, onMessage, client, delivered: false, abandoned: false, inputTokens: 0, outputTokens: 0, onUsage: null, stripHeaders, stripOverage: shouldStripOverageHeaders(config), synthesizeQuota: shouldSynthesizeQuotaHeaders(config), logLevel: resolveLogLevel(config), logMaxBodyBytes: resolveLogMaxBodyBytes(config) };
+      // The request's own token count, for its event-log entry; the client
+      // and dimension counters still get every reading as before.
+      ctx.onUsage = (/** @type {number} */ input, /** @type {number} */ output) => {
+        ctx.inputTokens += input || 0;
+        ctx.outputTokens += output || 0;
+        usageRecorder.onUsage?.(input, output);
+      };
       // Hold the session "in flight" across the WHOLE request (incl. retries and
       // a multi-minute streaming completion) so it stays counted as active and
       // never expires mid-request.
@@ -1821,7 +1882,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -1860,6 +1921,79 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       answerUnhandled(res);
     }
   };
+}
+
+/**
+ * The activity hooks, with every request that ends also recorded on the
+ * account manager's event log (the dashboard's Logs page). Layered here rather
+ * than added at each closing site, because every path that ends a request
+ * already ends it through onRequestEnd exactly once.
+ *
+ * The wrapper reads through to `hooks` (Object.create), so a hook the caller
+ * sets on its object afterwards — index.js wires reload and the account
+ * controls after the server exists — is still found.
+ *
+ * An activity row whose "account" is a parenthesised label — "(blocked)",
+ * "(too large)", an unknown pin — names no account, so the entry carries the
+ * label in its message and no account.
+ * @param {Record<string, any>} hooks
+ * @param {any} accountManager
+ * @returns {Record<string, any>}
+ */
+export function withRequestEvents(hooks, accountManager) {
+  const events = accountManager?.events;
+  if (!events) return hooks;
+  /** @type {Map<number, { started: number, account: string|null }>} */
+  const open = new Map();
+  const wrapped = Object.create(hooks);
+  wrapped.onRequestStart = (/** @type {number} */ id, /** @type {any} */ info) => {
+    open.set(id, { started: Date.now(), account: null });
+    return hooks.onRequestStart?.(id, info);
+  };
+  wrapped.onRequestRouted = (/** @type {number} */ id, /** @type {any} */ info) => {
+    const entry = open.get(id);
+    if (entry && info?.account) entry.account = info.account;
+    return hooks.onRequestRouted?.(id, info);
+  };
+  wrapped.onRequestEnd = (/** @type {number} */ id, /** @type {any} */ info = {}) => {
+    const entry = open.get(id);
+    open.delete(id);
+    const name = info.account || entry?.account || null;
+    // An unknown pin's label quotes what the client sent, which may be an
+    // email or an account uuid; the log says only that it named no account.
+    const label = typeof name === 'string' && name.startsWith('(')
+      ? (name.startsWith('(unknown pin') ? '(unknown account pin)' : name)
+      : null;
+    const account = label ? null : name;
+    const served = account ? accountManager.accounts?.find((/** @type {any} */ a) => a.name === account) : null;
+    const path = eventPath(info.path);
+    events.add({
+      kind: 'usage', type: 'request',
+      provider: info.provider ?? (served ? providerOf(served) : null),
+      account, model: info.model ?? null, status: info.status ?? null,
+      inputTokens: info.inputTokens ?? null, outputTokens: info.outputTokens ?? null,
+      ms: entry ? Date.now() - entry.started : null,
+      message: `${info.method || ''} ${path}${label ? ` ${label}` : ''}`.trim(),
+    });
+    return hooks.onRequestEnd?.(id, info);
+  };
+  return wrapped;
+}
+
+/**
+ * A request path as the event log keeps it: no query, and no pin token. A
+ * `/tc-acct/<pin>/` prefix names an account however the client spelled it (an
+ * email, a uuid, an index), and the entry already carries the configured name
+ * of the account that served it.
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function eventPath(raw) {
+  const path = String(raw || '').split('?')[0];
+  if (!path.startsWith(PIN_PREFIX)) return path;
+  const rest = path.slice(PIN_PREFIX.length);
+  const slash = rest.indexOf('/');
+  return `${PIN_PREFIX}…${slash >= 0 ? rest.slice(slash) : ''}`;
 }
 
 /**
@@ -3205,6 +3339,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const waitMs = Math.min(retryAfter * 1000, ctx.holdBudgetMs, 60_000);
       ctx.holdBudgetMs -= waitMs;
       console.log(`[TeamClaude] All accounts exhausted — holding connection, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(ctx.holdBudgetMs / 1000)}s budget left)`);
+      accountManager.events?.add({ kind: 'rotation', type: 'hold', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: holding the request, retry in ${Math.ceil(waitMs / 1000)}s` });
       await waitForRetry(waitMs, ctx.signal);
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
@@ -3218,6 +3353,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       if (clientGone(res)) { ctx.abandoned = true; return; }
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
+    accountManager.events?.add({ kind: 'rotation', type: 'exhausted', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: answered 429, retry after ${retryAfter}s` });
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),

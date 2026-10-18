@@ -15,6 +15,7 @@ import { safeLine } from './safe-text.js';
 import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from './account-routing.js';
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
+import { EventLog } from './event-log.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -546,8 +547,13 @@ export class AccountManager {
    * @param {Object} [opts.affinity]  the `affinity` config block (see AFFINITY_DEFAULTS)
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
+   * @param {import('./event-log.js').EventLog} [opts.events]  the event log to record into (a fresh one when omitted)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events } = {}) {
+    // What the dashboard's Logs page reads (event-log.js). One per manager, so
+    // each proxy in a process keeps its own; the server and the login flows
+    // record into the same one.
+    this.events = events ?? new EventLog();
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -881,6 +887,14 @@ export class AccountManager {
     const account = this.accounts[index];
     if (!account) return false;
     this._setCurrent(account);
+    // Every manual switch comes through here (POST /teamclaude/switch from the
+    // dashboard, the CLI and attach mode; the TUI's switch key; MCP), so it is
+    // recorded here, once, saying whether rotation will actually use it.
+    const { eligible, reason } = this.eligibility(index);
+    this.events.add({
+      kind: 'control', type: 'switch', provider: providerOf(account), account: account.name,
+      reason: eligible ? 'manual' : reason, message: `Switched to by hand${eligible ? '' : `: ${reason}, so rotation will not use it`}`,
+    });
     return true;
   }
 
@@ -1250,6 +1264,7 @@ export class AccountManager {
       : reason === 'upstream-rejected' ? 'was refused upstream on quota'
       : reason ? `is unavailable (${reason})` : 'can no longer serve normally';
     console.log(`[TeamClaude] Switched to account "${safeLine(best.name, 64)}" — "${safeLine(parked.name, 64)}" ${why} and only served as the fallback`);
+    this._logRotation('switch', best, `Switched from "${parked.name}": it ${why} and only served as the fallback`, reason || 'fallback');
   }
 
   /**
@@ -2655,8 +2670,10 @@ export class AccountManager {
     this._beginRamp(best);
     if (best.status === 'throttled') {
       console.log(`[TeamClaude] All accounts unavailable — revalidating throttled "${best.name}" with a live request`);
+      this._logRotation('exhausted', best, 'All accounts unavailable: retrying this rate-limited account', 'all_unavailable');
     } else {
       console.log(`[TeamClaude] All accounts over threshold — probing "${best.name}" to refresh quota`);
+      this._logRotation('exhausted', best, 'All accounts over threshold: probing this one to refresh quota', 'all_over_threshold');
     }
     return best;
   }
@@ -4169,6 +4186,7 @@ export class AccountManager {
     this._setCurrent(best);
     this._beginRamp(best);
     console.log(`[TeamClaude] Account "${best.name}" session quota reset and weekly expires sooner — switching to it`);
+    this._logRotation('switch', best, `Switched from "${current.name}": this account's 5-hour window reset and its weekly resets sooner`, 'session_reset');
   }
 
   _isNearQuota(account, model = null) {
@@ -4298,6 +4316,13 @@ export class AccountManager {
         console.log(scoped
           ? `[TeamClaude] Diverting "${safeLine(model, 64)}" to "${best.name}" — "${current.name}" cannot serve it`
           : `[TeamClaude] Switched to account "${best.name}"`);
+        // A diversion leaves the cursor where it is and repeats for every
+        // request of that family, so only a real move is an event.
+        if (!scoped) {
+          const from = this.accounts[previous];
+          const why = from ? this.unavailableReason(from) : null;
+          this._logRotation('switch', best, from ? `Switched from "${from.name}"${why ? ` (${why})` : ''}` : 'Switched to this account', why);
+        }
       }
       return best;
     }
@@ -4337,6 +4362,7 @@ export class AccountManager {
       this._setCurrent(soonestAccount);
       this._beginRamp(soonestAccount);
       console.log(`[TeamClaude] Account "${soonestAccount.name}" reset, switching to it`);
+      this._logRotation('switch', soonestAccount, 'Every account was unavailable; this one reset first', 'reset');
       return soonestAccount;
     }
 
@@ -4831,6 +4857,12 @@ export class AccountManager {
   setDisabled(accountIndex, disabled) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    // Recorded here rather than by each caller, so the dashboard, the CLI
+    // (through the reload it triggers), MCP and the TUI all leave one entry,
+    // and a reload that changes nothing leaves none.
+    if (!!account.disabled !== !!disabled) {
+      this.events.add({ kind: 'control', type: disabled ? 'disabled' : 'enabled', provider: providerOf(account), account: account.name, message: disabled ? 'Disabled' : 'Enabled' });
+    }
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';
@@ -4843,6 +4875,19 @@ export class AccountManager {
     }
     // The same explicit "try this again" for an API key sitting out a 401.
     if (!disabled) this.clearCredentialRejected(accountIndex);
+  }
+
+  /**
+   * Set an account's rotation priority, recording the change on the event log
+   * the way setDisabled does: one entry per real change, whoever made it.
+   * @param {number} accountIndex
+   * @param {number} priority
+   */
+  setPriority(accountIndex, priority) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.priority === priority) return;
+    this.events.add({ kind: 'control', type: 'priority', provider: providerOf(account), account: account.name, message: `Priority ${account.priority ?? 0} → ${priority}` });
+    account.priority = priority;
   }
 
   /**
@@ -5061,6 +5106,7 @@ export class AccountManager {
     // the next probe out by a full floor rather than hammering upstream.
     account.throttledAt = Date.now();
     console.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" rate limited for ${retryAfterSeconds}s`);
+    this._logRotation('rate_limited', account, `Rate limited for ${retryAfterSeconds}s`, 'rate_limited');
   }
 
   /**
@@ -5295,6 +5341,10 @@ export class AccountManager {
       account.credentialRejectedUntil = Date.now() + seconds * 1000;
       const nth = account.credentialRejections > 1 ? `, ${account.credentialRejections} in a row` : '';
       console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" held out of rotation for ${seconds}s: ${why}${nth} — it will be retried after that; if it keeps failing, check the key in the config`);
+      this.events.add({
+        kind: 'auth', type: 'credential_rejected', provider: providerOf(account), account: account.name,
+        reason: 'credential_rejected', message: `Key rejected, held out of rotation for ${seconds}s${nth}`,
+      });
       return;
     }
     const { remedy } = this._needsLogin(account, 'credential_rejected', why);
@@ -5312,6 +5362,14 @@ export class AccountManager {
    * @param {string} detail  one clause, no credential in it
    */
   _needsLogin(account, code, detail) {
+    // Logged on the transition only: a request that finds the account already
+    // signed out is not a second sign-out.
+    if (account.status !== 'error' || account.errorReason?.code !== code) {
+      this.events.add({
+        kind: 'auth', type: 'signed_out', provider: providerOf(account), account: account.name,
+        reason: code, message: `Signed out: ${detail}`,
+      });
+    }
     account.status = 'error';
     account.errorReason = {
       code,
@@ -5320,6 +5378,21 @@ export class AccountManager {
       remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
     };
     return account.errorReason;
+  }
+
+  /**
+   * Record a routing decision on the event log, beside the console line that
+   * already says it. Account names only; `reason` is a short code.
+   * @param {string} type
+   * @param {Record<string, any>|null|undefined} account
+   * @param {string} message
+   * @param {string|null} [reason]
+   */
+  _logRotation(type, account, message, reason = null) {
+    this.events.add({
+      kind: 'rotation', type, provider: account ? providerOf(account) : null,
+      account: account?.name ?? null, message, reason,
+    });
   }
 
   /**
@@ -5537,6 +5610,10 @@ export class AccountManager {
         type: a.type,
         provider: providerOf(a),
         orgName: a.orgName || null,
+        // What the dashboard's account row names the account by: its plan,
+        // and for a third-party backend the host it forwards to.
+        plan: planLabel(a),
+        backend: backendHost(a),
         priority: a.priority || 0,
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
@@ -5610,4 +5687,38 @@ export class AccountManager {
     this.refreshExpiredQuotas();
     return buildQuotaSummary(this.accounts);
   }
+}
+
+/**
+ * The plan an account is on, as a person names it: "Max 20x" or "Max 5x" from
+ * the OAuth profile's rate-limit tier, else "Max" or "Pro", else the Codex
+ * plan type ("Pro", "Plus"), else null. Display only; routing reads the
+ * profile fields themselves.
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {string|null}
+ */
+export function planLabel(account) {
+  const tier = String(account?.rateLimitTier || '').toLowerCase();
+  const max = /max_?(\d+)x/.exec(tier);
+  if (max) return `Max ${max[1]}x`;
+  if (account?.hasClaudeMax) return 'Max';
+  if (account?.hasClaudePro) return 'Pro';
+  const codex = account?.quota?.planType;
+  if (typeof codex === 'string' && codex) return safeLine(codex.charAt(0).toUpperCase() + codex.slice(1), 24);
+  return null;
+}
+
+/**
+ * The host an API-key account forwards to when it names its own `upstream` —
+ * a third-party backend (DeepSeek, z.ai, NanoGPT…) — so the dashboard can give
+ * each backend its own tab. Only the hostname: an upstream URL may carry
+ * credentials or a path the page has no business showing. Null for an
+ * account on its provider's own upstream, and for OAuth accounts, whose
+ * `upstream` is only ever a test or relay override.
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {string|null}
+ */
+export function backendHost(account) {
+  if (!account?.upstream || account.type === 'oauth') return null;
+  try { return new URL(account.upstream).hostname.toLowerCase() || null; } catch { return null; }
 }

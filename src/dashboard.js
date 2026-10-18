@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
+import { EVENT_LOG_CAPACITY } from './event-log.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -91,23 +92,6 @@ export function scopedWeeklyRows(quota) {
     rows.push({ family: f.family, label: f.label, utilization: f.u, resetAt: f.r });
   });
   rows.sort(function (a, b) { return a.family < b.family ? -1 : a.family > b.family ? 1 : 0; });
-  return rows;
-}
-
-// The bars on a subscription account's card, top to bottom: Fable, any other
-// model-scoped weekly bucket, then Session (the five-hour window), then Weekly
-// last. Fable leads as the one bucket that alone decides whether a Fable
-// request is served; the shared weekly closes the card since it bounds the rest.
-// The Session row is left out on a plan with no session window (showSessionRow).
-/** @param {any} quota */
-export function claudeQuotaRows(quota) {
-  var q = quota || {};
-  var scoped = scopedWeeklyRows(q);
-  var rows = scoped.filter(function (r) { return r.family === 'fable'; })
-    .concat(scoped.filter(function (r) { return r.family !== 'fable'; }))
-    .map(function (r) { return { label: r.label, utilization: r.utilization, resetAt: r.resetAt }; });
-  if (showSessionRow(q)) rows.push({ label: 'Session', utilization: q.unified5h, resetAt: q.unified5hReset });
-  rows.push({ label: 'Weekly', utilization: q.unified7d, resetAt: q.unified7dReset });
   return rows;
 }
 
@@ -747,6 +731,226 @@ export function problems(status) {
   return out;
 }
 
+// How a quota window reads, as the colour its bar is drawn in. The cut-offs
+// are the ones the card bars always used (70% and 90% used); the rows now show
+// the remaining side, so under 30% left is amber and under 10% left is red.
+/** @param {number|null|undefined} used */
+export function meterTone(used) {
+  if (used == null || !isFinite(Number(used))) return 'unknown';
+  var u = Number(used);
+  if (u >= 0.9) return 'bad';
+  if (u >= 0.7) return 'warn';
+  return 'ok';
+}
+
+// One quota column: its label, the fraction used and left (null when the
+// window has not reported), when it resets, and its tone.
+/** @param {string} label @param {any} utilization @param {any} resetAt */
+export function quotaMeter(label, utilization, resetAt) {
+  var known = utilization != null && isFinite(Number(utilization));
+  var used = known ? Math.max(0, Math.min(1, Number(utilization))) : null;
+  return { label: label, used: used, left: used == null ? null : 1 - used, resetAt: resetAt == null ? null : resetAt, tone: meterTone(used) };
+}
+
+// The Fable model the fleet served most recently, as a person names it
+// ("Fable 5.1"), for the Fable column's label. Upstream meters the family, not
+// the version, so this only names the column: the newest Fable id any account
+// lists in usage.recentModels, or plain "Fable" before one has been seen.
+/** @param {any[]} accounts */
+export function fableLabel(accounts) {
+  /** @type {string|null} */
+  var best = null;
+  var bestAt = -Infinity;
+  (accounts || []).forEach(function (a) {
+    var seen = (a && a.usage && a.usage.recentModels) || {};
+    Object.keys(seen).forEach(function (id) {
+      if (id.toLowerCase().indexOf('fable') < 0 || !(seen[id] > bestAt)) return;
+      bestAt = seen[id];
+      best = id;
+    });
+  });
+  var label = best ? modelLabel(best) : '';
+  return /^Fable\b/.test(label) ? label : 'Fable';
+}
+
+// The three quota columns of an account row, in the order the operator reads
+// them: the Fable weekly bucket, the five-hour window, then the shared weekly.
+// A slot is null where the account has no such window — a Codex account has no
+// Fable bucket, a plan that states no session window no five-hour row — so the
+// columns line up from one row to the next. Any other model-scoped weekly
+// bucket (Sonnet) goes to `extra`, behind the row's Show control. An account
+// metered some other way fills from the left: a token budget, or a third-party
+// backend's own reading (#530), whose text is all there is to say when no bar
+// can be drawn.
+/** @param {any} account @param {string} [fable] @param {number} [now] */
+export function accountMeters(account, fable, now) {
+  var a = account || {};
+  var q = a.quota || {};
+  /** @type {Array<any>} */
+  var slots = [null, null, null];
+  /** @type {Array<any>} */
+  var extra = [];
+  /** @type {string|null} */
+  var text = null;
+  if (q.unified5h != null || q.unified7d != null) {
+    if (a.provider !== 'codex') {
+      scopedWeeklyRows(q).forEach(function (r) {
+        if (r.family === 'fable') slots[0] = quotaMeter('7-day ' + (fable || 'Fable'), r.utilization, r.resetAt);
+        else extra.push(quotaMeter('7-day ' + r.label, r.utilization, r.resetAt));
+      });
+    }
+    if (a.provider === 'codex' ? q.unified5h != null : showSessionRow(q)) slots[1] = quotaMeter('5-hour limit', q.unified5h, q.unified5hReset);
+    slots[2] = quotaMeter('7-day limit', q.unified7d, q.unified7dReset);
+  } else if (q.tokensLimit != null && q.tokensRemaining != null) {
+    slots[0] = quotaMeter('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt);
+  } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
+    var bq = backendQuotaRows(q.backend, now);
+    bq.rows.slice(0, 3).forEach(function (r, i) { slots[i] = quotaMeter(r.label, r.utilization, r.resetAt); });
+    text = bq.text;
+  } else {
+    text = 'quota unknown (no traffic observed yet)';
+  }
+  return { slots: slots, extra: extra, text: text };
+}
+
+// One provider's quota pooled, for its summary card: how much of one column is
+// left across the accounts that report it (five accounts at 80% left read
+// "400% of 500%"), a segment per account, and the soonest reset among them.
+// `slot` is an accountMeters column. A disabled account is left out, since
+// nothing will spend it; one with no reading for the column is counted as
+// unknown, not guessed at.
+/** @param {any[]} accounts @param {number} slot @param {string} [fable] @param {number} [now] */
+export function poolSummary(accounts, slot, fable, now) {
+  var at = now == null ? Date.now() : now;
+  /** @type {{ label: string|null, count: number, left: number, segments: Array<any>, soonest: any, unknown: number }} */
+  var out = { label: null, count: 0, left: 0, segments: [], soonest: null, unknown: 0 };
+  (accounts || []).forEach(function (a) {
+    if (!a || a.disabled) return;
+    var m = accountMeters(a, fable, at).slots[slot];
+    if (!m) return;
+    out.label = out.label || m.label;
+    if (m.left == null) { out.unknown++; return; }
+    out.count++;
+    out.left += m.left;
+    out.segments.push({ name: a.name, left: m.left, tone: m.tone });
+    var r = typeof m.resetAt === 'number' ? m.resetAt : NaN;
+    if (isFinite(r) && r > at && (!out.soonest || r < out.soonest.resetAt)) out.soonest = { name: a.name, resetAt: r };
+  });
+  return out;
+}
+
+// Which tab an account is listed under: Claude, Codex, or one tab per
+// third-party backend host (status.accounts[].backend), so a DeepSeek key does
+// not sit among the Claude logins it shares a provider with.
+/** @param {any} account */
+export function accountGroup(account) {
+  var a = account || {};
+  if (a.backend) return 'backend:' + a.backend;
+  return a.provider === 'codex' ? 'codex' : 'anthropic';
+}
+
+/** @param {string} group */
+export function groupLabel(group) {
+  if (group === 'anthropic') return 'Claude';
+  if (group === 'codex') return 'Codex';
+  var host = String(group || '').replace(/^backend:/, '');
+  /** @type {Record<string, string>} */
+  var known = {
+    'api.deepseek.com': 'DeepSeek', 'api.z.ai': 'z.ai', 'open.bigmodel.cn': 'GLM',
+    'api.nano-gpt.com': 'NanoGPT', 'api.kimi.com': 'Kimi', 'api.kimi.ai': 'Kimi',
+  };
+  return Object.prototype.hasOwnProperty.call(known, host) ? known[host] : (host || 'Backend');
+}
+
+// The tab bar over the quota page: All, then Claude, Codex and each backend
+// in that order, each with how many accounts it holds.
+/** @param {any[]} accounts */
+export function providerTabs(accounts) {
+  var list = accounts || [];
+  /** @type {Record<string, number>} */
+  var counts = {};
+  list.forEach(function (a) { var g = accountGroup(a); counts[g] = (counts[g] || 0) + 1; });
+  /** @param {string} g */
+  var rank = function (g) { return g === 'anthropic' ? 0 : g === 'codex' ? 1 : 2; };
+  var groups = Object.keys(counts).sort(function (x, y) {
+    return rank(x) - rank(y) || (x < y ? -1 : x > y ? 1 : 0);
+  });
+  return [{ key: 'all', label: 'All', count: list.length }].concat(groups.map(function (g) {
+    return { key: g, label: groupLabel(g), count: counts[g] };
+  }));
+}
+
+// The Logs page's filter chips: one per event kind the proxy records
+// (event-log.js EVENT_KINDS), under the names the page shows them by.
+export var LOG_KINDS = [
+  { key: 'all', label: 'All' }, { key: 'usage', label: 'Usage' }, { key: 'signin', label: 'Sign-in' },
+  { key: 'auth', label: 'Auth' }, { key: 'rotation', label: 'Rotation' }, { key: 'control', label: 'Changes' },
+];
+
+// Fold one GET /teamclaude/logs reply into what the page holds: the log's
+// generation and its entries, oldest first, at most `cap`. A reply from another
+// generation means the server restarted with a fresh log. What is held
+// describes a process that is gone, and the reply only carries what is newer
+// than an id from that process, so the new log's first entries are missing:
+// the state empties and `refetch` says to ask again from the start. A server
+// that names no generation is read the old way, a lastId behind the newest
+// entry held being the same restart.
+/** @param {{ generation: string|null, events: any[] }|null} held @param {any} page @param {number} cap */
+export function mergeLogEvents(held, page, cap) {
+  var h = held || { generation: null, events: [] };
+  var have = h.events || [];
+  var p = page || {};
+  /** @type {any[]} */
+  var incoming = Array.isArray(p.events) ? p.events : [];
+  var gen = typeof p.generation === 'string' && p.generation ? p.generation : null;
+  var newest = have.length ? have[have.length - 1].id : 0;
+  if (gen ? (h.generation != null && gen !== h.generation) : (typeof p.lastId === 'number' && p.lastId < newest)) {
+    return { generation: gen, events: [], refetch: true };
+  }
+  var merged = have.concat(incoming.filter(function (e) { return e && typeof e.id === 'number' && e.id > newest; }));
+  var max = cap > 0 ? cap : merged.length;
+  return { generation: gen || h.generation, events: merged.length > max ? merged.slice(merged.length - max) : merged, refetch: false };
+}
+
+/** @param {any[]} events @param {{ kind?: string, provider?: string, account?: string }} filters */
+export function filterLogEvents(events, filters) {
+  var f = filters || {};
+  return (events || []).filter(function (e) {
+    if (f.kind && f.kind !== 'all' && e.kind !== f.kind) return false;
+    if (f.provider && e.provider !== f.provider) return false;
+    if (f.account && e.account !== f.account) return false;
+    return true;
+  });
+}
+
+// The Details column of a log row: what a request carried — model, status,
+// tokens, latency — or, for any other event, its reason code.
+/** @param {any} event */
+export function logEventDetail(event) {
+  var e = event || {};
+  /** @param {number} n */
+  var tok = function (n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + 'm' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n); };
+  var parts = [];
+  if (e.model) parts.push(modelLabel(e.model));
+  if (e.status != null) parts.push(String(e.status));
+  if (e.inputTokens != null || e.outputTokens != null) parts.push(tok(e.inputTokens || 0) + ' in / ' + tok(e.outputTokens || 0) + ' out');
+  if (e.ms != null) parts.push(e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + 's' : e.ms + 'ms');
+  if (!parts.length && e.reason) parts.push(e.reason);
+  return parts.join(' · ');
+}
+
+// How loudly a log row is drawn: red for what lost an account or a request,
+// amber for what will clear on its own, green for a sign-in that worked.
+/** @param {any} event */
+export function logEventTone(event) {
+  var e = event || {};
+  if (['signin_failed', 'signed_out', 'credential_rejected', 'exhausted'].indexOf(e.type) >= 0) return 'bad';
+  if (['rate_limited', 'signin_timeout', 'hold'].indexOf(e.type) >= 0) return 'warn';
+  if (e.type === 'signin_succeeded') return 'ok';
+  if (typeof e.status === 'number') return e.status >= 500 ? 'bad' : e.status >= 400 ? 'warn' : '';
+  return '';
+}
+
 // The usage views the page offers, derived from the windows the tracker
 // actually keeps rather than listed again here: a window added or renamed in
 // client-usage.js must not leave a button behind that reads zero for everyone.
@@ -778,7 +982,9 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
-  claudeQuotaRows, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
+  mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -794,6 +1000,8 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
+  `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
+  `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -810,40 +1018,103 @@ const PAGE = `<!doctype html>
      light desktop is honoured rather than overridden by the system. */
   :root {
     color-scheme: dark;
-    --bg: #101418; --panel: #171d24; --line: #242c36;
-    --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd;
+    --bg: #0d1117; --side: #0a0e13; --panel: #151b23; --panel2: #1c2430; --line: #262f3b; --track: #252e3a;
+    --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd; --accent-bg: rgba(83,177,253,.12);
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
       color-scheme: light;
-      --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
-      --text: #1f2328; --dim: #59636e; --accent: #0969da;
+      --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
+      --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
       --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
     }
   }
   :root[data-theme="light"] {
     color-scheme: light;
-    --bg: #f6f8fa; --panel: #ffffff; --line: #d8dee4;
-    --text: #1f2328; --dim: #59636e; --accent: #0969da;
+    --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
+    --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
     --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
   }
   * { box-sizing: border-box; margin: 0; }
-  body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; padding: 24px; }
-  main { max-width: 860px; margin: 0 auto; }
-  h1 { font-size: 18px; margin-bottom: 4px; }
-  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 24px 0 8px; }
-  .sub { color: var(--dim); margin-bottom: 16px; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  button { font: inherit; }
+  .shell { display: grid; grid-template-columns: 228px minmax(0, 1fr); min-height: 100vh; }
+  .side { background: var(--side); border-right: 1px solid var(--line); padding: 18px 12px; display: flex; flex-direction: column; gap: 2px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 15px; padding: 0 10px 10px; }
+  .brand i { width: 11px; height: 11px; border-radius: 3px; background: var(--accent); display: inline-block; }
+  #nav { display: flex; flex-direction: column; gap: 2px; }
+  .navsec { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); padding: 14px 10px 4px; }
+  .navbtn { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; font-size: 13px; text-align: left; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--dim); cursor: pointer; }
+  .navbtn:hover { color: var(--text); background: var(--panel); }
+  .navbtn.sel { color: var(--text); background: var(--accent-bg); box-shadow: inset 2px 0 0 var(--accent); }
+  .count { font-size: 11px; line-height: 18px; min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--panel2); color: var(--dim); text-align: center; font-variant-numeric: tabular-nums; }
+  .count.bad { background: var(--bad); color: #fff; }
+  .sidefoot { margin-top: auto; padding: 14px 10px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--dim); }
+  .sidefoot button { text-align: left; }
+  .content { padding: 22px 28px 40px; min-width: 0; }
+  .wrap { max-width: 1260px; margin: 0 auto; }
+  .top { margin-bottom: 14px; }
+  h1 { font-size: 20px; line-height: 1.3; }
+  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 22px 0 8px; }
+  .sub { color: var(--dim); margin-top: 2px; }
   .sub b { color: var(--text); font-weight: 600; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 10px; }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 16px; }
+  .tab { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--dim); cursor: pointer; }
+  .tab:hover { color: var(--text); }
+  .tab.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 8px; }
+  .scard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .scard .k { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; margin-bottom: 8px; }
+  .scard .k span + span { color: var(--dim); font-weight: 400; font-size: 12px; }
+  .pool + .pool { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .pool .pl { font-size: 12px; color: var(--dim); }
+  .pool .v { font-size: 24px; font-weight: 650; line-height: 1.25; margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
+  .pool .v small { font-size: 13px; color: var(--dim); font-weight: 400; }
+  .pool.small .v { font-size: 16px; }
+  .seg { display: flex; gap: 3px; height: 8px; }
+  .seg span { flex: 1; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .seg i, .bar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+  .seg i.warn, .bar i.warn { background: var(--warn); }
+  .seg i.bad, .bar i.bad { background: var(--bad); }
+  .scard .r { font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .scard .drain { font-size: 12px; color: var(--accent); margin-top: 8px; }
+  .more { font-size: 12px; background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; }
+  .sechead { display: flex; align-items: center; gap: 10px; margin: 22px 0 8px; }
+  .sechead h2 { margin: 0; }
+  .sechead .tag { margin-left: 2px; }
+  .rows { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  .arow { display: grid; grid-template-columns: minmax(180px, 1.2fr) repeat(3, minmax(140px, 1fr)) 116px; gap: 8px 20px; align-items: start; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+  .arow:last-child { border-bottom: 0; }
+  .who .name { font-weight: 600; overflow-wrap: anywhere; }
+  .who .badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .who .usage { margin-top: 6px; }
+  .meter .mt { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; font-size: 12px; color: var(--dim); }
+  .meter .mt b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .meter .mt b.warn { color: var(--warn); } .meter .mt b.bad { color: var(--bad); } .meter .mt b.ok { color: var(--ok); }
+  .bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; margin: 5px 0 4px; }
+  .meter .rs { font-size: 11px; color: var(--dim); min-height: 16px; }
+  .meter.none { color: var(--dim); font-size: 12px; opacity: .55; }
+  .ctl { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+  .btn { font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel2); color: var(--text); cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { color: #fff; filter: brightness(1.08); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .rowx { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; }
+  .rowx .more { align-self: flex-start; }
+  .xmeters { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 220px)); gap: 8px 20px; margin-top: 4px; }
+  .empty { color: var(--dim); padding: 18px 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin-bottom: 10px; }
   .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .name { font-weight: 600; }
   .tag { font-size: 12px; color: var(--dim); }
-  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .badge { font-size: 11px; line-height: 18px; padding: 0 7px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
   .badge.active { color: var(--ok); border-color: var(--ok); }
   .badge.throttled { color: var(--warn); border-color: var(--warn); }
-  .badge.error, .badge.exhausted { color: var(--bad); border-color: var(--bad); }
-  .badge.current { color: var(--accent); border-color: var(--accent); }
+  .badge.error, .badge.exhausted, .badge.disabled { color: var(--bad); border-color: var(--bad); }
+  .badge.current, .badge.drain { color: var(--accent); border-color: var(--accent); }
+  .badge.plan { color: var(--text); background: var(--panel2); }
   .badge.provider { color: var(--text); }
   .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
   .badge.meta { color: var(--dim); }
@@ -851,47 +1122,36 @@ const PAGE = `<!doctype html>
   .badge.sessions.known { color: var(--dim); }
   .badge.extra-usage { color: var(--warn); border-color: var(--warn); }
   .badge.extra-usage.billing { color: var(--bad); border-color: var(--bad); }
-  .quota { display: grid; grid-template-columns: 64px 1fr 170px; gap: 8px; align-items: center; margin-top: 6px; }
-  .quota .lbl { color: var(--dim); font-size: 12px; }
-  .quota .val { color: var(--dim); font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
-  .quota.models .names { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 6px; }
   .badge.model { color: var(--accent); border-color: var(--accent); }
-  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; }
-  .bar i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
-  .bar i.warn { background: var(--warn); }
-  .bar i.bad { background: var(--bad); }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 6px 10px; font-variant-numeric: tabular-nums; }
-  th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); }
+  th, td { text-align: left; padding: 7px 10px; font-variant-numeric: tabular-nums; vertical-align: top; }
+  th { color: var(--dim); font-size: 12px; font-weight: 500; border-bottom: 1px solid var(--line); white-space: nowrap; }
   td { border-bottom: 1px solid var(--line); }
   tr:last-child td { border-bottom: none; }
   td.num, th.num { text-align: right; }
-  .usage { color: var(--dim); font-size: 12px; margin-top: 6px; }
-  .blocked { color: var(--warn); font-size: 12px; margin-top: 6px; }
-  .act { font: inherit; font-size: 12px; padding: 1px 10px; border-radius: 999px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; margin-left: auto; }
-  /* Only the first control is pushed right; the rest sit beside it as a group. */
-  .act ~ .act { margin-left: 6px; }
-  .act:hover { background: var(--accent); color: var(--bg); }
-  .act:disabled { opacity: .5; cursor: default; }
+  td .btn + .btn { margin-left: 6px; }
+  .usage { color: var(--dim); font-size: 12px; }
+  .blocked { color: var(--warn); font-size: 12px; }
   #note { font-size: 12px; margin: 8px 0; display: none; }
   #note.ok, .cardnote.ok { color: var(--ok); } #note.warn, .cardnote.warn { color: var(--warn); } #note.error, .cardnote.error { color: var(--bad); }
-  .cardnote { font-size: 12px; margin: 8px 0 4px; }
+  .cardnote { font-size: 12px; }
   #caller { font-size: 12px; margin: 8px 0; color: var(--dim); }
   .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
   .filters label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .filters select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
+  select { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 12px; padding: 4px 8px; }
   .hint { color: var(--dim); font-size: 12px; margin-left: auto; }
-  .actions { display: flex; gap: 8px; margin: 8px 0 16px; }
-  .actions button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
-  .actions button:hover { color: var(--text); border-color: var(--text); }
+  p.hint { margin: 8px 0 0; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0 16px; }
+  .actions button, .chip { font-size: 12px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--dim); cursor: pointer; }
+  .actions button:hover, .chip:hover { color: var(--text); border-color: var(--text); }
   .actions button:disabled { opacity: .5; cursor: default; }
-  .actions button.sel { color: var(--text); border-color: var(--accent); }
-  .actions .lbl { color: var(--dim); font-size: 12px; align-self: center; }
-  /* Pushed to the far end: the two buttons on the left act on the fleet as it
-     stands, while this one edits a stored setting — a gap says so without a
-     second row. */
-  .actions .thr { display: flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: var(--dim); }
-  .actions .thr input { width: 64px; font: inherit; font-size: 12px; padding: 4px 8px; text-align: right; border-radius: 999px; border: 1px solid var(--line); background: transparent; color: var(--text); }
+  .actions button.sel, .chip.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
+  .actions .lbl { color: var(--dim); font-size: 12px; }
+  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .setting .tag { display: block; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -900,15 +1160,36 @@ const PAGE = `<!doctype html>
   .pin { color: var(--accent); font-size: 12px; }
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
+  .logbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .logbar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  td.when { color: var(--dim); white-space: nowrap; font-size: 12px; }
+  td.kind { white-space: nowrap; font-size: 12px; color: var(--dim); }
+  tr.bad td.ev { color: var(--bad); } tr.warn td.ev { color: var(--warn); } tr.ok td.ev { color: var(--ok); }
+  td.detail { color: var(--dim); font-size: 12px; }
+  .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
+  .plist .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
+  .plist .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #problems { display: none; margin: 0 0 16px; }
-  #problems div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
-  #problems .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
-  #problems .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
-  #keybox { display: none; margin: 40px auto; max-width: 420px; text-align: center; }
+  #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
-  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
-  footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
+  @media (max-width: 1080px) {
+    .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .who, .ctl { grid-column: 1 / -1; }
+    .ctl { flex-direction: row; flex-wrap: wrap; }
+  }
+  @media (max-width: 760px) {
+    .shell { grid-template-columns: 1fr; }
+    .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px; }
+    #nav { flex-direction: row; flex-wrap: wrap; }
+    .navbtn { width: auto; }
+    .navsec { display: none; }
+    .sidefoot { flex-direction: row; flex-wrap: wrap; align-items: center; margin-top: 8px; padding-top: 8px; }
+    .content { padding: 16px; }
+    .arow { grid-template-columns: 1fr; }
+  }
 </style>
 <script>
 (function () {
@@ -920,57 +1201,118 @@ const PAGE = `<!doctype html>
 </script>
 </head>
 <body>
-<main>
-  <div id="keybox">
-    <h1>TeamClaude</h1>
-    <p class="sub">Enter your proxy key to view status.</p>
-    <input id="key" type="password" placeholder="tc-..." autocomplete="off">
-    <br><button id="go">Connect</button>
-  </div>
-  <div id="app" style="display:none">
-    <h1>TeamClaude</h1>
-    <p class="sub" id="summary"></p>
-    <div class="actions">
-      <button id="reload" type="button">Reload config</button>
-      <button id="probe" type="button">Probe quotas</button>
-      <button id="theme" type="button" title="Switch between following the system, light and dark"></button>
-      <span class="thr">
-        <label for="thrVal">Switch at</label>
-        <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
-        <span>%</span>
-        <button id="thrSet" type="button">Set</button>
-      </span>
+<div id="keybox">
+  <h1>TeamClaude</h1>
+  <p class="sub">Enter your proxy key to view status.</p>
+  <input id="key" type="password" placeholder="tc-..." autocomplete="off">
+  <br><button id="go">Connect</button>
+</div>
+<div id="app" class="shell" style="display:none">
+  <aside class="side">
+    <div class="brand"><i></i>TeamClaude</div>
+    <nav id="nav"></nav>
+    <div class="sidefoot">
+      <button id="theme" class="more" type="button" title="Switch between following the system, light and dark"></button>
+      <span id="foot"></span>
+    </div>
+  </aside>
+  <main class="content">
+  <div class="wrap">
+    <div class="top">
+      <h1 id="pageTitle">Quota</h1>
+      <p class="sub" id="summary"></p>
     </div>
     <div id="err"></div>
-    <div id="problems"></div>
+    <div id="problems" class="plist"></div>
     <div id="note"></div>
-    <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="act" type="button">Change key</button></div>
-    <div id="routesWrap" style="display:none">
-      <h2>Routing</h2>
-      <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
-    </div>
-    <h2>Accounts</h2>
-    <div id="accounts"></div>
-    <div id="usageViewWrap" class="actions" style="display:none"></div>
-    <div id="clientsWrap" style="display:none">
-      <h2 id="clientsHeading">Clients</h2>
-      <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
-    </div>
-    <div id="dimensionsWrap"></div>
-    <div id="sessionsWrap" style="display:none">
-      <h2>Sessions</h2>
-      <div class="card" style="padding:0">
-        <div class="filters">
-          <label>Project <select id="fProject"></select></label>
-          <label>Client <select id="fClient"></select></label>
-          <span class="hint" id="sessionCount"></span>
+    <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="more" type="button">Change key</button></div>
+
+    <section id="page-quota">
+      <div id="tabs" class="tabs"></div>
+      <div id="summaryCards" class="cards"></div>
+      <div id="accounts"></div>
+    </section>
+
+    <section id="page-sessions" style="display:none">
+      <p class="sub" id="sessionsEmpty" style="display:none"></p>
+      <div id="sessionsWrap" style="display:none">
+        <div class="card" style="padding:0">
+          <div class="filters">
+            <label>Project <select id="fProject"></select></label>
+            <label>Client <select id="fClient"></select></label>
+            <span class="hint" id="sessionCount"></span>
+          </div>
+          <div style="padding:4px 6px"><table id="sessions"></table></div>
         </div>
-        <div style="padding:4px 6px"><table id="sessions"></table></div>
       </div>
-    </div>
-    <footer id="foot"></footer>
+    </section>
+
+    <section id="page-clients" style="display:none">
+      <p class="sub" id="clientsEmpty" style="display:none">No client usage yet. Requests are counted here per client key (proxy.clientKeys) and per configured usage dimension.</p>
+      <div id="usageViewWrap" class="actions" style="display:none"></div>
+      <div id="clientsWrap" style="display:none">
+        <h2 id="clientsHeading">Clients</h2>
+        <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
+      </div>
+      <div id="dimensionsWrap"></div>
+    </section>
+
+    <section id="page-accounts" style="display:none">
+      <div id="accountTools" class="actions"></div>
+      <div class="card" style="padding:4px 6px"><table id="accountTable"></table></div>
+    </section>
+
+    <section id="page-logs" style="display:none">
+      <div class="logbar">
+        <div id="logKinds" class="chips"></div>
+        <label>Provider <select id="logProvider"></select></label>
+        <label>Account <select id="logAccount"></select></label>
+        <span class="hint" id="logCount"></span>
+      </div>
+      <div class="card" style="padding:4px 6px"><table id="logs"></table></div>
+      <p class="hint">Requests, sign-ins, sign-outs, rotation and changes, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
+    </section>
+
+    <section id="page-problems" style="display:none">
+      <div id="problemList" class="plist"></div>
+    </section>
+
+    <section id="page-routing" style="display:none">
+      <div class="card" id="modeCard"></div>
+      <div id="routesWrap" style="display:none">
+        <h2>Routes</h2>
+        <div class="card" style="padding:4px 6px"><table id="routes"></table></div>
+      </div>
+    </section>
+
+    <section id="page-settings" style="display:none">
+      <div class="card">
+        <div class="setting">
+          <div><b>Switch threshold</b><span class="tag">The share of a quota window at which rotation leaves an account. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="thrVal">Switch at</label>
+            <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
+            <span>%</span>
+            <button id="thrSet" class="btn" type="button">Set</button>
+          </span>
+        </div>
+        <div class="setting">
+          <div><b>Config</b><span class="tag">Re-read the config file, as after a hand edit or a sign-in in another terminal.</span></div>
+          <button id="reload" class="btn" type="button">Reload config</button>
+        </div>
+        <div class="setting">
+          <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
+          <button id="probe" class="btn" type="button">Probe quotas</button>
+        </div>
+        <div class="setting">
+          <div><b>Proxy key</b><span class="tag">Forget the key this browser stored and enter another.</span></div>
+          <button id="forgetKey" class="btn" type="button">Change key</button>
+        </div>
+      </div>
+    </section>
   </div>
-</main>
+  </main>
+</div>
 <script>
 (function () {
   'use strict';
@@ -989,6 +1331,35 @@ const PAGE = `<!doctype html>
   var usageButtons = [];
   var UNAVAILABLE_TEXT = ${JSON.stringify(UNAVAILABLE_TEXT)};
 
+  // The sidebar, in the order an operator reaches for things. Every page is
+  // rendered on each poll and only shown or hidden, so switching pages never
+  // waits on the network and a page left open keeps up with the fleet.
+  var PAGES = [
+    { key: 'quota', label: 'Quota', section: 'Overview' },
+    { key: 'sessions', label: 'Sessions', section: 'Overview' },
+    { key: 'clients', label: 'Clients', section: 'Overview' },
+    { key: 'accounts', label: 'Accounts', section: 'Accounts' },
+    { key: 'logs', label: 'Logs', section: 'Observe' },
+    { key: 'problems', label: 'Problems', section: 'Observe' },
+    { key: 'routing', label: 'Routing', section: 'Control' },
+    { key: 'settings', label: 'Settings', section: 'Control' },
+  ];
+  var currentPage = 'quota';
+  var navButtons = {};
+  var navCounts = {};
+  // Which provider tab the quota page is showing; kept across polls.
+  var currentTab = 'all';
+  // Open "Show" expanders, by card or row. No prototype: an account named
+  // __proto__ would otherwise set it.
+  var expanded = Object.create(null);
+  // The Logs page's copy of the proxy's event log, fetched only while the page
+  // is open, so a dashboard left on Quota costs the server one request a poll.
+  var logState = { generation: null, events: [] };
+  var logFilters = { kind: 'all', provider: '', account: '' };
+  var logChips = [];
+  var logError = null;
+  var logsInFlight = false;
+
 ${SHARED_CONSTS}
 
 ${SHARED_HELPERS}
@@ -998,6 +1369,13 @@ ${SHARED_HELPERS}
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
+  }
+
+  function button(cls, text, onClick) {
+    var b = el('button', cls, text);
+    b.type = 'button';
+    b.addEventListener('click', onClick);
+    return b;
   }
 
   function fmtNum(n) {
@@ -1035,6 +1413,16 @@ ${SHARED_HELPERS}
     return (s / 86400).toFixed(1) + 'd';
   }
 
+  // How long until a reset, the way the rows say it: "40m", "3h 20m", "1 day",
+  // "2.5 days".
+  function fmtUntil(sec) {
+    var s = Math.max(0, Math.round(sec));
+    if (s < 3600) return Math.max(1, Math.round(s / 60)) + 'm';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+    var d = Math.round(s / 8640) / 10;
+    return d + (d === 1 ? ' day' : ' days');
+  }
+
   // Absolute wall-clock of a future timestamp: "17:30" today, "Wed 09:00"
   // beyond 24h — the countdown says how long, this says when.
   function fmtClock(ts) {
@@ -1046,112 +1434,305 @@ ${SHARED_HELPERS}
     return time;
   }
 
-  function quotaRow(label, ratio, resetAt) {
-    var row = el('div', 'quota');
-    row.appendChild(el('span', 'lbl', label));
+  function resetText(resetAt) {
+    var t = parseTs(resetAt);
+    if (isNaN(t) || t <= Date.now()) return '';
+    return 'resets in ' + fmtUntil((t - Date.now()) / 1000) + ' · ' + fmtClock(t);
+  }
+
+  function pctText(fraction) {
+    return Math.round(fraction * 100) + '%';
+  }
+
+  // One quota column: the label and what is left on top, the bar, the reset
+  // under it. The bar fills with what is LEFT, so a full green bar is an
+  // account with its window ahead of it.
+  function meterEl(m) {
+    var box = el('div', m ? 'meter' : 'meter none');
+    if (!m) { box.appendChild(el('div', 'mt', '—')); return box; }
+    var top = el('div', 'mt');
+    top.appendChild(el('span', '', m.label));
+    top.appendChild(el('b', m.tone === 'unknown' ? '' : m.tone, m.left == null ? '?' : pctText(m.left) + ' left'));
+    box.appendChild(top);
     var bar = el('div', 'bar');
-    var fill = el('i');
-    var pct = ratio == null ? null : Math.max(0, Math.min(1, Number(ratio)));
-    fill.style.width = (pct == null ? 0 : pct * 100) + '%';
-    if (pct != null && pct >= 0.9) fill.className = 'bad';
-    else if (pct != null && pct >= 0.7) fill.className = 'warn';
+    var fill = el('i', m.tone === 'warn' || m.tone === 'bad' ? m.tone : '');
+    fill.style.width = (m.left == null ? 0 : m.left * 100) + '%';
     bar.appendChild(fill);
-    row.appendChild(bar);
-    var resetTs = parseTs(resetAt);
-    var reset = !isNaN(resetTs) && resetTs > Date.now()
-      ? ' · ' + fmtIn((resetTs - Date.now()) / 1000) + ' · ' + fmtClock(resetTs)
-      : '';
-    row.appendChild(el('span', 'val', (pct == null ? '?' : Math.round(pct * 100) + '%') + reset));
-    return row;
+    box.appendChild(bar);
+    box.appendChild(el('div', 'rs', resetText(m.resetAt)));
+    return box;
   }
 
-  // A "Model" row under the quota bars: what this account is serving right now.
-  function modelsRow(usage) {
-    var labels = recentModelLabels(usage);
-    if (!labels.length) return null;
-    var row = el('div', 'quota models');
-    row.appendChild(el('span', 'lbl', 'Model'));
-    var names = el('span', 'names');
-    labels.forEach(function (l) { names.appendChild(el('span', 'badge model', l)); });
-    row.appendChild(names);
-    return row;
+  function modelBadges(usage, into) {
+    recentModelLabels(usage).forEach(function (l) { into.appendChild(el('span', 'badge model', l)); });
   }
 
-  function renderAccount(a, current, currentAccounts, fleetThreshold, fleetThresholds, caller, probeEntry) {
-    var card = el('div', 'card');
-    var head = el('div', 'row');
-    head.appendChild(el('span', 'name', a.name));
-    var isCurrent = currentAccounts
-      ? currentAccounts[a.provider] === a.name
-      : a.name === current;
-    accountBadges(a, current, currentAccounts, null, fleetThreshold, fleetThresholds).forEach(function (badge) {
-      head.appendChild(el('span', 'badge ' + badge.cls, badge.text));
+  function isCurrentAccount(a, s) {
+    return s.currentAccounts ? s.currentAccounts[a.provider] === a.name : a.name === s.currentAccount;
+  }
+
+  // One account on the quota page: who it is, its three quota columns, and
+  // the controls that act on it. Everything else the old card carried — why it
+  // is blocked, outside spend, the forecast, other model buckets — sits on a
+  // line under the columns, only when there is something to say.
+  function renderAccountRow(a, s, fable, probeEntry) {
+    var key = cardNoteKey(a);
+    var row = el('div', 'arow');
+    var who = el('div', 'who');
+    who.appendChild(el('div', 'name', a.name));
+    var badges = el('div', 'badges');
+    if (a.plan) badges.appendChild(el('span', 'badge plan', a.plan));
+    if (a.drainRank) badges.appendChild(el('span', 'badge drain', a.drainRank === 1 ? 'draining' : '#' + a.drainRank + ' in queue'));
+    // The first three are provider, type and priority: the section heading
+    // already names the provider, and the Accounts page carries the other two.
+    // "active" is the state every healthy row would wear, so it is left off.
+    accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds).slice(3).forEach(function (b) {
+      if (b.cls !== 'active') badges.appendChild(el('span', 'badge ' + b.cls, b.text));
     });
-    // Last in the row so the badges sit in the same place on every card.
-    if (!isCurrent) {
-      var btn = el('button', 'act', 'switch');
-      btn.addEventListener('click', function () { doSwitch(a.name, cardNoteKey(a), btn); });
-      head.appendChild(btn);
-    }
-    // Account controls, in the order an operator reaches for them: take it out
-    // of rotation, or move where rotation reaches it. Only the enable/disable
-    // control is shown for a disabled account — the rest would be moving an
-    // account that nothing will select anyway.
-    // Named ctl* deliberately: var is function-scoped, and this builder already
-    // declares a "last" further down (the last-used string). A button named
-    // last here is overwritten by that before any click can fire.
-    // A control this key would be refused is not drawn at all; the line under
-    // the actions says why, once (callerNotice).
-    if (callerCan(caller, '/teamclaude/disable')) {
-      var ctlDisable = el('button', 'act', a.disabled ? 'enable' : 'disable');
-      ctlDisable.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { disabled: !a.disabled }, ctlDisable); });
-      head.appendChild(ctlDisable);
-    }
-    // Zero-spend, like the page-wide Probe quotas button, so a client key may
-    // use it too. Disabled while a probe of this account is in flight, whether
-    // this button or a fleet cycle started it.
+    modelBadges(a.usage, badges);
+    who.appendChild(badges);
+    var u = a.usage || {};
+    who.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + (u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '')));
+    row.appendChild(who);
+
+    var meters = accountMeters(a, fable);
+    meters.slots.forEach(function (m) { row.appendChild(meterEl(m)); });
+
+    var ctl = el('div', 'ctl');
+    // Zero-spend, like the fleet-wide probe on the Settings page, so a client
+    // key may use it too. Disabled while a probe of this account is in flight,
+    // whether this button or a fleet cycle started it.
     if (canRefreshQuota(a, probeEntry)) {
-      var ctlRefresh = el('button', 'act', probeEntry.status === 'running' ? 'refreshing…' : 'refresh');
-      ctlRefresh.disabled = probeEntry.status === 'running';
-      ctlRefresh.addEventListener('click', function () { doRefreshQuota(a, cardNoteKey(a), ctlRefresh); });
-      head.appendChild(ctlRefresh);
+      var refresh = button('btn', probeEntry.status === 'running' ? 'Refreshing…' : 'Refresh quota', function () { doRefreshQuota(a, key, refresh); });
+      refresh.disabled = probeEntry.status === 'running';
+      ctl.appendChild(refresh);
     }
-    if (!a.disabled && callerCan(caller, '/teamclaude/priority')) {
-      var ctlFirst = el('button', 'act', 'prioritize');
-      ctlFirst.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'first' }, ctlFirst); });
-      head.appendChild(ctlFirst);
-      var ctlLast = el('button', 'act', 'deprioritize');
-      ctlLast.addEventListener('click', function () { doControlAccount(a.name, cardNoteKey(a), { place: 'last' }, ctlLast); });
-      head.appendChild(ctlLast);
+    if (!isCurrentAccount(a, s) && !a.disabled) {
+      var sw = button('btn', 'Switch to', function () { doSwitch(a.name, key, sw); });
+      ctl.appendChild(sw);
     }
-    card.appendChild(head);
-    if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    row.appendChild(ctl);
+
+    var x = el('div', 'rowx');
+    var said = 0;
+    var cn = cardNoteFor(cardNotes, key, Date.now());
+    if (cn) { x.appendChild(el('div', 'cardnote ' + cn.kind, cn.text)); said++; }
+    if (a.unavailable) { x.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable))); said++; }
+    if (meters.text) { x.appendChild(el('div', 'usage', meters.text)); said++; }
     var q = a.quota || {};
-    var models = modelsRow(a.usage);
-    if (q.unified5h != null || q.unified7d != null) {
-      // Model-scoped weekly buckets are learned from the usage endpoint rather
-      // than declared, so the rows come from the payload, in claudeQuotaRows'
-      // order, rather than from a hard-coded list of families.
-      claudeQuotaRows(q).forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
-    } else if (q.tokensLimit != null && q.tokensRemaining != null) {
-      card.appendChild(quotaRow('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt));
-    } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
-      var bq = backendQuotaRows(q.backend);
-      bq.rows.forEach(function (r) { card.appendChild(quotaRow(r.label, r.utilization, r.resetAt)); });
-      if (bq.text) card.appendChild(el('div', 'usage', bq.text));
-    } else {
-      card.appendChild(el('div', 'usage', 'quota unknown (no traffic observed yet)'));
-    }
-    if (models) card.appendChild(models);
     // Spend on this account that did not come through the proxy (#475).
     var outside = outsideSpendText(q.outsideSpend);
-    if (outside) card.appendChild(el('div', 'usage', 'outside: ' + outside));
+    if (outside) { x.appendChild(el('div', 'usage', 'outside: ' + outside)); said++; }
     var forecast = forecastText(q.forecast, Date.now());
-    if (forecast) card.appendChild(el('div', 'usage', 'forecast: ' + forecast));
-    var u = a.usage || {};
-    var last = u.lastUsed ? ' · last ' + fmtAgo(u.lastUsed) : '';
-    card.appendChild(el('div', 'usage', (u.totalRequests || 0) + ' req · ' + fmtNum(accountTokens(u)) + ' tok' + last));
+    if (forecast) { x.appendChild(el('div', 'usage', 'forecast: ' + forecast)); said++; }
+    if (meters.extra.length) {
+      var open = !!expanded['row:' + key];
+      var names = meters.extra.map(function (m) { return m.label; }).join(', ');
+      x.appendChild(button('more', (open ? 'Hide ' : 'Show ') + names, function () {
+        expanded['row:' + key] = !open;
+        if (lastStatus) render(lastStatus);
+      }));
+      if (open) {
+        var grid = el('div', 'xmeters');
+        meters.extra.forEach(function (m) { grid.appendChild(meterEl(m)); });
+        x.appendChild(grid);
+      }
+      said++;
+    }
+    if (said) row.appendChild(x);
+    return row;
+  }
+
+  // Which account in a group holds its provider's cursor. Backends share the
+  // Claude provider's cursor, so a backend group has a current account only
+  // when that cursor is on one of its own.
+  function currentIn(s, group, members) {
+    var provider = group === 'codex' ? 'codex' : 'anthropic';
+    var name = s.currentAccounts ? s.currentAccounts[provider] : s.currentAccount;
+    return members.some(function (a) { return a.name === name; }) ? name : null;
+  }
+
+  function poolBlock(p, small) {
+    var box = el('div', small ? 'pool small' : 'pool');
+    box.appendChild(el('div', 'pl', p.label));
+    var v = el('div', 'v');
+    v.appendChild(el('span', '', p.count ? pctText(p.left) : '?'));
+    v.appendChild(el('small', '', p.count ? ' of ' + (p.count * 100) + '% left' : ' no reading yet'));
+    box.appendChild(v);
+    var seg = el('div', 'seg');
+    p.segments.forEach(function (sg) {
+      var cell = el('span');
+      cell.title = sg.name + ': ' + pctText(sg.left) + ' left';
+      var fill = el('i', sg.tone === 'warn' || sg.tone === 'bad' ? sg.tone : '');
+      fill.style.width = (sg.left * 100) + '%';
+      cell.appendChild(fill);
+      seg.appendChild(cell);
+    });
+    box.appendChild(seg);
+    var line = p.soonest ? 'soonest reset: ' + p.soonest.name + ' · ' + resetText(p.soonest.resetAt).replace('resets ', '') : '';
+    if (p.unknown) line += (line ? ' · ' : '') + p.unknown + ' without a reading';
+    if (line) box.appendChild(el('div', 'r', line));
+    return box;
+  }
+
+  // A provider's summary card: its headline column pooled across its accounts
+  // (Fable weekly for Claude, the weekly limit for Codex), and the rest behind
+  // Show, the way the rows put the less used buckets behind theirs.
+  function summaryCard(s, group, members, fable) {
+    var card = el('div', 'scard');
+    var head = el('div', 'k');
+    head.appendChild(el('span', '', groupLabel(group)));
+    head.appendChild(el('span', '', members.length + (members.length === 1 ? ' account' : ' accounts')));
+    card.appendChild(head);
+    var order = group === 'codex' ? [2, 1] : [0, 1, 2];
+    var pools = order.map(function (i) { return poolSummary(members, i, fable); }).filter(function (p) { return p.label; });
+    if (!pools.length) {
+      card.appendChild(el('div', 'r', 'no quota reading yet'));
+    } else {
+      card.appendChild(poolBlock(pools[0], false));
+      var rest = pools.slice(1);
+      if (rest.length) {
+        var k = 'card:' + group;
+        var open = !!expanded[k];
+        var line = el('div', 'r');
+        line.appendChild(el('span', '', rest.map(function (p) { return p.label + ' ' + (p.count ? pctText(p.left) + ' left' : '?'); }).join(' · ') + '  '));
+        line.appendChild(button('more', open ? 'Hide' : 'Show', function () {
+          expanded[k] = !open;
+          if (lastStatus) render(lastStatus);
+        }));
+        card.appendChild(line);
+        if (open) rest.forEach(function (p) { card.appendChild(poolBlock(p, true)); });
+      }
+    }
+    // Drain mode's queue, when the server reports one: the account being spent
+    // first and when it resets, so "why this account" reads off the card.
+    var provider = group === 'codex' ? 'codex' : 'anthropic';
+    var queue = s.drainQueue && s.drainQueue[provider];
+    var head0 = queue && queue.length ? members.filter(function (a) { return a.name === queue[0]; })[0] : null;
+    if (head0) {
+      var weekly = accountMeters(head0, fable).slots[2];
+      var when = weekly ? resetText(weekly.resetAt) : '';
+      card.appendChild(el('div', 'drain', 'Draining: ' + head0.name + (when ? ' · ' + when : '')));
+    }
     return card;
+  }
+
+  function renderQuota(s) {
+    var accounts = s.accounts || [];
+    var tabs = providerTabs(accounts);
+    if (!tabs.some(function (t) { return t.key === currentTab; })) currentTab = 'all';
+    var tabBox = document.getElementById('tabs');
+    tabBox.textContent = '';
+    tabs.forEach(function (t) {
+      var b = button(t.key === currentTab ? 'tab sel' : 'tab', t.label, function () {
+        currentTab = t.key;
+        if (lastStatus) render(lastStatus);
+      });
+      b.appendChild(el('span', 'count', String(t.count)));
+      tabBox.appendChild(b);
+    });
+    var fable = fableLabel(accounts);
+    var groups = tabs.slice(1).map(function (t) { return t.key; }).filter(function (g) { return currentTab === 'all' || g === currentTab; });
+    var cards = document.getElementById('summaryCards');
+    cards.textContent = '';
+    var acc = document.getElementById('accounts');
+    acc.textContent = '';
+    if (!accounts.length) {
+      acc.appendChild(el('div', 'card empty', 'No accounts yet. Add one with teamclaude login.'));
+      return;
+    }
+    var probeAccounts = (s.probe || {}).accounts || [];
+    groups.forEach(function (g) {
+      var members = [];
+      accounts.forEach(function (a, i) { if (accountGroup(a) === g) members.push({ a: a, i: i }); });
+      var list = members.map(function (m) { return m.a; });
+      cards.appendChild(summaryCard(s, g, list, fable));
+      var head = el('div', 'sechead');
+      head.appendChild(el('h2', '', groupLabel(g)));
+      head.appendChild(el('span', 'count', String(members.length)));
+      var cur = currentIn(s, g, list);
+      if (cur) head.appendChild(el('span', 'tag', 'current: ' + cur));
+      acc.appendChild(head);
+      var rows = el('div', 'rows');
+      members.forEach(function (m) {
+        // The probe's list is the fleet in the same order; the name check keeps a
+        // payload that ever differs from pairing a row with another account's entry.
+        var pe = probeAccounts[m.i] && probeAccounts[m.i].name === m.a.name ? probeAccounts[m.i] : null;
+        rows.appendChild(renderAccountRow(m.a, s, fable, pe));
+      });
+      acc.appendChild(rows);
+    });
+  }
+
+  function statusText(a) {
+    if (a.disabled) return 'disabled';
+    if (a.unavailable) return UNAVAILABLE_TEXT[a.unavailable] || a.unavailable;
+    return a.status || 'unknown';
+  }
+
+  // Every account in one table, with the controls that change where rotation
+  // may reach it. A control this key would be refused is not drawn at all; the
+  // line at the top of the page says why, once (callerNotice).
+  function renderAccountsPage(s) {
+    var table = document.getElementById('accountTable');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Account', 'Provider', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request', ''].forEach(function (h, i) {
+      hr.appendChild(el('th', i >= 4 && i <= 8 ? 'num' : '', h));
+    });
+    table.appendChild(hr);
+    var accounts = (s.accounts || []).slice().sort(function (x, y) {
+      var gx = accountGroup(x), gy = accountGroup(y);
+      return gx === gy ? 0 : gx === 'anthropic' ? -1 : gy === 'anthropic' ? 1 : gx < gy ? -1 : 1;
+    });
+    if (!accounts.length) {
+      var tr0 = el('tr');
+      var td0 = el('td', 'dim', 'No accounts yet.');
+      td0.colSpan = 10;
+      tr0.appendChild(td0);
+      table.appendChild(tr0);
+    }
+    accounts.forEach(function (a) {
+      var key = cardNoteKey(a);
+      var tr = el('tr');
+      var name = el('td');
+      name.appendChild(el('div', 'name', a.name));
+      if (a.orgName) name.appendChild(el('div', 'tag', a.orgName));
+      var cn = cardNoteFor(cardNotes, key, Date.now());
+      if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+      tr.appendChild(name);
+      tr.appendChild(el('td', '', groupLabel(accountGroup(a))));
+      tr.appendChild(el('td', '', a.plan || a.type || '—'));
+      var st = el('td');
+      st.appendChild(el('span', 'badge ' + (a.disabled ? 'disabled' : (a.status || '')), statusText(a)));
+      if (isCurrentAccount(a, s)) { st.appendChild(el('span', '', ' ')); st.appendChild(el('span', 'badge current', 'current')); }
+      tr.appendChild(st);
+      tr.appendChild(el('td', 'num', String(a.priority || 0)));
+      tr.appendChild(el('td', 'num', (a.sessions || 0) + ' / ' + (a.knownSessions || 0)));
+      var u = a.usage || {};
+      tr.appendChild(el('td', 'num', fmtNum(u.totalRequests)));
+      tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
+      tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
+      var act = el('td', 'num');
+      if (!isCurrentAccount(a, s) && !a.disabled) {
+        var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
+        act.appendChild(ctlSwitch);
+      }
+      if (callerCan(s.caller, '/teamclaude/disable')) {
+        var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
+        act.appendChild(ctlDisable);
+      }
+      // Only enable/disable for a disabled account: the rest would move an
+      // account that nothing will select anyway.
+      if (!a.disabled && callerCan(s.caller, '/teamclaude/priority')) {
+        var ctlFirst = button('btn', 'Prioritize', function () { doControlAccount(a.name, key, { place: 'first' }, ctlFirst); });
+        act.appendChild(ctlFirst);
+        var ctlLast = button('btn', 'Deprioritize', function () { doControlAccount(a.name, key, { place: 'last' }, ctlLast); });
+        act.appendChild(ctlLast);
+      }
+      tr.appendChild(act);
+      table.appendChild(tr);
+    });
   }
 
   // The window a usage table is showing, in its own heading. The control sits
@@ -1264,10 +1845,18 @@ ${SHARED_HELPERS}
 
   function renderSessions(sessions) {
     var wrap = document.getElementById('sessionsWrap');
+    var empty = document.getElementById('sessionsEmpty');
     // Absent unless proxy.sessionDetail is on — the aggregate counts in the
     // summary line stay either way.
-    if (!sessions || !sessions.items) { wrap.style.display = 'none'; return; }
+    if (!sessions || !sessions.items) {
+      wrap.style.display = 'none';
+      empty.style.display = '';
+      empty.textContent = ((sessions && sessions.active) || 0) + ' active / ' + ((sessions && sessions.known) || 0)
+        + ' known conversations. Set proxy.sessionDetail to true to list them here.';
+      return;
+    }
     wrap.style.display = '';
+    empty.style.display = 'none';
 
     var all = sessionRows(sessions);
     var projectSel = document.getElementById('fProject');
@@ -1364,6 +1953,45 @@ ${SHARED_HELPERS}
     });
   }
 
+  // How sessions are spread, as the router resolved it, and drain mode's
+  // queue when the server reports one.
+  var MODE_TEXT = {
+    off: 'off: one account at a time, until it reaches its switch threshold',
+    even: 'even: new conversations go to the least-loaded account',
+    adaptive: 'adaptive: new conversations go where the quota burns slowest',
+    affinity: 'affinity: conversations stay on the account holding their cache',
+    drain: 'drain: the account whose weekly quota resets soonest is used until it runs out',
+  };
+  function renderRouting(s) {
+    var card = document.getElementById('modeCard');
+    card.textContent = '';
+    var sess = s.sessions || {};
+    var mode = sess.mode || (sess.distribute ? 'even' : 'off');
+    var line = el('div', 'setting');
+    var d = el('div');
+    d.appendChild(el('b', '', 'Session distribution'));
+    d.appendChild(el('span', 'tag', MODE_TEXT[mode] || mode));
+    line.appendChild(d);
+    line.appendChild(el('span', 'tag', 'Set with teamclaude distribute <mode>'));
+    card.appendChild(line);
+    var thr = el('div', 'setting');
+    var t = el('div');
+    t.appendChild(el('b', '', 'Switch threshold'));
+    t.appendChild(el('span', 'tag', thresholdPercentText(s.switchThreshold) + '% of a quota window' + (s.expiryRouting && s.expiryRouting.enabled ? ' · expiry-pressure routing on' : '')));
+    thr.appendChild(t);
+    card.appendChild(thr);
+    Object.keys(s.drainQueue || {}).forEach(function (provider) {
+      var q = s.drainQueue[provider] || [];
+      var row = el('div', 'setting');
+      var c = el('div');
+      c.appendChild(el('b', '', providerLabel(provider) + ' drain order'));
+      c.appendChild(el('span', 'tag', q.length ? q.join(' → ') : 'no account can serve right now'));
+      row.appendChild(c);
+      card.appendChild(row);
+    });
+    renderRoutes(s);
+  }
+
   // Where each metered family goes right now, and which accounts could take
   // it. The last row is the default: everything without its own route lands
   // on the current account.
@@ -1405,15 +2033,119 @@ ${SHARED_HELPERS}
     });
   }
 
-  // Top of the page and only when something is wrong: a banner that is always
-  // on is a banner nobody reads.
+  // The banner over every page, only when something is wrong — a banner that
+  // is always on is a banner nobody reads — and the same list on the Problems
+  // page, where it is not repeated as a banner.
   function renderProblems(s) {
-    var wrap = document.getElementById('problems');
     var list = problems(s);
+    var wrap = document.getElementById('problems');
+    var page = document.getElementById('problemList');
     wrap.textContent = '';
-    if (!list.length) { wrap.style.display = 'none'; return; }
-    wrap.style.display = 'block';
-    list.forEach(function (p) { wrap.appendChild(el('div', p.severity, p.text)); });
+    page.textContent = '';
+    list.forEach(function (p) {
+      wrap.appendChild(el('div', p.severity, p.text));
+      page.appendChild(el('div', p.severity, p.text));
+    });
+    if (!list.length) page.appendChild(el('p', 'sub', 'Nothing needs attention.'));
+    wrap.style.display = list.length && currentPage !== 'problems' ? 'block' : 'none';
+    setCount('problems', list.length, true);
+  }
+
+  function setCount(page, n, bad) {
+    var c = navCounts[page];
+    if (!c) return;
+    c.textContent = String(n);
+    c.className = bad ? 'count bad' : 'count';
+    c.style.display = n ? '' : 'none';
+  }
+
+  function buildLogFilters() {
+    var box = document.getElementById('logKinds');
+    LOG_KINDS.forEach(function (k) {
+      var chip = button('chip', k.label, function () {
+        logFilters.kind = k.key;
+        renderLogs();
+      });
+      box.appendChild(chip);
+      logChips.push({ key: k.key, btn: chip });
+    });
+    var provider = document.getElementById('logProvider');
+    fillFilter(provider, [], '');
+    [['anthropic', 'Claude'], ['codex', 'Codex']].forEach(function (p) {
+      var option = el('option', '', p[1]);
+      option.value = p[0];
+      provider.appendChild(option);
+    });
+    provider.addEventListener('change', function () { logFilters.provider = this.value; renderLogs(); });
+    document.getElementById('logAccount').addEventListener('change', function () { logFilters.account = this.value; renderLogs(); });
+  }
+
+  function fmtWhen(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    var time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return d.toDateString() === new Date().toDateString() ? time : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time;
+  }
+
+  // Newest first, and at most the newest 500 drawn: the page holds the whole
+  // log, but a table of thousands of rows rebuilt every few seconds would make
+  // the page the slowest thing on the machine.
+  function renderLogs() {
+    logChips.forEach(function (c) { c.btn.className = c.key === logFilters.kind ? 'chip sel' : 'chip'; });
+    var accSel = document.getElementById('logAccount');
+    fillFilter(accSel, uniqSorted(logState.events.map(function (e) { return e.account; })), logFilters.account);
+    logFilters.account = accSel.value;
+    var rows = filterLogEvents(logState.events, logFilters).slice().reverse();
+    document.getElementById('logCount').textContent = (logError ? 'cannot read the log: ' + logError + ' · ' : '')
+      + rows.length + ' of ' + logState.events.length + ' events';
+    var table = document.getElementById('logs');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Time', 'Kind', 'Account', 'Event', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    table.appendChild(hr);
+    if (!rows.length) {
+      var tr0 = el('tr');
+      var td0 = el('td', 'dim', logState.events.length ? 'No events match these filters.' : 'No events yet.');
+      td0.colSpan = 5;
+      tr0.appendChild(td0);
+      table.appendChild(tr0);
+      return;
+    }
+    rows.slice(0, 500).forEach(function (e) {
+      var tr = el('tr', logEventTone(e));
+      tr.appendChild(el('td', 'when', fmtWhen(e.at)));
+      var kind = LOG_KINDS.filter(function (k) { return k.key === e.kind; })[0];
+      tr.appendChild(el('td', 'kind', (kind ? kind.label : e.kind) + (e.provider ? ' · ' + providerLabel(e.provider) : '')));
+      tr.appendChild(el('td', '', e.account || '—'));
+      tr.appendChild(el('td', 'ev', e.message));
+      tr.appendChild(el('td', 'detail', logEventDetail(e)));
+      table.appendChild(tr);
+    });
+  }
+
+  function pollLogs() {
+    if (logsInFlight) return;
+    logsInFlight = true;
+    var held = logState.events;
+    var after = held.length ? held[held.length - 1].id : 0;
+    var again = false;
+    fetch('/teamclaude/logs?after=' + after, { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (page) {
+        if (!page) return;
+        logState = mergeLogEvents(logState, page, LOG_CAP);
+        again = logState.refetch;
+        logError = null;
+        renderLogs();
+      })
+      .catch(function (e) { logError = e.message; renderLogs(); })
+      // A restarted server's log is read again from its start, now rather
+      // than at the next poll.
+      .finally(function () { logsInFlight = false; if (again) pollLogs(); });
   }
 
   function render(s) {
@@ -1451,45 +2183,38 @@ ${SHARED_HELPERS}
     } else {
       sum.appendChild(el('b', '', s.currentAccount || 'none'));
     }
-    // Conversations, like the table below it and the count above that table:
-    // one page saying "sessions" here and "conversations" there would read as
-    // two different quantities rather than one counted twice.
+    // Conversations, like the Sessions table and the count above it: one page
+    // saying "sessions" here and "conversations" there would read as two
+    // different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
-    var acc = document.getElementById('accounts');
-    acc.textContent = '';
-    var now = Date.now();
-    var probeAccounts = probe.accounts || [];
-    (s.accounts || []).forEach(function (a, i) {
-      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
-      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      // The probe's list is the fleet in the same order; the name check keeps a
-      // payload that ever differs from pairing a card with another account's row.
-      var pe = probeAccounts[i] && probeAccounts[i].name === a.name ? probeAccounts[i] : null;
-      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller, pe));
-    });
+    renderQuota(s);
+    renderAccountsPage(s);
     renderProblems(s);
-    renderRoutes(s);
+    renderRouting(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     // The control means nothing with no usage table under it. The payload
     // already answers that: the server omits a dimension with no entries.
     var anyUsage = Object.keys(s.clients || {}).length || Object.keys(s.usageDimensions || {}).length;
     document.getElementById('usageViewWrap').style.display = anyUsage ? '' : 'none';
+    document.getElementById('clientsEmpty').style.display = anyUsage ? 'none' : '';
     renderSessions(s.sessions);
+    setCount('sessions', sess.active || 0, false);
+    setCount('accounts', (s.accounts || []).length, false);
     document.getElementById('foot').textContent = 'refreshes every ' + (POLL_MS / 1000) + 's · ' + new Date().toLocaleTimeString();
   }
 
-  // An account action reports above its own card, where the click was: the
-  // page-wide note sits above the cards and is off screen for a card further down.
+  // An account action reports beside its own row, where the click was: the
+  // page-wide note sits above everything and is off screen for a row further down.
   // No prototype: an account named __proto__ would otherwise set it.
   var cardNotes = Object.create(null);
   // With now set it re-renders at once, for a failure no poll follows. Otherwise the
   // poll the caller starts shows it: re-rendering the stale status here would
-  // rebuild the card and re-enable a switch button that must stay disabled
+  // rebuild the row and re-enable a switch button that must stay disabled
   // until the poll reports the switch.
   function cardNote(key, kind, text, now) {
     cardNotes[key] = { kind: kind, text: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + ' · ' + text, at: Date.now() };
@@ -1541,7 +2266,7 @@ ${SHARED_HELPERS}
         poll();
       })
       .catch(function (e) { cardNote(noteKey, 'error', 'change failed: ' + e.message, true); })
-      // Unlike doSwitch, always re-enabled: the card is rebuilt by the poll
+      // Unlike doSwitch, always re-enabled: the row is rebuilt by the poll
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
       .finally(function () { btn.disabled = false; });
@@ -1551,7 +2276,7 @@ ${SHARED_HELPERS}
   // request waits for the probe, so the poll after it shows the new bars.
   function doRefreshQuota(account, noteKey, btn) {
     btn.disabled = true;
-    btn.textContent = 'refreshing…';
+    btn.textContent = 'Refreshing…';
     var r = refreshQuotaRequest(account, localStorage.getItem(KEY));
     fetch(r.url, r.init)
       .then(function (res) {
@@ -1639,6 +2364,7 @@ ${SHARED_HELPERS}
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
         render(s);
+        if (currentPage === 'logs') pollLogs();
       })
       .catch(function (e) {
         var err = document.getElementById('err');
@@ -1653,6 +2379,42 @@ ${SHARED_HELPERS}
   function start() {
     poll();
     if (!timer) timer = setInterval(poll, POLL_MS);
+  }
+
+  function buildNav() {
+    var nav = document.getElementById('nav');
+    var section = null;
+    PAGES.forEach(function (p) {
+      if (p.section !== section) {
+        section = p.section;
+        nav.appendChild(el('div', 'navsec', section));
+      }
+      var b = button('navbtn', p.label, function () { showPage(p.key); });
+      var c = el('span', 'count');
+      c.style.display = 'none';
+      b.appendChild(c);
+      nav.appendChild(b);
+      navButtons[p.key] = b;
+      navCounts[p.key] = c;
+    });
+  }
+
+  // The page is in the URL's fragment, so a reload or a bookmark comes back to
+  // it; read and written only where there is a location to read (not in the
+  // test harness that boots this script).
+  function showPage(key) {
+    var page = PAGES.filter(function (p) { return p.key === key; })[0] || PAGES[0];
+    currentPage = page.key;
+    PAGES.forEach(function (p) {
+      document.getElementById('page-' + p.key).style.display = p.key === page.key ? '' : 'none';
+      navButtons[p.key].className = p.key === page.key ? 'navbtn sel' : 'navbtn';
+    });
+    document.getElementById('pageTitle').textContent = page.label;
+    if (typeof location !== 'undefined' && typeof history !== 'undefined' && location.hash !== '#' + page.key) {
+      try { history.replaceState(null, '', '#' + page.key); } catch (e) { /* a sandboxed frame: the page still switches */ }
+    }
+    if (lastStatus) renderProblems(lastStatus);
+    if (page.key === 'logs') { renderLogs(); pollLogs(); }
   }
 
   document.getElementById('go').addEventListener('click', function () {
@@ -1705,11 +2467,15 @@ ${SHARED_HELPERS}
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
-  document.getElementById('changeKey').addEventListener('click', function () { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); });
+  function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }
+  document.getElementById('changeKey').addEventListener('click', forgetKey);
+  document.getElementById('forgetKey').addEventListener('click', forgetKey);
   document.getElementById('thrVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('thrSet').click();
   });
   buildUsageViews();
+  buildLogFilters();
+  buildNav();
 
   ['fProject', 'fClient'].forEach(function (id) {
     document.getElementById(id).addEventListener('change', function () {
@@ -1717,6 +2483,11 @@ ${SHARED_HELPERS}
       if (lastStatus) render(lastStatus);
     });
   });
+
+  showPage(typeof location !== 'undefined' ? String(location.hash || '').slice(1) : '');
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('hashchange', function () { showPage(String(location.hash || '').slice(1)); });
+  }
 
   // Poll before asking: a loopback browser is key-exempt, so the prompt is
   // shown only once the server refuses the request without a valid key.
