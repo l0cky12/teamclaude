@@ -28,6 +28,8 @@ import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { WebSignInError } from './web-login.js';
+import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { logsAfter } from './event-log.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -428,6 +430,14 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  ['/teamclaude/remove', 'a client key cannot change accounts'],
+  // Every step of a dashboard sign-in, the read included: the status names the
+  // account the tokens went to, and a code pasted into another caller's
+  // sign-in would add an account all the same.
+  ['/teamclaude/login/start', 'a client key cannot sign accounts in'],
+  ['/teamclaude/login/code', 'a client key cannot sign accounts in'],
+  ['/teamclaude/login/status', 'a client key cannot sign accounts in'],
+  ['/teamclaude/login/cancel', 'a client key cannot sign accounts in'],
 ]);
 
 /**
@@ -741,6 +751,98 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.end(JSON.stringify({ ok: false, error: known ? message : 'account change failed; see the proxy log' }));
         }
         return;
+      }
+
+      // Removing an account — the web equivalent of `teamclaude remove`, and
+      // what the dashboard's Remove button sends. Body: {"account", "provider"?,
+      // "org"?}, resolved the way /probe resolves one card. The account leaves
+      // the running fleet and the config file, credentials included; nothing is
+      // revoked upstream, so the login stays valid wherever else it is used.
+      if (req.method === 'POST' && req.url === '/teamclaude/remove') {
+        if (!hooks.removeAccount) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'remove not supported' }));
+          return;
+        }
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (typeof body.account !== 'string' || !body.account.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"' }));
+          return;
+        }
+        const found = resolveAccountTarget(accountManager, { account: body.account, provider: body.provider, org: body.org });
+        if (found == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${safeLine(body.account, 80)}"` }));
+          return;
+        }
+        if ('ambiguous' in found) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `more than one account is named "${safeLine(body.account, 80)}"; add "provider" or "org"` }));
+          return;
+        }
+        try {
+          // The account itself, not its position: the removal waits for any
+          // reload in flight, which can move it.
+          const result = await hooks.removeAccount(accountManager.accounts[found.index]);
+          console.log(`[TeamClaude] Removed account "${safeLine(result.name, 80)}" (control endpoint)`);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          // The last account, or one a reload removed meanwhile: said as it is.
+          if (err instanceof RemovalRefused) {
+            res.writeHead(err.status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+            return;
+          }
+          // The account may already be out of the running fleet: say the save
+          // is what failed, so the caller does not read it as nothing changed.
+          console.error('[TeamClaude] Removing an account failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'the account may be removed from the running server, but saving the config file failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // Signing an account in from the dashboard (web-login.js). `start`
+      // {"provider": "claude"|"codex"} answers with the link to open; `code`
+      // {"id", "code"} takes what the browser was left holding (Claude's code,
+      // or the localhost:1455 address OpenAI redirected to); `status` {"id"}
+      // says how it went, including when the loopback listener finished it by
+      // itself; `cancel` {"id"} gives up and closes the listener. POSTs, all of
+      // them, so the cross-origin and client-key gates above cover every step.
+      if (req.method === 'POST' && /^\/teamclaude\/login\/(start|code|status|cancel)$/.test(req.url || '')) {
+        const signIns = hooks.webSignIns;
+        if (!signIns) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'signing in from the dashboard is not supported by this server' }));
+          return;
+        }
+        const step = (req.url || '').slice('/teamclaude/login/'.length);
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        const reply = (/** @type {number} */ code, /** @type {Record<string, any>} */ payload) => {
+          res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        try {
+          if (step === 'start') return reply(200, { ok: true, ...await signIns.start(body.provider) });
+          if (typeof body.id !== 'string' || !body.id) return reply(400, { ok: false, error: 'missing "id"' });
+          if (step === 'code') {
+            const { accepted } = signIns.submit(body.id, body.code);
+            return reply(accepted ? 200 : 400, accepted ? { ok: true } : { ok: false, error: 'paste the code or address first' });
+          }
+          if (step === 'status') return reply(200, { ok: true, ...signIns.status(body.id) });
+          return reply(200, { ok: true, cancelled: signIns.cancel(body.id) });
+        } catch (err) {
+          // A WebSignInError is written for the person at the page (a bad
+          // paste, an unknown provider); anything else may quote a provider's
+          // reply, and goes to the log.
+          if (err instanceof WebSignInError) return reply(400, { ok: false, error: err.message });
+          console.error(`[TeamClaude] Dashboard sign-in (${step}) failed:`, /** @type {Error} */ (err).message);
+          return reply(500, { ok: false, error: 'the sign-in could not start; see the proxy log' });
+        }
       }
 
       // One-shot quota probe — the web equivalent of the TUI's `p` key. It is
@@ -1208,6 +1310,26 @@ async function readControlBody(req, limit = 64 * 1024) {
     chunks.push(chunk);
   }
   return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * A control route's JSON body, or null after answering the request itself:
+ * 413 for one too large, 400 for one that is not JSON. An empty body is `{}`.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @returns {Promise<Record<string, any> | null>}
+ */
+async function readControlJson(req, res) {
+  try {
+    const parsed = JSON.parse(await readControlBody(req) || '{}');
+    // JSON.parse('null') and '"x"' are values too, and a field read off them throws.
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (err) {
+    const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+    res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+    return null;
+  }
 }
 
 /**

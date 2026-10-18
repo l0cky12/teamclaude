@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, resolveAccountTarget } from '../src/server.js';
+import { createProxyServer, resolveAccountTarget, callerView } from '../src/server.js';
 import {
   renderDashboardHtml, dashboardCsp, inlineScripts, scopedWeeklyRows, accountTokens,
   accountBadges, thresholdBadgeText,
@@ -15,6 +15,7 @@ import {
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -955,7 +956,8 @@ test('the page ships the same helper implementations it is tested against', () =
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone]) {
+    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+    providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -1034,7 +1036,10 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     el.fire('click');
   };
   const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
-  return { byId, store, requests, answer, rootAttrs, click, labelled };
+  // The latest element built that matches, for a control with no label to
+  // click by (an input the page made for itself).
+  const findLast = pred => built.slice().reverse().find(pred);
+  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -1522,4 +1527,279 @@ test('the status payload carries each account\'s email, null when none is stored
     { name: 'b', type: 'api_key', apiKey: 'sk-b' },
   ], 0.98);
   assert.deepEqual(am.getStatus().accounts.map(a => a.email), ['me@example.com', null]);
+});
+
+// ── Accounts page: signing in, removing, and telling the providers apart ──
+
+test('each provider family has its own colour class, and backends share one', () => {
+  assert.equal(providerTone('anthropic'), 'claude');
+  assert.equal(providerTone('codex'), 'codex');
+  assert.equal(providerTone('backend:api.deepseek.com'), 'backend');
+});
+
+test('only an OAuth login signed out upstream offers Sign in again, for its own provider', () => {
+  assert.equal(needsSignIn({ type: 'oauth', provider: 'anthropic', status: 'error' }), 'claude');
+  assert.equal(needsSignIn({ type: 'oauth', provider: 'codex', status: 'error' }), 'codex');
+  assert.equal(needsSignIn({ type: 'oauth', provider: 'anthropic', status: 'active' }), null);
+  assert.equal(needsSignIn({ type: 'apikey', provider: 'anthropic', status: 'error' }), null, 'a key is replaced, not signed in');
+  assert.equal(needsSignIn({ type: 'oauth', status: 'error', backend: 'api.z.ai' }), null);
+});
+
+test('a page counts as on the proxy\'s machine only at a loopback address', () => {
+  for (const h of ['localhost', '127.0.0.1', '[::1]', 'LOCALHOST']) assert.equal(isLoopbackHost(h), true, h);
+  for (const h of ['100.64.0.7', 'proxy.lan', '', undefined]) assert.equal(isLoopbackHost(h), false, String(h));
+});
+
+test('a sign-in step is a JSON POST carrying the stored key', () => {
+  const r = signInRequest('code', { id: 'x', code: 'c' }, 'tc-key');
+  assert.equal(r.url, '/teamclaude/login/code');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-key');
+  assert.deepEqual(JSON.parse(r.init.body), { id: 'x', code: 'c' });
+});
+
+test('Claude\'s loopback link is offered only to a page on the proxy\'s machine', () => {
+  const start = { provider: 'claude', url: 'https://claude.ai/oauth/authorize?r=code-page', browserUrl: 'https://claude.ai/oauth/authorize?r=loopback', listening: true };
+  const local = signInPlan(start, '127.0.0.1');
+  assert.equal(local.href, start.browserUrl);
+  assert.equal(local.auto, true);
+  const remote = signInPlan(start, '100.64.0.7');
+  assert.equal(remote.href, start.url, 'a browser elsewhere cannot reach the loopback listener');
+  assert.equal(remote.auto, false);
+  assert.match(remote.ask, /code/);
+});
+
+test('Codex always opens its one link, and asks for the localhost:1455 address unless it can finish by itself', () => {
+  const start = { provider: 'codex', url: 'https://auth.openai.com/oauth/authorize?x=1', browserUrl: null, listening: true };
+  assert.equal(signInPlan(start, 'localhost').auto, true);
+  const remote = signInPlan(start, 'proxy.lan');
+  assert.equal(remote.href, start.url);
+  assert.equal(remote.auto, false);
+  assert.match(remote.ask, /localhost:1455/);
+  const taken = signInPlan({ ...start, listening: false, note: 'Port 1455 is in use' }, 'localhost');
+  assert.equal(taken.auto, false, 'nothing listens, so the paste is the only way');
+  assert.equal(taken.note, 'Port 1455 is in use');
+});
+
+test('a polled sign-in reads as the page says it', () => {
+  assert.deepEqual(signInStatusOutcome({ ok: true, state: 'waiting' }, 'Claude'), { done: false, kind: '', text: 'Waiting for you to sign in…' });
+  assert.equal(signInStatusOutcome({ ok: true, state: 'finishing' }, 'Claude').done, false);
+  assert.deepEqual(signInStatusOutcome({ ok: true, state: 'succeeded', account: 'me@example.com', action: 'added' }, 'Codex'),
+    { done: true, kind: 'ok', text: 'Added the Codex account as me@example.com' });
+  assert.equal(signInStatusOutcome({ ok: true, state: 'succeeded', account: 'me@example.com', action: 'updated' }, 'Claude').text,
+    'Signed in to Claude again as me@example.com');
+  assert.deepEqual(signInStatusOutcome({ ok: true, state: 'failed', error: 'the provider answered HTTP 400' }, 'Claude'),
+    { done: true, kind: 'error', text: 'Claude sign-in failed: the provider answered HTTP 400' });
+  assert.equal(signInStatusOutcome({ ok: true, state: 'cancelled' }, 'Claude').kind, 'warn');
+  assert.equal(signInStatusOutcome({ ok: true, state: 'unknown' }, 'Claude').done, true);
+  assert.equal(signInStatusOutcome({ ok: false, error: 'a client key cannot sign accounts in' }, 'Claude').kind, 'error');
+});
+
+test('Remove names the card\'s provider and org, so a namesake is never the one removed', () => {
+  const r = removeRequest({ name: 'me@example.com', provider: 'codex', orgName: 'Acme' }, null);
+  assert.equal(r.url, '/teamclaude/remove');
+  assert.deepEqual(JSON.parse(r.init.body), { account: 'me@example.com', provider: 'codex', org: 'Acme' });
+  assert.deepEqual(JSON.parse(removeRequest({ name: 'k' }, null).init.body), { account: 'k' });
+  assert.equal(removeOutcome({ ok: true, name: 'me@example.com' }).kind, 'ok');
+  assert.match(removeOutcome({ ok: true, name: 'me@example.com' }).text, /no longer holds its sign-in/);
+  assert.deepEqual(removeOutcome({ ok: false, error: 'no such account "x"' }), { kind: 'error', text: 'remove failed: no such account "x"' });
+});
+
+test('Sign in to Codex starts the flow, shows the link, and a pasted address finishes it', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.labelled('Sign in to Claude'), 1);
+  page.click('Sign in to Codex');
+  const start = page.requests[0];
+  assert.equal(start.url, '/teamclaude/login/start');
+  assert.deepEqual(JSON.parse(start.init.body), { provider: 'codex' });
+  await page.answer(200, { ok: true, id: 'abc', provider: 'codex', url: 'https://auth.openai.com/oauth/authorize?x=1', browserUrl: null, listening: true, note: null });
+  const open = page.findLast(e => e.textContent === 'Open sign-in page');
+  assert.equal(open.href, 'https://auth.openai.com/oauth/authorize?x=1');
+  assert.equal(open.target, '_blank');
+  assert.equal(open.rel, 'noopener noreferrer');
+
+  const paste = page.findLast(e => typeof e.placeholder === 'string' && e.placeholder.startsWith('http://localhost:1455'));
+  paste.value = 'http://localhost:1455/auth/callback?code=c&state=s';
+  page.click('Finish sign-in');
+  const code = page.requests[0];
+  assert.equal(code.url, '/teamclaude/login/code');
+  assert.deepEqual(JSON.parse(code.init.body), { id: 'abc', code: 'http://localhost:1455/auth/callback?code=c&state=s' });
+  await page.answer(200, { ok: true });
+  // Accepted: the page asks at once rather than waiting out the poll interval.
+  assert.equal(page.requests[0].url, '/teamclaude/login/status');
+  await page.answer(200, { ok: true, state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'added' });
+  assert.match(page.byId('note').textContent, /Added the Codex account as me@example\.com$/);
+  assert.equal(page.byId('signIn').style.display, 'none', 'the panel closes');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'and the accounts list is read again');
+});
+
+test('a paste the server refuses is shown in the panel, which keeps waiting', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Sign in to Claude');
+  await page.answer(200, { ok: true, id: 'abc', provider: 'claude', url: 'https://claude.ai/x', browserUrl: 'http://localhost:9/x', listening: true });
+  page.findLast(e => e.placeholder === 'Paste the code here').value = 'stale#state';
+  page.click('Finish sign-in');
+  await page.answer(400, { ok: false, error: 'OAuth state mismatch: that code is from a different sign-in attempt.' });
+  assert.ok(page.findLast(e => /state mismatch/.test(e.textContent)), 'the reason is on the panel');
+  assert.notEqual(page.byId('signIn').style.display, 'none');
+  assert.equal(page.requests.length, 0, 'nothing else was sent');
+});
+
+test('a double-click on Remove does not remove', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }, { name: 'b', provider: 'anthropic', type: 'apikey', quota: {} }] });
+  page.click('Remove');
+  page.click('Confirm remove');
+  assert.equal(page.requests.length, 0, 'the second click of a double-click is ignored');
+});
+
+test('Remove asks for a second click, then sends the card\'s provider', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'me@example.com', provider: 'anthropic', type: 'apikey', quota: {} },
+      { name: 'me@example.com', provider: 'codex', type: 'oauth', quota: {} },
+    ],
+  });
+  assert.equal(page.labelled('Remove'), 2);
+  const removes = [];
+  // The Codex row's Remove: the second one built.
+  page.findLast(e => e.textContent === 'Remove' && e.listens('click')).fire('click');
+  assert.equal(page.requests.length, 0, 'the first click only arms it');
+  removes.push(page.findLast(e => e.textContent === 'Confirm remove'));
+  assert.ok(removes[0], 'the button now asks to confirm');
+  // Confirmed only after the double-click window: the page reads the clock,
+  // so the test moves it rather than waiting.
+  const realNow = Date.now;
+  Date.now = () => realNow() + 1000;
+  try {
+    removes[0].fire('click');
+  } finally {
+    Date.now = realNow;
+  }
+  const req = page.requests[0];
+  assert.equal(req.url, '/teamclaude/remove');
+  assert.deepEqual(JSON.parse(req.init.body), { account: 'me@example.com', provider: 'codex' });
+  await page.answer(200, { ok: true, name: 'me@example.com', provider: 'codex' });
+  assert.match(page.byId('note').textContent, /Removed me@example\.com/);
+});
+
+test('the Accounts page lists Claude and Codex apart, each under its own heading', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'claude-one', provider: 'anthropic', quota: {} },
+      { name: 'codex-one', provider: 'codex', quota: {} },
+    ],
+  });
+  assert.equal(page.labelled('Claude accounts'), 1);
+  assert.equal(page.labelled('Codex (ChatGPT) accounts'), 1);
+  assert.ok(page.findLast(e => e.className === 'pcard claude'), 'the Claude section wears the Claude colour');
+  assert.ok(page.findLast(e => e.className === 'pcard codex'), 'and the Codex one its own');
+});
+
+test('an account signed out upstream offers Sign in again for its own provider', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'work', email: 'me@example.com', provider: 'anthropic', type: 'oauth', status: 'error', quota: {} }] });
+  page.click('Sign in again');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { provider: 'claude' });
+  await page.answer(200, { ok: true, id: 'abc', provider: 'claude', url: 'https://claude.ai/x', browserUrl: null, listening: true });
+  assert.ok(page.findLast(e => e.textContent === 'Open the sign-in page and sign in as me@example.com.'), 'the panel says which login to use');
+});
+
+test('a client key sees neither the sign-in buttons nor Remove', async () => {
+  const page = bootPage();
+  await page.answer(200, { caller: callerView('ci'), accounts: [{ name: 'a', provider: 'anthropic', type: 'oauth', status: 'error', quota: {} }] });
+  assert.equal(page.labelled('Sign in to Claude'), 0);
+  assert.equal(page.labelled('Sign in to Codex'), 0);
+  assert.equal(page.labelled('Remove'), 0);
+  assert.equal(page.labelled('Sign in again'), 0);
+  assert.equal(page.byId('addBar').style.display, 'none');
+});
+
+test('a signed-out account that reads its sign-in from a file is sent to the tool that owns the file', () => {
+  const claude = { type: 'oauth', provider: 'anthropic', status: 'error', credentialsFromFile: true };
+  assert.equal(needsSignIn(claude), null, 'a sign-in here would be stored and never used');
+  assert.match(fileSignInHint(claude), /Claude Code \(claude \/login\).*Reload config/);
+  assert.match(fileSignInHint({ ...claude, provider: 'codex' }), /Codex CLI \(codex login\)/);
+  assert.equal(fileSignInHint({ ...claude, status: 'active' }), null);
+  assert.equal(fileSignInHint({ ...claude, credentialsFromFile: false }), null);
+});
+
+test('a sign-in that landed on a file-backed account says it did not take, rather than claiming success', () => {
+  const out = signInStatusOutcome({ ok: true, state: 'succeeded', account: 'me@example.com', action: 'updated', fileBacked: true }, 'Claude');
+  assert.equal(out.done, true);
+  assert.equal(out.kind, 'warn');
+  assert.match(out.text, /credentials file.*Claude Code/);
+});
+
+test('the only account cannot be removed: the button is there, disabled, and says why', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }] });
+  const lone = page.findLast(e => e.textContent === 'Remove');
+  assert.equal(lone.disabled, true);
+  assert.match(lone.title, /at least one account/);
+});
+
+test('a file-backed account in error shows where to sign in, and no Sign in again', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [
+    { name: 'a', provider: 'anthropic', type: 'oauth', status: 'error', credentialsFromFile: true, quota: {} },
+    { name: 'b', provider: 'anthropic', type: 'apikey', quota: {} },
+  ] });
+  assert.equal(page.labelled('Sign in again'), 0);
+  assert.ok(page.findLast(e => /credentials file/.test(e.textContent)));
+});
+
+test('status says whether an account reads its sign-in from a file, and never which file', () => {
+  const am = new AccountManager([
+    { name: 'filed', type: 'oauth', importFrom: '/tmp/demo-creds.json', accessToken: 't', refreshToken: 'r', expiresAt: 4102444800000 },
+    { name: 'inline', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: 4102444800000 },
+  ], 0.98);
+  const [filed, inline] = am.getStatus().accounts;
+  assert.equal(filed.credentialsFromFile, true);
+  assert.equal(inline.credentialsFromFile, false);
+  assert.doesNotMatch(JSON.stringify(am.getStatus()), /demo-creds/);
+});
+
+// A panel with a Codex sign-in the server has started, id 'abc'.
+async function pageWithSignIn() {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Sign in to Codex');
+  await page.answer(200, { ok: true, id: 'abc', provider: 'codex', url: 'https://auth.openai.com/oauth/authorize?x=1', browserUrl: null, listening: true });
+  return page;
+}
+
+test('Cancel on a sign-in whose code has arrived keeps the panel and follows it to the end', async () => {
+  const page = await pageWithSignIn();
+  page.click('Cancel');
+  assert.equal(page.requests[0].url, '/teamclaude/login/cancel');
+  await page.answer(200, { ok: true, cancelled: false });
+  assert.notEqual(page.byId('signIn').style.display, 'none', 'the panel stays');
+  assert.ok(page.findLast(e => /can no longer be cancelled/.test(e.textContent)), 'and says why');
+  const status = page.requests[0];
+  assert.equal(status.url, '/teamclaude/login/status');
+  assert.deepEqual(JSON.parse(status.init.body), { id: 'abc' }, 'still asking about the same sign-in');
+  await page.answer(200, { ok: true, state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'added' });
+  assert.match(page.byId('note').textContent, /Added the Codex account as me@example\.com$/);
+});
+
+test('Cancel the server honours closes the panel', async () => {
+  const page = await pageWithSignIn();
+  page.click('Cancel');
+  await page.answer(200, { ok: true, cancelled: true });
+  assert.equal(page.byId('signIn').style.display, 'none');
+});
+
+test('a new sign-in the server refuses leaves the one under way on the panel', async () => {
+  const page = await pageWithSignIn();
+  page.click('Sign in to Claude');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { provider: 'claude' });
+  await page.answer(400, { ok: false, error: 'the last sign-in is still finishing; it shows in the list in a moment' });
+  assert.ok(page.findLast(e => /still finishing/.test(e.textContent)), 'the refusal is on the panel');
+  assert.ok(page.findLast(e => e.textContent === 'Sign in to Codex' && e.className === 'sp'), 'which is still the Codex one');
+  assert.ok(page.findLast(e => e.textContent === 'Open sign-in page'), 'with its link');
 });

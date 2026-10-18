@@ -1,4 +1,5 @@
 import { importCredentials } from './oauth.js';
+import { importCodexCredentials } from './codex-auth.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
@@ -170,6 +171,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
     mgr.messageThreads = diskAcct.messageThreads === true;
+    // Where its tokens come from decides what a sign-in can fix (the
+    // dashboard's Sign in again), so an importFrom added or dropped on disk
+    // shows at once.
+    mgr.credentialsFromFile = !!diskAcct.importFrom;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
     // so a stale key there would win the spread and silently overwrite this
@@ -209,8 +214,15 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     let freshCred = null;
     if (diskAcct.type === 'oauth' && diskAcct.importFrom) {
       try {
-        const creds = await importCredentials(diskAcct.importFrom);
-        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: creds.expiresAt };
+        // The file's own format, as resolveAccounts reads it at startup: the
+        // Claude reader finds no token in a Codex auth.json, so a Codex login
+        // refreshed in its file reached the fleet only on a restart.
+        const creds = providerOf(diskAcct) === 'codex'
+          ? await importCodexCredentials(diskAcct.importFrom)
+          : await importCredentials(diskAcct.importFrom);
+        // A Codex auth.json carries no expiry; the staleness check below then
+        // leaves the file's token to win, as a fresh login there should.
+        freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: 'expiresAt' in creds ? creds.expiresAt : undefined };
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Re-import failed for "${safeLine(diskAcct.name, 64)}": ${err.message}`);
       }

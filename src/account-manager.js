@@ -374,6 +374,10 @@ function makeAccount(acct, index, listener = null) {
     // The login's email, from the OAuth profile or the Codex id token. Only the
     // dashboard reads it, to say whose login a renamed account is.
     email: acct.email || null,
+    // Its tokens are read from a file (`importFrom`), which wins over the
+    // config on every reload. Whether, never the path: this object's fields
+    // reach the status payload.
+    credentialsFromFile: !!acct.importFrom,
     organizationType: acct.organizationType || null,
     rateLimitTier: acct.rateLimitTier || null,
     seatTier: acct.seatTier || null,
@@ -5981,6 +5985,9 @@ export class AccountManager {
         provider: providerOf(a),
         orgName: a.orgName || null,
         email: a.email || null,
+        // A sign-in stored in the config does not reach such an account, so
+        // the dashboard offers no "Sign in again" for it.
+        credentialsFromFile: a.credentialsFromFile === true,
         // What the dashboard's account row names the account by: its plan,
         // and for a third-party backend the host it forwards to.
         plan: planLabel(a),

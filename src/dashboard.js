@@ -529,6 +529,179 @@ export function accountControlOutcome(res, spec) {
 }
 
 /**
+ * The colour family a provider group is drawn in, so a Claude login and a
+ * ChatGPT (Codex) login never look alike: the class on its badge, its tab and
+ * its section.
+ *
+ * @param {string} group  accountGroup()
+ */
+export function providerTone(group) {
+  if (group === 'anthropic') return 'claude';
+  if (group === 'codex') return 'codex';
+  return 'backend';
+}
+
+/**
+ * The provider a "Sign in again" button would sign in, or null when there is
+ * nothing to sign in: only an OAuth login the upstream has signed out
+ * (status `error`) needs one. A key is replaced, not signed in.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @returns {'claude'|'codex'|null}
+ */
+export function needsSignIn(account) {
+  var a = account || {};
+  if (a.type !== 'oauth' || a.status !== 'error' || a.backend) return null;
+  // Its tokens come from a file (importFrom) on every reload, so a sign-in
+  // here would be stored and never used: fileSignInHint says where to go.
+  if (a.credentialsFromFile) return null;
+  return a.provider === 'codex' ? 'codex' : 'claude';
+}
+
+/**
+ * What to do instead, for a signed-out account whose tokens are read from a
+ * credentials file (importFrom): sign in with the tool that owns the file,
+ * then reload. Null for every other account.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @returns {string|null}
+ */
+export function fileSignInHint(account) {
+  var a = account || {};
+  if (a.type !== 'oauth' || a.status !== 'error' || !a.credentialsFromFile) return null;
+  var tool = a.provider === 'codex' ? 'the Codex CLI (codex login)' : 'Claude Code (claude /login)';
+  return 'Its sign-in is read from a credentials file. Sign in again in ' + tool + ', then Reload config on the Settings page.';
+}
+
+/**
+ * Whether the page itself was opened on the proxy's machine. Only then can the
+ * browser reach a loopback listener there and finish a sign-in by itself.
+ *
+ * @param {string} hostname  location.hostname
+ */
+export function isLoopbackHost(hostname) {
+  var h = String(hostname || '').toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]';
+}
+
+/**
+ * POST for one step of a dashboard sign-in: 'start' {provider}, 'code'
+ * {id, code}, 'status' {id} or 'cancel' {id}.
+ *
+ * @param {string} step
+ * @param {Record<string, any>} body
+ * @param {string|null} key
+ */
+export function signInRequest(step, body, key) {
+  return {
+    url: '/teamclaude/login/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * What the sign-in panel offers for a started sign-in: the link to open, and
+ * what to do once the provider is done with the browser.
+ *
+ * Claude hands back two links. The loopback one finishes by itself, but only
+ * for a browser on the proxy's machine; the code-page one works from anywhere
+ * and ends on a page showing a code to paste. Codex has one link whose
+ * redirect names localhost:1455: it finishes by itself on the proxy's machine,
+ * and anywhere else lands on an address that does not load, which is the
+ * thing to paste.
+ *
+ * @param {any} start  the reply to 'start'
+ * @param {string} hostname  location.hostname
+ * @returns {{ href: string, auto: boolean, ask: string, note: string|null }}
+ */
+export function signInPlan(start, hostname) {
+  var s = start || {};
+  var local = isLoopbackHost(hostname);
+  if (s.provider === 'codex') {
+    var auto = local && !!s.listening;
+    return {
+      href: s.url,
+      auto: auto,
+      ask: auto
+        ? 'Approve the sign-in in the new tab and this finishes by itself. If the tab ends on a page that does not load, copy its whole address and paste it here.'
+        : 'Approve the sign-in in the new tab. It then goes to a localhost:1455 address that does not load: copy that whole address from the address bar and paste it here.',
+      note: s.note || null,
+    };
+  }
+  var loop = local && !!s.browserUrl;
+  return {
+    href: loop ? s.browserUrl : s.url,
+    auto: loop,
+    ask: loop
+      ? 'Approve the sign-in in the new tab and this finishes by itself.'
+      : 'Approve the sign-in in the new tab. The page then shows a code: copy it and paste it here.',
+    note: s.note || null,
+  };
+}
+
+/**
+ * Where a polled sign-in stands, as the panel says it. `done` closes the
+ * panel's wait: success, failure, a cancel, or a sign-in the server no longer
+ * knows (it was replaced, or the server restarted).
+ *
+ * @param {any} res  the reply to 'status'
+ * @param {string} label  the provider as the page names it
+ * @returns {{ done: boolean, kind: string, text: string }}
+ */
+export function signInStatusOutcome(res, label) {
+  var r = res || {};
+  if (r.ok !== true) return { done: true, kind: 'error', text: label + ' sign-in failed' + (r.error ? ': ' + r.error : '') };
+  if (r.state === 'succeeded' && r.fileBacked) {
+    return {
+      done: true, kind: 'warn',
+      text: 'Signed in' + (r.account ? ' as ' + r.account : '') + ', but that account reads its sign-in from a credentials file, which TeamClaude keeps using. Sign in again in '
+        + (label === 'Codex' ? 'the Codex CLI' : 'Claude Code') + ', then Reload config.',
+    };
+  }
+  if (r.state === 'succeeded') {
+    var who = r.account ? ' as ' + r.account : '';
+    return { done: true, kind: 'ok', text: (r.action === 'updated' ? 'Signed in to ' + label + ' again' : 'Added the ' + label + ' account') + who };
+  }
+  if (r.state === 'failed') return { done: true, kind: 'error', text: label + ' sign-in failed' + (r.error ? ': ' + r.error : '') };
+  if (r.state === 'cancelled') return { done: true, kind: 'warn', text: label + ' sign-in cancelled' };
+  if (r.state === 'unknown') return { done: true, kind: 'warn', text: label + ' sign-in is no longer running; start it again' };
+  if (r.state === 'finishing') return { done: false, kind: '', text: 'Code accepted, finishing the sign-in…' };
+  return { done: false, kind: '', text: 'Waiting for you to sign in…' };
+}
+
+/**
+ * POST to remove one account. The provider and org go with the name, so the
+ * button removes the account it sits on and not a namesake.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @param {string|null} key
+ */
+export function removeRequest(account, key) {
+  /** @type {{ account: any, provider?: any, org?: any }} */
+  var body = { account: account.name };
+  if (account.provider) body.provider = account.provider;
+  if (account.orgName) body.org = account.orgName;
+  return {
+    url: '/teamclaude/remove',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/** @param {any} res */
+export function removeOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'remove failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: 'Removed ' + res.name + '. TeamClaude no longer holds its sign-in; you stay signed in everywhere else.' };
+}
+
+/**
  * Whether the caller may use the control behind `path`. A status without the
  * `caller` field keeps every control: the server still refuses what it must.
  *
@@ -1004,6 +1177,7 @@ const SHARED_HELPERS = [
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1041,6 +1215,7 @@ const PAGE = `<!doctype html>
     --bg: #0d1117; --side: #0a0e13; --panel: #151b23; --panel2: #1c2430; --line: #262f3b; --track: #252e3a;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd; --accent-bg: rgba(83,177,253,.12);
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    --claude: #e0896a; --codex: #2bb88f; --backend: #a58bf0;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
@@ -1048,6 +1223,7 @@ const PAGE = `<!doctype html>
       --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
       --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
       --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+      --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
     }
   }
   :root[data-theme="light"] {
@@ -1055,6 +1231,7 @@ const PAGE = `<!doctype html>
     --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
     --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
     --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+    --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -1083,6 +1260,7 @@ const PAGE = `<!doctype html>
   .tab { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--dim); cursor: pointer; }
   .tab:hover { color: var(--text); }
   .tab.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
+  .sechead h2 { display: flex; align-items: center; gap: 8px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 8px; }
   .scard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
   .scard .k { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; margin-bottom: 8px; }
@@ -1136,7 +1314,41 @@ const PAGE = `<!doctype html>
   .badge.current, .badge.drain { color: var(--accent); border-color: var(--accent); }
   .badge.plan { color: var(--text); background: var(--panel2); }
   .badge.provider { color: var(--text); }
-  .badge.provider.codex { color: var(--accent); border-color: var(--accent); }
+  .badge.provider.anthropic { color: var(--claude); border-color: var(--claude); }
+  .badge.provider.codex { color: var(--codex); border-color: var(--codex); }
+  /* One colour per provider family (providerTone), on its dot, its section
+     and its sign-in button, so a Claude login and a ChatGPT one never look alike. */
+  .pdot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; background: var(--backend); }
+  .pdot.claude { background: var(--claude); } .pdot.codex { background: var(--codex); }
+  .rows.claude, .pcard.claude { border-left: 3px solid var(--claude); }
+  .rows.codex, .pcard.codex { border-left: 3px solid var(--codex); }
+  .rows.backend, .pcard.backend { border-left: 3px solid var(--backend); }
+  .btn.claude { color: var(--claude); border-color: var(--claude); background: color-mix(in srgb, var(--claude) 12%, transparent); }
+  .btn.codex { color: var(--codex); border-color: var(--codex); background: color-mix(in srgb, var(--codex) 12%, transparent); }
+  .btn.claude:hover, .btn.codex:hover { filter: brightness(1.15); }
+  .btn.claude:hover { color: var(--claude); border-color: var(--claude); } .btn.codex:hover { color: var(--codex); border-color: var(--codex); }
+  .btn.rm { min-width: 112px; }
+  .btn.danger { color: var(--bad); border-color: var(--bad); }
+  .btn.danger:hover { color: #fff; background: var(--bad); border-color: var(--bad); }
+  .addbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+  .addbar .lbl { color: var(--dim); font-size: 13px; margin-right: 2px; }
+  .addbar .btn { font-size: 13px; padding: 6px 14px; display: inline-flex; align-items: center; gap: 8px; }
+  /* The table is wider than a phone; it scrolls inside its card rather than
+     running past the card's edge with the row's buttons out of reach. */
+  .pcard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 4px 6px; margin-bottom: 18px; overflow-x: auto; }
+  .phead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 22px 0 8px; }
+  .phead h2 { margin: 0; display: flex; align-items: center; gap: 8px; }
+  .phead .tag { flex: 1 1 200px; }
+  .signin { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 0 0 16px; }
+  .signin.claude { border-color: var(--claude); } .signin.codex { border-color: var(--codex); }
+  .signin .sh { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 10px; }
+  .signin .sh .sp { flex: 1; }
+  .signin ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
+  .signin .line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 6px; }
+  .signin input { flex: 1 1 260px; min-width: 0; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .signin a.btn { text-decoration: none; display: inline-block; }
+  .signin .st { font-size: 12px; color: var(--dim); margin-top: 10px; }
+  .signin .st.ok { color: var(--ok); } .signin .st.warn { color: var(--warn); } .signin .st.error { color: var(--bad); }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
@@ -1278,8 +1490,9 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-accounts" style="display:none">
-      <div id="accountTools" class="actions"></div>
-      <div class="card" style="padding:4px 6px"><table id="accountTable"></table></div>
+      <div id="addBar" class="addbar"></div>
+      <div id="signIn" class="signin" style="display:none"></div>
+      <div id="accountGroups"></div>
     </section>
 
     <section id="page-logs" style="display:none">
@@ -1601,7 +1814,12 @@ ${SHARED_HELPERS}
   function summaryCard(s, group, members, fable) {
     var card = el('div', 'scard');
     var head = el('div', 'k');
-    head.appendChild(el('span', '', groupLabel(group)));
+    var title = el('span', '', groupLabel(group));
+    title.insertBefore(el('span', 'pdot ' + providerTone(group)), title.firstChild);
+    title.style.display = 'flex';
+    title.style.alignItems = 'center';
+    title.style.gap = '8px';
+    head.appendChild(title);
     head.appendChild(el('span', '', members.length + (members.length === 1 ? ' account' : ' accounts')));
     card.appendChild(head);
     var order = group === 'codex' ? [2, 1] : [0, 1, 2];
@@ -1648,6 +1866,7 @@ ${SHARED_HELPERS}
         currentTab = t.key;
         if (lastStatus) render(lastStatus);
       });
+      if (t.key !== 'all') b.insertBefore(el('span', 'pdot ' + providerTone(t.key)), b.firstChild);
       b.appendChild(el('span', 'count', String(t.count)));
       tabBox.appendChild(b);
     });
@@ -1668,12 +1887,12 @@ ${SHARED_HELPERS}
       var list = members.map(function (m) { return m.a; });
       cards.appendChild(summaryCard(s, g, list, fable));
       var head = el('div', 'sechead');
-      head.appendChild(el('h2', '', groupLabel(g)));
+      head.appendChild(groupHeading(g, groupLabel(g)));
       head.appendChild(el('span', 'count', String(members.length)));
       var cur = currentIn(s, g, list);
       if (cur) head.appendChild(el('span', 'tag', 'current: ' + cur));
       acc.appendChild(head);
-      var rows = el('div', 'rows');
+      var rows = el('div', 'rows ' + providerTone(g));
       members.forEach(function (m) {
         // The probe's list is the fleet in the same order; the name check keeps a
         // payload that ever differs from pairing a row with another account's entry.
@@ -1690,70 +1909,148 @@ ${SHARED_HELPERS}
     return a.status || 'unknown';
   }
 
-  // Every account in one table, with the controls that change where rotation
-  // may reach it. A control this key would be refused is not drawn at all; the
-  // line at the top of the page says why, once (callerNotice).
+  // What each provider section on the Accounts page says it holds.
+  var GROUP_BLURB = {
+    anthropic: 'Claude Pro and Max sign-ins, and Anthropic API keys. Claude Code uses these.',
+    codex: 'ChatGPT sign-ins (Plus, Pro, Business). The Codex CLI uses these.',
+  };
+
+  // The heading over one provider's accounts, wherever they are listed.
+  function groupHeading(group, text) {
+    var h = el('h2');
+    h.appendChild(el('span', 'pdot ' + providerTone(group)));
+    h.appendChild(el('span', '', text));
+    return h;
+  }
+
+  // The accounts, one section per provider, with the controls that change
+  // where rotation may reach each one. A control this key would be refused is
+  // not drawn at all; the line at the top of the page says why, once
+  // (callerNotice). Claude and Codex always get a section, empty or not, so
+  // the page says where a sign-in will land before there is one.
   function renderAccountsPage(s) {
-    var table = document.getElementById('accountTable');
-    table.textContent = '';
-    var hr = el('tr');
-    ['Account', 'Provider', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request', ''].forEach(function (h, i) {
-      hr.appendChild(el('th', i >= 4 && i <= 8 ? 'num' : '', h));
+    var canSignIn = callerCan(s.caller, '/teamclaude/login/start');
+    var canRemove = callerCan(s.caller, '/teamclaude/remove');
+    renderAddBar(canSignIn);
+    var box = document.getElementById('accountGroups');
+    box.textContent = '';
+    var accounts = s.accounts || [];
+    var groups = ['anthropic', 'codex'].concat(providerTabs(accounts).slice(1).map(function (t) { return t.key; })
+      .filter(function (g) { return g !== 'anthropic' && g !== 'codex'; }));
+    groups.forEach(function (g) {
+      var members = accounts.filter(function (a) { return accountGroup(a) === g; });
+      var head = el('div', 'phead');
+      head.appendChild(groupHeading(g, g === 'codex' ? 'Codex (ChatGPT) accounts' : groupLabel(g) + ' accounts'));
+      head.appendChild(el('span', 'count', String(members.length)));
+      head.appendChild(el('span', 'tag', GROUP_BLURB[g] || 'A third-party backend, reached with an API key.'));
+      box.appendChild(head);
+      var card = el('div', 'pcard ' + providerTone(g));
+      box.appendChild(card);
+      if (!members.length) {
+        card.appendChild(el('div', 'empty', canSignIn
+          ? 'No ' + groupLabel(g) + ' accounts yet. Use Sign in to ' + groupLabel(g) + ' above to add one.'
+          : 'No ' + groupLabel(g) + ' accounts yet.'));
+        return;
+      }
+      var table = el('table');
+      card.appendChild(table);
+      var hr = el('tr');
+      ['Account', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request', ''].forEach(function (h, i) {
+        hr.appendChild(el('th', i >= 3 && i <= 7 ? 'num' : '', h));
+      });
+      table.appendChild(hr);
+      members.forEach(function (a) { table.appendChild(accountTableRow(a, s, canSignIn, canRemove)); });
     });
-    table.appendChild(hr);
-    var accounts = (s.accounts || []).slice().sort(function (x, y) {
-      var gx = accountGroup(x), gy = accountGroup(y);
-      return gx === gy ? 0 : gx === 'anthropic' ? -1 : gy === 'anthropic' ? 1 : gx < gy ? -1 : 1;
-    });
-    if (!accounts.length) {
-      var tr0 = el('tr');
-      var td0 = el('td', 'dim', 'No accounts yet.');
-      td0.colSpan = 10;
-      tr0.appendChild(td0);
-      table.appendChild(tr0);
+  }
+
+  function accountTableRow(a, s, canSignIn, canRemove) {
+    var key = cardNoteKey(a);
+    var tr = el('tr');
+    var name = el('td');
+    name.appendChild(el('div', 'name', a.name));
+    if (a.orgName) name.appendChild(el('div', 'tag', a.orgName));
+    var emailLine = accountEmailLine(a);
+    if (emailLine) name.appendChild(el('div', 'tag', emailLine));
+    var cn = cardNoteFor(cardNotes, key, Date.now());
+    if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+    var fileHint = fileSignInHint(a);
+    if (fileHint) name.appendChild(el('div', 'cardnote warn', fileHint));
+    tr.appendChild(name);
+    tr.appendChild(el('td', '', a.plan || a.type || '—'));
+    var st = el('td');
+    st.appendChild(el('span', 'badge ' + (a.disabled ? 'disabled' : (a.status || '')), statusText(a)));
+    if (isCurrentAccount(a, s)) { st.appendChild(el('span', '', ' ')); st.appendChild(el('span', 'badge current', 'current')); }
+    tr.appendChild(st);
+    tr.appendChild(el('td', 'num', String(a.priority || 0)));
+    tr.appendChild(el('td', 'num', (a.sessions || 0) + ' / ' + (a.knownSessions || 0)));
+    var u = a.usage || {};
+    tr.appendChild(el('td', 'num', fmtNum(u.totalRequests)));
+    tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
+    tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
+    var act = el('td', 'num');
+    // Signed out upstream: the one thing that brings it back is a sign-in,
+    // so it comes first. The tokens go to whichever account the browser
+    // signs in as, which the panel says.
+    var again = needsSignIn(a);
+    if (again && canSignIn) {
+      act.appendChild(button('btn ' + again, 'Sign in again', function () { startSignIn(again, a.email || a.name); }));
     }
-    accounts.forEach(function (a) {
-      var key = cardNoteKey(a);
-      var tr = el('tr');
-      var name = el('td');
-      name.appendChild(el('div', 'name', a.name));
-      if (a.orgName) name.appendChild(el('div', 'tag', a.orgName));
-      var emailLine = accountEmailLine(a);
-      if (emailLine) name.appendChild(el('div', 'tag', emailLine));
-      var cn = cardNoteFor(cardNotes, key, Date.now());
-      if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      tr.appendChild(name);
-      tr.appendChild(el('td', '', groupLabel(accountGroup(a))));
-      tr.appendChild(el('td', '', a.plan || a.type || '—'));
-      var st = el('td');
-      st.appendChild(el('span', 'badge ' + (a.disabled ? 'disabled' : (a.status || '')), statusText(a)));
-      if (isCurrentAccount(a, s)) { st.appendChild(el('span', '', ' ')); st.appendChild(el('span', 'badge current', 'current')); }
-      tr.appendChild(st);
-      tr.appendChild(el('td', 'num', String(a.priority || 0)));
-      tr.appendChild(el('td', 'num', (a.sessions || 0) + ' / ' + (a.knownSessions || 0)));
-      var u = a.usage || {};
-      tr.appendChild(el('td', 'num', fmtNum(u.totalRequests)));
-      tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
-      tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
-      var act = el('td', 'num');
-      if (!isCurrentAccount(a, s) && !a.disabled) {
-        var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
-        act.appendChild(ctlSwitch);
-      }
-      if (callerCan(s.caller, '/teamclaude/disable')) {
-        var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
-        act.appendChild(ctlDisable);
-      }
-      // Only enable/disable for a disabled account: the rest would move an
-      // account that nothing will select anyway.
-      if (!a.disabled && callerCan(s.caller, '/teamclaude/priority')) {
-        var ctlFirst = button('btn', 'Prioritize', function () { doControlAccount(a.name, key, { place: 'first' }, ctlFirst); });
-        act.appendChild(ctlFirst);
-        var ctlLast = button('btn', 'Deprioritize', function () { doControlAccount(a.name, key, { place: 'last' }, ctlLast); });
-        act.appendChild(ctlLast);
-      }
-      tr.appendChild(act);
-      table.appendChild(tr);
+    if (!isCurrentAccount(a, s) && !a.disabled) {
+      var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
+      act.appendChild(ctlSwitch);
+    }
+    if (callerCan(s.caller, '/teamclaude/disable')) {
+      var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
+      act.appendChild(ctlDisable);
+    }
+    // Only enable/disable for a disabled account: the rest would move an
+    // account that nothing will select anyway.
+    if (!a.disabled && callerCan(s.caller, '/teamclaude/priority')) {
+      var ctlFirst = button('btn', 'Prioritize', function () { doControlAccount(a.name, key, { place: 'first' }, ctlFirst); });
+      act.appendChild(ctlFirst);
+      var ctlLast = button('btn', 'Deprioritize', function () { doControlAccount(a.name, key, { place: 'last' }, ctlLast); });
+      act.appendChild(ctlLast);
+    }
+    // Two clicks: the first arms the button for a few seconds, the second
+    // removes. There is no undo short of signing in again. Arming changes
+    // nothing but this button, which keeps its width, so no other control
+    // slides under the pointer between the clicks; and a second click too
+    // soon after the first is a double-click, not a decision.
+    // The only account cannot go: the server would refuse to start without it.
+    if (canRemove && (s.accounts || []).length <= 1) {
+      var lone = button('btn rm', 'Remove', function () {});
+      lone.disabled = true;
+      lone.title = 'The proxy needs at least one account to start. Sign in another account first.';
+      act.appendChild(lone);
+    } else if (canRemove) {
+      var armedAt = removeArmed[key];
+      var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+      var ctlRemove = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {
+        if (!armed) { removeArmed[key] = Date.now(); if (lastStatus) render(lastStatus); return; }
+        if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
+        delete removeArmed[key];
+        doRemove(a, key, ctlRemove);
+      });
+      ctlRemove.title = armed ? 'Click again to sign ' + a.name + ' out of TeamClaude' : 'Sign ' + a.name + ' out of TeamClaude';
+      act.appendChild(ctlRemove);
+    }
+    tr.appendChild(act);
+    return tr;
+  }
+
+  // The buttons that add an account. Rebuilt with the page; the sign-in
+  // panel under them is not, so a paste being typed survives the poll.
+  function renderAddBar(canSignIn) {
+    var bar = document.getElementById('addBar');
+    bar.textContent = '';
+    bar.style.display = canSignIn ? '' : 'none';
+    if (!canSignIn) return;
+    bar.appendChild(el('span', 'lbl', 'Add an account:'));
+    [['claude', 'Sign in to Claude', 'Sign in with a Claude Pro or Max account'], ['codex', 'Sign in to Codex', 'Sign in with a ChatGPT account, for the Codex CLI']].forEach(function (p) {
+      var b = button('btn ' + p[0], p[1], function () { startSignIn(p[0], null); });
+      b.title = p[2];
+      b.insertBefore(el('span', 'pdot ' + p[0]), b.firstChild);
+      bar.appendChild(b);
     });
   }
 
@@ -2292,6 +2589,265 @@ ${SHARED_HELPERS}
       // above, and a button that stayed dead after a refused change would be
       // the only control an operator could not retry.
       .finally(function () { btn.disabled = false; });
+  }
+
+  // Remove armed by a first click, by card, and how long the arming lasts.
+  // No prototype: an account named __proto__ would otherwise set it.
+  var removeArmed = Object.create(null);
+  var REMOVE_CONFIRM_MS = 8000;
+  var REMOVE_DOUBLE_CLICK_MS = 400;
+
+  // The account leaves TeamClaude: the running fleet and the config file,
+  // credentials included. Nothing is revoked upstream, so the login keeps
+  // working wherever else it is signed in.
+  function doRemove(account, noteKey, btn) {
+    btn.disabled = true;
+    var r = removeRequest(account, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = removeOutcome(json);
+        // The page-wide note: on success the row this would sit on is gone.
+        if (out.kind === 'ok') note(out.kind, out.text);
+        else cardNote(noteKey, out.kind, out.text, false);
+        poll();
+      })
+      .catch(function (e) { cardNote(noteKey, 'error', 'remove failed: ' + e.message, true); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The dashboard's one sign-in (the server runs one at a time): which
+  // provider, the server's id for it once started, and what the panel shows.
+  // seq tells a reply from a sign-in that has since been replaced.
+  var signIn = null;
+  var signInSeq = 0;
+  var signInTimer = null;
+  var SIGN_IN_POLL_MS = 2000;
+  var SIGN_IN_LABEL = { claude: 'Claude', codex: 'Codex' };
+
+  function pageHost() {
+    return typeof location !== 'undefined' ? location.hostname : '';
+  }
+
+  function signInFetch(step, body) {
+    var r = signInRequest(step, body, localStorage.getItem(KEY));
+    return fetch(r.url, r.init).then(function (res) {
+      if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+      return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+    });
+  }
+
+  function stopSignInPoll() {
+    if (signInTimer) { clearInterval(signInTimer); signInTimer = null; }
+  }
+
+  // who is the account a Sign in again button stands on, so the panel can
+  // say which login to use; null for a new account. A sign-in already under
+  // way keeps its panel until the server has taken the new one: it refuses
+  // while the last one is finishing, and that one's outcome must still show.
+  function startSignIn(provider, who) {
+    var prev = signIn && signIn.id && !signIn.done ? signIn : null;
+    var seq = ++signInSeq;
+    var next = { seq: seq, provider: provider, who: who, id: null, plan: null, done: false, pasteError: null, notice: null, status: { kind: '', text: 'Starting the sign-in…' } };
+    showPage('accounts');
+    if (!prev) {
+      stopSignInPoll();
+      signIn = next;
+      renderSignIn();
+    }
+    var refused = function (text) {
+      if (seq !== signInSeq) return;
+      if (prev && signIn === prev) {
+        prev.notice = text;
+        renderSignIn();
+        return;
+      }
+      if (signIn !== next) return;
+      next.done = true;
+      next.status = { kind: 'error', text: text };
+      renderSignIn();
+    };
+    signInFetch('start', { provider: provider })
+      .then(function (json) {
+        if (!json) return;
+        if (json.ok !== true) { refused('The sign-in could not start' + (json.error ? ': ' + json.error : '')); return; }
+        if (seq !== signInSeq) return;
+        stopSignInPoll();
+        signIn = next;
+        next.id = json.id;
+        next.plan = signInPlan(json, pageHost());
+        next.status = { kind: '', text: 'Waiting for you to sign in…' };
+        renderSignIn();
+        signInTimer = setInterval(pollSignIn, SIGN_IN_POLL_MS);
+      })
+      .catch(function (e) { refused('The sign-in could not start: ' + e.message); });
+  }
+
+  function pollSignIn() {
+    if (!signIn || !signIn.id || signIn.done) { stopSignInPoll(); return; }
+    var seq = signIn.seq;
+    signInFetch('status', { id: signIn.id })
+      .then(function (json) {
+        if (!json || !signIn || signIn.seq !== seq || signIn.done) return;
+        var out = signInStatusOutcome(json, SIGN_IN_LABEL[signIn.provider]);
+        if (!out.done) { setSignInStatus(out); return; }
+        stopSignInPoll();
+        if (out.kind === 'ok') {
+          signIn = null;
+          renderSignIn();
+          note('ok', out.text);
+          poll();
+          return;
+        }
+        signIn.done = true;
+        signIn.status = out;
+        renderSignIn();
+      })
+      // A missed poll is retried by the next one.
+      .catch(function () {});
+  }
+
+  function submitSignInCode(input, btn) {
+    if (!signIn || !signIn.id) return;
+    var code = input.value.trim();
+    if (!code) { signIn.pasteError = 'Paste the ' + (signIn.provider === 'codex' ? 'address' : 'code') + ' first.'; renderSignIn(); return; }
+    var seq = signIn.seq;
+    btn.disabled = true;
+    signInFetch('code', { id: signIn.id, code: code })
+      .then(function (json) {
+        if (!json || !signIn || signIn.seq !== seq) return;
+        if (json.ok !== true) {
+          signIn.pasteError = json.error || 'that could not be used';
+          renderSignIn();
+          return;
+        }
+        signIn.pasteError = null;
+        signIn.pasted = true;
+        renderSignIn();
+        pollSignIn();
+      })
+      .catch(function (e) {
+        if (!signIn || signIn.seq !== seq) return;
+        signIn.pasteError = 'could not send it: ' + e.message;
+        renderSignIn();
+      })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // Close the panel, cancelling a sign-in still waiting. One whose code has
+  // arrived cannot be cancelled (the server says cancelled: false): the panel
+  // stays and follows it to the end, since an account is stored either way.
+  function closeSignIn() {
+    if (!signIn) return;
+    if (!signIn.id || signIn.done) {
+      stopSignInPoll();
+      signIn = null;
+      renderSignIn();
+      return;
+    }
+    var seq = signIn.seq;
+    signInFetch('cancel', { id: signIn.id })
+      .then(function (json) {
+        if (!json || !signIn || signIn.seq !== seq) return;
+        if (json.ok === true && json.cancelled === false) {
+          signIn.notice = 'The code has already arrived, so this sign-in can no longer be cancelled. It is being finished.';
+          renderSignIn();
+          pollSignIn();
+          return;
+        }
+        if (json.ok !== true) {
+          signIn.notice = 'Could not cancel' + (json.error ? ': ' + json.error : '');
+          renderSignIn();
+          return;
+        }
+        stopSignInPoll();
+        signIn = null;
+        renderSignIn();
+      })
+      .catch(function (e) {
+        if (!signIn || signIn.seq !== seq) return;
+        signIn.notice = 'Could not cancel: ' + e.message;
+        renderSignIn();
+      });
+  }
+
+  // Only the status line, while the person may be typing a paste: rebuilding
+  // the panel would drop what is in the field.
+  var signInStatusEl = null;
+  function setSignInStatus(out) {
+    if (!signIn) return;
+    signIn.status = out;
+    if (signInStatusEl) {
+      signInStatusEl.className = 'st' + (out.kind ? ' ' + out.kind : '');
+      signInStatusEl.textContent = out.text;
+    }
+  }
+
+  function renderSignIn() {
+    var box = document.getElementById('signIn');
+    box.textContent = '';
+    signInStatusEl = null;
+    if (!signIn) { box.style.display = 'none'; return; }
+    var p = signIn.provider;
+    var label = SIGN_IN_LABEL[p];
+    box.className = 'signin ' + p;
+    box.style.display = '';
+    var head = el('div', 'sh');
+    head.appendChild(el('span', 'pdot ' + p));
+    head.appendChild(el('span', 'sp', (signIn.who ? 'Sign in to ' + label + ' again' : 'Sign in to ' + label)));
+    head.appendChild(button('btn', signIn.done ? 'Close' : 'Cancel', closeSignIn));
+    box.appendChild(head);
+    var plan = signIn.plan;
+    if (plan && !signIn.done) {
+      var steps = el('ol');
+      var one = el('li', '', signIn.who
+        ? 'Open the sign-in page and sign in as ' + signIn.who + '.'
+        : 'Open the sign-in page and sign in with the ' + (p === 'codex' ? 'ChatGPT' : 'Claude') + ' account you want to add.');
+      var line = el('div', 'line');
+      var open = el('a', 'btn ' + p, 'Open sign-in page');
+      open.href = plan.href;
+      open.target = '_blank';
+      open.rel = 'noopener noreferrer';
+      line.appendChild(open);
+      // The link itself, to copy to a browser on another device.
+      var link = el('input');
+      link.readOnly = true;
+      link.value = plan.href;
+      link.title = 'The sign-in link, to open on another device';
+      link.addEventListener('focus', function () { this.select(); });
+      line.appendChild(link);
+      one.appendChild(line);
+      steps.appendChild(one);
+      var two = el('li', '', plan.ask);
+      var line2 = el('div', 'line');
+      var paste = el('input');
+      paste.placeholder = p === 'codex' ? 'http://localhost:1455/auth/callback?code=…' : 'Paste the code here';
+      paste.autocomplete = 'off';
+      paste.spellcheck = false;
+      var finish = button('btn primary', 'Finish sign-in', function () { submitSignInCode(paste, finish); });
+      paste.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitSignInCode(paste, finish); });
+      line2.appendChild(paste);
+      line2.appendChild(finish);
+      two.appendChild(line2);
+      if (signIn.pasteError) two.appendChild(el('div', 'st error', signIn.pasteError));
+      steps.appendChild(two);
+      box.appendChild(steps);
+      if (plan.note) box.appendChild(el('div', 'st warn', plan.note));
+      box.appendChild(el('div', 'st', 'Signing in to an account TeamClaude already has refreshes its sign-in instead of adding it twice.'));
+    }
+    if (signIn.notice) box.appendChild(el('div', 'st warn', signIn.notice));
+    var st = signIn.status || { kind: '', text: '' };
+    signInStatusEl = el('div', 'st' + (st.kind ? ' ' + st.kind : ''), st.text);
+    box.appendChild(signInStatusEl);
+    if (signIn.done) {
+      var who = signIn.who;
+      var provider = p;
+      box.appendChild(button('btn ' + p, 'Try again', function () { startSignIn(provider, who); }));
+    }
   }
 
   // One account's quota, read now from the zero-spend usage endpoint. The
