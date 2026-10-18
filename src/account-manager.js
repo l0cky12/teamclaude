@@ -2481,11 +2481,12 @@ export class AccountManager {
     const currentIndex = this._currentIndexForProvider(provider);
     const current = this.accounts[currentIndex];
     // Drain mode's walk, read without moving anything: the scope's resting
-    // account while nothing displaces it, else the head of the drain order.
+    // account while nothing displaces it, else the account that does, and the
+    // head of the drain order when there is no resting account to displace.
     if (this.distributionMode === 'drain') {
       const { incumbent } = this._drainIncumbent(current ?? null, excluded, model, null, provider);
-      if (incumbent && !this._drainDisplacement(incumbent, excluded, model, null)) return incumbent.index;
-      return this._pickBestAvailable(excluded, model)?.index ?? null;
+      if (!incumbent) return this._pickBestAvailable(excluded, model)?.index ?? null;
+      return (this._drainChallenger(incumbent, excluded, model, null)?.account ?? incumbent).index;
     }
     if (current && this._isAvailable(current, model)) {
       // Mirror getActiveAccount's priority preemption: a strictly higher-priority
@@ -4404,20 +4405,30 @@ export class AccountManager {
    * The 5-hour window is not a key: it is the availability gate, so an
    * account whose 5-hour window is used up is simply not in the list until it
    * resets. Expiry pressure is not consulted either, nor the expiry band.
+   *
+   * `unknownLast` ranks an unknown reset after the known ones in its tier
+   * instead of before them. A pick that has to be made moves the
+   * conversations anyway, so it may as well learn a window; a move nothing
+   * forces would pay for the lesson with a second move (_drainChallenger).
    * @param {Set<number>|null} [exclude]
    * @param {string|null} [model]
    * @param {string|null} [advisorModel]
+   * @param {{ unknownLast?: boolean }} [options]
    * @returns {Array<Record<string, any>>}
    */
-  _drainOrder(exclude = null, model = null, advisorModel = null) {
+  _drainOrder(exclude = null, model = null, advisorModel = null, { unknownLast = false } = {}) {
+    const unknown = unknownLast ? Infinity : -Infinity;
     const ranked = this.accounts
       .filter(a => !exclude?.has(a.index) && this._isAvailable(a, model, advisorModel))
-      .map(a => ({
-        account: a,
-        priority: a.priority || 0,
-        hour: this._drainResetHour(a, model),
-        used: this._governingWeekly(a, model) ?? -Infinity,
-      }));
+      .map(a => {
+        const hour = this._drainResetHour(a, model);
+        return {
+          account: a,
+          priority: a.priority || 0,
+          hour: hour === -Infinity ? unknown : hour,
+          used: this._governingWeekly(a, model) ?? -Infinity,
+        };
+      });
     // Spelled out rather than subtracted: -Infinity minus itself is NaN.
     const cmp = (/** @type {number} */ x, /** @type {number} */ y) => (x === y ? 0 : x < y ? -1 : 1);
     ranked.sort((x, y) => cmp(x.priority, y.priority) || cmp(x.hour, y.hour)
@@ -4426,9 +4437,12 @@ export class AccountManager {
   }
 
   /**
-   * Why `incumbent` should give way, or null when it holds: 'priority' when an
-   * account in a better priority tier can serve this request, 'reset' when one
-   * in the same tier has a KNOWN weekly reset in a strictly earlier hour.
+   * Where `incumbent`, which can still serve this request, should give way to,
+   * and why; null when it holds. Only an account that may displace it is a
+   * candidate: one in a better priority tier ('priority'), or one in the same
+   * tier with a KNOWN weekly reset in a strictly earlier hour ('reset'). Among
+   * those, the first in drain order with an unknown reset after the known ones,
+   * so the best tier wins and, within it, the soonest known reset.
    *
    * Deliberately narrower than _drainOrder. The remaining-quota tie-break is
    * not a reason to move: two accounts resetting in the same hour would trade
@@ -4437,28 +4451,32 @@ export class AccountManager {
    * lapsed reads as unknown until the account is used again, and its new reset
    * is the furthest out in the fleet, so moving there to find that out and
    * straight back again buys nothing. Both still decide a pick that has to be
-   * made anyway (_drainOrder).
+   * made anyway (_drainOrder). The move goes to the account that justified it,
+   * not to the head of the full order: that head can be an unknown reset or a
+   * same-hour tie, a move the rule refuses, which one qualifying account
+   * elsewhere would otherwise license.
    * @param {Record<string, any>} incumbent
    * @param {Set<number>|null} exclude
    * @param {string|null} model
    * @param {string|null} advisorModel
-   * @returns {'priority'|'reset'|null}
+   * @returns {{ account: Record<string, any>, reason: 'priority'|'reset' }|null}
    */
-  _drainDisplacement(incumbent, exclude, model, advisorModel) {
+  _drainChallenger(incumbent, exclude, model, advisorModel) {
+    // The order first: its availability check clears a window whose reset has
+    // passed, which a reset read before it would still name as the soonest.
+    const order = this._drainOrder(exclude, model, advisorModel, { unknownLast: true });
     const priority = incumbent.priority || 0;
     const hour = this._drainResetHour(incumbent, model);
-    /** @type {'priority'|'reset'|null} */
-    let found = null;
-    for (const a of this.accounts) {
-      if (a === incumbent || exclude?.has(a.index) || (a.priority || 0) > priority) continue;
-      // Availability first: it clears a window whose reset has passed, which a
-      // reset read before it would still name as the soonest.
-      if (!this._isAvailable(a, model, advisorModel)) continue;
-      if ((a.priority || 0) < priority) return 'priority';
-      const h = this._drainResetHour(a, model);
-      if (h !== -Infinity && h < hour) found = 'reset';
+    for (const account of order) {
+      if (account === incumbent) continue;
+      const tier = account.priority || 0;
+      if (tier < priority) return { account, reason: 'priority' };
+      // Sorted by tier: nothing from here on is in a better or the same one.
+      if (tier > priority) break;
+      const h = this._drainResetHour(account, model);
+      if (h !== -Infinity && h < hour) return { account, reason: 'reset' };
     }
-    return found;
+    return null;
   }
 
   /**
@@ -4472,7 +4490,12 @@ export class AccountManager {
    *     back;
    *   - a request the current account cannot serve while it still serves
    *     everything else (a route, the advisor's family).
-   * Either falls back to the current account when its holder cannot serve.
+   * A scope with no holder yet starts from the current account. Once it has
+   * one, a holder that cannot serve leaves no incumbent, so its replacement is
+   * a full drain-order pick: the conversations on the holder miss their
+   * prompt cache wherever they go, which leaves the current account no better
+   * claim on them than the account the order puts first, and falling back to
+   * it would skip the remaining-quota tie-break.
    * @param {Record<string, any>|null} current
    * @param {Set<number>|null} exclude
    * @param {string|null} model
@@ -4490,14 +4513,16 @@ export class AccountManager {
     if (!apart) return { incumbent: serves(current) ? current : null, apart, key, held: null };
     const idx = this._drainHolders.get(key);
     const held = idx != null ? (this.accounts[idx] ?? null) : null;
-    return { incumbent: serves(held) ? held : serves(current) ? current : null, apart, key, held };
+    if (held) return { incumbent: serves(held) ? held : null, apart, key, held };
+    return { incumbent: serves(current) ? current : null, apart, key, held };
   }
 
   /**
    * Drain mode's selection: stay on the account this request's scope rests on
-   * until it cannot serve or something strictly better appears (a better
-   * priority tier, or a known weekly reset in an earlier hour), then take the
-   * head of _drainOrder. A move for the shared scope moves the cursor; a move
+   * until something strictly better appears (a better priority tier, or a
+   * known weekly reset in an earlier hour), and move to that account
+   * (_drainChallenger); or until it cannot serve, and take the head of
+   * _drainOrder. A move for the shared scope moves the cursor; a move
    * for a scope that rests apart (see _drainIncumbent) moves only its holder.
    * Each move is logged once, with its reason. Returns null when nothing can
    * serve, leaving the exhausted-fleet handling to the caller.
@@ -4509,12 +4534,12 @@ export class AccountManager {
   _selectDrainMode(exclude, model, advisorModel) {
     const current = this.accounts[this.currentIndex] ?? null;
     const { incumbent, apart, key, held } = this._drainIncumbent(current, exclude, model, advisorModel);
-    const displaced = incumbent ? this._drainDisplacement(incumbent, exclude, model, advisorModel) : null;
-    if (incumbent && !displaced) {
+    const challenger = incumbent ? this._drainChallenger(incumbent, exclude, model, advisorModel) : null;
+    if (incumbent && !challenger) {
       if (apart) this._drainHolders.set(key, incumbent.index);
       return incumbent;
     }
-    const best = this._pickBestAvailable(exclude, model, advisorModel);
+    const best = challenger?.account ?? this._pickBestAvailable(exclude, model, advisorModel);
     if (!best) return null;
     // What this request moved off, for the log. The shared slot can name
     // another provider's account (a first request for this provider borrows
@@ -4530,10 +4555,8 @@ export class AccountManager {
       this._beginRamp(best);
       const name = (/** @type {Record<string, any>} */ a) => `"${safeLine(a.name, 64)}"`;
       let why = '';
-      if (incumbent && displaced === 'priority') why = ` — higher priority than ${name(incumbent)}`;
-      else if (incumbent && this._drainResetHour(best, model) === -Infinity) {
-        why = ` — ${name(incumbent)} is outranked and ${name(best)}'s weekly reset is not known yet`;
-      } else if (incumbent) why = ` — its weekly quota resets sooner than ${name(incumbent)}'s`;
+      if (incumbent && challenger?.reason === 'priority') why = ` — higher priority than ${name(incumbent)}`;
+      else if (incumbent) why = ` — its weekly quota resets sooner than ${name(incumbent)}'s`;
       else if (from) why = ` — ${name(from)} cannot serve, and ${name(best)} resets soonest`;
       else why = ' — first in drain order';
       console.log(apart
@@ -4545,10 +4568,12 @@ export class AccountManager {
 
   /**
    * Drain order per provider partition for a model-agnostic request, as the
-   * router will follow it: the account the cursor is draining comes first while
-   * nothing displaces it (_drainDisplacement), since the remaining-quota
-   * tie-break never moves it off. Only accounts that can serve right now.
-   * Account indexes, keyed by provider.
+   * router will follow it. First the account the next request goes to: the one
+   * the cursor is draining while nothing displaces it, since the remaining-
+   * quota tie-break never moves it off, else the account that does
+   * (_drainChallenger), which need not head a fresh pick. The rest follow in
+   * drain order, as each pick made when an account runs out takes them. Only
+   * accounts that can serve right now. Account indexes, keyed by provider.
    * @returns {Record<string, number[]>}
    */
   _drainQueue() {
@@ -4559,8 +4584,9 @@ export class AccountManager {
       let order = this._drainOrder(excluded, null, null);
       const idx = this._currentIndexForProvider(provider);
       const current = idx != null ? (this.accounts[idx] ?? null) : null;
-      if (current && order.includes(current) && !this._drainDisplacement(current, excluded, null, null)) {
-        order = [current, ...order.filter(a => a !== current)];
+      if (current && order.includes(current)) {
+        const next = this._drainChallenger(current, excluded, null, null)?.account ?? current;
+        order = [next, ...order.filter(a => a !== next)];
       }
       queue[provider] = order.map(a => a.index);
     }

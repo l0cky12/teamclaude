@@ -198,6 +198,40 @@ test('a Fable request ranks by the Fable weekly reset and moves only its own sco
   assert.equal(am.getStatus().routes.find(r => r.name === 'fable').target, 'b');
 });
 
+test('a holder that runs out is replaced by the full drain order, not by the shared cursor', () => {
+  const base = hourBase();
+  const am = mgr(['a', 'b', 'c']);
+  // 'a' holds the shared cursor. For Fable, 'b' resets first; 'a' and 'c'
+  // reset in the same later hour, 'a' with 10% of its Fable weekly left and
+  // 'c' with 70%.
+  weekly(am, 0, 0.2, base + 24 * H);
+  fableWeekly(am, 0, 0.90, base + 50 * H + 5 * M);
+  weekly(am, 1, 0.2, base + 72 * H);
+  fableWeekly(am, 1, 0.10, base + 30 * H);
+  weekly(am, 2, 0.2, base + 72 * H);
+  fableWeekly(am, 2, 0.30, base + 50 * H + 40 * M);
+  drainLog(() => {
+    assert.equal(pick(am, OPUS), 'a');
+    assert.equal(pick(am, FABLE), 'b');
+  });
+
+  // The Fable holder runs out. Its conversations lose their cache wherever
+  // they go, so the shared cursor has no claim on them: the pick is the drain
+  // order's, and the same-hour tie goes to the most remaining.
+  am.accounts[1].quota.unified7dFable = 0.99;
+  assert.deepEqual(am._drainOrder(null, FABLE).map(a => a.name), ['c', 'a']);
+  assert.equal(am.getStatus().routes.find(r => r.name === 'fable').target, 'c');
+  const lines = drainLog(() => assert.equal(pick(am, FABLE), 'c'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Drain: routing "claude-fable-5" to "c" — "b" cannot serve/);
+  // The shared scope did not move, and 'c' now holds Fable.
+  assert.equal(am.currentIndex, 0);
+  assert.equal(drainLog(() => {
+    assert.equal(pick(am, OPUS), 'a');
+    assert.equal(pick(am, FABLE), 'c');
+  }).length, 0);
+});
+
 test('a same-hour tie is broken by the most weekly remaining', () => {
   const base = hourBase();
   const am = mgr(['a', 'b', 'c']);
@@ -299,6 +333,65 @@ test('an unknown weekly reset ranks first for a new pick but never displaces the
   // so its window is learned.
   am.accounts[0].quota.unified7d = 0.99;
   drainLog(() => assert.equal(pick(am), 'b'));
+});
+
+test('a move off a usable account goes only to one that may displace it, never to an unknown reset', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const base = hourBase();
+  const am = mgr(['a', 'b', 'c']);
+  weekly(am, 0, 0.30, base + 48 * H);
+  weekly(am, 1, 0.30, base + 24 * H);
+  session(am, 1, 0.99, Date.now() + 2 * H);
+  // 'c' has no weekly reading yet, so it heads a fresh pick.
+  assert.equal(am._drainOrder()[0].name, 'c');
+  assert.equal(pick(am), 'a');
+
+  t.mock.timers.tick(2 * H + 1);
+  // 'b' is back and resets a day sooner than 'a': a reason to move. The move
+  // goes to 'b' itself, not to the head of a fresh pick: moving to 'c' would
+  // be a move an unknown reset made, and would move again to 'b' as soon as
+  // c's window came back later than b's.
+  const status = am.getStatus();
+  assert.deepEqual(status.drainQueue[DEFAULT_PROVIDER], ['b', 'c', 'a']);
+  assert.equal(status.defaultTarget, 'b');
+  const lines = drainLog(() => assert.equal(pick(am), 'b'));
+  assert.equal(am.currentIndex, 1);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Drain: switched to account "b" — its weekly quota resets sooner than "a"'s/);
+
+  // Learning c's window later than b's moves nothing.
+  weekly(am, 2, 0.30, base + 72 * H);
+  assert.equal(drainLog(() => assert.equal(pick(am), 'b')).length, 0);
+});
+
+test('a move to a better tier prefers a known reset there, and the unknown waits for a pick that has to be made', () => {
+  const base = hourBase();
+  const am = mgr([oauth('a', { priority: 1 }), oauth('b'), oauth('c'), oauth('d', { priority: 1 })]);
+  weekly(am, 0, 0.30, base + 48 * H);
+  weekly(am, 1, 0.30, base + 24 * H);
+  // 'c' has no weekly reading.
+  am.setDisabled(1, true);
+  am.setDisabled(2, true);
+  weekly(am, 3, 0.30, base + 2 * H);
+  drainLog(() => assert.equal(pick(am), 'd'));
+
+  // 'b' and 'c' come back in the better tier: the tier is reason enough to
+  // move, whatever either reset reads. A fresh pick would take 'c' to learn
+  // its window; a move off an account that could have stayed takes 'b', whose
+  // reset is known, rather than move to 'c' and very likely on again.
+  am.setDisabled(1, false);
+  am.setDisabled(2, false);
+  assert.equal(am._drainOrder()[0].name, 'c');
+  assert.deepEqual(am.getStatus().drainQueue[DEFAULT_PROVIDER], ['b', 'c', 'd', 'a']);
+  let lines = drainLog(() => assert.equal(pick(am), 'b'));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Drain: switched to account "b" — higher priority than "d"/);
+  assert.equal(drainLog(() => assert.equal(pick(am), 'b')).length, 0);
+
+  // When 'b' runs out the pick has to be made, and the unknown goes first.
+  am.accounts[1].quota.unified7d = 0.99;
+  lines = drainLog(() => assert.equal(pick(am), 'c'));
+  assert.match(lines[0], /Drain: switched to account "c" — "b" cannot serve/);
 });
 
 test('the Claude and Codex pools are ranked independently', () => {
