@@ -1751,3 +1751,43 @@ test('status says whether an account reads its sign-in from a file, and never wh
   assert.equal(inline.credentialsFromFile, false);
   assert.doesNotMatch(JSON.stringify(am.getStatus()), /demo-creds/);
 });
+
+// A panel with a Codex sign-in the server has started, id 'abc'.
+async function pageWithSignIn() {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Sign in to Codex');
+  await page.answer(200, { ok: true, id: 'abc', provider: 'codex', url: 'https://auth.openai.com/oauth/authorize?x=1', browserUrl: null, listening: true });
+  return page;
+}
+
+test('Cancel on a sign-in whose code has arrived keeps the panel and follows it to the end', async () => {
+  const page = await pageWithSignIn();
+  page.click('Cancel');
+  assert.equal(page.requests[0].url, '/teamclaude/login/cancel');
+  await page.answer(200, { ok: true, cancelled: false });
+  assert.notEqual(page.byId('signIn').style.display, 'none', 'the panel stays');
+  assert.ok(page.findLast(e => /can no longer be cancelled/.test(e.textContent)), 'and says why');
+  const status = page.requests[0];
+  assert.equal(status.url, '/teamclaude/login/status');
+  assert.deepEqual(JSON.parse(status.init.body), { id: 'abc' }, 'still asking about the same sign-in');
+  await page.answer(200, { ok: true, state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'added' });
+  assert.match(page.byId('note').textContent, /Added the Codex account as me@example\.com$/);
+});
+
+test('Cancel the server honours closes the panel', async () => {
+  const page = await pageWithSignIn();
+  page.click('Cancel');
+  await page.answer(200, { ok: true, cancelled: true });
+  assert.equal(page.byId('signIn').style.display, 'none');
+});
+
+test('a new sign-in the server refuses leaves the one under way on the panel', async () => {
+  const page = await pageWithSignIn();
+  page.click('Sign in to Claude');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { provider: 'claude' });
+  await page.answer(400, { ok: false, error: 'the last sign-in is still finishing; it shows in the list in a moment' });
+  assert.ok(page.findLast(e => /still finishing/.test(e.textContent)), 'the refusal is on the panel');
+  assert.ok(page.findLast(e => e.textContent === 'Sign in to Codex' && e.className === 'sp'), 'which is still the Codex one');
+  assert.ok(page.findLast(e => e.textContent === 'Open sign-in page'), 'with its link');
+});

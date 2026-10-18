@@ -2640,34 +2640,45 @@ ${SHARED_HELPERS}
   }
 
   // who is the account a Sign in again button stands on, so the panel can
-  // say which login to use; null for a new account.
+  // say which login to use; null for a new account. A sign-in already under
+  // way keeps its panel until the server has taken the new one: it refuses
+  // while the last one is finishing, and that one's outcome must still show.
   function startSignIn(provider, who) {
-    stopSignInPoll();
+    var prev = signIn && signIn.id && !signIn.done ? signIn : null;
     var seq = ++signInSeq;
-    signIn = { seq: seq, provider: provider, who: who, id: null, plan: null, done: false, pasteError: null, status: { kind: '', text: 'Starting the sign-in…' } };
+    var next = { seq: seq, provider: provider, who: who, id: null, plan: null, done: false, pasteError: null, notice: null, status: { kind: '', text: 'Starting the sign-in…' } };
     showPage('accounts');
-    renderSignIn();
+    if (!prev) {
+      stopSignInPoll();
+      signIn = next;
+      renderSignIn();
+    }
+    var refused = function (text) {
+      if (seq !== signInSeq) return;
+      if (prev && signIn === prev) {
+        prev.notice = text;
+        renderSignIn();
+        return;
+      }
+      if (signIn !== next) return;
+      next.done = true;
+      next.status = { kind: 'error', text: text };
+      renderSignIn();
+    };
     signInFetch('start', { provider: provider })
       .then(function (json) {
-        if (!json || !signIn || signIn.seq !== seq) return;
-        if (json.ok !== true) {
-          signIn.done = true;
-          signIn.status = { kind: 'error', text: 'The sign-in could not start' + (json.error ? ': ' + json.error : '') };
-          renderSignIn();
-          return;
-        }
-        signIn.id = json.id;
-        signIn.plan = signInPlan(json, pageHost());
-        signIn.status = { kind: '', text: 'Waiting for you to sign in…' };
+        if (!json) return;
+        if (json.ok !== true) { refused('The sign-in could not start' + (json.error ? ': ' + json.error : '')); return; }
+        if (seq !== signInSeq) return;
+        stopSignInPoll();
+        signIn = next;
+        next.id = json.id;
+        next.plan = signInPlan(json, pageHost());
+        next.status = { kind: '', text: 'Waiting for you to sign in…' };
         renderSignIn();
         signInTimer = setInterval(pollSignIn, SIGN_IN_POLL_MS);
       })
-      .catch(function (e) {
-        if (!signIn || signIn.seq !== seq) return;
-        signIn.done = true;
-        signIn.status = { kind: 'error', text: 'The sign-in could not start: ' + e.message };
-        renderSignIn();
-      });
+      .catch(function (e) { refused('The sign-in could not start: ' + e.message); });
   }
 
   function pollSignIn() {
@@ -2721,11 +2732,41 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  // Close the panel, cancelling a sign-in still waiting. One whose code has
+  // arrived cannot be cancelled (the server says cancelled: false): the panel
+  // stays and follows it to the end, since an account is stored either way.
   function closeSignIn() {
-    stopSignInPoll();
-    if (signIn && signIn.id && !signIn.done) signInFetch('cancel', { id: signIn.id }).catch(function () {});
-    signIn = null;
-    renderSignIn();
+    if (!signIn) return;
+    if (!signIn.id || signIn.done) {
+      stopSignInPoll();
+      signIn = null;
+      renderSignIn();
+      return;
+    }
+    var seq = signIn.seq;
+    signInFetch('cancel', { id: signIn.id })
+      .then(function (json) {
+        if (!json || !signIn || signIn.seq !== seq) return;
+        if (json.ok === true && json.cancelled === false) {
+          signIn.notice = 'The code has already arrived, so this sign-in can no longer be cancelled. It is being finished.';
+          renderSignIn();
+          pollSignIn();
+          return;
+        }
+        if (json.ok !== true) {
+          signIn.notice = 'Could not cancel' + (json.error ? ': ' + json.error : '');
+          renderSignIn();
+          return;
+        }
+        stopSignInPoll();
+        signIn = null;
+        renderSignIn();
+      })
+      .catch(function (e) {
+        if (!signIn || signIn.seq !== seq) return;
+        signIn.notice = 'Could not cancel: ' + e.message;
+        renderSignIn();
+      });
   }
 
   // Only the status line, while the person may be typing a paste: rebuilding
@@ -2792,6 +2833,7 @@ ${SHARED_HELPERS}
       if (plan.note) box.appendChild(el('div', 'st warn', plan.note));
       box.appendChild(el('div', 'st', 'Signing in to an account TeamClaude already has refreshes its sign-in instead of adding it twice.'));
     }
+    if (signIn.notice) box.appendChild(el('div', 'st warn', signIn.notice));
     var st = signIn.status || { kind: '', text: '' };
     signInStatusEl = el('div', 'st' + (st.kind ? ' ' + st.kind : ''), st.text);
     box.appendChild(signInStatusEl);

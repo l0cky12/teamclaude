@@ -742,11 +742,10 @@ async function serverCommand() {
       outcome = await upsertOAuthAccount(undefined, await flow.tokens, 'login', null, false, { fatal: false, notify: false });
     }
     await reloadAccounts();
-    // Tokens stored for an account that reads its own from a file
-    // (`importFrom`) are not the ones it uses: the reload just read that file
+    // The upsert reports `fileBacked` for the exact entry it updated: one that
+    // reads its tokens from a file (`importFrom`), which the reload just read
     // again. The caller says so instead of reporting a repaired account.
-    const fileBacked = accountManager.accounts.some((/** @type {any} */ a) => a.name === outcome?.name && a.credentialsFromFile);
-    return outcome ? { ...outcome, fileBacked } : outcome;
+    return outcome;
   };
 
   /**
@@ -1328,10 +1327,10 @@ async function loginCodexCommand() {
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
  * existing entry rather than given with --routing: used, never written. True
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
- * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
+ * @returns {Promise<{ action: 'updated' | 'added', name: string, fileBacked?: boolean }>}
  */
 async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false) {
-  /** @type {{ action: 'updated' | 'added', name: string }} */
+  /** @type {{ action: 'updated' | 'added', name: string, fileBacked?: boolean }} */
   let outcome = { action: 'added', name: requestedName || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
@@ -1366,7 +1365,9 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
     if (idx >= 0) {
       const prev = config.accounts[idx];
       config.accounts[idx] = { ...prev, ...account, name: prev.name };
-      outcome = { action: 'updated', name: prev.name };
+      // The entry reads its tokens from a file, which the next reload reads
+      // again: the ones stored here are not the ones it will use.
+      outcome = { action: 'updated', name: prev.name, fileBacked: !!prev.importFrom };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
@@ -3004,7 +3005,7 @@ function orgLabel(a) {
  *   unidentifiable account and pokes a running server afterwards. The TUI's
  *   login runs INSIDE that server: it must survive a failed login (`fatal:
  *   false` throws instead) and reloads itself rather than over HTTP.
- * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
+ * @returns {Promise<{ action: 'updated' | 'added', name: string, fileBacked?: boolean }>}
  */
 async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false, { fatal = true, notify = true } = {}) {
   // Fetch profile to auto-name and deduplicate by account+org identity. A
@@ -3055,7 +3056,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // read of the file: only this account's row (and, in the multi-org case, the
   // display name of its namesakes) changes; every other row stays as it is on
   // disk.
-  /** @type {{ action: 'updated' | 'added', name: string }} */
+  /** @type {{ action: 'updated' | 'added', name: string, fileBacked?: boolean }} */
   let outcome = { action: 'added', name: name || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
@@ -3095,7 +3096,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
-      outcome = { action: 'updated', name: prev.name };
+      // As in upsertCodexAccount: an importFrom entry keeps reading its file.
+      outcome = { action: 'updated', name: prev.name, fileBacked: !!prev.importFrom };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);

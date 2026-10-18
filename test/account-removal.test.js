@@ -124,3 +124,17 @@ test('a reload keeps the "sign-in comes from a file" flag in step with the confi
   await syncAccountsFromDisk({ accounts: [{ ...entry }] }, memConfig, accountManager);
   assert.equal(accountManager.accounts[0].credentialsFromFile, false);
 });
+
+test('the last running account is refused even when the config also holds an entry with no credential', async () => {
+  const config = { accounts: [
+    { id: 'id-a', name: 'a@example.com', type: 'apikey', apiKey: 'sk-demo-1' },
+    // resolveAccounts drops this one: it never reaches the fleet, and a server
+    // left with only it would refuse to start.
+    { id: 'id-x', name: 'x@example.com', type: 'oauth' },
+  ] };
+  const accountManager = new AccountManager([{ ...config.accounts[0] }], 0.98);
+  const remove = createAccountRemover({ accountManager, config, exclusive: serialQueue(), persist: async () => {} });
+  await assert.rejects(remove(accountManager.accounts[0]), err => err instanceof RemovalRefused && err.status === 409);
+  assert.equal(accountManager.accounts.length, 1);
+  assert.equal(config.accounts.length, 2);
+});

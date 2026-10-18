@@ -44,8 +44,9 @@ export class RemovalRefused extends Error {
  * removal hook leaves the callback.net tombstone, when the install is signed in
  * there.
  *
- * The last account is refused: a server whose config holds none refuses to
- * start, and the dashboard that could sign one in again would go with it.
+ * The last running account is refused: a server left with no usable account
+ * refuses to start, and the dashboard that could sign one in again would go
+ * with it.
  *
  * @param {object} opts
  * @param {any} opts.accountManager
@@ -58,7 +59,10 @@ export function createAccountRemover({ accountManager, config, persist, exclusiv
   return account => exclusive(async () => {
     const index = accountManager.accounts.indexOf(account);
     if (index < 0) throw new RemovalRefused('that account was already removed', 404);
-    if (config.accounts.length <= 1 && accountManager.accounts.length <= 1) {
+    // The running fleet, not the config: an entry that resolved to no usable
+    // account (no token, an importFrom file gone) is in the config list and
+    // would not let the server start either.
+    if (accountManager.accounts.length <= 1) {
       throw new RemovalRefused('this is the only account, and the proxy needs one to start: sign in another account first', 409);
     }
     // Resolved before removeAccount, which splices the manager's list.
