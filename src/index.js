@@ -26,6 +26,7 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { signInEvent, thresholdEvent } from './event-log.js';
+import { WebSignIns } from './web-login.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -707,35 +708,64 @@ async function serverCommand() {
   let hooks = {};
 
   /**
-   * The TUI login panel's sign-in: one account's OAuth flow, stored with the
-   * same upsert `teamclaude login` uses, then a reload so the running pool
-   * picks it up. Its caller records the outcome on the event log.
-   * @param {Record<string, any>} account
-   * @param {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt) => void }} opts
+   * One provider's interactive sign-in, stored with the same upsert
+   * `teamclaude login` uses, then a reload so the running pool picks it up.
+   * The TUI's login panel and the dashboard both run it; each caller records
+   * the outcome on the event log.
+   *
+   * `via` is who asked. The TUI's panel opens a browser on this machine when
+   * the terminal looks local. The dashboard never
+   * does: the page opens the link in the browser it runs in, which may be on
+   * another machine, and a second window on the server would be one nobody
+   * asked for. For Claude, a browser on this machine is also the only one that
+   * can reach the loopback listener, so the panel listens only when it opens
+   * one; the dashboard always listens, and hands back the loopback link
+   * (`browserUrl`) for a page that is itself on this machine.
+   * @param {'claude' | 'codex'} provider
+   * @param {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt & { browserUrl?: string | null }) => void, via: 'terminal' | 'dashboard' }} opts
    */
-  const loginFromPanel = async (account, { signal, onPrompt }) => {
+  const signInProvider = async (provider, { signal, onPrompt, via }) => {
     // The TUI's login panel shows the link, copies it and takes the paste;
-    // `onPrompt` hands it what it needs once the flow is listening. A browser
-    // is opened here only when the terminal looks local. For Claude, that is
-    // also the only case with a loopback listener: on a remote session it
-    // could not be reached, and the code page's paste is the whole flow. Codex
+    // `onPrompt` hands it what it needs once the flow is listening. Codex
     // always listens on 1455, because `ssh -L 1455:localhost:1455` makes it
     // reachable from the laptop.
     const remote = isRemoteSession();
+    const openHere = via === 'terminal' && !remote;
     let outcome;
-    if (account && providerOf(account) === 'codex') {
+    if (provider === 'codex') {
       const flow = await startCodexLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
-      if (!remote && !signal?.aborted) openBrowser(flow.url);
+      if (openHere && !signal?.aborted) openBrowser(flow.url);
       onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit });
       outcome = await upsertCodexAccount(undefined, await flow.credentials, null, false);
     } else {
-      const flow = await startOAuthLogin({ loopback: !remote, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
-      if (flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
-      onPrompt?.({ provider: 'claude', url: flow.url, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit });
+      const flow = await startOAuthLogin({ loopback: via === 'dashboard' || openHere, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+      if (openHere && flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
+      onPrompt?.({ provider: 'claude', url: flow.url, browserUrl: flow.browserUrl, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit });
       outcome = await upsertOAuthAccount(undefined, await flow.tokens, 'login', null, false, { fatal: false, notify: false });
     }
     await reloadAccounts();
     return outcome;
+  };
+
+  /**
+   * A sign-in as an entry on the event log (the dashboard's Logs page):
+   * started, then succeeded or failed.
+   * @param {{ provider: 'claude' | 'codex', account: string | null, via: string }} signIn
+   * @param {() => Promise<any>} run
+   */
+  const loggedSignIn = async (signIn, run) => {
+    accountManager.events.add(signInEvent('started', signIn));
+    try {
+      const outcome = await run();
+      accountManager.events.add(signInEvent('succeeded', {
+        ...signIn, account: outcome?.name ?? signIn.account,
+        detail: signIn.account && outcome?.name && outcome.name !== signIn.account ? `a different account than "${signIn.account}"` : null,
+      }));
+      return outcome;
+    } catch (err) {
+      accountManager.events.add(signInEvent('failed', { ...signIn, error: err }));
+      throw err;
+    }
   };
 
   if (useTUI) {
@@ -773,19 +803,8 @@ async function serverCommand() {
       // Each sign-in is also an entry on the event log (the dashboard's Logs page).
       loginAccount: async (/** @type {Record<string, any>} */ account, /** @type {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt) => void }} */ { signal, onPrompt } = {}) => {
         const provider = account && providerOf(account) === 'codex' ? 'codex' : 'claude';
-        const signIn = { provider, account: account?.name ?? null, via: 'terminal' };
-        accountManager.events.add(signInEvent('started', signIn));
-        try {
-          const outcome = await loginFromPanel(account, { signal, onPrompt });
-          accountManager.events.add(signInEvent('succeeded', {
-            ...signIn, account: outcome?.name ?? signIn.account,
-            detail: outcome?.name && outcome.name !== signIn.account ? `a different account than "${signIn.account}"` : null,
-          }));
-          return outcome;
-        } catch (err) {
-          accountManager.events.add(signInEvent('failed', { ...signIn, error: err }));
-          throw err;
-        }
+        return loggedSignIn({ provider, account: account?.name ?? null, via: 'terminal' },
+          () => signInProvider(provider, { signal, onPrompt, via: 'terminal' }));
       },
       // `p` key: on-demand fleet-wide quota refresh. The prober is constructed
       // after the TUI, so this is a thunk over the closure variable.
@@ -871,6 +890,36 @@ async function serverCommand() {
     let result;
     await atomicConfigUpdate((/** @type {any} */ diskConfig) => { result = setAccountDisabled(diskConfig, account, disabled, spec); });
     return result;
+  };
+
+  // The dashboard's sign-in buttons (POST /teamclaude/login/*): the TUI
+  // panel's flow, with the page holding the link and the paste field.
+  hooks.webSignIns = new WebSignIns({
+    signIn: (provider, { signal, onPrompt }) => loggedSignIn({ provider, account: null, via: 'dashboard' },
+      () => signInProvider(provider, { signal, onPrompt, via: 'dashboard' })),
+  });
+
+  // The dashboard's Remove (POST /teamclaude/remove): the account leaves the
+  // running fleet and the config file, credentials included, the way the
+  // TUI's remove does. In-process rather than a file edit and a reload, like
+  // the MCP remove_account tool: the TUI may be saving the same list. The
+  // manager's removal hook leaves the callback.net tombstone, when this
+  // install is signed in there, so the other installs drop it too.
+  hooks.removeAccount = async (/** @type {number} */ index) => {
+    const account = accountManager.accounts[index];
+    if (!account) throw new Error('no account at that position');
+    // Resolved before removeAccount, which splices the manager's list.
+    const cfgIdx = configIndexFor(config.accounts, accountManager.accounts, index);
+    accountManager.removeAccount(index);
+    if (cfgIdx >= 0) {
+      // The save adopts rows on disk that are not in memory, so the entry has
+      // to be marked before it goes or the save would read it back in.
+      markAccountRemoved(config, config.accounts[cfgIdx]?.id);
+      config.accounts.splice(cfgIdx, 1);
+    }
+    accountManager.events.add({ kind: 'control', type: 'account_removed', provider: providerOf(account), account: account.name, message: 'Removed (dashboard)' });
+    await atomicConfigUpdate(mergeAccountsOnto);
+    return { name: account.name, provider: providerOf(account), persisted: cfgIdx >= 0 };
   };
 
   // Whether one of a Codex account's free rate-limit reset credits should be

@@ -20,6 +20,29 @@ account. Retry after confirming the credential is valid, or pass
 credential the upstream rejects with 401 (and that cannot be refreshed) is
 refused regardless of `--name` — log in again to get a fresh one.
 
+## Signing in from the dashboard
+
+The [web dashboard](usage.md#status-dashboard-browser)'s **Accounts** page has a **Sign in to Claude** button and a **Sign in to Codex** button. Either one starts the same sign-in as `teamclaude login` (or `login --codex`) inside the running server, and opens a panel:
+
+1. **Open sign-in page** opens the provider's page in a new tab. The link is also in a box beside the button, to copy to a browser on another device.
+2. Sign in, and approve. Then paste what the browser was left with into the field, and press **Finish sign-in**:
+   - Claude: the page shows a code. Paste it.
+   - Codex: OpenAI sends the browser to `http://localhost:1455/auth/callback?…`. On any machine but the proxy's, that page does not load. Copy its whole address from the address bar and paste it.
+
+When the dashboard is open on the proxy's own machine (at `localhost` or `127.0.0.1`), the sign-in finishes by itself once you approve: the browser reaches the listener on that machine, and there is nothing to paste. The panel says which case you are in. A paste that cannot be used, such as one from another attempt, is refused with the reason, and you can paste again.
+
+The tokens go to the account the browser signed in as, matched by identity exactly as `teamclaude login` does. Signing in as an account TeamClaude already has refreshes its sign-in instead of adding it twice. That is also what **Sign in again** does: it is on the row of a Claude or Codex login that upstream has signed out (`error`), and it opens the same panel. Each sign-in is on the Logs page as `Sign-in started (dashboard)`, then succeeded, failed, cancelled or timed out.
+
+The server runs one dashboard sign-in at a time. Starting another cancels the first, and **Cancel** gives up and closes the listener. The panel waits five minutes. Nothing opens on the server's own screen: the link opens in the browser the dashboard runs in. The buttons are hidden for a page holding a `proxy.clientKeys` key, because signing accounts in is the operator's business. The endpoints behind them are in [Usage](usage.md#account-sign-in-and-removal-endpoints).
+
+## Removing an account
+
+**Remove** on an account's row in the dashboard's **Accounts** page signs that one account out of TeamClaude, and leaves every other account alone. The first click arms it, and the button turns into **Confirm remove** for a few seconds. The second click removes. This does the same as `teamclaude remove <name>`: the account leaves the running fleet at once, and its entry, credentials included, leaves the config file. A conversation pinned to it moves to another account on its next request.
+
+Nothing is revoked with Anthropic or OpenAI. You stay signed in to claude.ai, ChatGPT, Claude Code and the Codex CLI wherever else you use the account. TeamClaude only forgets its copy of the tokens. This matters because an account imported from Claude Code shares that sign-in, and revoking it would sign Claude Code out too. To undo a removal, sign the account in again.
+
+When this install is signed in to [callback.net](#syncing-accounts-across-machines-callbacknet), the removal is recorded there, as it is for `teamclaude remove`, so your other installs drop the account too.
+
 ## Import from Claude Code
 
 If you already have Claude Code set up, import its credentials directly:
@@ -102,7 +125,7 @@ teamclaude routing <name> --check  # test the proxy the account already has
 
 Rename while the server runs: an API-key account's saved quota readings are matched by name, so a rename made with the server stopped loses them on the next start. Sessions launched with `TC_ACCT=<old name>` pin by name and need relaunching with the new one.
 
-`login`, `import`, `enable`, `disable`, `priority`, `rename` and `routing` notify a running server to reload, so credential, priority, enable/disable, name and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI or through the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
+`login`, `import`, `enable`, `disable`, `priority`, `rename` and `routing` notify a running server to reload, so credential, priority, enable/disable, name and routing changes are picked up live; the same reload (POST `/teamclaude/reload`, or **R** in the TUI) also applies hand edits to an account's `upstream`/`modelMap`. Account **removals** made on disk (`teamclaude remove` from another shell, or a hand edit) are applied by the same reload: a running account whose entry is gone from the file is dropped from the fleet, and the reload reports how many it added and how many it removed. An account added in the TUI is safe during the moment between its addition and its save — a reload that reads the file first leaves it alone rather than treating the missing row as a removal. Removing one from the TUI, the dashboard's [Remove](#removing-an-account) or the [MCP endpoint](usage.md#mcp-endpoint)'s `remove_account` takes effect at once.
 
 ## Syncing accounts across machines (callback.net)
 
