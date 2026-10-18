@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
+import { logoDataUrl, logoMarkup } from './logo.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -48,7 +49,10 @@ export function inlineScripts(html) {
  * only network the script may touch is this origin, for status and switch.
  * Styles need `'unsafe-inline'` because the layout uses `style=` attributes,
  * which hashes do not cover; CSSOM writes (`el.style.width = …`) are not
- * governed by CSP at all. `frame-ancestors 'none'` keeps the page out of
+ * governed by CSP at all. `img-src data:` admits one image, the tab icon,
+ * which is the logo inlined as a `data:` URL in `<head>`: a `data:` image can
+ * carry no script and reach no network, and nothing from `'self'` or any
+ * other origin is allowed. `frame-ancestors 'none'` keeps the page out of
  * another site's iframe, where a click on "switch" could be overlaid.
  */
 export function dashboardCsp(html = PAGE) {
@@ -62,6 +66,7 @@ export function dashboardCsp(html = PAGE) {
     "default-src 'none'",
     `script-src ${hashes}`,
     "style-src 'unsafe-inline'",
+    "img-src data:",
     "connect-src 'self'",
     "base-uri 'none'",
     "form-action 'none'",
@@ -1024,6 +1029,7 @@ const PAGE = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TeamClaude</title>
+<link rel="icon" type="image/svg+xml" href="${logoDataUrl()}">
 <style>
   /* Dark is the default, and stays the default for a viewer whose system says
      nothing. The light palette is applied two ways: by the media query when no
@@ -1056,7 +1062,7 @@ const PAGE = `<!doctype html>
   .shell { display: grid; grid-template-columns: 228px minmax(0, 1fr); min-height: 100vh; }
   .side { background: var(--side); border-right: 1px solid var(--line); padding: 18px 12px; display: flex; flex-direction: column; gap: 2px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
   .brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 15px; padding: 0 10px 10px; }
-  .brand i { width: 11px; height: 11px; border-radius: 3px; background: var(--accent); display: inline-block; }
+  .brand svg { width: 20px; height: 20px; flex: none; }
   #nav { display: flex; flex-direction: column; gap: 2px; }
   .navsec { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); padding: 14px 10px 4px; }
   .navbtn { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; font-size: 13px; text-align: left; padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--dim); cursor: pointer; }
@@ -1223,7 +1229,7 @@ const PAGE = `<!doctype html>
 </div>
 <div id="app" class="shell" style="display:none">
   <aside class="side">
-    <div class="brand"><i></i>TeamClaude</div>
+    <div class="brand">${logoMarkup()}TeamClaude</div>
     <nav id="nav"></nav>
     <div class="sidefoot">
       <button id="theme" class="more" type="button" title="Switch between following the system, light and dark"></button>
