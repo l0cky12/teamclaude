@@ -109,6 +109,23 @@ test('start, a bad paste, a good one: the HTTP contract the page relies on', asy
   });
 });
 
+// The dashboard at http://<tailscale-ip>:port: browsers send no fetch metadata
+// to a plain-http address that is not localhost, only Origin. The proxy key
+// and an Origin naming this very host are what let the sign-in through.
+test('a sign-in from a browser on a plain-http address works with the proxy key, and only with it', async () => {
+  await withServer({}, async ({ port }) => {
+    const plain = (/** @type {Record<string, string>} */ headers) => fetch(`http://127.0.0.1:${port}/teamclaude/login/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}`, ...headers },
+      body: JSON.stringify({ provider: 'claude' }),
+    });
+    const keyed = await plain({ 'x-api-key': PROXY_KEY });
+    assert.equal(keyed.status, 200, await keyed.text());
+    assert.equal((await plain({})).status, 403, 'no key: a page could have sent it');
+    assert.equal((await plain({ 'x-api-key': CLIENT_KEY })).status, 403, 'a client key may not sign in');
+  });
+});
+
 test('cancel over HTTP, and a body that is not JSON', async () => {
   await withServer({}, async ({ port, am }) => {
     const auth = { 'x-api-key': PROXY_KEY };
