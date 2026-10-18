@@ -395,7 +395,7 @@ const WRITE_TOOLS = [
   {
     name: 'set_distribution',
     title: 'Set session distribution',
-    description: `How new sessions are spread across equal-priority accounts. ${Object.entries(DISTRIBUTE_MODES).map(([mode, m]) => `${mode}: ${m.said}`).join(' ')} Saved and applied live.`,
+    description: `How sessions are placed across equal-priority accounts. ${Object.entries(DISTRIBUTE_MODES).map(([mode, m]) => `${mode}: ${m.said}`).join(' ')} Saved and applied live.`,
     properties: { mode: { type: 'string', enum: Object.keys(DISTRIBUTE_MODES) } },
     required: ['mode'],
     write: true,

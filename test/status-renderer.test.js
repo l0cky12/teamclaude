@@ -123,6 +123,14 @@ test('renderStatus says single-account once the drain has finished', () => {
   assert.match(output, /Sessions\s+2 active \/ 3 known · single-account/);
 });
 
+test('renderStatus names drain mode, and the pinned sessions it is still draining', () => {
+  const status = sampleStatus();
+  status.sessions = { known: 3, active: 2, perAccount: { 0: 2 }, distribute: false, mode: 'drain', draining: 0 };
+  assert.match(renderStatus(status, { color: false, now }), /Sessions\s+2 active \/ 3 known · drain$/m);
+  status.sessions.draining = 2;
+  assert.match(renderStatus(status, { color: false, now }), /Sessions\s+2 active \/ 3 known · drain, draining 2/);
+});
+
 test('renderStatus omits the sessions line when the status has no sessions field', () => {
   const output = renderStatus(sampleStatus(), { color: false, now });
   assert.doesNotMatch(output, /Sessions\s/);
