@@ -24,7 +24,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
-import { signInEvent, thresholdEvent } from './event-log.js';
+import { signInEvent, thresholdEvent, briefError } from './event-log.js';
 import { signInGuard } from './web-login.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
@@ -896,7 +896,7 @@ async function serverCommand() {
     const name = signIn.name ?? undefined;
     return signIn.provider === 'codex'
       ? upsertCodexAccount(name, signIn.credentials, routing, false, { autoName: 'numbered', check })
-      : upsertOAuthAccount(name, signIn.credentials, 'login', routing, false, { fatal: false, notify: false, autoName: 'numbered', check });
+      : upsertOAuthAccount(name, signIn.credentials, 'login', routing, false, { fatal: false, notify: false, autoName: 'numbered', check, redact: true });
   };
 
   // Whether one of a Codex account's free rate-limit reset credits should be
@@ -2996,7 +2996,7 @@ function orgLabel(a) {
  * @param {boolean} [storeRouting] - false when `routing` was borrowed from the
  * existing entry rather than given with --routing: used, never written. True
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
- * @param {{ fatal?: boolean, notify?: boolean, autoName?: 'email' | 'numbered', check?: ((accounts: Record<string, any>[], idx: number, incoming: Record<string, any>) => void) | null }} [opts] The CLI exits on an
+ * @param {{ fatal?: boolean, notify?: boolean, autoName?: 'email' | 'numbered', check?: ((accounts: Record<string, any>[], idx: number, incoming: Record<string, any>) => void) | null, redact?: boolean }} [opts] The CLI exits on an
  *   unidentifiable account and pokes a running server afterwards. The TUI's
  *   login runs INSIDE that server: it must survive a failed login (`fatal:
  *   false` throws instead) and reloads itself rather than over HTTP.
@@ -3004,10 +3004,12 @@ function orgLabel(a) {
  *   (the CLI's way, with " (org)" added when one email holds several orgs), or
  *   the first free `account-N` (the dashboard's). `check`: runs under the lock
  *   once the row is chosen (`idx`, -1 to add) and before anything is written;
- *   throwing refuses the save (see web-login.js signInGuard).
+ *   throwing refuses the save (see web-login.js signInGuard). `redact`: this
+ *   runs in the server for the dashboard, whose output is not the operator's
+ *   own terminal, so a profile lookup's error body is not printed (briefError).
  * @returns {Promise<{ action: 'updated' | 'added', name: string }>}
  */
-async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false, { fatal = true, notify = true, autoName = 'email', check = null } = {}) {
+async function upsertOAuthAccount(name, creds, source = 'unknown', routing = null, storeRouting = false, { fatal = true, notify = true, autoName = 'email', check = null, redact = false } = {}) {
   // Fetch profile to auto-name and deduplicate by account+org identity. A
   // credentials file is routinely past its access token's hour while its
   // refresh token is still good, so a stale token is renewed first and the
@@ -3041,7 +3043,9 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   }
 
   if (!profileOk) {
-    console.error(`Warning: importing named account without profile detection — ${profile?.error ? sanitizeText(profile.error) : 'profile unavailable'}`);
+    const why = !profile?.error ? 'profile unavailable'
+      : redact ? briefError(new Error(`Could not identify OAuth account — ${profile.error}`)) : sanitizeText(profile.error);
+    console.error(`Warning: importing named account without profile detection — ${why}`);
   }
   // The dashboard's sign-in numbers its accounts instead (see saveWebSignIn).
   if (!name && autoName === 'email' && profile?.email) {

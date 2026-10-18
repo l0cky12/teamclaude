@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { WebLogins, startWebFlow, signInGuard, WebLoginError, WEB_LOGIN_TIMEOUT_MS, WEB_LOGIN_MAX_PENDING } from '../src/web-login.js';
+import { WebLogins, startWebFlow, signInGuard, WebLoginError, WEB_LOGIN_TIMEOUT_MS, WEB_LOGIN_MAX_PENDING, operatorError } from '../src/web-login.js';
 import { startCodexLogin } from '../src/codex-auth.js';
 import { EventLog } from '../src/event-log.js';
 import { findUpsertTarget } from '../src/identity.js';
@@ -280,14 +280,71 @@ test('a failed token exchange ends the sign-in with 502 and records signin_faile
   const r = await logins.finish({ id, input: pasteFor('claude', url) });
   assert.equal(r.status, 502);
   assert.equal(r.body.retry, undefined);
-  // The upstream's body is cut off; our own words and its status stay.
-  assert.match(r.body.error, /Token exchange failed \(400\)/);
+  // The upstream's body is cut off; only its status stays.
+  assert.match(r.body.error, /the provider answered HTTP 400/);
   assert.equal(r.body.error.includes('upstream text'), false);
   assert.equal(saved.length, 0);
   assert.equal(logins.pending.has(id), false);
   const last = events.since(0).events.at(-1);
   assert.equal(last?.type, 'signin_failed');
   assert.equal(last?.message.includes('upstream text'), false);
+});
+
+/** Run fn with console.error and console.log captured; returns what they printed. */
+async function captureConsole(/** @type {() => Promise<void>} */ fn) {
+  const lines = /** @type {string[]} */ ([]);
+  const { error, log } = console;
+  console.error = (...a) => { lines.push(a.join(' ')); };
+  console.log = (...a) => { lines.push(a.join(' ')); };
+  try { await fn(); } finally { console.error = error; console.log = log; }
+  return lines.join('\n');
+}
+
+// The save hook is index.js's upsert, which throws this shape when the
+// signed-in account's profile cannot be read: the provider's body quoted in
+// full. None of it may reach the reply, the event log or the server's output.
+test('a profile lookup the provider refused is reported without its body anywhere', async () => {
+  const body = '{"error":{"message":"denied for someone@example.com","org":"org-secret"}}';
+  const { logins, events } = setup({
+    save: async () => { throw new Error(`Could not identify OAuth account — HTTP 403: ${body}. Retry with valid credentials, or pass --name to add the account without profile detection.`); },
+  });
+  let r;
+  const printed = await captureConsole(async () => {
+    const { body: { id, url } } = await logins.start({ provider: 'claude' });
+    r = await logins.finish({ id, input: pasteFor('claude', url) });
+  });
+  assert.equal(r.status, 500);
+  const logged = JSON.stringify(events.since(0).events);
+  for (const where of [r.body.error, logged, printed]) {
+    assert.equal(where.includes('someone@example.com'), false, where);
+    assert.equal(where.includes('org-secret'), false, where);
+  }
+  assert.match(r.body.error, /profile could not be read/);
+  assert.match(printed, /profile could not be read/);
+});
+
+test('our own errors stay readable: a guard refusal on the log, a failed save in the server output', async () => {
+  const guarded = setup({ save: async () => { throw new WebLoginError(409, 'Signed in as "b", not "a"'); } });
+  let r;
+  await captureConsole(async () => {
+    const { body: { id, url } } = await guarded.logins.start({ provider: 'claude' });
+    r = await guarded.logins.finish({ id, input: pasteFor('claude', url) });
+  });
+  assert.equal(r.status, 409);
+  assert.match(guarded.events.since(0).events.at(-1)?.message ?? '', /Signed in as "b", not "a"/);
+
+  const broken = setup({ save: async () => { throw new Error("EACCES: permission denied, open '/data/teamclaude.json'"); } });
+  const printed = await captureConsole(async () => {
+    const { body: { id, url } } = await broken.logins.start({ provider: 'claude' });
+    await broken.logins.finish({ id, input: pasteFor('claude', url) });
+  });
+  assert.match(printed, /EACCES: permission denied/);
+});
+
+test('operatorError cuts only the shapes that carry a provider\'s text', () => {
+  assert.equal(operatorError(new Error('Codex token exchange failed (401): <html>x</html>')), 'the provider answered HTTP 401');
+  assert.equal(operatorError(new Error('The sign-in was refused: access_denied (you said no)')), 'the provider refused the sign-in (access_denied)');
+  assert.equal(operatorError(new Error('reload failed: config is not valid JSON')), 'reload failed: config is not valid JSON');
 });
 
 test('while a paste is being exchanged, a second finish or a cancel is refused, and the sweep leaves it alone', async () => {

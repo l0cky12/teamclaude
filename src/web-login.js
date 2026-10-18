@@ -117,7 +117,25 @@ export class WebLoginError extends Error {
     super(message);
     this.name = 'WebLoginError';
     this.status = status;
+    // Every message here is written by this module (account names quoted,
+    // never a provider's text), so the event log may carry it as it is.
+    this.publicMessage = message;
   }
+}
+
+/**
+ * An error for the server's own output. The shapes known to carry a
+ * provider's text (a token or profile response body, an OAuth
+ * error_description) are cut to briefError's fixed phrase, the same as on the
+ * event log; anything else (a config write that failed, a reload) is our own
+ * and is printed whole, since that is what the operator needs to fix it.
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function operatorError(error) {
+  const message = String(/** @type {any} */ (error)?.message ?? error ?? 'unknown error');
+  const upstream = /^(?:The sign-in was refused|OpenAI refused the sign-in):|^Could not identify OAuth account|(?:\(|HTTP )\d{3}\)?\s*:/;
+  return upstream.test(message) ? briefError(error) : safeLine(message, 300);
 }
 
 /**
@@ -326,7 +344,7 @@ export class WebLogins {
     } catch (err) {
       this._forget(entry);
       this._event('failed', entry, { error: err });
-      console.error(`[TeamClaude] Could not start a dashboard sign-in: ${briefError(err)}`);
+      console.error(`[TeamClaude] Could not start a dashboard sign-in: ${operatorError(err)}`);
       return refuse(500, 'Could not start the sign-in; see the proxy log');
     }
     // close() ran while the flow was starting.
@@ -370,7 +388,7 @@ export class WebLogins {
     } catch (err) {
       this._forget(entry);
       this._event('failed', entry, { error: err });
-      console.error(`[TeamClaude] Dashboard sign-in failed: ${briefError(err)}`);
+      console.error(`[TeamClaude] Dashboard sign-in failed: ${operatorError(err)}`);
       return refuse(502, `Sign-in failed: ${briefError(err)}. Start it again`);
     }
 
@@ -384,7 +402,7 @@ export class WebLogins {
       this._forget(entry);
       this._event('failed', entry, { error: err });
       if (err instanceof WebLoginError) return refuse(err.status, err.message);
-      console.error(`[TeamClaude] Dashboard sign-in could not be saved: ${briefError(err)}`);
+      console.error(`[TeamClaude] Dashboard sign-in could not be saved: ${operatorError(err)}`);
       return refuse(500, `Signed in, but the account could not be saved: ${briefError(err)}`);
     }
     this._forget(entry);
@@ -400,7 +418,7 @@ export class WebLogins {
     try {
       await this.hooks.reload?.();
     } catch (err) {
-      console.error(`[TeamClaude] Reload after a dashboard sign-in failed: ${briefError(err)}`);
+      console.error(`[TeamClaude] Reload after a dashboard sign-in failed: ${operatorError(err)}`);
       return refuse(500, 'Signed in and saved to the config file, but the reload failed; see the proxy log');
     }
     return { status: 200, body: { ok: true, account: outcome.name, action: outcome.action } };
