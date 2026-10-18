@@ -210,8 +210,13 @@ the views it changed.
   accounts named `demo-a@example.com` with a key of `sk-demo-1`:
 
   ```sh
-  TEAMCLAUDE_CONFIG=/tmp/tc-shots/teamclaude.json node src/index.js server --headless
+  TEAMROUTER_CONFIG=/tmp/tc-shots/teamclaude.json \
+  TEAMCLAUDE_CONFIG=/tmp/tc-shots/teamclaude.json \
+    node src/index.js server --headless
   ```
+
+  Set both variables: `TEAMROUTER_CONFIG` wins over `TEAMCLAUDE_CONFIG`, so
+  an inherited one would load the real config.
 
   Give it its own `proxy.port`, `"upstreamProxy": false` and
   `"autoUpdate": false`.
@@ -219,9 +224,11 @@ the views it changed.
   `preview_snapshot` with `save: true`). Use `preview_resize` for the narrow
   shot.
 - TUI: run it in a terminal of fixed size (tmux works) with the same
-  throwaway config and capture an image of it. If you can't produce an
-  image, paste `tmux capture-pane -p` output in a code block and say why in
-  the PR body.
+  throwaway config and capture an image of it. One way: render
+  `tmux capture-pane -p -e` output (which keeps the colours) to HTML and
+  screenshot it with T3's `html_preview`. Text in a code block is not a
+  substitute. If you can't produce the images, open the PR as a **draft**
+  labelled `needs-human-review` and say which screenshots are missing.
 
 ### Where the images go
 
@@ -295,7 +302,8 @@ The prompt includes:
 
 - the original task
 - the classification and its reason
-- the diff range (`git diff master...HEAD`)
+- the diff range (`git diff origin/master...HEAD`, after `git fetch origin`;
+  a local `master` may be stale)
 - the check results
 - for a front-end change: the local paths of the screenshots (see
   [Screenshots](#screenshots-for-front-end-changes))
