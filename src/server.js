@@ -29,6 +29,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
+import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { logsAfter } from './event-log.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -782,11 +783,19 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         try {
-          const result = await hooks.removeAccount(found.index);
+          // The account itself, not its position: the removal waits for any
+          // reload in flight, which can move it.
+          const result = await hooks.removeAccount(accountManager.accounts[found.index]);
           console.log(`[TeamClaude] Removed account "${safeLine(result.name, 80)}" (control endpoint)`);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, ...result }));
         } catch (err) {
+          // The last account, or one a reload removed meanwhile: said as it is.
+          if (err instanceof RemovalRefused) {
+            res.writeHead(err.status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+            return;
+          }
           // The account may already be out of the running fleet: say the save
           // is what failed, so the caller does not read it as nothing changed.
           console.error('[TeamClaude] Removing an account failed:', /** @type {Error} */ (err).message);

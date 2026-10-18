@@ -27,6 +27,7 @@ import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { signInEvent, thresholdEvent } from './event-log.js';
 import { WebSignIns } from './web-login.js';
+import { createAccountRemover, serialQueue } from './account-removal.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -676,14 +677,11 @@ async function serverCommand() {
   // manager list the first is still changing — and, now that a reload removes,
   // could drop an account by an index the other reload has already shifted.
   // Each caller waits for the previous reload to settle, whichever way it
-  // settled, and then runs its own against the list as it stands.
-  /** @type {Promise<unknown>} */
-  let reloading = Promise.resolve();
-  const reloadAccounts = () => {
-    const next = reloading.catch(() => {}).then(doReload);
-    reloading = next;
-    return next;
-  };
+  // settled, and then runs its own against the list as it stands. The
+  // dashboard's Remove takes its turn on the same queue (account-removal.js
+  // says why).
+  const accountQueue = serialQueue();
+  const reloadAccounts = () => accountQueue(doReload);
 
   // The account half of a save. The TUI's save below starts with it, and the
   // MCP endpoint uses it alone: an account changed there is changed in-process,
@@ -735,16 +733,20 @@ async function serverCommand() {
     if (provider === 'codex') {
       const flow = await startCodexLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
       if (openHere && !signal?.aborted) openBrowser(flow.url);
-      onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit });
+      onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit, settled: flow.settled });
       outcome = await upsertCodexAccount(undefined, await flow.credentials, null, false);
     } else {
       const flow = await startOAuthLogin({ loopback: via === 'dashboard' || openHere, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
       if (openHere && flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
-      onPrompt?.({ provider: 'claude', url: flow.url, browserUrl: flow.browserUrl, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit });
+      onPrompt?.({ provider: 'claude', url: flow.url, browserUrl: flow.browserUrl, remote, listening: Boolean(flow.browserUrl), note: null, submit: flow.submit, settled: flow.settled });
       outcome = await upsertOAuthAccount(undefined, await flow.tokens, 'login', null, false, { fatal: false, notify: false });
     }
     await reloadAccounts();
-    return outcome;
+    // Tokens stored for an account that reads its own from a file
+    // (`importFrom`) are not the ones it uses: the reload just read that file
+    // again. The caller says so instead of reporting a repaired account.
+    const fileBacked = accountManager.accounts.some((/** @type {any} */ a) => a.name === outcome?.name && a.credentialsFromFile);
+    return outcome ? { ...outcome, fileBacked } : outcome;
   };
 
   /**
@@ -899,28 +901,11 @@ async function serverCommand() {
       () => signInProvider(provider, { signal, onPrompt, via: 'dashboard' })),
   });
 
-  // The dashboard's Remove (POST /teamclaude/remove): the account leaves the
-  // running fleet and the config file, credentials included, the way the
-  // TUI's remove does. In-process rather than a file edit and a reload, like
-  // the MCP remove_account tool: the TUI may be saving the same list. The
-  // manager's removal hook leaves the callback.net tombstone, when this
-  // install is signed in there, so the other installs drop it too.
-  hooks.removeAccount = async (/** @type {number} */ index) => {
-    const account = accountManager.accounts[index];
-    if (!account) throw new Error('no account at that position');
-    // Resolved before removeAccount, which splices the manager's list.
-    const cfgIdx = configIndexFor(config.accounts, accountManager.accounts, index);
-    accountManager.removeAccount(index);
-    if (cfgIdx >= 0) {
-      // The save adopts rows on disk that are not in memory, so the entry has
-      // to be marked before it goes or the save would read it back in.
-      markAccountRemoved(config, config.accounts[cfgIdx]?.id);
-      config.accounts.splice(cfgIdx, 1);
-    }
-    accountManager.events.add({ kind: 'control', type: 'account_removed', provider: providerOf(account), account: account.name, message: 'Removed (dashboard)' });
-    await atomicConfigUpdate(mergeAccountsOnto);
-    return { name: account.name, provider: providerOf(account), persisted: cfgIdx >= 0 };
-  };
+  // The dashboard's Remove (POST /teamclaude/remove).
+  hooks.removeAccount = createAccountRemover({
+    accountManager, config, exclusive: accountQueue,
+    persist: () => atomicConfigUpdate(mergeAccountsOnto),
+  });
 
   // Whether one of a Codex account's free rate-limit reset credits should be
   // spent to undo a spent weekly window. Wired as a hook rather than reached

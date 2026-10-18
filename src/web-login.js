@@ -38,13 +38,15 @@ export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
  * @property {string | null} [account]  the account the tokens went to
  * @property {'added' | 'updated' | null} [action]
  * @property {string | null} [error]  one line, safe for the page
+ * @property {boolean} [fileBacked]  the account reads its tokens from a credentials file
+ *   (`importFrom`), so the ones this sign-in stored are not the ones it uses
  */
 
 /**
  * @typedef {(provider: 'claude' | 'codex', opts: {
  *   signal: AbortSignal,
  *   onPrompt: (prompt: import('./login-flow.js').LoginPrompt & { browserUrl?: string | null }) => void,
- * }) => Promise<{ name?: string, action?: 'added' | 'updated' } | null | undefined>} SignIn
+ * }) => Promise<{ name?: string, action?: 'added' | 'updated', fileBacked?: boolean } | null | undefined>} SignIn
  */
 
 /**
@@ -57,6 +59,7 @@ export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
  * @property {string | null} account
  * @property {'added' | 'updated' | null} action
  * @property {string | null} error
+ * @property {boolean} fileBacked
  */
 
 export class WebSignIns {
@@ -80,11 +83,17 @@ export class WebSignIns {
    */
   async start(provider) {
     if (provider !== 'claude' && provider !== 'codex') throw new WebSignInError('provider must be "claude" or "codex"');
+    // A sign-in whose code is already being exchanged will store an account
+    // whatever happens here; replacing it would only stop the page from
+    // hearing how it ended.
+    if (this._current?.state === 'finishing') {
+      throw new WebSignInError('the last sign-in is still finishing; it shows in the list in a moment');
+    }
     this.cancel(this._current?.id ?? '');
     const id = randomBytes(16).toString('hex');
     const controller = new AbortController();
     /** @type {SignInEntry} */
-    const entry = { id, provider, controller, submit: null, state: 'waiting', account: null, action: null, error: null };
+    const entry = { id, provider, controller, submit: null, state: 'waiting', account: null, action: null, error: null, fileBacked: false };
     this._current = entry;
 
     /** @type {(prompt: any) => void} */
@@ -97,6 +106,7 @@ export class WebSignIns {
         entry.state = 'succeeded';
         entry.account = typeof result?.name === 'string' ? result.name : null;
         entry.action = result?.action === 'updated' || result?.action === 'added' ? result.action : null;
+        entry.fileBacked = result?.fileBacked === true;
       },
       err => {
         entry.state = /** @type {any} */ (err)?.name === 'AbortError' ? 'cancelled' : 'failed';
@@ -117,6 +127,13 @@ export class WebSignIns {
     if (!first.prompt) throw new WebSignInError('the sign-in ended before it started');
     const { prompt: started } = first;
     entry.submit = started.submit;
+    // The wait for a code is over. A paste says so through submit; the
+    // loopback listener says so only here, and from then on the exchange is
+    // under way and Cancel cannot stop it. A cancel or the timeout ends the
+    // wait too, and the outcome's own handler names those.
+    started.settled?.then(() => {
+      if (entry.state === 'waiting' && !controller.signal.aborted) entry.state = 'finishing';
+    });
     return {
       id,
       provider,
@@ -156,7 +173,7 @@ export class WebSignIns {
   status(id) {
     const entry = this._entry(id);
     if (!entry) return { state: 'unknown' };
-    return { state: entry.state, provider: entry.provider, account: entry.account, action: entry.action, error: entry.error };
+    return { state: entry.state, provider: entry.provider, account: entry.account, action: entry.action, error: entry.error, fileBacked: entry.fileBacked };
   }
 
   /**

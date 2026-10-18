@@ -170,6 +170,10 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
     mgr.messageThreads = diskAcct.messageThreads === true;
+    // Where its tokens come from decides what a sign-in can fix (the
+    // dashboard's Sign in again), so an importFrom added or dropped on disk
+    // shows at once.
+    mgr.credentialsFromFile = !!diskAcct.importFrom;
     // Mirror onto the memConfig entry: the TUI save stencil rebuilds
     // diskConfig.accounts from config.accounts as `{ ...diskAcct, ...live }`,
     // so a stale key there would win the spread and silently overwrite this

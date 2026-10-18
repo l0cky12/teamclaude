@@ -57,6 +57,12 @@ test('Remove takes the account out of the fleet and the config file, and leaves 
 
     const logs = await fetch(`http://127.0.0.1:${port}/teamclaude/logs`).then(r => r.json());
     assert.ok(logs.events.some(e => e.type === 'account_removed' && e.account === 'a@example.com'), 'the removal is on the event log');
+
+    // The last one stays: a config with no accounts would not start again.
+    const last = await post(port, '/teamclaude/remove', { account: 'b@example.com' });
+    assert.equal(last.status, 409);
+    assert.match((await last.json()).error, /only account/);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).accounts.map(a => a.name), ['b@example.com']);
   });
 });
 

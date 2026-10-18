@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, callerView } from '../src/server.js';
 import { WebSignIns } from '../src/web-login.js';
+import { RemovalRefused } from '../src/account-removal.js';
 
 // The dashboard's Sign in to Claude / Codex buttons and its Remove button call
 // POST /teamclaude/login/{start,code,status,cancel} and POST /teamclaude/remove.
@@ -85,7 +86,7 @@ test('a dashboard sign-in: start, paste, and the status that names the account',
     runs[0].resolve({ name: 'me@example.com', action: 'updated' });
     await new Promise(resolve => setImmediate(resolve));
     const status = await (await post(port, '/teamclaude/login/status', { id: started.id })).json();
-    assert.deepEqual(status, { ok: true, state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'updated', error: null });
+    assert.deepEqual(status, { ok: true, state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'updated', error: null, fileBacked: false });
   });
 });
 
@@ -128,12 +129,23 @@ test('a flow that breaks before it starts is a 500 whose reason stays in the log
 
 test('remove takes the account the provider names, not its namesake', async () => {
   const calls = [];
-  const removeAccount = async (index) => { calls.push(index); return { name: 'me@example.com', provider: 'codex', persisted: true }; };
-  await withServer({ removeAccount }, async (port) => {
+  const removeAccount = async (account) => { calls.push(account); return { name: 'me@example.com', provider: 'codex', persisted: true }; };
+  await withServer({ removeAccount }, async (port, am) => {
     const res = await post(port, '/teamclaude/remove', { account: 'me@example.com', provider: 'codex' });
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { ok: true, name: 'me@example.com', provider: 'codex', persisted: true });
-    assert.deepEqual(calls, [1]);
+    // The account object itself, so a reload that runs first cannot shift it.
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0], am.accounts[1]);
+  });
+});
+
+test('a refused removal answers with its own status and reason', async () => {
+  const removeAccount = async () => { throw new RemovalRefused('this is the only account, and the proxy needs one to start: sign in another account first', 409); };
+  await withServer({ removeAccount }, async (port) => {
+    const res = await post(port, '/teamclaude/remove', { account: 'other@example.com' });
+    assert.equal(res.status, 409);
+    assert.match((await res.json()).error, /only account/);
   });
 });
 

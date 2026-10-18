@@ -37,6 +37,8 @@ export const PANEL_LOGIN_TIMEOUT_MS = 5 * 60_000;
  * @property {(text: string) => boolean} submit  a pasted answer: true when it settled the
  *   login, false when there was nothing to use; throws, with a message for the person,
  *   when the paste cannot be used
+ * @property {Promise<void>} [settled]  the wait for a code is over, by a paste, the
+ *   loopback listener, a cancel or the timeout (codeRace)
  */
 
 /**

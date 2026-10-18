@@ -547,7 +547,25 @@ export function providerTone(group) {
 export function needsSignIn(account) {
   var a = account || {};
   if (a.type !== 'oauth' || a.status !== 'error' || a.backend) return null;
+  // Its tokens come from a file (importFrom) on every reload, so a sign-in
+  // here would be stored and never used: fileSignInHint says where to go.
+  if (a.credentialsFromFile) return null;
   return a.provider === 'codex' ? 'codex' : 'claude';
+}
+
+/**
+ * What to do instead, for a signed-out account whose tokens are read from a
+ * credentials file (importFrom): sign in with the tool that owns the file,
+ * then reload. Null for every other account.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @returns {string|null}
+ */
+export function fileSignInHint(account) {
+  var a = account || {};
+  if (a.type !== 'oauth' || a.status !== 'error' || !a.credentialsFromFile) return null;
+  var tool = a.provider === 'codex' ? 'the Codex CLI (codex login)' : 'Claude Code (claude /login)';
+  return 'Its sign-in is read from a credentials file. Sign in again in ' + tool + ', then Reload config on the Settings page.';
 }
 
 /**
@@ -632,6 +650,13 @@ export function signInPlan(start, hostname) {
 export function signInStatusOutcome(res, label) {
   var r = res || {};
   if (r.ok !== true) return { done: true, kind: 'error', text: label + ' sign-in failed' + (r.error ? ': ' + r.error : '') };
+  if (r.state === 'succeeded' && r.fileBacked) {
+    return {
+      done: true, kind: 'warn',
+      text: 'Signed in' + (r.account ? ' as ' + r.account : '') + ', but that account reads its sign-in from a credentials file, which TeamClaude keeps using. Sign in again in '
+        + (label === 'Codex' ? 'the Codex CLI' : 'Claude Code') + ', then Reload config.',
+    };
+  }
   if (r.state === 'succeeded') {
     var who = r.account ? ' as ' + r.account : '';
     return { done: true, kind: 'ok', text: (r.action === 'updated' ? 'Signed in to ' + label + ' again' : 'Added the ' + label + ' account') + who };
@@ -1147,7 +1172,7 @@ const SHARED_HELPERS = [
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
-  providerTone, needsSignIn, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
+  providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1942,6 +1967,8 @@ ${SHARED_HELPERS}
     if (emailLine) name.appendChild(el('div', 'tag', emailLine));
     var cn = cardNoteFor(cardNotes, key, Date.now());
     if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+    var fileHint = fileSignInHint(a);
+    if (fileHint) name.appendChild(el('div', 'cardnote warn', fileHint));
     tr.appendChild(name);
     tr.appendChild(el('td', '', a.plan || a.type || '—'));
     var st = el('td');
@@ -1983,7 +2010,13 @@ ${SHARED_HELPERS}
     // nothing but this button, which keeps its width, so no other control
     // slides under the pointer between the clicks; and a second click too
     // soon after the first is a double-click, not a decision.
-    if (canRemove) {
+    // The only account cannot go: the server would refuse to start without it.
+    if (canRemove && (s.accounts || []).length <= 1) {
+      var lone = button('btn rm', 'Remove', function () {});
+      lone.disabled = true;
+      lone.title = 'The proxy needs at least one account to start. Sign in another account first.';
+      act.appendChild(lone);
+    } else if (canRemove) {
       var armedAt = removeArmed[key];
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
       var ctlRemove = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {

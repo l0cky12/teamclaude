@@ -15,7 +15,7 @@ import {
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
-  providerTone, needsSignIn, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
+  providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
 } from '../src/dashboard.js';
 import { EVENT_KINDS } from '../src/event-log.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
@@ -956,7 +956,7 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
     meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
-    providerTone, needsSignIn, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome]) {
+    providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -1637,7 +1637,7 @@ test('a paste the server refuses is shown in the panel, which keeps waiting', as
 
 test('a double-click on Remove does not remove', async () => {
   const page = bootPage();
-  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }] });
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }, { name: 'b', provider: 'anthropic', type: 'apikey', quota: {} }] });
   page.click('Remove');
   page.click('Confirm remove');
   assert.equal(page.requests.length, 0, 'the second click of a double-click is ignored');
@@ -1705,4 +1705,49 @@ test('a client key sees neither the sign-in buttons nor Remove', async () => {
   assert.equal(page.labelled('Remove'), 0);
   assert.equal(page.labelled('Sign in again'), 0);
   assert.equal(page.byId('addBar').style.display, 'none');
+});
+
+test('a signed-out account that reads its sign-in from a file is sent to the tool that owns the file', () => {
+  const claude = { type: 'oauth', provider: 'anthropic', status: 'error', credentialsFromFile: true };
+  assert.equal(needsSignIn(claude), null, 'a sign-in here would be stored and never used');
+  assert.match(fileSignInHint(claude), /Claude Code \(claude \/login\).*Reload config/);
+  assert.match(fileSignInHint({ ...claude, provider: 'codex' }), /Codex CLI \(codex login\)/);
+  assert.equal(fileSignInHint({ ...claude, status: 'active' }), null);
+  assert.equal(fileSignInHint({ ...claude, credentialsFromFile: false }), null);
+});
+
+test('a sign-in that landed on a file-backed account says it did not take, rather than claiming success', () => {
+  const out = signInStatusOutcome({ ok: true, state: 'succeeded', account: 'me@example.com', action: 'updated', fileBacked: true }, 'Claude');
+  assert.equal(out.done, true);
+  assert.equal(out.kind, 'warn');
+  assert.match(out.text, /credentials file.*Claude Code/);
+});
+
+test('the only account cannot be removed: the button is there, disabled, and says why', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }] });
+  const lone = page.findLast(e => e.textContent === 'Remove');
+  assert.equal(lone.disabled, true);
+  assert.match(lone.title, /at least one account/);
+});
+
+test('a file-backed account in error shows where to sign in, and no Sign in again', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [
+    { name: 'a', provider: 'anthropic', type: 'oauth', status: 'error', credentialsFromFile: true, quota: {} },
+    { name: 'b', provider: 'anthropic', type: 'apikey', quota: {} },
+  ] });
+  assert.equal(page.labelled('Sign in again'), 0);
+  assert.ok(page.findLast(e => /credentials file/.test(e.textContent)));
+});
+
+test('status says whether an account reads its sign-in from a file, and never which file', () => {
+  const am = new AccountManager([
+    { name: 'filed', type: 'oauth', importFrom: '/tmp/demo-creds.json', accessToken: 't', refreshToken: 'r', expiresAt: 4102444800000 },
+    { name: 'inline', type: 'oauth', accessToken: 't2', refreshToken: 'r2', expiresAt: 4102444800000 },
+  ], 0.98);
+  const [filed, inline] = am.getStatus().accounts;
+  assert.equal(filed.credentialsFromFile, true);
+  assert.equal(inline.credentialsFromFile, false);
+  assert.doesNotMatch(JSON.stringify(am.getStatus()), /demo-creds/);
 });

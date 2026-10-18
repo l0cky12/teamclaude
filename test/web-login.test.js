@@ -41,7 +41,7 @@ test('a started sign-in hands back its links, and Claude alone carries the loopb
   assert.equal(claude.url, 'https://claude.example/authorize');
   assert.equal(claude.browserUrl, 'http://localhost:4242/authorize');
   assert.equal(claude.listening, true);
-  assert.deepEqual(signIns.status(claude.id), { state: 'waiting', provider: 'claude', account: null, action: null, error: null });
+  assert.deepEqual(signIns.status(claude.id), { state: 'waiting', provider: 'claude', account: null, action: null, error: null, fileBacked: false });
 
   const codex = await signIns.start('codex');
   assert.equal(codex.browserUrl, null, 'Codex has one link; its redirect is fixed to localhost:1455');
@@ -56,7 +56,7 @@ test('an accepted paste moves the sign-in on, and the outcome names the account'
 
   runs[0].settle.resolve({ name: 'me@example.com', action: 'added' });
   await tick();
-  assert.deepEqual(signIns.status(id), { state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'added', error: null });
+  assert.deepEqual(signIns.status(id), { state: 'succeeded', provider: 'codex', account: 'me@example.com', action: 'added', error: null, fileBacked: false });
   assert.throws(() => signIns.submit(id, 'good'), WebSignInError, 'a finished sign-in takes no more pastes');
 });
 
@@ -133,4 +133,50 @@ test('a listener note reaches the page on one line', async () => {
   assert.equal(start.listening, false);
   assert.ok(!/\n/.test(start.note), start.note);
   assert.match(start.note, /^Port 1455 is in use/);
+});
+
+test('a code the loopback listener caught moves the sign-in on too, and Cancel no longer claims to stop it', async () => {
+  let listenerWon;
+  const settled = new Promise(resolve => { listenerWon = resolve; });
+  const { signIn, runs } = stubFlow({ prompt: { settled } });
+  const signIns = new WebSignIns({ signIn });
+  const { id } = await signIns.start('claude');
+  assert.equal(signIns.status(id).state, 'waiting');
+
+  listenerWon();
+  await tick();
+  assert.equal(signIns.status(id).state, 'finishing', 'no paste, but the wait for a code is over');
+  assert.equal(signIns.cancel(id), false, 'the exchange is under way: a cancel would be a lie');
+  assert.equal(runs[0].signal.aborted, false);
+
+  runs[0].settle.resolve({ name: 'me@example.com', action: 'added' });
+  await tick();
+  assert.equal(signIns.status(id).state, 'succeeded');
+});
+
+test('a sign-in that is finishing is not replaced by a new one, so its outcome is not lost', async () => {
+  const { signIn, runs } = stubFlow();
+  const signIns = new WebSignIns({ signIn });
+  const { id } = await signIns.start('codex');
+  signIns.submit(id, 'good');
+  await assert.rejects(signIns.start('claude'), err => err instanceof WebSignInError && /still finishing/.test(err.message));
+  assert.equal(runs.length, 1, 'no second flow was started');
+  assert.equal(runs[0].signal.aborted, false);
+  runs[0].settle.resolve({ name: 'me@example.com', action: 'updated' });
+  await tick();
+  assert.equal(signIns.status(id).state, 'succeeded', 'the page can still read how it ended');
+  await signIns.start('claude');
+  assert.equal(runs.length, 2, 'once it has ended, a new one starts');
+});
+
+test('a cancel ends the wait as cancelled, not as finishing', async () => {
+  let ended;
+  const settled = new Promise(resolve => { ended = resolve; });
+  const { signIn, runs } = stubFlow({ prompt: { settled } });
+  const signIns = new WebSignIns({ signIn });
+  const { id } = await signIns.start('claude');
+  runs[0].signal.addEventListener('abort', () => ended());
+  assert.equal(signIns.cancel(id), true);
+  await tick();
+  assert.equal(signIns.status(id).state, 'cancelled');
 });
