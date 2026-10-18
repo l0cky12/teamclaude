@@ -186,6 +186,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
+      // A re-login or `teamclaude accounts` rewrites it on disk, and the entry
+      // still holding the old one would put it back on the next save.
+      if (diskAcct.email) cfgAcct.email = diskAcct.email; else delete cfgAcct.email;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;

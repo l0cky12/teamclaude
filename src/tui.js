@@ -2254,6 +2254,8 @@ export class TUI {
           if (entry.accountUuid) amAcct.accountUuid = entry.accountUuid;
           if (entry.orgUuid) amAcct.orgUuid = entry.orgUuid;
           if (entry.orgName) amAcct.orgName = entry.orgName;
+          // The config entry has it now; the dashboard reads the running one.
+          if (entry.email) amAcct.email = entry.email;
           for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
             amAcct[field] = entry[field];
           }
