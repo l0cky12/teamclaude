@@ -20,6 +20,7 @@ import {
   canUpsertOAuthAccount,
   isTokenRejection,
   oauthIdentityFields,
+  oauthEmailField,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
@@ -1311,6 +1312,9 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       source: 'login',
       accountId: creds.accountId,
       userId: creds.userId,
+      // From the id token, like the default name above; absent when the token
+      // carried none, so a re-login keeps the one already stored.
+      ...(creds.email ? { email: creds.email } : {}),
       accessToken: creds.accessToken,
       refreshToken: creds.refreshToken,
       expiresAt: creds.expiresAt,
@@ -1951,6 +1955,7 @@ async function accountsCommand() {
       if (p.accountUuid && a.accountUuid !== p.accountUuid) { a.accountUuid = p.accountUuid; touchedIds.add(a.id); }
       if (p.orgUuid && a.orgUuid !== p.orgUuid) { a.orgUuid = p.orgUuid; touchedIds.add(a.id); }
       if (p.orgName && a.orgName !== p.orgName) { a.orgName = p.orgName; touchedIds.add(a.id); }
+      if (p.email && a.email !== p.email) { a.email = p.email; touchedIds.add(a.id); }
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
         if (p[field] != null && a[field] !== p[field]) { a[field] = p[field]; touchedIds.add(a.id); }
       }
@@ -1987,7 +1992,7 @@ async function accountsCommand() {
   // profile fields onto the touched rows only, leaving every other row — and
   // every other field of these rows — as it is on disk.
   if (touchedIds.size > 0 || removedIds.size > 0) {
-    const fields = ['name', 'accountUuid', 'orgUuid', 'orgName', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
+    const fields = ['name', 'accountUuid', 'orgUuid', 'orgName', 'email', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
     await atomicConfigUpdate(disk => {
       disk.accounts = disk.accounts.filter(d => !removedIds.has(d?.id));
       for (const a of config.accounts) {
@@ -3026,6 +3031,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       type: 'oauth',
       source,
       ...oauthIdentityFields(profile),
+      ...oauthEmailField(profile),
       organizationType: profile?.organizationType || null,
       rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
       seatTier: profile?.seatTier || null,

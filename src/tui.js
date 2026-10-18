@@ -8,6 +8,7 @@ import {
   updateAccountEntry,
   canUpsertOAuthAccount,
   oauthIdentityFields,
+  oauthEmailField,
 } from './identity.js';
 import { configIndexFor, managerAccountFor, markAccountRemoved, markAccountAdded } from './account-pairing.js';
 import { PROVIDERS, providerOf, isSubscriptionAccount, upstreamFor } from './provider.js';
@@ -2217,6 +2218,7 @@ export class TUI {
       const entry = {
         name, type: 'oauth', source: 'import',
         ...oauthIdentityFields(profile),
+        ...oauthEmailField(profile),
         organizationType: profile?.organizationType || null,
         rateLimitTier: profile?.rateLimitTier || creds.rateLimitTier || null,
         seatTier: profile?.seatTier || null,

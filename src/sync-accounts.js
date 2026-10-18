@@ -105,6 +105,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    // Unlike the org, an email written by `teamclaude accounts` or a re-login
+    // replaces the running one: it is display-only, so nothing keys on it.
+    if (diskAcct.email && mgr.email !== diskAcct.email) mgr.email = diskAcct.email;
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }

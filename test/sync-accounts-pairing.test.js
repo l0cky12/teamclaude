@@ -89,3 +89,18 @@ test('pairing survives a memConfig entry the manager never received', async () =
   assert.equal(mem[1].upstream, 'https://api.example.test/anthropic', 'the live account keeps its own binding');
   assert.equal(mem[0].upstream, undefined, 'the dropped entry must not absorb it');
 });
+
+test('an email written to disk reaches the running account', async () => {
+  const disk = [{ name: 'work', type: 'apikey', apiKey: 'k-work' }];
+  const mem = disk.map(a => ({ ...a }));
+  const am = new AccountManager(mem.map(a => ({ ...a })), 0.98);
+  assert.equal(am.accounts[0].email, null);
+
+  // `teamclaude accounts` backfills it, then a re-login with a changed email.
+  disk[0].email = 'me@example.com';
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: mem }, am);
+  assert.equal(am.accounts[0].email, 'me@example.com');
+  disk[0].email = 'new@example.com';
+  await syncAccountsFromDisk({ accounts: disk }, { accounts: mem }, am);
+  assert.equal(am.accounts[0].email, 'new@example.com');
+});

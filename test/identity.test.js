@@ -12,6 +12,7 @@ import {
   canUpsertOAuthAccount,
   isTokenRejection,
   oauthIdentityFields,
+  oauthEmailField,
 } from '../src/identity.js';
 
 test('orgKey prefers orgUuid, falls back to orgName, else null', () => {
@@ -342,4 +343,16 @@ test('a token write resolves the right row for one person in two orgs', async ()
   // The row the write should land on is the one whose id matches, not the first
   // identity match (which would be the personal row).
   assert.equal(rows.findIndex(r => r.id === acme.id), 1);
+});
+
+test('the email rides along as its own field, and only from a profile that has one', () => {
+  assert.deepEqual(oauthEmailField({ email: 'a@example.com', accountUuid: 'u' }), { email: 'a@example.com' });
+  // Absent, not null: spread over a stored entry, a failed or empty profile
+  // must keep the email the entry already has.
+  const stored = { name: 'work', email: 'a@example.com' };
+  for (const profile of [null, undefined, { error: 'offline' }, { email: '' }, { email: 7 }, {}]) {
+    assert.deepEqual({ ...stored, ...oauthEmailField(profile) }, stored);
+  }
+  // Identity matching still ignores it.
+  assert.deepEqual(oauthIdentityFields({ email: 'a@example.com' }), {});
 });

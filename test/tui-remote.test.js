@@ -671,7 +671,7 @@ const hostileStatus = () => statusFixture({
     accounts: [{ name: 9, eligible: 'yes' }, { name: `bravo\x1b[2J`, eligible: true }],
   }],
   accounts: [
-    { name: 5, type: { evil: true }, status: `active${CLIP}\r\nforged`, orgName: `org\x1b[2J`, quota: {} },
+    { name: 5, type: { evil: true }, status: `active${CLIP}\r\nforged`, orgName: `org\x1b[2J`, email: `me${CLIP}@example.com`, quota: {} },
     { name: `alpha${CLIP}`, type: `oauth\x9b2J`, status: 'active', unavailable: `disabled${CLIP}`, quota: {} },
     { name: 'x'.repeat(500), type: 'oauth', status: 'active', quota: {} },
   ],
@@ -696,7 +696,7 @@ test('a hostile status payload is coerced and stripped before it is drawn', asyn
   assert.equal(am.routes[0].match[1], '7');
   assert.deepEqual(am.routes[0].accounts.map(a => a.eligible), [true, true]);
   assert.equal(am.routes[0].accounts[0].name, '9');
-  for (const a of am.accounts) for (const k of ['name', 'type', 'status', 'orgName', 'unavailable']) if (a[k]) noControls(a[k]);
+  for (const a of am.accounts) for (const k of ['name', 'type', 'status', 'orgName', 'email', 'unavailable']) if (a[k]) noControls(a[k]);
   for (const r of am.routes) {
     for (const k of ['name', 'bucket', 'color', 'pinned', 'target']) if (r[k]) noControls(r[k]);
     r.match.forEach(noControls);

@@ -219,3 +219,17 @@ export function oauthIdentityFields(profile) {
       .map(key => [key, profile[key]])
   );
 }
+
+/**
+ * The login's email as an entry field, for the dashboard to show beside an
+ * account the operator renamed. Kept apart from oauthIdentityFields: an email
+ * says whose login this is, but it is not what two entries are matched by.
+ * Absent rather than null when the profile has none, so a re-import over a
+ * failed profile keeps the email already stored.
+ * @param {Record<string, any>|null|undefined} profile - a fetchProfile result, success or error
+ * @returns {{ email?: string }}
+ */
+export function oauthEmailField(profile) {
+  if (!profile || profile.error || typeof profile.email !== 'string' || !profile.email) return {};
+  return { email: profile.email };
+}

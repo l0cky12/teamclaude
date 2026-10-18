@@ -30,6 +30,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
       "accountUuid": "...",
       "orgUuid": "...",
       "orgName": "Acme",
+      "email": "user@example.com",
       "priority": 0,
       "accessToken": "sk-ant-oat01-...",
       "refreshToken": "sk-ant-ort01-...",
@@ -87,6 +88,7 @@ While the config is being rewritten — by the server rotating a refresh token, 
 | `sx.mode` | `always` (route all upstream traffic), `429` (direct, fail over to the proxy after a 429), or `off` (keep the key but don't use it). Defaults to `always` when a key is set |
 | `accounts[].accountUuid` | Anthropic account (person) id; set automatically from the OAuth profile |
 | `accounts[].orgUuid` / `orgName` | Organization the account is scoped to — lets one email hold multiple org accounts |
+| `accounts[].email` | The login's email, written at sign-in from the OAuth profile (Claude) or the id token (Codex), and saved for older accounts by `teamclaude accounts` (which also renames them to their email) or a re-login. **Display only**: the dashboard shows it under a renamed account's name, and nothing matches or routes by it. Applied live on reload |
 | `accounts[].priority` | Rotation preference, lower = preferred (default 0) |
 | `accounts[].switchThreshold` | Per-account override of the fleet-wide `switchThreshold`: a number, or a per-bucket table like `{ "unified7dFable": 0.8 }`. Resolution is per bucket — the account table's entry for that bucket, else the account's own `default` (or bare number), else the fleet's `switchThreshold` for that bucket — so a table without `default` only overrides the buckets it lists and inherits the rest from the fleet. Still a *preference*, exactly like the fleet setting: the all-exhausted revalidation probe can override it too. That is what keeps it a different setting from the hard `accounts[].maxUsage` cap below. No CLI editor — hand-edit and reload, same as `maxUsage`. Applied live on reload. See [Per-account thresholds](quota.md#per-account-thresholds) When any account is opted into `allowExtraUsage`, the fallback spends quota between this threshold and 100% before any account is billed; a reserve that must hold is `maxUsage`. |
 | `accounts[].displayOrder` | Where the account sits in the TUI's account list, lowest first; unset lists after every account that has one. **Display only** — it decides nothing about which account rotation spends, which is `priority` above. Set it from the TUI (**`g`** → **Reorder accounts**), or by hand; applied live on reload |

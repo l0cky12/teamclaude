@@ -308,7 +308,7 @@ test('import stores quota tier metadata returned by the OAuth profile', async ()
   assert.match(id, /^[0-9a-f-]{36}$/, 'a new entry is given an id');
   assert.deepEqual(entry, {
     name: 'team@x.com', type: 'oauth', source: 'import',
-    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team', email: 'team@x.com',
     organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
     hasClaudeMax: true, hasClaudePro: false,
     accessToken: 'fresh', refreshToken: 'r', expiresAt,

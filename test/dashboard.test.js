@@ -11,7 +11,7 @@ import {
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
-  callerCan, callerNotice, cardNoteKey, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
+  callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
@@ -1485,4 +1485,29 @@ test('a backend account card draws its probed windows, not "quota unknown" (#530
   assert.deepEqual(backendQuotaRows({ label: 'Balance', text: '$4.20', utilization: null }, now),
     { rows: [], text: 'Balance: $4.20' });
   assert.deepEqual(backendQuotaRows(null, now), { rows: [], text: null });
+});
+
+test('a renamed account shows its email under the name; one named by its email does not repeat it', () => {
+  assert.equal(accountEmailLine({ name: 'work', email: 'me@example.com' }), 'me@example.com');
+  assert.equal(accountEmailLine({ name: 'me@example.com', email: 'me@example.com' }), null);
+  // Not yet known (an account added before emails were kept), or junk.
+  assert.equal(accountEmailLine({ name: 'account-1', email: null }), null);
+  assert.equal(accountEmailLine({ name: 'account-1' }), null);
+  assert.equal(accountEmailLine({ name: 'account-1', email: 5 }), null);
+});
+
+test('the account row\'s email line runs inside the serialized bundle', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return accountEmailLine;`)();
+  assert.equal(isolated({ name: 'work', email: 'me@example.com' }), 'me@example.com');
+  assert.match(script, /accountEmailLine\(a\)/, 'the accounts table calls it');
+});
+
+test('the status payload carries each account\'s email, null when none is stored', () => {
+  const am = new AccountManager([
+    { name: 'work', type: 'api_key', apiKey: 'sk-a', email: 'me@example.com' },
+    { name: 'b', type: 'api_key', apiKey: 'sk-b' },
+  ], 0.98);
+  assert.deepEqual(am.getStatus().accounts.map(a => a.email), ['me@example.com', null]);
 });

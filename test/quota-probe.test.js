@@ -299,6 +299,31 @@ test('prober learns missing quota tier metadata with the first quota refresh', a
   assert.equal(am.getQuotaSummary().accounts[0].tier.weight, 1);
 });
 
+test('a probe reads the profile once for an account with a tier but no email, and the email survives a restart', async () => {
+  const am = new AccountManager([oauth('work', { rateLimitTier: 'default_claude_max_20x' })], 0.98);
+  let profileReads = 0;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    probeFn: async () => ({ sevenDay: { utilization: 0.2, resetAt: 2000 } }),
+    profileFn: async () => { profileReads++; return { email: 'me@example.com', rateLimitTier: 'default_claude_max_20x' }; },
+    log: () => {},
+  });
+
+  await prober.probeAll();
+  await prober.probeAll();
+
+  assert.equal(am.accounts[0].email, 'me@example.com');
+  assert.equal(profileReads, 1, 'with the email known there is nothing left to read');
+
+  const restarted = new AccountManager([oauth('work', { rateLimitTier: 'default_claude_max_20x' })], 0.98);
+  restarted.restoreQuotaState(am.exportQuotaState());
+  assert.equal(restarted.accounts[0].email, 'me@example.com');
+  // The config's email is the latest sign-in's, so it beats the state file's.
+  const relogged = new AccountManager([oauth('work', { email: 'new@example.com' })], 0.98);
+  relogged.restoreQuotaState(am.exportQuotaState());
+  assert.equal(relogged.accounts[0].email, 'new@example.com');
+});
+
 // A third-party backend account is typed `oauth` with a static token (the
 // documented DeepSeek/GLM pattern), so a type check alone sends THAT provider's
 // key to api.anthropic.com every cycle — which answers 429, leaving a permanent
