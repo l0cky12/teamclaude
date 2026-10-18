@@ -16,6 +16,7 @@ import {
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
 } from '../src/dashboard.js';
+import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -1208,7 +1209,8 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
     assert.equal(page.status, 200);
     assert.match(page.headers.get('content-type'), /text\/html/);
     const html = await page.text();
-    assert.match(html, /TeamClaude/);
+    assert.match(html, /<title>TeamRouter<\/title>/);
+    assert.match(html, /<h1>TeamRouter<\/h1>/);
 
     // The page keeps the proxy key in localStorage, so it ships with a policy
     // that lets nothing load from anywhere and admits only its own script —
@@ -1230,6 +1232,16 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
       assert.match(csp, new RegExp(`'sha256-${hash.replace(/[+/=]/g, '\\$&')}'`));
     }
     assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
+
+    // The tab icon is the logo inlined as a data: URL, so the page needs no
+    // asset route; the policy admits data URLs and no network image source.
+    assert.match(csp, /(^|; )img-src data:(;|$)/);
+    assert.doesNotMatch(csp, /img-src[^;]*'self'/);
+    assert.match(html, /<link rel="icon" type="image\/svg\+xml" href="data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+">/);
+    assert.ok(html.includes(`href="${logoDataUrl()}"`), 'the icon is the logo module\'s data URL');
+    // The sidebar carries the same mark inline beside the name, decorative
+    // so a screen reader announces the name once.
+    assert.ok(html.includes(`<div class="brand">${logoMarkup()}TeamRouter</div>`));
 
     // The asset route is GET + exact path only — a POST to the same path must
     // NOT hit the dashboard handler. It used to flow on to the forwarder and

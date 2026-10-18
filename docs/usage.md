@@ -265,7 +265,7 @@ Every `/teamclaude/…` route the server exposes — `status`, `quota`, `logs`, 
 
 ## Status dashboard (browser)
 
-`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Quota, Sessions, Clients), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it.
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Quota, Sessions, Clients), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it. The dashboard uses the TeamRouter name and a mark of three red bars on a dark red tile in its sidebar and browser tab. The icon is embedded in the page and needs no asset request. Both `/teamclaude/dashboard` and `/teamrouter/dashboard` work.
 
 `teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The **Theme** button at the foot of the sidebar cycles system → light → dark; the choice is kept in the browser's localStorage, and "system" follows the browser's `prefers-color-scheme`. Dark is what a browser that states no preference gets.
 
