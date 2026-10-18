@@ -149,14 +149,25 @@ test('the Logs page offers a chip for every kind the proxy records', () => {
   assert.deepEqual(LOG_KINDS.slice(1).map(k => k.key), [...EVENT_KINDS]);
 });
 
-test('log pages merge in order, skip what is held, and a restarted server starts over', () => {
-  const a = mergeLogEvents([], { events: [{ id: 1 }, { id: 2 }], lastId: 2 }, 10);
-  assert.deepEqual(a.map(e => e.id), [1, 2]);
-  const b = mergeLogEvents(a, { events: [{ id: 2 }, { id: 3 }], lastId: 3 }, 10);
-  assert.deepEqual(b.map(e => e.id), [1, 2, 3]);
-  assert.deepEqual(mergeLogEvents(b, { events: [{ id: 4 }, { id: 5 }], lastId: 5 }, 3).map(e => e.id), [3, 4, 5]);
-  // lastId behind what is held: a fresh log on a restarted server.
-  assert.deepEqual(mergeLogEvents(b, { events: [], lastId: 1 }, 10), []);
+test('log pages merge in order, skip what is held, and keep at most the cap', () => {
+  const a = mergeLogEvents(null, { generation: 'g1', events: [{ id: 1 }, { id: 2 }], lastId: 2 }, 10);
+  assert.deepEqual(a.events.map(e => e.id), [1, 2]);
+  assert.equal(a.generation, 'g1');
+  assert.equal(a.refetch, false);
+  const b = mergeLogEvents(a, { generation: 'g1', events: [{ id: 2 }, { id: 3 }], lastId: 3 }, 10);
+  assert.deepEqual(b.events.map(e => e.id), [1, 2, 3]);
+  assert.deepEqual(mergeLogEvents(b, { generation: 'g1', events: [{ id: 4 }, { id: 5 }], lastId: 5 }, 3).events.map(e => e.id), [3, 4, 5]);
+});
+
+test('a restarted server is a new log: what is held goes, and the page asks again from the start', () => {
+  const held = { generation: 'old', events: [{ id: 1 }, { id: 2 }] };
+  // The new process logged three events before the page polled again, so its
+  // counter is past the cursor: ids alone would keep 1-2 from the old log and
+  // never fetch the new 1-2. The generation says it is another log.
+  const next = mergeLogEvents(held, { generation: 'new', events: [{ id: 3 }], lastId: 3 }, 10);
+  assert.deepEqual(next, { generation: 'new', events: [], refetch: true });
+  // A server that names no generation: a lastId behind what is held is the same restart.
+  assert.equal(mergeLogEvents({ generation: null, events: [{ id: 5 }] }, { events: [], lastId: 1 }, 10).refetch, true);
 });
 
 test('log filters combine kind, provider and account', () => {
@@ -1087,6 +1098,27 @@ test('the Logs page fetches the event log only while it is open, and from where 
   // The next status poll brings the log along, asking only for what is newer.
   page.click('Logs');
   assert.equal(page.requests.shift().url, '/teamclaude/logs?after=2');
+});
+
+test('the Logs page reads a restarted server\'s log again from its start', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Logs');
+  const at = new Date().toISOString();
+  const ev = (/** @type {number} */ id, /** @type {string} */ message) => ({ id, at, kind: 'control', type: 'switch', provider: null, account: null, message });
+  page.requests.shift().resolve({ status: 200, ok: true, json: async () => ({ generation: 'old', lastId: 2, capacity: 2000, events: [ev(1, 'old one'), ev(2, 'old two')] }) });
+  await new Promise(r => setImmediate(r));
+  page.click('Logs');
+  const resumed = page.requests.shift();
+  assert.equal(resumed.url, '/teamclaude/logs?after=2');
+  resumed.resolve({ status: 200, ok: true, json: async () => ({ generation: 'new', lastId: 3, capacity: 2000, events: [ev(3, 'new three')] }) });
+  await new Promise(r => setImmediate(r));
+  const again = page.requests.shift();
+  assert.equal(again?.url, '/teamclaude/logs?after=0', 'asked again from the start, without waiting for the next poll');
+  again.resolve({ status: 200, ok: true, json: async () => ({ generation: 'new', lastId: 3, capacity: 2000, events: [ev(1, 'new one'), ev(2, 'new two'), ev(3, 'new three')] }) });
+  await new Promise(r => setImmediate(r));
+  // Only the new log's three: the old process's two are gone.
+  assert.equal(page.byId('logCount').textContent, '3 of 3 events');
 });
 
 test('a provider tab narrows the quota page to that provider\'s accounts', async () => {

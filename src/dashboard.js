@@ -887,22 +887,29 @@ export var LOG_KINDS = [
   { key: 'auth', label: 'Auth' }, { key: 'rotation', label: 'Rotation' }, { key: 'control', label: 'Changes' },
 ];
 
-// Fold one GET /teamclaude/logs reply into the entries the page holds, oldest
-// first, at most `cap`. A reply whose lastId is behind the newest entry held
-// means the server restarted with a fresh log: what is held describes a
-// process that is gone, so it is dropped rather than interleaved.
-/** @param {any[]} held @param {any} page @param {number} cap */
+// Fold one GET /teamclaude/logs reply into what the page holds: the log's
+// generation and its entries, oldest first, at most `cap`. A reply from another
+// generation means the server restarted with a fresh log. What is held
+// describes a process that is gone, and the reply only carries what is newer
+// than an id from that process, so the new log's first entries are missing:
+// the state empties and `refetch` says to ask again from the start. A server
+// that names no generation is read the old way, a lastId behind the newest
+// entry held being the same restart.
+/** @param {{ generation: string|null, events: any[] }|null} held @param {any} page @param {number} cap */
 export function mergeLogEvents(held, page, cap) {
-  var have = held || [];
+  var h = held || { generation: null, events: [] };
+  var have = h.events || [];
   var p = page || {};
   /** @type {any[]} */
   var incoming = Array.isArray(p.events) ? p.events : [];
+  var gen = typeof p.generation === 'string' && p.generation ? p.generation : null;
   var newest = have.length ? have[have.length - 1].id : 0;
-  var base = typeof p.lastId === 'number' && p.lastId < newest ? [] : have;
-  var top = base.length ? base[base.length - 1].id : 0;
-  var merged = base.concat(incoming.filter(function (e) { return e && typeof e.id === 'number' && e.id > top; }));
+  if (gen ? (h.generation != null && gen !== h.generation) : (typeof p.lastId === 'number' && p.lastId < newest)) {
+    return { generation: gen, events: [], refetch: true };
+  }
+  var merged = have.concat(incoming.filter(function (e) { return e && typeof e.id === 'number' && e.id > newest; }));
   var max = cap > 0 ? cap : merged.length;
-  return merged.length > max ? merged.slice(merged.length - max) : merged;
+  return { generation: gen || h.generation, events: merged.length > max ? merged.slice(merged.length - max) : merged, refetch: false };
 }
 
 /** @param {any[]} events @param {{ kind?: string, provider?: string, account?: string }} filters */
@@ -1347,7 +1354,7 @@ const PAGE = `<!doctype html>
   var expanded = Object.create(null);
   // The Logs page's copy of the proxy's event log, fetched only while the page
   // is open, so a dashboard left on Quota costs the server one request a poll.
-  var logEvents = [];
+  var logState = { generation: null, events: [] };
   var logFilters = { kind: 'all', provider: '', account: '' };
   var logChips = [];
   var logError = null;
@@ -2086,11 +2093,11 @@ ${SHARED_HELPERS}
   function renderLogs() {
     logChips.forEach(function (c) { c.btn.className = c.key === logFilters.kind ? 'chip sel' : 'chip'; });
     var accSel = document.getElementById('logAccount');
-    fillFilter(accSel, uniqSorted(logEvents.map(function (e) { return e.account; })), logFilters.account);
+    fillFilter(accSel, uniqSorted(logState.events.map(function (e) { return e.account; })), logFilters.account);
     logFilters.account = accSel.value;
-    var rows = filterLogEvents(logEvents, logFilters).slice().reverse();
+    var rows = filterLogEvents(logState.events, logFilters).slice().reverse();
     document.getElementById('logCount').textContent = (logError ? 'cannot read the log: ' + logError + ' · ' : '')
-      + rows.length + ' of ' + logEvents.length + ' events';
+      + rows.length + ' of ' + logState.events.length + ' events';
     var table = document.getElementById('logs');
     table.textContent = '';
     var hr = el('tr');
@@ -2098,7 +2105,7 @@ ${SHARED_HELPERS}
     table.appendChild(hr);
     if (!rows.length) {
       var tr0 = el('tr');
-      var td0 = el('td', 'dim', logEvents.length ? 'No events match these filters.' : 'No events yet.');
+      var td0 = el('td', 'dim', logState.events.length ? 'No events match these filters.' : 'No events yet.');
       td0.colSpan = 5;
       tr0.appendChild(td0);
       table.appendChild(tr0);
@@ -2119,7 +2126,9 @@ ${SHARED_HELPERS}
   function pollLogs() {
     if (logsInFlight) return;
     logsInFlight = true;
-    var after = logEvents.length ? logEvents[logEvents.length - 1].id : 0;
+    var held = logState.events;
+    var after = held.length ? held[held.length - 1].id : 0;
+    var again = false;
     fetch('/teamclaude/logs?after=' + after, { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
@@ -2128,12 +2137,15 @@ ${SHARED_HELPERS}
       })
       .then(function (page) {
         if (!page) return;
-        logEvents = mergeLogEvents(logEvents, page, LOG_CAP);
+        logState = mergeLogEvents(logState, page, LOG_CAP);
+        again = logState.refetch;
         logError = null;
         renderLogs();
       })
       .catch(function (e) { logError = e.message; renderLogs(); })
-      .finally(function () { logsInFlight = false; });
+      // A restarted server's log is read again from its start, now rather
+      // than at the next poll.
+      .finally(function () { logsInFlight = false; if (again) pollLogs(); });
   }
 
   function render(s) {

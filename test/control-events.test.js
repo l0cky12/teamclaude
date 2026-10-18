@@ -33,6 +33,23 @@ test('setDisabled and setPriority record a real change once, with the provider',
   assert.equal(am.accounts[1].priority, 3);
 });
 
+// The TUI's switch key and MCP call setCurrentAccount directly; the HTTP
+// handler calls it too and adds nothing of its own.
+test('a manual switch is recorded by setCurrentAccount, saying whether rotation will use it', () => {
+  const am = new AccountManager([
+    { name: 'work', type: 'apikey', apiKey: 'k' },
+    { name: 'spare', type: 'apikey', apiKey: 'k2', disabled: true },
+  ], 0.98);
+  am.setCurrentAccount(1);
+  am.setCurrentAccount(0);
+  const [toSpare, toWork] = controls(am);
+  assert.deepEqual([toSpare.type, toSpare.account, toSpare.provider], ['switch', 'spare', 'anthropic']);
+  assert.match(toSpare.message, /so rotation will not use it/);
+  assert.deepEqual([toWork.type, toWork.account, toWork.reason], ['switch', 'work', 'manual']);
+  assert.equal(am.setCurrentAccount(9), false);
+  assert.equal(controls(am).length, 2);
+});
+
 test('a reload that picks up a disk edit records it; one that changes nothing records nothing', async () => {
   const disk = [{ name: 'work', type: 'apikey', apiKey: 'k' }, { name: 'spare', type: 'apikey', apiKey: 'k2' }];
   const am = new AccountManager(disk.map(a => ({ ...a })), 0.98);
@@ -95,6 +112,16 @@ test('through a running server: CLI-style edits and a dashboard disable each lea
     const after = await logs();
     assert.equal(after.length, 4);
     assert.deepEqual([after[3].type, after[3].account, after[3].provider], ['enabled', 'work', 'anthropic']);
+
+    // The switch endpoint (the dashboard, the CLI, attach mode) leaves one entry too.
+    const sw = await fetch(`${base}/teamclaude/switch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ account: 'spare' }),
+    });
+    assert.equal(sw.status, 200, await sw.text());
+    const switched = (await logs()).filter((/** @type {any} */ e) => e.type === 'switch');
+    assert.deepEqual(switched.map((/** @type {any} */ e) => e.account), ['spare']);
   } finally {
     await server.stop();
   }

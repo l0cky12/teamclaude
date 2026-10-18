@@ -7,6 +7,14 @@ import { AccountManager } from '../src/account-manager.js';
 
 const NOW = 1_000_000_000_000;
 
+test('each log names its generation, so a reader can tell a restart from new events', () => {
+  const a = new EventLog();
+  const b = new EventLog();
+  assert.equal(typeof a.since(0).generation, 'string');
+  assert.equal(a.since(0).generation, a.since(5).generation);
+  assert.notEqual(a.since(0).generation, b.since(0).generation);
+});
+
 test('ids increase and since() returns only what is newer', () => {
   const log = new EventLog({ now: () => NOW });
   const a = log.add({ kind: 'usage', type: 'request', message: 'one' });

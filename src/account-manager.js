@@ -887,6 +887,14 @@ export class AccountManager {
     const account = this.accounts[index];
     if (!account) return false;
     this._setCurrent(account);
+    // Every manual switch comes through here (POST /teamclaude/switch from the
+    // dashboard, the CLI and attach mode; the TUI's switch key; MCP), so it is
+    // recorded here, once, saying whether rotation will actually use it.
+    const { eligible, reason } = this.eligibility(index);
+    this.events.add({
+      kind: 'control', type: 'switch', provider: providerOf(account), account: account.name,
+      reason: eligible ? 'manual' : reason, message: `Switched to by hand${eligible ? '' : `: ${reason}, so rotation will not use it`}`,
+    });
     return true;
   }
 

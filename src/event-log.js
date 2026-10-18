@@ -17,6 +17,7 @@
 // id), a model, a status code, token counts and latency, and a short reason.
 // Reasons are codes or one-line messages written here, never a response body.
 
+import { randomUUID } from 'node:crypto';
 import { safeLine } from './safe-text.js';
 
 /** How many entries are kept before the oldest are dropped. */
@@ -86,6 +87,10 @@ export class EventLog {
     /** @type {LogEvent[]} */
     this.entries = [];
     this.lastId = 0;
+    // Names this log. Ids restart at 1 with every process, so a reader that
+    // held events from the last one cannot tell from ids alone whether it
+    // missed the new one's first entries; a different generation says so.
+    this.generation = randomUUID();
   }
 
   /**
@@ -123,7 +128,7 @@ export class EventLog {
    * to the present instead of paging through history it never saw.
    * @param {number} [after]
    * @param {number} [limit]
-   * @returns {{ events: LogEvent[], lastId: number, capacity: number }}
+   * @returns {{ events: LogEvent[], lastId: number, capacity: number, generation: string }}
    */
   since(after = 0, limit = EVENT_LOG_PAGE) {
     const from = Number.isFinite(after) && after > 0 ? after : 0;
@@ -133,7 +138,7 @@ export class EventLog {
     const oldest = this.entries[0]?.id ?? this.lastId + 1;
     const start = Math.max(0, from + 1 - oldest);
     const newer = this.entries.slice(start);
-    return { events: newer.slice(-max), lastId: this.lastId, capacity: this.capacity };
+    return { events: newer.slice(-max), lastId: this.lastId, capacity: this.capacity, generation: this.generation };
   }
 }
 
