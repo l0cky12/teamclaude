@@ -138,6 +138,20 @@ export class EventLog {
 }
 
 /**
+ * The event-log entry for a switch threshold that changed: one number, or a
+ * per-bucket table. Built here so the reload that applies a CLI or dashboard
+ * change and the TUI's settings screen word it the same way.
+ * @param {unknown} threshold  the new switchThreshold
+ * @returns {{ kind: 'control', type: 'threshold', message: string }}
+ */
+export function thresholdEvent(threshold) {
+  const message = typeof threshold === 'number' && Number.isFinite(threshold)
+    ? `Switch threshold set to ${Math.round(threshold * 1000) / 10}%`
+    : 'Switch thresholds set per quota bucket';
+  return { kind: 'control', type: 'threshold', message };
+}
+
+/**
  * Parse the `after` query of GET /teamclaude/logs: a non-negative integer, or 0.
  * @param {string|undefined} url
  * @returns {number}
@@ -150,17 +164,26 @@ export function logsAfter(url) {
 }
 
 /**
- * A sign-in failure as one line we can stand behind. Our own messages (a
- * pasted code that does not parse, a timeout) pass through; a token
- * endpoint's refusal ("Token exchange failed (400): <body>") is cut at its
- * status, because the body is the upstream's text, not ours.
+ * A sign-in failure as one line safe for anyone who may read the log. The
+ * errors a login throws carry upstream text: a token endpoint's response body,
+ * an OAuth error_description, a profile lookup's body. So the line is never
+ * the error's own message. It is one of a few fixed phrases, keeping only an
+ * HTTP status or an OAuth error code (`access_denied`) from it, unless the
+ * thrower marked a message of its own as public (`publicMessage`).
  * @param {unknown} error
  * @returns {string}
  */
 export function briefError(error) {
-  const message = String(/** @type {any} */ (error)?.message ?? error ?? 'unknown error');
-  const status = /^(.{1,80}?\(\d{3}\))\s*:/.exec(message);
-  return safeLine(status ? status[1] : message, 160);
+  const err = /** @type {any} */ (error);
+  if (typeof err?.publicMessage === 'string' && err.publicMessage) return safeLine(err.publicMessage, 160);
+  const message = String(err?.message ?? err ?? '');
+  const refused = /^(?:The sign-in was refused|OpenAI refused the sign-in): ([a-z_]{1,40})\b/.exec(message);
+  if (refused) return `the provider refused the sign-in (${refused[1]})`;
+  if (/^Could not identify OAuth account/.test(message)) return 'the signed-in account\'s profile could not be read';
+  const status = /(?:\(|HTTP )(\d{3})\b/.exec(message);
+  if (status) return `the provider answered HTTP ${status[1]}`;
+  if (/^That /.test(message)) return 'the pasted code or address could not be used';
+  return 'the full reason is in the server\'s output';
 }
 
 /**

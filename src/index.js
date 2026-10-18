@@ -24,7 +24,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
-import { signInEvent } from './event-log.js';
+import { signInEvent, thresholdEvent } from './event-log.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
@@ -589,8 +589,12 @@ async function serverCommand() {
     // manager on every decision, so assigning it is the whole application —
     // and without this a change from outside the TUI waited for a restart.
     if (diskConfig.switchThreshold != null) {
+      const before = JSON.stringify(accountManager.switchThreshold);
       config.switchThreshold = diskConfig.switchThreshold;
       accountManager.switchThreshold = diskConfig.switchThreshold;
+      // Recorded where every writer's change lands (the CLI, the dashboard,
+      // MCP, a hand edit), and only when the value moved.
+      if (JSON.stringify(diskConfig.switchThreshold) !== before) accountManager.events.add(thresholdEvent(diskConfig.switchThreshold));
     }
     // Pick up expiry-routing edits the same way, so the knob hot-applies.
     config.expiryRouting = diskConfig.expiryRouting;

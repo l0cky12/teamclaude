@@ -4849,6 +4849,12 @@ export class AccountManager {
   setDisabled(accountIndex, disabled) {
     const account = this.accounts[accountIndex];
     if (!account) return;
+    // Recorded here rather than by each caller, so the dashboard, the CLI
+    // (through the reload it triggers), MCP and the TUI all leave one entry,
+    // and a reload that changes nothing leaves none.
+    if (!!account.disabled !== !!disabled) {
+      this.events.add({ kind: 'control', type: disabled ? 'disabled' : 'enabled', provider: providerOf(account), account: account.name, message: disabled ? 'Disabled' : 'Enabled' });
+    }
     account.disabled = disabled;
     if (!disabled && account.status === 'error') {
       account.status = 'active';
@@ -4861,6 +4867,19 @@ export class AccountManager {
     }
     // The same explicit "try this again" for an API key sitting out a 401.
     if (!disabled) this.clearCredentialRejected(accountIndex);
+  }
+
+  /**
+   * Set an account's rotation priority, recording the change on the event log
+   * the way setDisabled does: one entry per real change, whoever made it.
+   * @param {number} accountIndex
+   * @param {number} priority
+   */
+  setPriority(accountIndex, priority) {
+    const account = this.accounts[accountIndex];
+    if (!account || account.priority === priority) return;
+    this.events.add({ kind: 'control', type: 'priority', provider: providerOf(account), account: account.name, message: `Priority ${account.priority ?? 0} → ${priority}` });
+    account.priority = priority;
   }
 
   /**

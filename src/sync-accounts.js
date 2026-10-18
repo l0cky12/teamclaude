@@ -109,7 +109,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
     if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
-    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
+    if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) accountManager.setPriority(mgr.index, diskAcct.priority);
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field
     // puts the account back among the unplaced instead of leaving it stuck at

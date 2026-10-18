@@ -715,11 +715,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.log(`[TeamClaude] ${isPriority
             ? `Set priority of "${result.name}" to ${result.priority}`
             : `${result.disabled ? 'Disabled' : 'Enabled'} account "${result.name}"`} (control endpoint)`);
-          accountManager.events?.add({
-            kind: 'control', type: isPriority ? 'priority' : (result.disabled ? 'disabled' : 'enabled'),
-            provider: result.provider ?? null, account: result.name,
-            message: isPriority ? `Priority set to ${result.priority}` : (result.disabled ? 'Disabled from the dashboard' : 'Enabled from the dashboard'),
-          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, ...result }));
         } catch (err) {
@@ -946,7 +941,6 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // that quietly retires an account would otherwise change nothing visible.
         console.log(`[TeamClaude] Switch threshold set to ${Math.round(saved * 1000) / 10}% (dashboard)`
           + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
-        accountManager.events?.add({ kind: 'control', type: 'threshold', message: `Switch threshold set to ${Math.round(saved * 1000) / 10}%` });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
         return;

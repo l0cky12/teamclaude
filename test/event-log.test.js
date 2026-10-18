@@ -63,9 +63,22 @@ test('logsAfter reads a non-negative integer and nothing else', () => {
   assert.equal(logsAfter(undefined), 0);
 });
 
-test('a token endpoint refusal is cut at its status; our own messages pass through', () => {
-  assert.equal(briefError(new Error('Token exchange failed (400): {"error":"invalid_grant","detail":"x"}')), 'Token exchange failed (400)');
-  assert.equal(briefError(new Error('That is not the whole code.')), 'That is not the whole code.');
+test('a sign-in failure is a fixed phrase: no upstream text survives into the log', () => {
+  const said = (/** @type {unknown} */ e) => briefError(e);
+  // A token endpoint's body, a profile lookup's body, an OAuth error_description:
+  // each keeps only its status or error code.
+  assert.equal(said(new Error('Token exchange failed (400): {"error":"invalid_grant","detail":"secret-ish"}')), 'the provider answered HTTP 400');
+  assert.equal(said(new Error('Codex token exchange failed (401): <html>upstream page</html>')), 'the provider answered HTTP 401');
+  const profile = said(new Error('Could not identify OAuth account — HTTP 403: {"email":"someone@example.com"}'));
+  assert.equal(profile, "the signed-in account's profile could not be read");
+  assert.equal(said(new Error('The sign-in was refused: access_denied (The user said no to app <b>x</b>)')), 'the provider refused the sign-in (access_denied)');
+  // An error "code" that is not one is not kept either.
+  assert.equal(said(new Error('OpenAI refused the sign-in: Not A Code (whatever)')), "the full reason is in the server's output");
+  assert.equal(said(new Error('That is not the whole code. Paste all of what the page shows')), 'the pasted code or address could not be used');
+  assert.equal(said(new Error('something nobody planned for: token=abc')), "the full reason is in the server's output");
+  assert.equal(said('a bare string'), "the full reason is in the server's output");
+  // A message the thrower wrote for people and marked public passes through.
+  assert.equal(said(Object.assign(new Error('internal'), { publicMessage: 'Signed in as "b", not "a"' })), 'Signed in as "b", not "a"');
 });
 
 test('signInEvent tells a cancel and a timeout apart from a failure', () => {

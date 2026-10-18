@@ -1,4 +1,5 @@
 import { createWriteStream } from 'node:fs';
+import { thresholdEvent } from './event-log.js';
 import { gatingUtilization } from './model.js';
 import { importCredentials, fetchProfile, formatMoney } from './oauth.js';
 import {
@@ -1570,6 +1571,8 @@ export class TUI {
       this.am.switchThreshold = prev.live;
     })) { this.mode = 'settings'; if (this.running) this.render(); return; }
     this._addLog(`Switch threshold set to ${formatPercent(v)}`);
+    // The settings screen saves without a reload, so it records its own change.
+    if (JSON.stringify(prev.live) !== JSON.stringify(v)) this.am.events?.add(thresholdEvent(v));
     this.mode = 'settings';
     if (this.running) this.render();
   }

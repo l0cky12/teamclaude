@@ -298,10 +298,10 @@ The Logs page is what happened to the accounts, newest first:
 | Kind | Entries |
 |---|---|
 | **Usage** | Every request served: account, model, status, input and output tokens, latency. A request the proxy refused before choosing an account is listed without one. |
-| **Sign-in** | An interactive sign-in from the terminal's login panel: started, succeeded, failed, timed out or cancelled. A config reload that brings an account fresh credentials is listed here too. |
+| **Sign-in** | An interactive sign-in from the terminal's login panel: started, succeeded, failed, timed out or cancelled. A failure says why in a fixed phrase (the provider's HTTP status, or its OAuth error code), never the provider's own text. A config reload that brings an account fresh credentials is listed here too. |
 | **Auth** | An account losing its credentials: an OAuth account signed out (refresh token rejected, credentials gone), an API key refused with a 401. Once per transition, not once per request. |
 | **Rotation** | The router moving off an account: a switch, a rate limit, a session-window reset, every account exhausted, a hold. |
-| **Changes** | An account enabled, disabled, reprioritized or switched to by hand, the switch threshold changed, accounts added or removed by a reload. |
+| **Changes** | An account enabled, disabled, reprioritized or switched to by hand, the switch threshold changed, accounts added or removed by a reload. Recorded wherever the change came from: the dashboard, the CLI, the TUI, MCP or a hand edit of the config file. |
 
 Chips narrow it to one kind, and two selectors to one provider or one account. The page asks for the log only while it is open.
 

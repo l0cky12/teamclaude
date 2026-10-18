@@ -1,6 +1,6 @@
 // GET /teamclaude/logs: a request served through the proxy becomes a usage
-// entry, a dashboard change a control entry, and `?after=` returns only what is
-// newer. The caller's own activity hooks still see every request.
+// entry, and `?after=` returns only what is newer. The caller's own activity
+// hooks still see every request. Control entries are in control-events.test.js.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -57,24 +57,6 @@ test('a served request is a usage entry with its account, model, status and toke
   const after = await (await fetch(`${url}/teamclaude/logs?after=${page.lastId}`)).json();
   assert.deepEqual(after.events, []);
   assert.equal(after.lastId, page.lastId);
-});
-
-test('a dashboard enable/disable is a control entry', async t => {
-  const { url } = await fixture(t, {
-    setAccountDisabled: async (/** @type {string} */ name, /** @type {boolean} */ disabled) => ({ name, disabled, provider: 'anthropic' }),
-    reload: async () => ({ added: 0, removed: 0 }),
-  });
-  const res = await fetch(`${url}/teamclaude/disable`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ account: 'work', disabled: true }),
-  });
-  assert.equal(res.status, 200);
-  const page = await (await fetch(`${url}/teamclaude/logs`)).json();
-  const control = page.events.filter((/** @type {any} */ e) => e.kind === 'control');
-  assert.equal(control.length, 1);
-  assert.equal(control[0].type, 'disabled');
-  assert.equal(control[0].account, 'work');
 });
 
 test('a refused request names no account', async t => {
