@@ -557,6 +557,20 @@ export function cardNoteKey(account) {
 }
 
 /**
+ * The email line under an account's name, or null for none. An account named
+ * after its email already shows it; a renamed one ("work", "account-1") would
+ * otherwise hide whose login it is.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @returns {string|null}
+ */
+export function accountEmailLine(account) {
+  var email = account && account.email;
+  if (typeof email !== 'string' || !email) return null;
+  return email === account.name ? null : email;
+}
+
+/**
  * The result of the last action on one account card, while it is recent
  * enough to show. Kept outside the card, which the poll rebuilds every few
  * seconds.
@@ -981,7 +995,7 @@ export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
@@ -1698,6 +1712,8 @@ ${SHARED_HELPERS}
       var name = el('td');
       name.appendChild(el('div', 'name', a.name));
       if (a.orgName) name.appendChild(el('div', 'tag', a.orgName));
+      var emailLine = accountEmailLine(a);
+      if (emailLine) name.appendChild(el('div', 'tag', emailLine));
       var cn = cardNoteFor(cardNotes, key, Date.now());
       if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
       tr.appendChild(name);

@@ -43,6 +43,7 @@
       "accountUuid": "optional-account-uuid",
       "orgUuid": "optional-organization-uuid",
       "orgName": "Acme",
+      "email": "user@example.com",
       "priority": 0,
       "accessToken": "sk-ant-oat01-your-access-token",
       "refreshToken": "sk-ant-ort01-your-refresh-token"

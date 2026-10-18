@@ -259,6 +259,7 @@ export class RemoteAccountManager {
       type: text(a?.type, 16, '?'),
       status: text(a?.status, 16, a?.status == null ? undefined : '?'),
       orgName: a?.orgName == null ? a?.orgName : text(a.orgName, NAME_MAX),
+      email: a?.email == null ? a?.email : text(a.email, NAME_MAX),
       unavailable: a?.unavailable == null ? a?.unavailable : text(a.unavailable, 64),
       // Booleans that decide a red "billing" tag: anything but a literal true
       // from the other end reads as off, never as a claim that money moves.

@@ -105,6 +105,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     // account (e.g. after disk-side org disambiguation or a `priority` change).
     if (diskAcct.orgUuid && !mgr.orgUuid) mgr.orgUuid = diskAcct.orgUuid;
     if (diskAcct.orgName && !mgr.orgName) mgr.orgName = diskAcct.orgName;
+    // Unlike the org, an email written by `teamclaude accounts` or a re-login
+    // replaces the running one: it is display-only, so nothing keys on it.
+    if (diskAcct.email && mgr.email !== diskAcct.email) mgr.email = diskAcct.email;
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
@@ -183,6 +186,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       if (diskAcct.switchThreshold != null) cfgAcct.switchThreshold = diskAcct.switchThreshold; else delete cfgAcct.switchThreshold;
       if (diskAcct.routing) cfgAcct.routing = diskAcct.routing; else delete cfgAcct.routing;
       if (diskAcct.priority != null) cfgAcct.priority = diskAcct.priority; else delete cfgAcct.priority;
+      // A re-login or `teamclaude accounts` rewrites it on disk, and the entry
+      // still holding the old one would put it back on the next save.
+      if (diskAcct.email) cfgAcct.email = diskAcct.email; else delete cfgAcct.email;
       // The TUI's reorder writes this key onto the entry, so after one
       // arrangement every entry carries a value for a hand edit to lose to.
       if (Number.isFinite(diskAcct.displayOrder)) cfgAcct.displayOrder = diskAcct.displayOrder; else delete cfgAcct.displayOrder;

@@ -62,3 +62,14 @@ test('a displayOrder removed on disk does not come back', async () => {
   assert.equal('displayOrder' in written, false);
   assert.equal(running.displayOrder, null, 'the account did not go back among the unplaced');
 });
+
+test('an email rewritten on disk stays rewritten through the next save', async () => {
+  const { written, running } = await roundTrip(entry({ email: 'old@example.com' }), entry({ email: 'new@example.com' }));
+  assert.equal(written.email, 'new@example.com', 'the save wrote the old email back over the re-login');
+  assert.equal(running.email, 'new@example.com');
+});
+
+test('an email removed on disk does not come back', async () => {
+  const { written } = await roundTrip(entry({ email: 'old@example.com' }), entry({}));
+  assert.equal('email' in written, false);
+});

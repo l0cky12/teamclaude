@@ -223,6 +223,20 @@ test('re-importing the same account+org still updates in place', async () => {
   assert.equal(am.accounts[0].credential, 'fresh');
 });
 
+test('re-importing an account gives the running one its email, without waiting for a reload', async () => {
+  const accounts = [{ name: 'work', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme', email: 'old@x.com' }];
+  const { tui, am, config } = makeTUI({ accounts });
+  config.accounts = [{ id: accounts[0].id, name: 'work', type: 'oauth', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme', email: 'old@x.com' }];
+  tui._readCredentials = async () => ({ accessToken: 'fresh', refreshToken: 'r2', expiresAt: Date.now() + 3600_000 });
+  tui._readProfile = async () => ({ email: 'a@x.com', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' });
+
+  await tui._doImport();
+
+  assert.equal(config.accounts[0].name, 'work', 'the custom name is kept');
+  assert.equal(config.accounts[0].email, 'a@x.com');
+  assert.equal(am.accounts[0].email, 'a@x.com', 'the dashboard reads the running account');
+});
+
 test('re-importing a routed account keeps its proxy and says the profile lookup went around it', async () => {
   const accounts = [{ name: 'a@x.com', index: 0, type: 'oauth', credential: 'old', accountUuid: 'u1', orgUuid: 'o-acme', orgName: 'Acme' }];
   const { tui, config } = makeTUI({ accounts });
@@ -308,7 +322,7 @@ test('import stores quota tier metadata returned by the OAuth profile', async ()
   assert.match(id, /^[0-9a-f-]{36}$/, 'a new entry is given an id');
   assert.deepEqual(entry, {
     name: 'team@x.com', type: 'oauth', source: 'import',
-    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team',
+    accountUuid: 'u1', orgUuid: 'o1', orgName: 'Team', email: 'team@x.com',
     organizationType: 'claude_team', rateLimitTier: 'default_raven', seatTier: 'team_standard',
     hasClaudeMax: true, hasClaudePro: false,
     accessToken: 'fresh', refreshToken: 'r', expiresAt,

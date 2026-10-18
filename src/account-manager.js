@@ -371,6 +371,9 @@ function makeAccount(acct, index, listener = null) {
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
+    // The login's email, from the OAuth profile or the Codex id token. Only the
+    // dashboard reads it, to say whose login a renamed account is.
+    email: acct.email || null,
     organizationType: acct.organizationType || null,
     rateLimitTier: acct.rateLimitTier || null,
     seatTier: acct.seatTier || null,
@@ -5419,6 +5422,7 @@ export class AccountManager {
     for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
       if (profile[field] != null) account[field] = profile[field];
     }
+    if (typeof profile.email === 'string' && profile.email) account.email = profile.email;
   }
 
   /**
@@ -5853,6 +5857,7 @@ export class AccountManager {
         seatTier: a.seatTier,
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
+        email: a.email,
       };
       const adaptive = {
         burnRate: this.burnRateLearner.export(a.index),
@@ -5883,6 +5888,8 @@ export class AccountManager {
       for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
         if (match.profile?.[field] != null) account[field] = match.profile[field];
       }
+      // One the config names wins: it is what the latest sign-in said.
+      if (!account.email && typeof match.profile?.email === 'string' && match.profile.email) account.email = match.profile.email;
       this.burnRateLearner.restore(account.index, match.adaptive?.burnRate);
       this.outsideSpend.restore(account.index, match.outsideSpend);
       this.concurrencyLearner.restore(account.index, match.adaptive?.concCap);
@@ -5973,6 +5980,7 @@ export class AccountManager {
         type: a.type,
         provider: providerOf(a),
         orgName: a.orgName || null,
+        email: a.email || null,
         // What the dashboard's account row names the account by: its plan,
         // and for a third-party backend the host it forwards to.
         plan: planLabel(a),

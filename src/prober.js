@@ -217,7 +217,10 @@ export class Prober {
       this.am.applyUsageData(account.index, usage);
       const missingTier = !account.rateLimitTier && !account.seatTier
         && account.hasClaudeMax == null && account.hasClaudePro == null;
-      if (missingTier && this.profileFn) {
+      // The email too: an account added before emails were kept has none, and
+      // the profile read costs no quota. Once found it is kept in the state
+      // file, so this is one read per account, not one per probe.
+      if ((missingTier || !account.email) && this.profileFn) {
         const profile = await this._withTimeout(this.profileFn(account.credential, account.routing ?? null));
         this.am.applyProfileData(account.index, profile);
       }
