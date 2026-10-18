@@ -43,12 +43,10 @@ Build it yourself with `docker build -t teamclaude .` from a checkout.
 
 ```bash
 export TAILSCALE_IP=$(tailscale ip -4)
-docker compose -f docker/docker-compose.preview.yml build
-docker compose -f docker/docker-compose.preview.yml run --rm preview login
-docker compose -f docker/docker-compose.preview.yml up -d
+docker compose -f docker/docker-compose.preview.yml up --build -d
 ```
 
-The proxy refuses to start with no accounts, so `run … login` signs one in first, with the same paste flow as [over SSH](accounts.md#signing-accounts-in-over-ssh) (`login --codex` for a Codex account). Then open `http://<tailscale-ip>:3466/teamclaude/dashboard` and enter the preview's own proxy key:
+It starts with no accounts (`--allow-empty`). Open `http://<tailscale-ip>:3466/teamclaude/dashboard`, enter the preview's own proxy key, and add an account with **Add Claude account** or **Add Codex account** on the Accounts page (see [Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)). `docker compose -f docker/docker-compose.preview.yml run --rm preview login` signs one in from the terminal instead. The key:
 
 ```bash
 docker exec teamclaude-preview node -e "console.log(require('/data/teamclaude.json').proxy.apiKey)"
@@ -295,13 +293,15 @@ Each column says how much is **left**, green until 70% is used, amber to 90%, re
 
 With [drain mode](routing.md#drain-mode) on, the card also names the account being drained and when it resets, and each row's badge says `draining` or its place in the queue (`#2 in queue`), from `drainQueue` and `accounts[].drainRank` in `/teamclaude/status`.
 
+Where the page may sign accounts in (`caller.signIn` in `/teamclaude/status`: the shared proxy key, or a key-less browser on the proxy's own machine), the Claude and Codex sections each have an **Add account** button, and a row whose login upstream refused has **Sign in again**. Both open the sign-in dialog described in [Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard).
+
 Each row for an account the quota probe can read (a Claude or Codex subscription, or a backend that publishes its own quota) has a **Refresh quota** button: a one-shot, zero-spend probe of that account alone, sent as `POST /teamclaude/probe` with an `{"account": ...}` body (see [Quota probe](quota.md#quota-probe)). The row's bars update on the poll after it, and a failure — the usage endpoint not answering, say — shows under the row. Like **Probe quotas** it spends nothing, so a page holding a `proxy.clientKeys` key keeps it. A disabled account has no refresh button, since the probe leaves accounts out of rotation alone.
 
 Each enabled account that is not the current one has a **Switch to** button that makes it the current one (the same `POST /teamclaude/switch` the CLI uses). It is a nudge, not a pin: normal rotation resumes from there. What happens to traffic already running depends on `distributeSessions` — with it on, a conversation pinned to another account keeps it until it goes idle, so the badge moves before the traffic does; with it off (the default), everything follows the switch on its next request. The page reports whether rotation will actually use the target: an errored, rate-limited, or over-threshold account — or one outranked by a higher-priority account — is still switched to, but the page says so and why rather than reporting a bare "done".
 
 ### Accounts
 
-One table of every account: provider, plan, state, priority, conversations, requests, tokens and when it was last used, with **Switch to**, **Disable** / **Enable** (`POST /teamclaude/disable`) and, for an enabled account, **Prioritize** and **Deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The result of any account button appears under that account's name for a minute; a priority move reports the number the account landed on, since a relative move picks a number the operator did not type. These are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key (see the endpoint notes above), so for such a key the page does not draw them.
+One table of every account: provider, plan, state, priority, conversations, requests, tokens and when it was last used. **Add Claude account** and **Add Codex account** above it open the sign-in dialog, as **Sign in again** does on a row whose login upstream refused. Each row has **Switch to**, **Disable** / **Enable** (`POST /teamclaude/disable`) and, for an enabled account, **Prioritize** and **Deprioritize** (`POST /teamclaude/priority` with `place: "first"` / `"last"`). Unlike switch, these write the config file and reload the server — the same as `teamclaude disable`, `enable` and `priority --first` / `--last` — so they persist across restarts. A disabled account shows only the enable button: reordering an account that nothing will select is a control that looks like it does something and does not. The result of any account button appears under that account's name for a minute; a priority move reports the number the account landed on, since a relative move picks a number the operator did not type. These are refused when the page holds a `proxy.clientKeys` key rather than the shared proxy key (see the endpoint notes above), so for such a key the page does not draw them.
 
 ### Logs
 

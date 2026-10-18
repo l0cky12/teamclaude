@@ -978,6 +978,82 @@ export function usageFor(entry, view) {
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
+// What the sign-in dialog says for each provider (POST /teamclaude/login/*):
+// the two steps the operator takes in another tab, in the words each
+// provider's own pages lead them through.
+export var SIGNIN_TEXT = {
+  claude: {
+    title: 'Sign in to Claude',
+    step1: 'Open the sign-in page in a new tab and approve access for Claude Code. Use the account you want to add or repair.',
+    step2: 'Anthropic then shows an authorization code. Copy it and paste it here.',
+    empty: 'Paste the authorization code first.',
+  },
+  codex: {
+    title: 'Sign in to Codex (ChatGPT)',
+    step1: 'Open the sign-in page in a new tab and approve access for the Codex CLI.',
+    step2: 'Your browser is then sent to a localhost page that will probably not load. That is expected: copy the full address from the address bar and paste it here.',
+    empty: 'Paste the address your browser was sent to first.',
+  },
+};
+
+// Which sign-in an account can be given again: 'claude' or 'codex' for an
+// OAuth login of that provider, null for an API key or a third-party backend,
+// which have no browser sign-in. The server checks the same and says why.
+/** @param {any} account */
+export function signInProvider(account) {
+  var a = account || {};
+  if (a.type !== 'oauth' || a.backend) return null;
+  if (a.provider === 'codex') return 'codex';
+  return a.provider === 'anthropic' ? 'claude' : null;
+}
+
+// An account out of rotation until someone signs it in again: upstream
+// rejected its refresh token, or the token it holds (errorReason, which
+// /teamclaude/status sets only while the account is in error).
+/** @param {any} account */
+export function needsSignIn(account) {
+  var a = account || {};
+  var code = a.errorReason && a.errorReason.code;
+  return !!signInProvider(a) && (code === 'refresh_rejected' || code === 'credential_rejected');
+}
+
+// Whether this page may offer sign-in at all. Status answers per caller
+// (caller.signIn): a client key, or a key-less browser on another machine,
+// would be refused, so the page draws no button that can only fail. An older
+// server that does not say is taken as no.
+/** @param {any} status */
+export function canSignIn(status) {
+  return !!(status && status.caller && status.caller.signIn === true);
+}
+
+/** @param {'start'|'finish'|'cancel'} step @param {any} body @param {string|null} key */
+export function signInRequest(step, body, key) {
+  return {
+    url: '/teamclaude/login/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+// What a POST /teamclaude/login/finish reply means for the dialog: 'ok'
+// closes it; 'retry' keeps it open for another paste (the server keeps the
+// sign-in open on any 400); 'ended' leaves it on screen to read, finished,
+// since the server has closed that sign-in.
+/** @param {number} status @param {any} json */
+export function signInOutcome(status, json) {
+  var j = json || {};
+  if (status === 200 && j.ok) {
+    return { kind: 'ok', text: 'Signed in ' + j.account + (j.action === 'added' ? ' (added)' : ' (updated)') };
+  }
+  var error = typeof j.error === 'string' && j.error ? j.error : 'sign-in failed (status ' + status + ')';
+  if (status === 400) return { kind: 'retry', text: error };
+  if (status === 404) return { kind: 'ended', text: 'This sign-in has expired or already ended. Close it and start again.' };
+  return { kind: 'ended', text: error };
+}
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
@@ -985,6 +1061,7 @@ const SHARED_HELPERS = [
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  signInProvider, needsSignIn, canSignIn, signInRequest, signInOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1002,6 +1079,7 @@ const SHARED_CONSTS = [
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
+  `var SIGNIN_TEXT = ${JSON.stringify(SIGNIN_TEXT)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1175,6 +1253,21 @@ const PAGE = `<!doctype html>
   #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
+  .sechead .add { margin-left: auto; }
+  a.btn { text-decoration: none; display: inline-block; }
+  .modal { position: fixed; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center; padding: 16px; background: rgba(0,0,0,.55); }
+  .mbox { width: min(540px, 100%); max-height: calc(100vh - 32px); overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; box-shadow: 0 16px 48px rgba(0,0,0,.45); }
+  .mbox h3 { font-size: 17px; margin-bottom: 12px; }
+  .mbox .sub { margin: -6px 0 12px; }
+  .mbox ol { padding-left: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .mbox .mrow { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .mbox .btn { font-size: 13px; padding: 6px 14px; }
+  .mbox label { display: block; font-size: 13px; color: var(--dim); }
+  .mtext { display: block; width: 100%; margin-top: 8px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; font-size: 13px; }
+  textarea.mtext { min-height: 88px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .mmsg { font-size: 12px; min-height: 18px; margin-top: 12px; color: var(--dim); }
+  .mmsg.error { color: var(--bad); } .mmsg.ok { color: var(--ok); }
+  .mfoot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   @media (max-width: 1080px) {
     .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .who, .ctl { grid-column: 1 / -1; }
@@ -1313,6 +1406,7 @@ const PAGE = `<!doctype html>
   </div>
   </main>
 </div>
+<div id="signin" class="modal" role="dialog" aria-modal="true"></div>
 <script>
 (function () {
   'use strict';
@@ -1499,6 +1593,9 @@ ${SHARED_HELPERS}
     meters.slots.forEach(function (m) { row.appendChild(meterEl(m)); });
 
     var ctl = el('div', 'ctl');
+    if (canSignIn(s) && needsSignIn(a)) {
+      ctl.appendChild(button('btn primary', 'Sign in again', function () { openSignIn(signInProvider(a), a.name); }));
+    }
     // Zero-spend, like the fleet-wide probe on the Settings page, so a client
     // key may use it too. Disabled while a probe of this account is in flight,
     // whether this button or a fleet cycle started it.
@@ -1638,7 +1735,14 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     if (!accounts.length) {
-      acc.appendChild(el('div', 'card empty', 'No accounts yet. Add one with teamclaude login.'));
+      var empty = el('div', 'card empty', canSignIn(s) ? 'No accounts yet. Sign one in:' : 'No accounts yet. Add one with teamclaude login.');
+      if (canSignIn(s)) {
+        var add = el('div', 'actions');
+        add.appendChild(button('btn', 'Add Claude account', function () { openSignIn('claude', null); }));
+        add.appendChild(button('btn', 'Add Codex account', function () { openSignIn('codex', null); }));
+        empty.appendChild(add);
+      }
+      acc.appendChild(empty);
       return;
     }
     var probeAccounts = (s.probe || {}).accounts || [];
@@ -1652,6 +1756,9 @@ ${SHARED_HELPERS}
       head.appendChild(el('span', 'count', String(members.length)));
       var cur = currentIn(s, g, list);
       if (cur) head.appendChild(el('span', 'tag', 'current: ' + cur));
+      if (canSignIn(s) && (g === 'anthropic' || g === 'codex')) {
+        head.appendChild(button('btn add', 'Add account', function () { openSignIn(g === 'codex' ? 'codex' : 'claude', null); }));
+      }
       acc.appendChild(head);
       var rows = el('div', 'rows');
       members.forEach(function (m) {
@@ -1674,6 +1781,12 @@ ${SHARED_HELPERS}
   // may reach it. A control this key would be refused is not drawn at all; the
   // line at the top of the page says why, once (callerNotice).
   function renderAccountsPage(s) {
+    var tools = document.getElementById('accountTools');
+    tools.textContent = '';
+    if (canSignIn(s)) {
+      tools.appendChild(button('btn', 'Add Claude account', function () { openSignIn('claude', null); }));
+      tools.appendChild(button('btn', 'Add Codex account', function () { openSignIn('codex', null); }));
+    }
     var table = document.getElementById('accountTable');
     table.textContent = '';
     var hr = el('tr');
@@ -1714,6 +1827,9 @@ ${SHARED_HELPERS}
       tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
       tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
       var act = el('td', 'num');
+      if (canSignIn(s) && needsSignIn(a)) {
+        act.appendChild(button('btn primary', 'Sign in again', function () { openSignIn(signInProvider(a), a.name); }));
+      }
       if (!isCurrentAccount(a, s) && !a.disabled) {
         var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
         act.appendChild(ctlSwitch);
@@ -2339,6 +2455,213 @@ ${SHARED_HELPERS}
       })
       .catch(function (e) { note('error', label + ' failed: ' + e.message); })
       .finally(function () { btn.disabled = false; });
+  }
+
+  // The sign-in dialog (POST /teamclaude/login/*). One at a time, and outside
+  // #app, so the re-render every poll never touches it. The server holds the
+  // sign-in itself: five minutes, then it expires.
+  var signin = null;
+
+  function signInBox() {
+    var box = document.getElementById('signin');
+    box.textContent = '';
+    box.style.display = 'flex';
+    var m = el('div', 'mbox');
+    box.appendChild(m);
+    return m;
+  }
+
+  function signInFoot(m, s, primary, onPrimary) {
+    s.msg = el('div', 'mmsg');
+    m.appendChild(s.msg);
+    var foot = el('div', 'mfoot');
+    s.cancel = button('btn', 'Cancel', function () { closeSignIn(s); });
+    foot.appendChild(s.cancel);
+    s.go = button('btn primary', primary, onPrimary);
+    foot.appendChild(s.go);
+    m.appendChild(foot);
+  }
+
+  function signInSay(s, kind, text) {
+    s.msg.className = 'mmsg' + (kind ? ' ' + kind : '');
+    s.msg.textContent = text;
+  }
+
+  // A new account first asks for an optional name, which the server takes
+  // with the start; signing an existing account in again starts at once.
+  function openSignIn(provider, account) {
+    if (signin || !provider) return;
+    var s = { provider: provider, account: account || null, id: null, url: null, busy: false, ended: false };
+    signin = s;
+    var m = signInBox();
+    m.appendChild(el('h3', '', SIGNIN_TEXT[provider].title));
+    if (s.account) {
+      m.appendChild(el('p', 'sub', 'Signing in again as ' + s.account + '. Use that same login: a different one is refused.'));
+    } else {
+      var label = el('label', '', 'Name for the new account (optional)');
+      var name = el('input', 'mtext');
+      name.id = 'signinName';
+      name.type = 'text';
+      name.autocomplete = 'off';
+      label.appendChild(name);
+      m.appendChild(label);
+      m.appendChild(el('p', 'hint', 'Leave it blank for the next numbered name (' + (provider === 'codex' ? 'codex-N' : 'account-N') + ').'));
+    }
+    signInFoot(m, s, 'Continue', function () { startSignIn(s); });
+    if (s.account) startSignIn(s);
+  }
+
+  function startSignIn(s) {
+    if (s.busy || s.id) return;
+    var body = { provider: s.provider };
+    if (s.account) body.account = s.account;
+    else {
+      var name = String(document.getElementById('signinName').value || '').trim();
+      if (name) body.name = name;
+    }
+    s.busy = true;
+    s.go.disabled = true;
+    signInSay(s, '', 'Starting the sign-in…');
+    var r = signInRequest('start', body, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { closeSignIn(s); localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return {}; }).then(function (j) { return { status: res.status, json: j || {} }; });
+      })
+      .then(function (out) {
+        s.busy = false;
+        if (!out) return;
+        // Only an https link becomes the Open button's href: never a javascript: URL.
+        var ok = out.status === 200 && out.json.ok && out.json.id && typeof out.json.url === 'string' && out.json.url.indexOf('https://') === 0;
+        // Closed while the start was in flight: give the server its slot back
+        // rather than leave it open for five minutes.
+        if (signin !== s) {
+          if (ok) { var c = signInRequest('cancel', { id: out.json.id }, localStorage.getItem(KEY)); fetch(c.url, c.init).catch(function () {}); }
+          return;
+        }
+        if (!ok) {
+          s.go.disabled = false;
+          signInSay(s, 'error', out.json.error || 'Could not start the sign-in (status ' + out.status + ').');
+          return;
+        }
+        s.id = out.json.id;
+        s.url = out.json.url;
+        renderSignInSteps(s);
+      })
+      .catch(function (e) {
+        s.busy = false;
+        if (signin !== s) return;
+        s.go.disabled = false;
+        signInSay(s, 'error', 'Could not start the sign-in: ' + e.message);
+      });
+  }
+
+  function renderSignInSteps(s) {
+    var text = SIGNIN_TEXT[s.provider];
+    var m = signInBox();
+    m.appendChild(el('h3', '', text.title));
+    if (s.account) m.appendChild(el('p', 'sub', 'Signing in again as ' + s.account + '.'));
+    var ol = el('ol');
+    var one = el('li');
+    one.appendChild(el('div', '', text.step1));
+    var row = el('div', 'mrow');
+    // A link rather than window.open: it opens a tab the way any link does,
+    // and noopener keeps the provider's page from reaching back into this one.
+    var open = el('a', 'btn primary', 'Open sign-in page');
+    open.href = s.url;
+    open.target = '_blank';
+    open.rel = 'noopener noreferrer';
+    row.appendChild(open);
+    row.appendChild(button('btn', 'Copy link', function () { copySignInLink(s); }));
+    one.appendChild(row);
+    // Shown when the browser will not copy for us (the clipboard API needs
+    // https or localhost, and a tailnet address is neither).
+    s.link = el('input', 'mtext');
+    s.link.readOnly = true;
+    s.link.value = s.url;
+    s.link.style.display = 'none';
+    one.appendChild(s.link);
+    ol.appendChild(one);
+    var two = el('li');
+    two.appendChild(el('div', '', text.step2));
+    var input = el('textarea', 'mtext');
+    input.id = 'signinInput';
+    input.placeholder = 'Paste here';
+    input.spellcheck = false;
+    two.appendChild(input);
+    ol.appendChild(two);
+    m.appendChild(ol);
+    signInFoot(m, s, 'Finish sign-in', function () { finishSignIn(s); });
+  }
+
+  function copySignInLink(s) {
+    var fallback = function () {
+      s.link.style.display = '';
+      s.link.select();
+      var copied = false;
+      try { copied = typeof document.execCommand === 'function' && document.execCommand('copy'); } catch (e) { copied = false; }
+      signInSay(s, copied ? 'ok' : '', copied ? 'Link copied.' : 'Select the link above and copy it.');
+    };
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(s.url).then(function () { signInSay(s, 'ok', 'Link copied.'); }, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  function finishSignIn(s) {
+    if (s.busy || s.ended || !s.id) return;
+    var input = String(document.getElementById('signinInput').value || '').trim();
+    if (!input) { signInSay(s, 'error', SIGNIN_TEXT[s.provider].empty); return; }
+    s.busy = true;
+    s.go.disabled = true;
+    signInSay(s, '', 'Finishing the sign-in…');
+    var r = signInRequest('finish', { id: s.id, input: input }, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { s.ended = true; closeSignIn(s); localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return {}; }).then(function (j) { return signInOutcome(res.status, j); });
+      })
+      .then(function (out) {
+        s.busy = false;
+        if (!out) return;
+        if (out.kind === 'ok') {
+          s.ended = true;
+          closeSignIn(s);
+          note('ok', out.text);
+          poll();
+          return;
+        }
+        if (out.kind === 'retry') {
+          s.go.disabled = false;
+          signInSay(s, 'error', out.text);
+          return;
+        }
+        // The server has closed this sign-in; what it said stays readable.
+        s.ended = true;
+        s.cancel.textContent = 'Close';
+        signInSay(s, 'error', out.text);
+      })
+      .catch(function (e) {
+        s.busy = false;
+        s.go.disabled = false;
+        signInSay(s, 'error', 'Could not finish the sign-in: ' + e.message);
+      });
+  }
+
+  // Closing an open sign-in cancels it on the server: it would otherwise hold
+  // one of the four slots until it expires. Not while its code is being
+  // exchanged, which the server would refuse anyway.
+  function closeSignIn(s) {
+    if (signin !== s) return;
+    signin = null;
+    var box = document.getElementById('signin');
+    box.style.display = 'none';
+    box.textContent = '';
+    if (s.id && !s.ended && !s.busy) {
+      var r = signInRequest('cancel', { id: s.id }, localStorage.getItem(KEY));
+      fetch(r.url, r.init).catch(function () {});
+    }
   }
 
   function showKeybox() {

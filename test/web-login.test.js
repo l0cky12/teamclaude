@@ -104,7 +104,7 @@ test('start hands back a sign-in link for each provider, and records the start',
   assert.match(claude.body.id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 
   const started = events.since(0).events;
-  assert.deepEqual(started.map(e => [e.type, e.provider, e.account]), [['signin_started', 'claude', null], ['signin_started', 'codex', null]]);
+  assert.deepEqual(started.map(e => [e.type, e.provider, e.account]), [['signin_started', 'anthropic', null], ['signin_started', 'codex', null]]);
   assert.match(started[0].message, /\(dashboard\)/);
   logins.close();
 });
@@ -189,7 +189,8 @@ test('a finished sign-in is saved through the hook and reloaded, and returns no 
     const last = events.since(0).events.at(-1);
     assert.equal(last?.type, 'signin_succeeded');
     assert.equal(last?.account, 'laptop');
-    assert.equal(last?.provider, provider);
+    // The log names providers the way every other entry does (provider.js ids).
+    assert.equal(last?.provider, provider === 'claude' ? 'anthropic' : provider);
 
     // The id is spent.
     assert.equal(logins.pending.has(id), false);

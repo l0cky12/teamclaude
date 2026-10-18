@@ -237,6 +237,13 @@ The sign-in runs in the server's process, so the key is not offered in `teamclau
 
 The browser dashboard (`/teamclaude/dashboard`) can add a Claude or Codex subscription and sign an existing one in again. This is for a proxy that runs as a service, in a container or on another machine, where nobody uses its terminal and `teamclaude login` would mean getting a shell on the host first.
 
+**Add Claude account** and **Add Codex account** on the Accounts page (or **Add account** beside a provider on the Quota page) open the sign-in dialog. A new account first asks for an optional name. An account whose login upstream refused shows **Sign in again** on its row, which skips the name. The dialog then has two steps:
+
+1. **Open sign-in page** opens the provider's sign-in in a new tab. **Copy link** copies it for another device. Over plain `http` (a Tailscale or LAN address) browsers keep the clipboard API from the page, so the dialog shows the link, selected, and copies it the older way; where the browser refuses that too, it asks you to copy the selected link yourself.
+2. Paste what the provider gives you, then **Finish sign-in**.
+
+**Cancel** ends the sign-in on the server too.
+
 Both flows are paste-only. Nothing on the proxy's machine waits for the browser to come back, since the browser is wherever you opened the page:
 
 - **Claude.** Open the sign-in page, or copy its link to another device, and sign in. Anthropic then shows an authorization code. Paste it into the dashboard and finish.
