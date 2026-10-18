@@ -338,11 +338,17 @@ export async function listenForCallback(port, expectedState) {
 /**
  * Start a Codex sign-in and hand back what finishing it needs.
  *
- * The listener on port 1455 is always tried, remote session or not: with
+ * The listener on port 1455 is tried by default, remote session or not: with
  * `ssh -L 1455:localhost:1455` a browser on the laptop reaches it and the
  * sign-in finishes by itself. Whether or not it is listening, `submit` takes
  * the address the browser was left on (see parseCodexCallback), and the first
  * of the two to arrive is exchanged for tokens.
+ *
+ * `listen: false` skips the listener, leaving the paste as the only way back.
+ * The dashboard's sign-in (web-login.js) asks for that: its browser is on
+ * whatever machine opened the page, never this one's loopback, and binding
+ * 1455 there would only collide with a `codex login` or a CLI sign-in running
+ * on the same host for no gain.
  *
  * Opening a browser is the caller's decision, so this never does.
  *
@@ -351,15 +357,18 @@ export async function listenForCallback(port, expectedState) {
  * @param {AbortSignal | null} [opts.signal]  cancels the wait and closes the listener
  * @param {number} [opts.timeoutMs]
  * @param {number} [opts.port]  where to listen; tests only, as the redirect always names 1455
+ * @param {boolean} [opts.listen]  false: bind nothing, and take the pasted address alone
  * @param {typeof exchangeCodexCode} [opts.exchange]  injectable so tests need no token endpoint
  */
-export async function startCodexLogin({ routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, port = CALLBACK_PORT, exchange = exchangeCodexCode } = {}) {
+export async function startCodexLogin({ routing = null, signal = null, timeoutMs = LOGIN_TIMEOUT_MS, port = CALLBACK_PORT, listen = true, exchange = exchangeCodexCode } = {}) {
   const codeVerifier = randomBytes(32).toString('base64url');
   const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
   const state = randomBytes(32).toString('base64url');
   const url = buildCodexAuthUrl({ state, codeChallenge });
 
-  const { server, code, error } = await listenForCallback(port, state);
+  const { server, code, error } = listen
+    ? await listenForCallback(port, state)
+    : { server: null, code: null, error: null };
   const race = codeRace({
     listener: code,
     parse: text => parseCodexCallback(text, state),

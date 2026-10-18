@@ -229,9 +229,55 @@ The server decides whether its terminal is remote from its own environment (`SSH
 
 The tokens go to the account the browser actually signed in as, matched by identity exactly as `teamclaude login` does — not to whichever row was highlighted. Sign in as a different account and that account is updated (or added) instead, the activity pane says so, and the row you picked still needs its login.
 
-The sign-in runs in the server's process, so the key is not offered in `teamclaude attach`. You can also sign in on a machine that has a browser: if that install and the server are both signed in to [callback.net](#syncing-accounts-across-machines-callbacknet), run `teamclaude login` there, and the server takes the new token at its next pass (press **R** in its TUI, or run `teamclaude callback sync` on it, to start one now).
+The sign-in runs in the server's process, so the key is not offered in `teamclaude attach`. You can also sign in on a machine that has a browser: if that install and the server are both signed in to [callback.net](#syncing-accounts-across-machines-callbacknet), run `teamclaude login` there, and the server takes the new token at its next pass (press **R** in its TUI, or run `teamclaude callback sync` on it, to start one now). Or sign it in from the browser dashboard: see [Signing in from the dashboard](#signing-in-from-the-dashboard).
 
 **Reorder accounts** sets the order the account list is drawn in — `↑`/`↓` pick an account, `←`/`→` move it up and down, each move saved as you make it. It writes a `displayOrder` on the entry and touches nothing else: an account keeps its place in the `accounts` array, so route pins, session pins and `TC_ACCT` all go on naming the same accounts, and rotation order stays `priority`'s business alone. An account with no `displayOrder` — every account, until the first time you arrange them, and every one added afterwards — lists after the ones that have one, which is where a newly added account appeared anyway. A [third-party backend](#third-party-backend-accounts) served by a local process is infrastructure rather than a seat to rotate between: the TUI keeps those at the end of the list, and the screen leaves them there.
+
+## Signing in from the dashboard
+
+The browser dashboard (`/teamclaude/dashboard`) can add a Claude or Codex subscription and sign an existing one in again. This is for a proxy that runs as a service, in a container or on another machine, where nobody uses its terminal and `teamclaude login` would mean getting a shell on the host first.
+
+**Add Claude account** and **Add Codex account** on the Accounts page (or **Add account** beside a provider on the Quota page) open the sign-in dialog. A new account first asks for an optional name. An account whose login upstream refused shows **Sign in again** on its row, which skips the name. The dialog then has two steps:
+
+1. **Open sign-in page** opens the provider's sign-in in a new tab. **Copy link** copies it for another device. Over plain `http` (a Tailscale or LAN address) browsers keep the clipboard API from the page, so the dialog shows the link, selected, and copies it the older way; where the browser refuses that too, it asks you to copy the selected link yourself.
+2. Paste what the provider gives you, then **Finish sign-in**.
+
+**Cancel** ends the sign-in on the server too.
+
+Both flows are paste-only. Nothing on the proxy's machine waits for the browser to come back, since the browser is wherever you opened the page:
+
+- **Claude.** Open the sign-in page, or copy its link to another device, and sign in. Anthropic then shows an authorization code. Paste it into the dashboard and finish.
+- **Codex.** Open the sign-in page and sign in. OpenAI then sends the browser to a `http://localhost:1455/auth/callback?...` page that will not load. Copy that page's full address from the address bar and paste it. The proxy does not listen on port 1455 for this, so the sign-in cannot collide with a `codex login` on the same host.
+
+If a paste can't be used (it came from an earlier attempt, or it is the sign-in link itself), the dashboard says why and the sign-in stays open for another try. Once a paste is accepted, the code is spent: if the provider then refuses it, start again.
+
+A sign-in that is not finished expires after five minutes, and at most four can be open at once. Open sign-ins live in the server's memory only, so a restart forgets them. Finishing one saves the account to the config file, under the same lock and through the same code as `teamclaude login`, and reloads the server, so the account serves the next request.
+
+**Adding an account.** You can give the new account a name; it is checked the way `teamclaude rename` checks one (not blank, not all digits, not the name or email of another account). Leave it blank and the account is numbered, `account-N` for Claude and `codex-N` for Codex. Unlike `teamclaude login`, a blank name does not become the email the provider reports, because account names are shown to every holder of a client key, in `/teamclaude/status` and on the event log. If you sign in as an account that is already in the pool, that account's tokens are replaced and it keeps its name.
+
+**Signing an account in again.** You must sign in as that same account. If the provider reports a different one, nothing is saved, and the dashboard answers `Signed in as "<name>", not "<account>"`, naming the other account by its name in the pool, or "a different account" when it is not in the pool. The email the provider reported is never shown. This is stricter than the TUI's `l` key, which updates whichever account the browser signed in as. Three kinds of account cannot be signed in again from the dashboard:
+
+- one with no stored identity to compare, such as an account added with `teamclaude login --name` when the profile could not be read: use `teamclaude login --name <account>`;
+- one that reads its tokens from a file (`importFrom`): sign in where that file comes from;
+- one that is not in the config file.
+
+An account with its own [`routing`](#per-account-routing-routing) proxy is signed in through that proxy.
+
+Each sign-in is recorded on the event log (the dashboard's Logs page) as `signin_started`, then one of `signin_succeeded`, `signin_failed` (including a refused re-login), `signin_cancelled` or `signin_timeout`. A paste that was refused and can be retried is not recorded, because the sign-in has not ended. An entry names the account by its configured name and never carries an email, a code or a token.
+
+### Who may sign in
+
+A sign-in can replace an account's tokens, so only the operator can start one:
+
+- A request with the shared `proxy.apiKey` may, and so may a key-less request from the proxy's own machine.
+- A `proxy.clientKeys` key may not: the sign-in endpoints answer `403`.
+- With no key configured at all, only the proxy's own machine may: a loopback caller with no `X-Forwarded-For`, `X-Real-IP` or `Forwarded` header, and `proxy.trustLoopback` not set to `false`. That is the rule the [MCP endpoint](usage.md#mcp-endpoint) uses. Set `proxy.apiKey` to sign in from another machine.
+
+`caller.signIn` in `/teamclaude/status` says whether the caller asking may sign in, and the page hides the sign-in buttons when it may not. The endpoints are described under [Sign-in endpoints](usage.md#sign-in-endpoints).
+
+### Starting with no accounts
+
+`teamclaude server` refuses to start with no accounts configured. Pass `--allow-empty` (or set `TEAMCLAUDE_ALLOW_EMPTY=1`) to start it anyway, then sign the first account in from the dashboard. Until then, every request is answered `429` with "no accounts are configured yet".
 
 ## Signing accounts in over SSH
 

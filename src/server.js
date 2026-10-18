@@ -30,6 +30,7 @@ import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { logsAfter } from './event-log.js';
+import { WebLogins } from './web-login.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -350,15 +351,61 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
  * @returns {string|null}
  */
 export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null) {
-  if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
-  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
+  const offBox = keylessOffBox(headers, remoteAddress, proxyConfig, boundHost);
+  if (offBox === 'remote') {
     return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
   }
+  if (offBox === 'host') return 'request refused: the Host header does not name this proxy';
+  return null;
+}
+
+/**
+ * The test behind keylessMcpRefusal and signInRefusal. With no key configured
+ * at all: whether the caller is somewhere other than this machine ('remote'),
+ * names another host in its Host header ('host'), or neither (null). With a
+ * key configured this is always null, because the key gate has decided.
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string|undefined} remoteAddress
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @param {string|null} [boundHost]
+ * @returns {'remote'|'host'|null}
+ */
+function keylessOffBox(headers, remoteAddress, proxyConfig, boundHost = null) {
+  if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
+  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) return 'remote';
   // The address actually bound, when the caller knows it (TEAMCLAUDE_HOST can
   // differ from proxy.host — see createProxyServer's `bindHost`).
-  if (!isLocalHostHeader(headers.host ?? headers[':authority'], boundHost || proxyConfig?.host)) {
-    return 'request refused: the Host header does not name this proxy';
+  if (!isLocalHostHeader(headers.host ?? headers[':authority'], boundHost || proxyConfig?.host)) return 'host';
+  return null;
+}
+
+/**
+ * Why POST /teamclaude/login/{start,finish,cancel} refuses this caller, or
+ * null when it may sign accounts in from the dashboard (web-login.js).
+ *
+ * A sign-in writes an account's tokens, so it answers to the operator alone,
+ * the same callers the MCP endpoint's write tools answer to:
+ *   - A client key (proxy.clientKeys) names a tenant. It is refused here, and
+ *     before its body is read by the CLIENT_KEY_REFUSED_PATHS gate.
+ *   - With no key configured at all the key gate admits every caller, so the
+ *     caller has to be on this machine, by the test the MCP endpoint uses.
+ *   - The shared proxy.apiKey, and a key-exempt loopback caller when a key is
+ *     configured, are the operator.
+ *
+ * @param {string|null|undefined} client  the client-key name the gate resolved, or null
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string|undefined} remoteAddress
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @param {string|null} [boundHost]
+ * @returns {string|null}
+ */
+export function signInRefusal(client, headers, remoteAddress, proxyConfig, boundHost = null) {
+  if (client) return CLIENT_KEY_REFUSED_PATHS.get('/teamclaude/login/start') ?? 'a client key cannot sign accounts in';
+  const offBox = keylessOffBox(headers, remoteAddress, proxyConfig, boundHost);
+  if (offBox === 'remote') {
+    return 'request refused: with no proxy key configured, accounts can be signed in only from this machine; set proxy.apiKey to sign in from another machine';
   }
+  if (offBox === 'host') return 'request refused: the Host header does not name this proxy';
   return null;
 }
 
@@ -428,6 +475,17 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
+  // A sign-in adds an account, or replaces one's tokens.
+  ['/teamclaude/login/start', 'a client key cannot sign accounts in'],
+  ['/teamclaude/login/finish', 'a client key cannot sign accounts in'],
+  ['/teamclaude/login/cancel', 'a client key cannot sign accounts in'],
+]);
+
+/** The dashboard's sign-in routes (web-login.js), by the step each runs. */
+const WEB_LOGIN_ROUTES = new Map([
+  ['/teamclaude/login/start', /** @type {const} */ ('start')],
+  ['/teamclaude/login/finish', /** @type {const} */ ('finish')],
+  ['/teamclaude/login/cancel', /** @type {const} */ ('cancel')],
 ]);
 
 /**
@@ -437,12 +495,19 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
  * above, so the page and the gate cannot disagree. A key-less loopback caller
  * and the shared proxy.apiKey are the operator; only a client key is refused.
  *
+ * `signIn` says whether POST /teamclaude/login/* would be admitted, which
+ * takes more than the key: with no key configured, an operator calling from
+ * another machine is refused it too (see signInRefusal). The status route
+ * passes the answer for its request; without one, a client key is refused and
+ * anyone else is not.
+ *
  * @param {string|null|undefined} client  the client-key name, or null
- * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[] }}
+ * @param {{ signIn?: boolean }} [opts]
+ * @returns {{ kind: 'operator'|'client', client: string|null, refused: string[], signIn: boolean }}
  */
-export function callerView(client) {
-  if (!client) return { kind: 'operator', client: null, refused: [] };
-  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
+export function callerView(client, { signIn = !client } = {}) {
+  if (!client) return { kind: 'operator', client: null, refused: [], signIn };
+  return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()], signIn: false };
 }
 
 /**
@@ -452,14 +517,24 @@ export function callerView(client) {
  * @param {any} [sx]
  * @param {any} [clientUsage]
  * @param {any} [dimensionUsage]
- * @param {{ bindHost?: string|null }} [opts]  `bindHost`: the address the caller
+ * @param {{ bindHost?: string|null, webLogins?: WebLogins|null }} [opts]  `bindHost`: the address the caller
  *   binds, when it is not `config.proxy.host` (TEAMCLAUDE_HOST overrides it). The
  *   DNS-rebinding Host check accepts that address as naming this machine; given
  *   only the config value, a server bound off-box through the env var refused a
  *   key-less caller naming the very address it listens on (#423).
+ *   `webLogins`: the dashboard's open sign-ins, for a test that drives their
+ *   flows and their clock; by default the server keeps its own.
  */
-export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null } = {}) {
+export function createProxyServer(accountManager, config, hooks = {}, sx = null, clientUsage = null, dimensionUsage = null, { bindHost = null, webLogins = null } = {}) {
   const boundHost = () => bindHost || config.proxy?.host;
+  // Sign-ins started from the dashboard and not yet finished: per server and
+  // in memory only, so a restart forgets them (see web-login.js).
+  const signIns = webLogins ?? new WebLogins({
+    hooks,
+    accounts: () => accountManager.accounts,
+    configAccounts: () => config.accounts || [],
+    events: accountManager.events ?? null,
+  });
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -622,7 +697,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        const signIn = !signInRefusal(req.tcClient, req.headers, req.socket.remoteAddress, config.proxy, boundHost());
+        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient, { signIn }), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -956,6 +1032,47 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Signing accounts in from the dashboard (web-login.js): start a
+      // provider's paste-only flow, finish it with what the browser was left
+      // holding, or cancel it. Operator only (signInRefusal): a client key was
+      // refused above before its body was read, and with no key configured at
+      // all only this machine may sign in. The answers, statuses included, are
+      // WebLogins'; this route reads the body and sends them.
+      const webLoginStep = req.method === 'POST' ? WEB_LOGIN_ROUTES.get(req.url || '') : undefined;
+      if (webLoginStep) {
+        const refusal = signInRefusal(req.tcClient, req.headers, req.socket.remoteAddress, config.proxy, boundHost());
+        if (refusal) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: refusal }));
+          return;
+        }
+        // Checked before a flow starts: a sign-in this server could not save,
+        // or could not make live, would waste the operator's trip to the provider.
+        if (!signIns.available) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'sign-in from the dashboard is not supported by this server' }));
+          return;
+        }
+        /** @type {Record<string, any>} */
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        if (typeof body !== 'object' || Array.isArray(body)) body = {};
+        const reply = webLoginStep === 'start' ? await signIns.start(body)
+          : webLoginStep === 'finish' ? await signIns.finish(body)
+            : signIns.cancel(body);
+        // A start reply carries a sign-in link, and a finish an account name.
+        res.writeHead(reply.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(reply.body));
+        return;
+      }
+
       // MCP management endpoint — the tool-shaped face of this control plane,
       // off unless proxy.mcp says otherwise. The gates above are the same ones
       // the other /teamclaude/ routes pass, with one addition: a config with no
@@ -1037,6 +1154,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     sweepTimer.unref();
     server.on('close', () => clearInterval(sweepTimer));
   }
+  // A closed server has no route left to finish an open sign-in with.
+  server.on('close', () => signIns.close());
 
   // Forward-proxy support (always on, so multiple claude instances can use
   // either ANTHROPIC_BASE_URL or HTTPS_PROXY against the same server). A CONNECT
@@ -2893,9 +3012,16 @@ const EXHAUSTED_MESSAGE_MAX_NAMES = 3;
  * @param {Record<string, any>[]} candidates
  * @param {string|null|undefined} model
  * @param {number} retryAfter
+ * @param {{ poolEmpty?: boolean }} [opts]  `poolEmpty`: the server has no accounts at all
  * @returns {string}
  */
-export function exhaustedMessage(candidates, model, retryAfter) {
+export function exhaustedMessage(candidates, model, retryAfter, { poolEmpty = false } = {}) {
+  // A server started with no accounts at all (`--allow-empty`), waiting for
+  // its first sign-in. "Check the model's route" below would send the operator
+  // looking for a misconfiguration that is not there.
+  if (poolEmpty) {
+    return 'No account can serve this request: no accounts are configured yet. Sign one in from the dashboard (/teamclaude/dashboard) or with `teamclaude login`.';
+  }
   const eligible = candidates.filter(a => !a.disabled);
   const disabled = candidates.length - eligible.length;
 
@@ -3362,7 +3488,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: exhaustedMessage(candidates, ctx.model, retryAfter),
+        message: exhaustedMessage(candidates, ctx.model, retryAfter, { poolEmpty: !accountManager.accounts?.length }),
       },
     }));
     return;

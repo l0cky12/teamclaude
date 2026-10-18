@@ -15,6 +15,7 @@ import {
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  SIGNIN_TEXT, signInProvider, needsSignIn, canSignIn, signInRequest, signInOutcome,
 } from '../src/dashboard.js';
 import { EVENT_KINDS } from '../src/event-log.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
@@ -954,7 +955,8 @@ test('the page ships the same helper implementations it is tested against', () =
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone]) {
+    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+    signInProvider, needsSignIn, canSignIn, signInRequest, signInOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -968,6 +970,52 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
+test('sign-in is offered for an OAuth login of either provider, and asked for only when upstream refused it', () => {
+  assert.equal(signInProvider({ type: 'oauth', provider: 'anthropic' }), 'claude');
+  assert.equal(signInProvider({ type: 'oauth', provider: 'codex' }), 'codex');
+  assert.equal(signInProvider({ type: 'apikey', provider: 'anthropic' }), null);
+  assert.equal(signInProvider({ type: 'apikey', provider: 'anthropic', backend: 'api.z.ai' }), null);
+  assert.equal(signInProvider(null), null);
+  const refused = { type: 'oauth', provider: 'anthropic', status: 'error' };
+  assert.equal(needsSignIn({ ...refused, errorReason: { code: 'refresh_rejected' } }), true);
+  assert.equal(needsSignIn({ ...refused, errorReason: { code: 'credential_rejected' } }), true);
+  assert.equal(needsSignIn({ ...refused, errorReason: null }), false);
+  assert.equal(needsSignIn({ type: 'apikey', provider: 'anthropic', errorReason: { code: 'credential_rejected' } }), false, 'an API key has no browser sign-in');
+});
+
+test('canSignIn trusts only an explicit caller.signIn', () => {
+  assert.equal(canSignIn({ caller: { signIn: true } }), true);
+  assert.equal(canSignIn({ caller: { signIn: false } }), false);
+  assert.equal(canSignIn({ caller: {} }), false, 'an older server that does not say');
+  assert.equal(canSignIn(null), false);
+});
+
+test('signInRequest posts JSON to the step with the key', () => {
+  const r = signInRequest('finish', { id: 'w', input: 'code' }, 'tc-k');
+  assert.equal(r.url, '/teamclaude/login/finish');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(r.init.body), { id: 'w', input: 'code' });
+  assert.equal(signInRequest('cancel', { id: 'w' }, null).init.headers['x-api-key'], '');
+});
+
+test('signInOutcome: success closes, a 400 stays open for another paste, anything else ends the sign-in', () => {
+  assert.deepEqual(signInOutcome(200, { ok: true, account: 'laptop', action: 'added' }), { kind: 'ok', text: 'Signed in laptop (added)' });
+  assert.equal(signInOutcome(200, { ok: true, account: 'a', action: 'updated' }).text, 'Signed in a (updated)');
+  assert.deepEqual(signInOutcome(400, { ok: false, error: 'That is the sign-in link, not the code.', retry: true }), { kind: 'retry', text: 'That is the sign-in link, not the code.' });
+  assert.equal(signInOutcome(404, { ok: false, error: 'gone' }).kind, 'ended');
+  assert.match(signInOutcome(404, {}).text, /expired/);
+  assert.deepEqual(signInOutcome(409, { ok: false, error: 'Signed in as "b", not "a"' }), { kind: 'ended', text: 'Signed in as "b", not "a"' });
+  assert.equal(signInOutcome(502, null).text, 'sign-in failed (status 502)');
+});
+
+test('the dialog words each provider\'s second step the way its pages behave', () => {
+  assert.equal(SIGNIN_TEXT.claude.title, 'Sign in to Claude');
+  assert.match(SIGNIN_TEXT.claude.step2, /authorization code/);
+  assert.equal(SIGNIN_TEXT.codex.title, 'Sign in to Codex (ChatGPT)');
+  assert.match(SIGNIN_TEXT.codex.step2, /localhost page/);
+});
+
 function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
@@ -1033,7 +1081,10 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     el.fire('click');
   };
   const labelled = label => built.slice(mark).filter(e => e.textContent === label).length;
-  return { byId, store, requests, answer, rootAttrs, click, labelled };
+  // The latest element built with this label, whenever it was built: a
+  // message line is built before the click that fills it.
+  const find = label => built.filter(e => e.textContent === label).at(-1);
+  return { byId, store, requests, answer, rootAttrs, click, labelled, find };
 }
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
@@ -1119,6 +1170,131 @@ test('the Logs page reads a restarted server\'s log again from its start', async
   await new Promise(r => setImmediate(r));
   // Only the new log's three: the old process's two are gone.
   assert.equal(page.byId('logCount').textContent, '3 of 3 events');
+});
+
+const tick = () => new Promise(r => setImmediate(r));
+/** @param {string} id @param {string} url */
+const started = (id, url) => ({ status: 200, ok: true, json: async () => ({ ok: true, id, provider: 'x', url, expiresAt: 0 }) });
+const REFUSED = { name: 'a', provider: 'anthropic', type: 'oauth', status: 'error', errorReason: { code: 'refresh_rejected' }, quota: {} };
+
+test('no sign-in control is drawn for a caller the server would refuse', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    caller: { kind: 'client', client: 'ci', refused: ['/teamclaude/login/start'], signIn: false },
+    currentAccounts: { anthropic: 'b' },
+    accounts: [REFUSED, { name: 'b', provider: 'anthropic', type: 'oauth', quota: {} }],
+  });
+  for (const label of ['Sign in again', 'Add account', 'Add Claude account', 'Add Codex account']) {
+    assert.equal(page.labelled(label), 0, label);
+  }
+});
+
+test('Sign in again walks a refused Claude account through start and finish, then polls', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    caller: { kind: 'operator', client: null, refused: [], signIn: true },
+    currentAccounts: { anthropic: 'b' },
+    accounts: [REFUSED, { name: 'b', provider: 'anthropic', type: 'oauth', status: 'active', quota: { unified7d: 0.1 } }],
+  });
+  // On its quota row and in the Accounts table, and not for the healthy one.
+  assert.equal(page.labelled('Sign in again'), 2);
+  page.click('Sign in again');
+  const start = page.requests.shift();
+  assert.equal(start.url, '/teamclaude/login/start');
+  assert.deepEqual(JSON.parse(start.init.body), { provider: 'claude', account: 'a' });
+  start.resolve(started('w1', 'https://claude.ai/oauth/authorize?x=1'));
+  await tick();
+  assert.equal(page.find('Sign in to Claude') != null, true);
+  const open = page.find('Open sign-in page');
+  assert.equal(open.href, 'https://claude.ai/oauth/authorize?x=1');
+  assert.equal(open.target, '_blank');
+  assert.match(open.rel, /noopener/);
+
+  page.byId('signinInput').value = '  the-code#state ';
+  page.click('Finish sign-in');
+  const finish = page.requests.shift();
+  assert.equal(finish.url, '/teamclaude/login/finish');
+  assert.deepEqual(JSON.parse(finish.init.body), { id: 'w1', input: 'the-code#state' });
+  finish.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'a', action: 'updated' }) });
+  await tick();
+  assert.equal(page.byId('signin').style.display, 'none');
+  assert.match(page.byId('note').textContent, /Signed in a \(updated\)/);
+  assert.equal(page.requests.length, 1, 'no cancel for a finished sign-in');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the poll after it shows the account back');
+});
+
+test('Add Codex account takes a name, stays open after a bad paste, and cancels on close', async () => {
+  const page = bootPage();
+  await page.answer(200, { caller: { signIn: true }, accounts: [] });
+  page.click('Add Codex account');
+  assert.equal(page.find('Sign in to Codex (ChatGPT)') != null, true);
+  page.byId('signinName').value = '  laptop ';
+  page.click('Continue');
+  const start = page.requests.shift();
+  assert.deepEqual(JSON.parse(start.init.body), { provider: 'codex', name: 'laptop' });
+  start.resolve(started('w2', 'https://auth.openai.com/oauth/authorize?y=2'));
+  await tick();
+
+  // Nothing pasted: said so, and nothing sent.
+  page.click('Finish sign-in');
+  assert.equal(page.requests.length, 0);
+  assert.ok(page.find(SIGNIN_TEXT.codex.empty));
+
+  page.byId('signinInput').value = 'http://localhost:1455/auth/callback?code=c&state=old';
+  page.click('Finish sign-in');
+  page.requests.shift().resolve({ status: 400, ok: false, json: async () => ({ ok: false, error: 'That address is from an earlier sign-in.', retry: true }) });
+  await tick();
+  assert.ok(page.find('That address is from an earlier sign-in.'));
+  assert.equal(page.find('Finish sign-in').disabled, false, 'open for another paste');
+
+  page.click('Cancel');
+  const cancel = page.requests.shift();
+  assert.equal(cancel.url, '/teamclaude/login/cancel');
+  assert.deepEqual(JSON.parse(cancel.init.body), { id: 'w2' });
+  assert.equal(page.byId('signin').style.display, 'none');
+});
+
+test('a sign-in the provider refuses ends the dialog without closing it', async () => {
+  const page = bootPage();
+  await page.answer(200, { caller: { signIn: true }, accounts: [] });
+  page.click('Add Claude account');
+  page.click('Continue');
+  page.requests.shift().resolve(started('w3', 'https://claude.ai/oauth/authorize'));
+  await tick();
+  page.byId('signinInput').value = 'code#state';
+  page.click('Finish sign-in');
+  page.requests.shift().resolve({ status: 502, ok: false, json: async () => ({ ok: false, error: 'Token exchange failed (400)' }) });
+  await tick();
+  assert.ok(page.find('Token exchange failed (400)'));
+  assert.equal(page.find('Finish sign-in').disabled, true);
+  page.click('Close');
+  assert.equal(page.requests.length, 0, 'the server already closed it: no cancel');
+  assert.equal(page.byId('signin').style.display, 'none');
+});
+
+test('closing the dialog while its start is in flight cancels what the server opened', async () => {
+  const page = bootPage();
+  await page.answer(200, { caller: { signIn: true }, accounts: [] });
+  page.click('Add Claude account');
+  page.click('Continue');
+  const start = page.requests.shift();
+  page.click('Cancel');
+  start.resolve(started('w4', 'https://claude.ai/oauth/authorize'));
+  await tick();
+  const cancel = page.requests.shift();
+  assert.equal(cancel.url, '/teamclaude/login/cancel');
+  assert.deepEqual(JSON.parse(cancel.init.body), { id: 'w4' });
+});
+
+test('a start whose link is not https never becomes a link', async () => {
+  const page = bootPage();
+  await page.answer(200, { caller: { signIn: true }, accounts: [] });
+  page.click('Add Claude account');
+  page.click('Continue');
+  page.requests.shift().resolve(started('w5', 'javascript:alert(1)'));
+  await tick();
+  assert.equal(page.find('Open sign-in page'), undefined);
+  assert.equal(page.find('Continue').disabled, false);
 });
 
 test('a provider tab narrows the quota page to that provider\'s accounts', async () => {

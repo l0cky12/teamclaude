@@ -112,6 +112,7 @@ Every `TEAMCLAUDE_*` variable below is also read under the name `TEAMROUTER_*`, 
 | `TEAMCLAUDE_CONFIG` | Path to the config file (default `~/.config/teamclaude.json`, or `~/.config/teamrouter.json` when that file exists) |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_DISABLE_AUTOUPDATE` | Set to `1` to skip the background self-update check |
+| `TEAMCLAUDE_ALLOW_EMPTY` | Set to `1` to start the server with no accounts configured, the same as `teamclaude server --allow-empty`, so the first account can be [signed in from the dashboard](accounts.md#signing-in-from-the-dashboard) |
 | `TEAMCLAUDE_CONFIG_LOCK_WAIT_MS` | How long a writer waits for another process's `<config>.lock` before writing without it (default `2000`). See [Where it lives](#where-it-lives) |
 | `TEAMCLAUDE_REMOTE` | Whether sign-in treats this terminal as remote. `1`: remote, so no browser is opened on this machine and a Claude login skips its loopback listener; you open the link elsewhere and paste the answer back. `0`: local. Unset, it reads `SSH_CONNECTION`/`SSH_TTY`, and on Linux a missing `DISPLAY`/`WAYLAND_DISPLAY`. Set it for a server a service started, which never sees your SSH session. See [Signing accounts in over SSH](accounts.md#signing-accounts-in-over-ssh) |
 | `TEAMCLAUDE_CALLBACK_CLIENT_ID` | The OAuth2 app `teamclaude callback login` signs in to callback.net as, for a self-registered app or a test realm. The built-in id is the project's own |

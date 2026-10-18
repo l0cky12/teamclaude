@@ -7,9 +7,9 @@
 # branch".
 #
 #   export TAILSCALE_IP=$(tailscale ip -4)
-#   docker compose -f docker/docker-compose.preview.yml build
-#   docker compose -f docker/docker-compose.preview.yml run --rm preview login
-#   docker compose -f docker/docker-compose.preview.yml up -d
+#   docker compose -f docker/docker-compose.preview.yml up --build -d
+#
+# It starts with no accounts (--allow-empty); sign one in from the dashboard.
 
 name: teamclaude-preview
 
@@ -19,7 +19,7 @@ services:
       context: ..
     image: teamclaude:preview
     container_name: teamclaude-preview
-    command: ["server", "--headless"]
+    command: ["server", "--headless", "--allow-empty"]
     ports:
       - "${TAILSCALE_IP:?set TAILSCALE_IP to this machine's Tailscale address (tailscale ip -4)}:3466:3456"
     volumes:
