@@ -5583,6 +5583,10 @@ export class AccountManager {
         type: a.type,
         provider: providerOf(a),
         orgName: a.orgName || null,
+        // What the dashboard's account row names the account by: its plan,
+        // and for a third-party backend the host it forwards to.
+        plan: planLabel(a),
+        backend: backendHost(a),
         priority: a.priority || 0,
         // The attached TUI spreads these fields onto its own account objects
         // and sorts its rows by this one, so without it `teamclaude attach`
@@ -5656,4 +5660,38 @@ export class AccountManager {
     this.refreshExpiredQuotas();
     return buildQuotaSummary(this.accounts);
   }
+}
+
+/**
+ * The plan an account is on, as a person names it: "Max 20x" or "Max 5x" from
+ * the OAuth profile's rate-limit tier, else "Max" or "Pro", else the Codex
+ * plan type ("Pro", "Plus"), else null. Display only; routing reads the
+ * profile fields themselves.
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {string|null}
+ */
+export function planLabel(account) {
+  const tier = String(account?.rateLimitTier || '').toLowerCase();
+  const max = /max_?(\d+)x/.exec(tier);
+  if (max) return `Max ${max[1]}x`;
+  if (account?.hasClaudeMax) return 'Max';
+  if (account?.hasClaudePro) return 'Pro';
+  const codex = account?.quota?.planType;
+  if (typeof codex === 'string' && codex) return safeLine(codex.charAt(0).toUpperCase() + codex.slice(1), 24);
+  return null;
+}
+
+/**
+ * The host an API-key account forwards to when it names its own `upstream` —
+ * a third-party backend (DeepSeek, z.ai, NanoGPT…) — so the dashboard can give
+ * each backend its own tab. Only the hostname: an upstream URL may carry
+ * credentials or a path the page has no business showing. Null for an
+ * account on its provider's own upstream, and for OAuth accounts, whose
+ * `upstream` is only ever a test or relay override.
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {string|null}
+ */
+export function backendHost(account) {
+  if (!account?.upstream || account.type === 'oauth') return null;
+  try { return new URL(account.upstream).hostname.toLowerCase() || null; } catch { return null; }
 }

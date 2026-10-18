@@ -32,7 +32,7 @@ teamclaude probe off    # back to passive (default)
 teamclaude probe        # show current setting
 ```
 
-The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account. The browser dashboard has the same one-shot refresh for the whole fleet (**Probe quotas**) and for a single account (the **refresh** button on its card), and so does the control endpoint:
+The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account. The browser dashboard has the same one-shot refresh for the whole fleet (**Probe quotas**) and for a single account (the **Refresh quota** button on its row), and so does the control endpoint:
 
 ```bash
 curl -X POST http://localhost:3456/teamclaude/probe                     # every account

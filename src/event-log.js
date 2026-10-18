@@ -53,15 +53,24 @@ export const EVENT_KINDS = /** @type {const} */ (['usage', 'signin', 'auth', 'ro
  */
 
 /** Fields an entry may carry beyond the fixed ones, and how each is kept. */
-const NUMBER_FIELDS = ['status', 'inputTokens', 'outputTokens', 'ms'];
+const NUMBER_FIELDS = /** @type {const} */ (['status', 'inputTokens', 'outputTokens', 'ms']);
 const TEXT_FIELDS = /** @type {const} */ ([['model', 80], ['reason', 60]]);
 
-/** A non-negative finite number, or null. */
+/**
+ * A non-negative finite number, or null.
+ * @param {unknown} value
+ * @returns {number|null}
+ */
 function count(value) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
 }
 
-/** A sanitised single line, or null for an empty or absent value. */
+/**
+ * A sanitised single line, or null for an empty or absent value.
+ * @param {unknown} value
+ * @param {number} max
+ * @returns {string|null}
+ */
 function line(value, max) {
   if (value == null || value === '') return null;
   return safeLine(String(value), max);
@@ -160,11 +169,13 @@ export function briefError(error) {
  * AbortError is the operator cancelling, a "timed out" error the flow's own
  * deadline, anything else a failure.
  * @param {'started'|'succeeded'|'failed'} step
- * @param {{ provider: string, account?: string|null, via: string, error?: unknown, detail?: string|null }} info
+ * @param {{ provider: string, account?: string|null, via: string, error?: unknown, detail?: string|null }} info  `provider` 'claude' is recorded as 'anthropic'
  * @returns {{ kind: 'signin', type: string, provider: string, account: string|null, message: string, reason?: string }}
  */
 export function signInEvent(step, { provider, account = null, via, error = null, detail = null }) {
-  const base = { kind: /** @type {const} */ ('signin'), provider, account };
+  // Named the way every other entry names it (provider.js ids), so the Logs
+  // page's provider filter finds a sign-in beside the requests it led to.
+  const base = { kind: /** @type {const} */ ('signin'), provider: provider === 'claude' ? 'anthropic' : provider, account };
   if (step === 'started') return { ...base, type: 'signin_started', message: `Sign-in started (${via})` };
   if (step === 'succeeded') return { ...base, type: 'signin_succeeded', message: `Signed in (${via})${detail ? `: ${detail}` : ''}` };
   const err = /** @type {any} */ (error);
