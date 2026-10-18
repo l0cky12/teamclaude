@@ -59,11 +59,11 @@ NixOS and Home Manager modules (`flake.nix`, `nix/`), and
     `x509`.
   - UI and control: `status-renderer`, `dashboard`, `mcp`, `mcp-tools`,
     `config-ops`, `client-usage`, `session-titles`, `terminal-title`,
-    `early-log`.
+    `early-log`, `event-log` (the dashboard's Logs page).
   - Infrastructure: `config` (`withConfigLock`, `atomicConfigUpdate`),
     `crash-log`, `event-loop-monitor`, `safe-text`, `updater`, `service`,
-    `alias`, `claude-env`, `brand`.
-- `test/`: about 250 `*.test.js` files (kebab-case) and `test/README.md`.
+    `alias`, `claude-env`, `brand`, `types` (shared JSDoc typedefs only).
+- `test/`: about 260 `*.test.js` files (kebab-case) and `test/README.md`.
 - `test-helpers/spawn-server.js`: starts a real proxy for tests. It must stay
   outside `test/` so `node --test` doesn't run it as a test.
 - `docs/`: user documentation: accounts, configuration, proxy modes, quota,
@@ -179,6 +179,66 @@ upstream PR, cut the branch from `KarpelesLab/teamclaude` `master` (add an
 `upstream` remote if it's missing) so `AGENTS.md` and `CLAUDE.md` are not
 included.
 
+## Screenshots for front-end changes
+
+A PR that changes what someone sees must show it. A back-end-only PR needs
+no screenshots.
+
+Front-end means:
+
+- the web dashboard (`src/dashboard.js`, served at `/teamclaude/dashboard`)
+- the terminal UI (`src/tui.js`, `src/tui-remote.js`, `src/status-renderer.js`)
+
+CLI text output (`teamclaude status`, `accounts` and the other commands)
+needs no images. Paste the output before and after in fenced code blocks
+instead. A change that is only partly front-end needs screenshots only of
+the views it changed.
+
+### What to capture
+
+- A before and an after image of every view that changed, each with a
+  one-line caption saying what changed.
+- For a dashboard layout change, a narrow shot (about 390px wide) as well.
+- Take "before" from `master` (a temporary `git worktree add`) and "after"
+  from your branch.
+
+### How to capture
+
+- Never run against the real `~/.config/teamclaude.json`. Screenshots must
+  not show real emails, account ids, tokens or organisation names. Start the
+  proxy from a throwaway config with placeholder accounts, for example API-key
+  accounts named `demo-a@example.com` with a key of `sk-demo-1`:
+
+  ```sh
+  TEAMCLAUDE_CONFIG=/tmp/tc-shots/teamclaude.json node src/index.js server --headless
+  ```
+
+  Give it its own `proxy.port`, `"upstreamProxy": false` and
+  `"autoUpdate": false`.
+- Dashboard: open it in T3's browser preview (`preview_open`, then
+  `preview_snapshot` with `save: true`). Use `preview_resize` for the narrow
+  shot.
+- TUI: run it in a terminal of fixed size (tmux works) with the same
+  throwaway config and capture an image of it. If you can't produce an
+  image, paste `tmux capture-pane -p` output in a code block and say why in
+  the PR body.
+
+### Where the images go
+
+GitHub's CLI can't attach images to a PR, so commit them to the `pr-assets`
+branch on `origin`, never to the feature branch (it would be squash-merged
+into `master`). The branch is an orphan that holds only screenshots. Work on
+it in a temporary worktree so your checkout is untouched:
+`git worktree add /tmp/pr-assets pr-assets` after fetching it, or
+`git worktree add --orphan -b pr-assets /tmp/pr-assets` if it doesn't exist
+yet. Put each PR's images under `pr-<number>/`, push, remove the worktree,
+and link the images in the PR body as
+`https://raw.githubusercontent.com/l0cky12/teamclaude/pr-assets/pr-<number>/<file>.png`.
+Open the PR first if you need its number, then edit the body.
+
+The PR body gets a `## Screenshots` section, before `## Review`, with the
+images and captions as a before/after pair per view.
+
 ## Review workflow
 
 Every agent-authored PR goes through this workflow. If the human gives
@@ -187,7 +247,7 @@ explicit instructions in the session, those override it.
 ### Roles
 
 - **Implementer:** writes the change. By default this is Claude.
-- **Reviewer:** Codex, model `gpt-6.1-sol`, reasoning effort `high`.
+- **Reviewer:** Codex, model `gpt-6-astra`, reasoning effort `high`.
 - If you were invoked as the reviewer: review only. Don't edit files, push,
   open PRs, or start another review.
 
@@ -207,6 +267,7 @@ A change is **large** if any of these apply:
 - It touches `.github/workflows/`, `nix/`, or `package.json` (other than a
   version-only release bump).
 - It is a refactor across several modules.
+- It changes the layout of the dashboard or the TUI, not just its wording.
 
 Everything else is **small**, including docs-only changes and version-only
 release bumps. Nothing skips review.
@@ -225,7 +286,7 @@ in the PR body. If unsure, treat the change as large.
 Reviews go only through T3 Code's `delegate_task`. There is no Codex CLI
 fallback. Use:
 
-- target: provider `codex`, model `gpt-6.1-sol`, options
+- target: provider `codex`, model `gpt-6-astra`, options
   `reasoningEffort: high`
 - `role: review`, `mode: async`, shared checkout (no worktree isolation)
 - a new `clientRequestId` for every round
@@ -236,6 +297,8 @@ The prompt includes:
 - the classification and its reason
 - the diff range (`git diff master...HEAD`)
 - the check results
+- for a front-end change: the local paths of the screenshots (see
+  [Screenshots](#screenshots-for-front-end-changes))
 - from round 2 on: every earlier finding and the implementer's response to
   each
 
@@ -260,6 +323,7 @@ The reviewer returns a list of findings. Each finding has:
   - a background call or spending that isn't off by default
   - missing docs or `config.example.json` updates
   - secrets or account ids
+  - a front-end change without the screenshots it needs
   - a change outside the scope of one person's own accounts
 
 **Non-blocking findings:** style and suggestions. Fix them or not; they never
@@ -294,8 +358,9 @@ review 1 → fix → review 2 → fix → review 3.
 
 ### Outside T3
 
-If `delegate_task` isn't available, for example in a plain CLI session,
-review can't run. Don't skip it silently. Open a **draft** PR labelled
+If `delegate_task` isn't available, for example in a plain CLI session, or
+`orchestrator_capabilities` doesn't offer `gpt-6-astra`, review can't run.
+Don't substitute another model. Don't skip it silently. Open a **draft** PR labelled
 `needs-human-review`, and state in the body "Codex review unavailable".
 
 ### PR body: Review section
@@ -304,7 +369,7 @@ Every agent PR body ends with a `## Review` section containing:
 
 - the classification and its reason
 - the number of review rounds
-- the reviewer model and effort (`gpt-6.1-sol`, `high`)
+- the reviewer model and effort (`gpt-6-astra`, `high`)
 - the findings that were fixed
 - the findings that were disputed, with their reasoning
 - unresolved findings, if any
