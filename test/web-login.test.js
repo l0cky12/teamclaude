@@ -465,6 +465,58 @@ test('available needs both the save hook and reload', () => {
 });
 
 // The guard on its own, against rows as findUpsertTarget would pick them.
+// The reviewer's case: the chosen name was free at start, then another
+// account took it with a different identity. The upsert finds no row for this
+// identity (-1) and would add a second "laptop"; the guard refuses.
+test('signInGuard: a chosen name taken while the sign-in was open is refused, not duplicated', () => {
+  const rows = [{ id: 'e-other', name: 'laptop', accountUuid: 'uuid-other', orgUuid: 'org-1' }];
+  const incoming = { name: 'laptop', accountUuid: 'uuid-mine', orgUuid: 'org-1' };
+  assert.throws(() => signInGuard({ target: null, name: 'laptop' })(rows, -1, incoming), (/** @type {any} */ err) => (
+    err instanceof WebLoginError && err.status === 409 && /"laptop" already names another account/.test(err.message)));
+  // Free names, and numbered ones (picked under the lock), still go through.
+  assert.doesNotThrow(() => signInGuard({ target: null, name: 'desk' })(rows, -1, incoming));
+  assert.doesNotThrow(() => signInGuard({ target: null, name: null })(rows, -1, incoming));
+});
+
+test('two open sign-ins choosing one name: the second to finish is refused with nothing written', async () => {
+  /** @type {any[]} */
+  const configAccounts = [];
+  const { logins } = setup({
+    configAccounts,
+    save: async (/** @type {any} */ signIn) => {
+      // The real upsert runs the guard under the lock with the rows as they now are.
+      signInGuard(signIn)(configAccounts, -1, { name: signIn.name, accountUuid: `uuid-${configAccounts.length}` });
+      configAccounts.push({ id: `e-${configAccounts.length}`, name: signIn.name, accountUuid: `uuid-${configAccounts.length}` });
+      return { action: 'added', name: signIn.name };
+    },
+  });
+  const one = (await logins.start({ provider: 'claude', name: 'laptop' })).body;
+  const two = (await logins.start({ provider: 'claude', name: 'laptop' })).body;
+  assert.equal((await logins.finish({ id: one.id, input: pasteFor('claude', one.url) })).status, 200);
+  const second = await logins.finish({ id: two.id, input: pasteFor('claude', two.url) });
+  assert.equal(second.status, 409);
+  assert.match(second.body.error, /"laptop" already names another account/);
+  assert.equal(configAccounts.filter(a => a.name === 'laptop').length, 1);
+});
+
+for (const provider of /** @type {const} */ (['claude', 'codex'])) {
+  test(`a pasted ${provider} refusal keeps its error code and none of the provider's description`, async () => {
+    const { logins } = setup();
+    const { body: { id, url } } = await logins.start({ provider });
+    const state = new URL(url).searchParams.get('state');
+    const base = provider === 'codex' ? 'http://localhost:1455/auth/callback' : 'https://console.anthropic.com/oauth/code/callback';
+    const r = await logins.finish({ id, input: `${base}?error=access_denied&error_description=PRIVATE_PROVIDER_DETAIL&state=${state}` });
+    assert.equal(r.status, 400);
+    assert.equal(r.body.retry, true);
+    assert.equal(r.body.error.includes('PRIVATE_PROVIDER_DETAIL'), false);
+    assert.match(r.body.error, /The provider refused the sign-in \(access_denied\)/);
+    // Our own parser's words still come through for a paste that is simply wrong.
+    const wrong = await logins.finish({ id, input: provider === 'codex' ? 'http://localhost:1455/auth/callback?code=c' : 'a-code#another-attempt' });
+    assert.equal(wrong.status, 400);
+    assert.match(wrong.body.error, /state|whole/i);
+  });
+}
+
 test('signInGuard: a re-login must land on its own row', () => {
   const rows = [
     { id: 'e-work', name: 'work', accountUuid: 'uuid-work', orgUuid: 'org-1' },

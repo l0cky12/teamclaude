@@ -227,7 +227,36 @@ export function signInGuard({ target, name }) {
         ? `${quoted(name)} already names another account`
         : `This sign-in matched ${quoted(hit.name)} by name only, so its tokens were not replaced`);
     }
+    // A new row under a chosen name: the name was checked at start, but
+    // another sign-in or a rename may have taken it since, and the upsert only
+    // finds that row when the identities agree. Checked again here, under the
+    // lock, so two accounts never end up sharing it.
+    if (!hit && name) {
+      try {
+        checkNewAccountName(accounts, name);
+      } catch (err) {
+        if (err instanceof ConfigOpError) throw new WebLoginError(409, err.message);
+        throw err;
+      }
+    }
   };
+}
+
+/**
+ * What the reply says about a paste that could not be used. Our parsers'
+ * own messages pass through. A pasted refusal (the address carried `error=`)
+ * keeps only its OAuth error code: its error_description is the provider's
+ * text, and nothing of the provider's goes into a reply.
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function pasteError(error) {
+  const message = String(/** @type {any} */ (error)?.message ?? error ?? '');
+  if (/^(?:The sign-in was refused|OpenAI refused the sign-in):/.test(message)) {
+    const code = /:\s*([a-z_]{1,40})\b/.exec(message);
+    return `The provider refused the sign-in${code ? ` (${code[1]})` : ''}. Open the sign-in page again and approve access`;
+  }
+  return safeLine(message, 300);
 }
 
 /** @param {number} ms */
@@ -375,7 +404,7 @@ export class WebLogins {
     try {
       taken = flow.submit(body.input);
     } catch (err) {
-      return refuse(400, safeLine(err instanceof Error ? err.message : String(err), 300), { retry: true });
+      return refuse(400, pasteError(err), { retry: true });
     }
     if (!taken) return refuse(400, again, { retry: true });
 
