@@ -1462,6 +1462,8 @@ const PAGE = `<!doctype html>
   .ckeys .st { font-size: 12px; color: var(--dim); }
   .ckeys .st.ok { color: var(--ok); } .ckeys .st.warn { color: var(--warn); } .ckeys .st.error { color: var(--bad); }
   .ckeys table { margin-top: 8px; }
+  /* Show details and Revoke stack on a phone; keep them apart there too. */
+  .ckeys td .btn + .btn { margin-top: 4px; }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
