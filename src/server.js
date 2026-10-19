@@ -27,7 +27,7 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
@@ -431,6 +431,10 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
+  // A client key that could mint keys could hand out access the operator never
+  // granted, and one that could revoke could lock the other clients out.
+  ['/teamclaude/client-keys/create', 'a client key cannot manage client keys'],
+  ['/teamclaude/client-keys/revoke', 'a client key cannot manage client keys'],
   // Every step of a dashboard sign-in, the read included: the status names the
   // account the tokens went to, and a code pasted into another caller's
   // sign-in would add an account all the same.
@@ -632,7 +636,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
         // upstream-fetch.js), never which origins or requests.
-        res.end(JSON.stringify({ ...extra, ...status, caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        // `clientKeys` names the configured keys, never the keys themselves: the
+        // Clients page lists a key that has not been used yet, which the usage
+        // table cannot, since it only holds names that spent something.
+        res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
         return;
       }
 
@@ -1055,6 +1062,53 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
+        return;
+      }
+
+      // Client keys — what the dashboard's Clients page sends to make a key for
+      // one of the operator's machines or agents, or to revoke one. `create`
+      // {"name"} answers with the generated key, the only time the server says
+      // it; `revoke` {"name"} drops every entry under that name. Both write the
+      // config file under its lock and reload, since both auth gates read
+      // proxy.clientKeys off the running config. The client-key refusal above
+      // keeps both to the operator.
+      if (req.method === 'POST' && (req.url === '/teamclaude/client-keys/create' || req.url === '/teamclaude/client-keys/revoke')) {
+        const isCreate = req.url === '/teamclaude/client-keys/create';
+        // Checked before the write, as /threshold does: a key saved but not
+        // loaded would be refused by the gate until the next restart.
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'client key changes not supported' }));
+          return;
+        }
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        /** @type {any} */ let result;
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+            result = isCreate ? addClientKey(c, body.name) : revokeClientKey(c, body.name);
+          });
+        } catch (err) {
+          const bad = err instanceof ConfigOpError;
+          const message = /** @type {Error} */ (err).message;
+          if (!bad) console.error('[TeamClaude] Client key change failed:', message);
+          res.writeHead(bad ? 400 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: bad ? message : 'client key change failed; see the proxy log' }));
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a client key change failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        // The name only: the key never reaches the log.
+        console.log(`[TeamClaude] ${isCreate ? 'Created' : 'Revoked'} client key "${safeLine(result.name, 80)}" (control endpoint)`);
+        // no-store: the create reply carries the key itself.
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ...result }));
         return;
       }
 
