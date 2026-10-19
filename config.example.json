@@ -10,7 +10,7 @@
       { "name": "project", "header": "x-teamclaude-project" },
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
-    "sessionDetail": false,
+    "sessionDetail": true,
     "mcp": "off"
   },
   "upstream": "https://api.anthropic.com",

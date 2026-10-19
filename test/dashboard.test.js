@@ -13,7 +13,7 @@ import {
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-  meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
+  meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -89,6 +89,75 @@ test('a column the account has no window for stays empty, so the columns line up
     [null, '5-hour limit', '7-day limit']);
 });
 
+test('an empty shared or Fable week makes session capacity zero without changing upstream quota', () => {
+  const now = Date.now();
+  for (const weekly of [
+    { unified7d: 1, unified7dReset: now + 10_000 },
+    { unified7d: 0.2, unified7dFable: 1, unified7dFableReset: now + 10_000 },
+    { unified7d: 0.2, scopedWeekly: { fable: { utilization: 1, resetAt: now + 10_000 } } },
+  ]) {
+    const account = { quota: { unified5h: 0, unified5hReset: now + 1_000, ...weekly } };
+    const original = JSON.parse(JSON.stringify(account));
+    const session = accountMeters(account, undefined, now).slots[1];
+    assert.equal(session.left, 0);
+    assert.equal(session.tone, 'bad');
+    assert.equal(session.note, 'Weekly limit empty');
+    assert.equal(session.resetAt, null, 'do not promise the session reset will unblock the week');
+    assert.equal(accountQuotaExhausted(account, now), true);
+    assert.equal(poolSummary([account], 1, undefined, now).left, 0, 'the pool cannot advertise unusable session quota');
+    assert.deepEqual(account, original);
+  }
+  const codex = { provider: 'codex', quota: { unified5h: 0, unified7d: 1 } };
+  assert.equal(accountMeters(codex).slots[1].left, 0);
+  assert.equal(accountMeters({ quota: { unified7d: 1, sessionWindowStated: false } }).slots[1], null);
+});
+
+test('unknown, unspent, expired and other model weeks do not suppress fresh session capacity', () => {
+  const now = Date.now();
+  for (const weekly of [
+    {}, { unified7d: 0 }, { unified7d: 0.99 },
+    { unified7d: 1, unified7dReset: now },
+    { unified7dFable: 1, unified7dFableReset: now - 1 },
+    { unified7d: 0.1, scopedWeekly: { sonnet: { utilization: 1 } } },
+  ]) {
+    const account = { quota: { unified5h: 0, ...weekly } };
+    assert.equal(accountMeters(account, undefined, now).slots[1].left, 1);
+    assert.equal(accountQuotaExhausted(account, now), false);
+  }
+  assert.equal(accountQuotaExhausted({ quota: {} }, now), false);
+  assert.equal(accountQuotaExhausted(null, now), false);
+  assert.equal(accountMeters({ provider: 'codex', quota: { unified5h: 0, unified7d: 0.1, unified7dFable: 1 } }).slots[1].left, 1);
+});
+
+test('empty primary windows hide rows, while unknown or reset windows stay visible', () => {
+  const now = Date.now();
+  assert.equal(accountQuotaExhausted({ quota: { unified5h: 1 } }, now), true);
+  assert.equal(accountQuotaExhausted({ quota: { unified5h: 1, unified5hReset: now } }, now), false);
+  assert.equal(accountQuotaExhausted({ quota: { tokensLimit: 100, tokensRemaining: 0 } }, now), true);
+  assert.equal(accountQuotaExhausted({ quota: { backend: { utilization: 1 } } }, now), true);
+  assert.equal(accountQuotaExhausted({ quota: { backend: { text: '$0', utilization: null } } }, now), false);
+});
+
+test('backend exhaustion clears when all structured windows expire, without a new probe', () => {
+  const now = Date.now();
+  for (const windows of [
+    { fiveHour: { utilization: 1, resetAt: now + 100 } },
+    { fiveHour: { utilization: 1, resetAt: now + 50 }, weekly: { utilization: 1, resetAt: now + 100 } },
+  ]) {
+    const backend = { label: 'Plan', text: 'cached quota reading', utilization: 1, windows };
+    const account = { quota: { backend } };
+    assert.equal(accountQuotaExhausted(account, now), true);
+    assert.equal(accountQuotaExhausted(account, now + 100), false, 'reset alone makes the account visible again');
+    assert.deepEqual(accountMeters(account, undefined, now + 100).slots, [null, null, null]);
+    assert.deepEqual(backendQuotaRows(backend, now + 100), { rows: [], text: 'Plan: cached quota reading' });
+  }
+  assert.equal(accountQuotaExhausted({ quota: { backend: {
+    utilization: 1, windows: { fiveHour: { utilization: 1, resetAt: now }, weekly: { utilization: 1, resetAt: null } },
+  } } }, now), true, 'an unexpired weekly reading still hides the account');
+  assert.equal(accountQuotaExhausted({ quota: { backend: { utilization: 1, windows: {} } } }, now), true,
+    'aggregate-only backends keep their reading');
+});
+
 test('an account metered another way fills from the left, or says why there is nothing', () => {
   assert.deepEqual(labels(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } })), ['Tokens', null, null]);
   assert.equal(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).slots[0].left, 0.25);
@@ -145,6 +214,26 @@ test('tabs list Claude, Codex, then each backend host, with counts', () => {
   ]);
   assert.equal(accountGroup({}), 'anthropic');
   assert.equal(groupLabel('backend:__proto__'), '__proto__');
+});
+
+test('the five-hour pool uses session readings and resets independently of weekly quota', () => {
+  const now = Date.now();
+  const pool = poolSummary([
+    { name: 'a', quota: { unified5h: 0.2, unified5hReset: now + 7200000, unified7d: 0.99, unified7dReset: now + 1000 } },
+    { name: 'b', quota: { unified5h: 0.75, unified5hReset: now + 3600000, unified7d: 0.01 } },
+    { name: 'disabled', disabled: true, quota: { unified5h: 0, unified5hReset: now + 2000 } },
+    { name: 'no-session', quota: { unified7d: 0.4, sessionWindowStated: false } },
+    { name: 'unknown', provider: 'codex', quota: { unified5h: NaN, unified7d: 0.2 } },
+  ], 1, 'Fable', now);
+  assert.equal(pool.label, '5-hour limit');
+  assert.equal(pool.count, 2);
+  assert.equal(pool.left, 1.05);
+  assert.deepEqual(pool.segments, [
+    { name: 'a', left: 0.8, tone: 'ok' },
+    { name: 'b', left: 0.25, tone: 'warn' },
+  ]);
+  assert.deepEqual(pool.soonest, { name: 'b', resetAt: now + 3600000 });
+  assert.equal(pool.unknown, 1);
 });
 
 test('the Logs page offers a chip for every kind the proxy records', () => {
@@ -957,7 +1046,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-    meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+    meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
@@ -1020,8 +1109,9 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const document = { getElementById: byId, createElement: () => stubEl(), documentElement };
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
+  let poll;
   new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
-    document, localStorage, fetch, () => 1, () => {});
+    document, localStorage, fetch, fn => { poll = fn; return 1; }, () => {});
   const answer = async (status, body = {}) => {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
@@ -1041,8 +1131,84 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   // The latest element built that matches, for a control with no label to
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
-  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast };
+  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
 }
+
+test('Show all reveals exhausted quota rows, survives polls and tabs, and can hide them again', async () => {
+  const page = bootPage();
+  const fleet = { accounts: [
+    { name: 'quota-ready-demo', quota: { unified5h: 0, unified7d: 0.2 } },
+    { name: 'quota-spent-demo', quota: { unified5h: 0, unified7d: 1 } },
+    { name: 'quota-unknown-demo', provider: 'codex', quota: {} },
+  ] };
+  await page.answer(200, fleet);
+  // Management always builds one name; Quota builds a second only if visible.
+  assert.equal(page.labelled('quota-ready-demo'), 2);
+  assert.equal(page.labelled('quota-spent-demo'), 1);
+  assert.equal(page.labelled('quota-unknown-demo'), 2);
+  assert.equal(page.labelled('1 exhausted account hidden'), 1);
+  assert.equal(page.labelled('100%'), 2, 'both summaries exclude the weekly-exhausted session capacity');
+  assert.equal(page.labelled('200%'), 0);
+  page.click('Show all');
+  assert.equal(page.labelled('quota-spent-demo'), 2);
+  assert.equal(page.labelled('Weekly limit empty'), 1);
+  page.poll();
+  await page.answer(200, fleet);
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'a poll keeps Show all');
+  page.click('Claude');
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'provider tabs keep Show all');
+  assert.equal(page.labelled('quota-unknown-demo'), 1, 'provider tab still filters Quota');
+  page.click('Hide exhausted');
+  assert.equal(page.labelled('quota-spent-demo'), 1);
+  fleet.accounts[0].quota.unified7d = 1;
+  page.poll();
+  await page.answer(200, fleet);
+  assert.equal(page.labelled('quota-ready-demo'), 1, 'new exhaustion hides automatically');
+  assert.equal(page.labelled('All accounts in this group have an exhausted limit. Use Show all to see them.'), 1);
+  fleet.accounts[1].quota.unified7d = 0;
+  page.poll();
+  await page.answer(200, fleet);
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'recovered quota returns automatically');
+  const fresh = bootPage();
+  await fresh.answer(200, fleet);
+  assert.equal(fresh.labelled('quota-ready-demo'), 1, 'a new page defaults to hiding');
+  assert.equal(fresh.labelled('Show all'), 1);
+});
+
+test('Claude and Codex get adjacent five-hour cards without changing existing summaries', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'claude', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.4, unified7dFable: 0.6 } },
+      { name: 'codex', provider: 'codex', quota: { unified5h: 0.7, unified7d: 0.1 } },
+      { name: 'backend', backend: 'example.test', quota: { tokensLimit: 100, tokensRemaining: 50 } },
+    ],
+  });
+  assert.equal(page.built.filter(e => e.className === 'scard').length, 5);
+  assert.equal(page.built.filter(e => e.className === 'summary-pair').length, 2);
+  const poolLabels = () => page.built.filter(e => e.className === 'pl').map(e => e.textContent);
+  assert.deepEqual(poolLabels(), ['7-day Fable', '5-hour limit', '7-day limit', '5-hour limit', 'Tokens']);
+  assert.equal(page.labelled('80%'), 1, 'Claude session quota');
+  assert.equal(page.labelled('30%'), 1, 'Codex session quota');
+  assert.equal(page.labelled('40%'), 1, 'the original Claude headline stays Fable');
+  assert.equal(page.labelled('90%'), 1, 'the original Codex headline stays weekly');
+  page.click('Codex');
+  assert.equal(page.labelled('5-hour limit'), 2, 'the filtered group has its session card and row');
+  assert.equal(page.labelled('80%'), 0, 'Claude cards are filtered out');
+});
+
+test('five-hour cards show an unknown reading when no session window is reported', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'claude', provider: 'anthropic', quota: { unified7d: 0.3, sessionWindowStated: false } },
+      { name: 'codex', provider: 'codex', quota: {} },
+    ],
+  });
+  assert.equal(page.built.filter(e => e.className === 'scard').length, 4);
+  assert.equal(page.labelled(' no reading yet'), 2);
+  assert.equal(page.labelled('?'), 2, 'unknown session capacity is not shown as full');
+});
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {
   const page = bootPage();
