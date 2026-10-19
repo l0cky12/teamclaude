@@ -993,7 +993,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
     // Fire with the proxy as `this`, the way the page sees the element, so a
     // handler that touches an unstubbed property gets the absorbing stub.
-    target.fire = type => { for (const fn of listeners.get(type) || []) fn.call(proxy); };
+    target.fire = (type, event) => { for (const fn of listeners.get(type) || []) fn.call(proxy, event); };
     built.push(proxy);
     return proxy;
   };
@@ -1850,4 +1850,40 @@ test('the Clients page carries the client key form, kept to the operator', () =>
   assert.ok(html.includes("callerCan(s.caller, '/teamclaude/client-keys/create')"), 'hidden for a caller that would be refused');
   assert.ok(callerView('ci').refused.includes('/teamclaude/client-keys/create'));
   assert.ok(callerView('ci').refused.includes('/teamclaude/client-keys/revoke'));
+});
+
+// The proxy's first key closes the gate this page came in through. Its next
+// poll would be refused and the key box would cover the one-time key panel
+// before the key was copied, so polling waits for Done.
+test('creating the proxy\'s first key from a key-less page keeps the key on screen until Done', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clientKeys: [], caller: { kind: 'operator', client: null, refused: [] } });
+  page.byId('ckName').value = 'laptop';
+  page.byId('ckForm').fire('submit', { preventDefault() {} });
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/client-keys/create');
+  await page.answer(200, { ok: true, name: 'laptop', key: 'tc-new', firstKey: true });
+
+  assert.equal(page.requests.length, 0, 'no status poll while the new key is on screen');
+  assert.equal(page.byId('ckIssued').style.display, '');
+  assert.notEqual(page.byId('keybox').style.display, 'block');
+  assert.ok(page.findLast(e => e.value === 'tc-new'), 'the key is shown');
+  assert.ok(page.findLast(e => /Copy the key before you press Done/.test(e.textContent)), 'the page says what happens next');
+
+  page.click('Done');
+  assert.equal(page.requests.length, 1, 'Done resumes polling');
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(401);
+  assert.equal(page.byId('keybox').style.display, 'block');
+});
+
+test('a key created by a page that already holds one keeps polling', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], clientKeys: [], caller: { kind: 'operator', client: null, refused: [] } });
+  page.byId('ckName').value = 'laptop';
+  page.byId('ckForm').fire('submit', { preventDefault() {} });
+  await page.answer(200, { ok: true, name: 'laptop', key: 'tc-new', firstKey: false });
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
 });

@@ -2259,6 +2259,11 @@ ${SHARED_HELPERS}
         ckStatus(out.kind, out.text);
         if (json.ok && step === 'create') {
           document.getElementById('ckName').value = '';
+          // The proxy's first key closes a gate this page may have come in
+          // through without a key. Its next poll would then be refused and
+          // the key box would cover the panel before the key was copied, so
+          // polling waits for Done.
+          holdPoll = !!json.firstKey && !localStorage.getItem(KEY);
           showIssuedKey(json.name, json.key);
         }
         // A revoked key's panel would offer setup for a key that no longer works.
@@ -2273,12 +2278,15 @@ ${SHARED_HELPERS}
   // endpoint never returns keys, so closing the panel is the end of it (the
   // config file still holds it for whoever can read that).
   var issuedName = null;
+  // Set while a first key's panel is open on a page that holds no key: see doClientKey.
+  var holdPoll = false;
 
   function hideIssuedKey() {
     issuedName = null;
     var box = document.getElementById('ckIssued');
     box.textContent = '';
     box.style.display = 'none';
+    if (holdPoll) { holdPoll = false; poll(); }
   }
 
   function copyField(field, btn) {
@@ -2316,13 +2324,16 @@ ${SHARED_HELPERS}
     head.appendChild(el('b', '', 'Key for ' + name));
     head.appendChild(el('span', 'hint', 'Copy it now: the dashboard will not show it again.'));
     box.appendChild(head);
-    var origin = location.origin;
+    var origin = typeof location !== 'undefined' ? location.origin : '';
     var setup = clientKeySetup(origin, key);
     snippet(box, 'Key', key, 0);
     snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
     snippet(box, 'Codex CLI: add to ~/.codex/config.toml', setup.codex, 7);
-    if (isLoopbackHost(location.hostname)) {
+    if (isLoopbackHost(pageHost())) {
       box.appendChild(el('div', 'lbl', 'This page is open at ' + origin + '. A client on another machine needs an address of this one it can reach instead.'));
+    }
+    if (holdPoll) {
+      box.appendChild(el('div', 'st warn', 'The proxy now asks every caller off its own machine for a key, this page included. Copy the key before you press Done: the page will then ask for one. To manage keys from here again, set proxy.apiKey.'));
     }
     var actions = el('div', 'line');
     var check = el('span', 'st');
@@ -3167,6 +3178,7 @@ ${SHARED_HELPERS}
   }
 
   function poll() {
+    if (holdPoll) return;
     fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
