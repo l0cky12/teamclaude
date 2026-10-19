@@ -5,7 +5,7 @@
 [![node](https://img.shields.io/node/v/@karpeleslab/teamclaude.svg)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Multi-account proxy for [Claude Code](https://claude.ai/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
+Multi-account proxy for [Claude Code](https://claude.com/product/claude-code) and [Codex](https://github.com/openai/codex): it pools Claude Max, ChatGPT/Codex, API-key and third-party backend accounts, and rotates on quota.
 
 It sits between the coding agent and the provider's API, holds several accounts, and moves to the next one when the current account gets close to its session or weekly limit. The session keeps running instead of stopping on a 429. Claude accounts serve Claude Code, Codex accounts serve the Codex CLI, and both pools share one proxy.
 
