@@ -234,8 +234,9 @@ export function clientAgent(userAgent) {
 }
 
 // Text a client wraps around a prompt rather than text a person wrote: Claude
-// Code's reminders and Codex's environment and instructions preambles.
-const WRAPPER = /^<(?:system-reminder|environment_context|user_instructions)\b/;
+// Code's reminders and Codex's environment and instructions preambles. Cut
+// out span by span, since a client may put one in the same block as the prompt.
+const WRAPPER = /<(system-reminder|environment_context|user_instructions)\b[^>]*>[\s\S]*?<\/\1>/g;
 
 /**
  * The text of a message's content: a string, or the text of its text blocks
@@ -247,8 +248,9 @@ const WRAPPER = /^<(?:system-reminder|environment_context|user_instructions)\b/;
 function userText(content) {
   const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
   return blocks
-    .filter((b) => (b?.type === 'text' || b?.type === 'input_text') && typeof b.text === 'string' && !WRAPPER.test(b.text.trimStart()))
-    .map((b) => b.text)
+    .filter((b) => (b?.type === 'text' || b?.type === 'input_text') && typeof b.text === 'string')
+    .map((b) => b.text.replace(WRAPPER, ' ').trim())
+    .filter(Boolean)
     .join(' ')
     .trim();
 }

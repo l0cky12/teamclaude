@@ -1734,6 +1734,9 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
     // outer catch tells an entry it still has to account for from one that is
     // already closed.
     let openEntry = null;
+    // Who sent this, for every row that closes it (the event log's Client
+    // column): a refused or blocked request is still worth attributing.
+    const caller = { client: req.tcClient ?? forcedClient ?? null, agent: req.headers['user-agent'] ?? null };
     try {
       // Refused before any path-prefix classification below, so each of those
       // sees the path upstream will see (see hasDotSegment). Logged like the
@@ -1741,7 +1744,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       if (hasDotSegment(req.url)) {
         const reqId = ++counter;
         const sessionId = req.headers['x-claude-code-session-id'] || null;
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false });
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: safeLine(req.url), account: '(refused: dot-segment in path)', status: 400, model: null, sessionId, pinned: false, ...caller });
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'Request path must not contain dot-segments' } }));
         recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1817,7 +1820,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           const shown = safeLine(token ?? raw);
           const reqId = ++counter;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false, ...caller });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1871,7 +1874,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = clientSessionId(req.headers);
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false, ...caller });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
           recordEarlyOutcome(accountManager, { sessionId }, req.url, true);
@@ -1891,7 +1894,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // close. The cost of this order is one spurious close if the hook threw
         // before registering anything, which every consumer already tolerates.
         openEntry = { reqId, sessionId };
-        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: req.tcClient ?? forcedClient ?? null });
+        hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId, pinned: pinnedIndex != null, client: caller.client });
       }
 
       // Buffer request body (needed to resend on a different account after a 429).
@@ -1910,7 +1913,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         if (bodyBytes > maxBodyBytes) {
           await refuseOversizedBody(req, res);
           openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(too large)', status: 413, model: modelFinder.done ? modelFinder.value : null, sessionId, pinned: pinnedIndex != null });
+          if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(too large)', status: 413, model: modelFinder.done ? modelFinder.value : null, sessionId, pinned: pinnedIndex != null, ...caller });
           return;
         }
         bodyChunks.push(chunk);
@@ -1971,7 +1974,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         }
         recordEarlyOutcome(accountManager, { pinKey }, req.url, true);
         openEntry = null;   // this path owns the close below; the outer catch must not repeat it
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, effort, sessionId });
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: '(blocked)', status: 400, model, effort, sessionId, prompt, ...caller });
         return;
       }
 
@@ -2063,7 +2066,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, agent: req.headers['user-agent'] ?? null, prompt, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, ...caller, prompt, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -2089,7 +2092,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         try {
           hooks.onRequestEnd?.(entry.reqId, {
             method: req.method, path: req.url, account: null, status,
-            model: null, sessionId: entry.sessionId, pinned: false,
+            model: null, sessionId: entry.sessionId, pinned: false, ...caller,
           });
         } catch (hookErr) {
           reportFailure('[TeamClaude] activity hook failed while closing a request:', hookErr);

@@ -102,6 +102,29 @@ test('with proxy.logPrompts on, a usage entry carries the prompt and the client 
   assert.equal(entry.agent, 'claude-cli/2.1.3');
 });
 
+test('a blocked request keeps its client and prompt', async t => {
+  const am = new AccountManager([{ name: 'work', type: 'apikey', apiKey: 'fake' }], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { logPrompts: true, clientKeys: [{ name: 'laptop', key: 'tc-laptop-test' }] },
+    blockedModels: ['claude-fable-*'],
+    upstream: 'http://127.0.0.1:9',
+  });
+  const port = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); });
+  const url = `http://127.0.0.1:${port}`;
+  const res = await fetch(`${url}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'tc-laptop-test', 'user-agent': 'claude-cli/2.1.3' },
+    body: JSON.stringify(TOOL_LOOP),
+  });
+  assert.equal(res.status, 400);
+  await res.text();
+  const page = await (await fetch(`${url}/teamclaude/logs`)).json();
+  const blocked = page.events.filter((/** @type {any} */ e) => e.status === 400);
+  assert.equal(blocked.length, 1);
+  assert.deepEqual([blocked[0].client, blocked[0].agent, blocked[0].prompt], ['laptop', 'claude-cli/2.1.3', 'rename the helper']);
+});
+
 test('a refused request names no account', async t => {
   const { url } = await fixture(t);
   // fetch would normalise the dot-segment away; node:http sends the path as written.

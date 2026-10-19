@@ -156,6 +156,11 @@ test('requestPrompt reads the last user text of a Messages or Responses body', (
     { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'add a test' }] },
     { type: 'function_call_output', call_id: 'c', output: 'done' },
   ] })), 'add a test');
+  // A wrapper sharing a block with the prompt is cut out, not the whole block.
+  assert.equal(requestPrompt(body({ messages: [
+    { role: 'user', content: 'old prompt' },
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>context</system-reminder>\nfix the new bug' }] },
+  ] })), 'fix the new bug');
   assert.equal(requestPrompt(Buffer.from('not json')), null);
   assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: [{ type: 'image' }] }] })), null);
 });

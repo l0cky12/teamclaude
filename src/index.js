@@ -568,7 +568,6 @@ async function serverCommand() {
       // reload adds or drops one without a restart.
       config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
       config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
-      config.proxy.logPrompts = diskConfig.proxy.logPrompts;
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
@@ -579,6 +578,8 @@ async function serverCommand() {
     // the endpoint to be off as surely as one who deletes the key, and leaving
     // the old mode in memory would keep it served.
     if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
+    // Prompt capture likewise: deleting the section must turn it off.
+    if (config.proxy) config.proxy.logPrompts = diskConfig.proxy?.logPrompts;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);
