@@ -31,7 +31,7 @@ import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setThresh
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
-import { logsAfter } from './event-log.js';
+import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -1953,6 +1953,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       const effort = parseRequestEffort(body, provider);
       if (effort && !hideActivity) hooks.onRequestModel?.(reqId, { model, effort });
 
+      // What the prompt says, for the Logs page. Opt-in (proxy.logPrompts),
+      // read live so a reload turns it on or off: the event log answers every
+      // key holder, and this is the one field holding what a person wrote.
+      const prompt = /** @type {any} */ (config)?.proxy?.logPrompts === true && !hideActivity ? requestPrompt(body) : null;
+
       // Model blocklist (issue #116): reject a request for a blocked model right
       // here instead of forwarding it. A model no account can serve (e.g. Fable
       // once it left base plans) otherwise gets rate-limited upstream and hangs
@@ -2058,7 +2063,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         // marked open would send the outer catch to call that same throwing hook
         // a second time for one request.
         openEntry = null;
-        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
+        if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, effort, sessionId, pinned: ctx.pinnedIndex != null, client, agent: req.headers['user-agent'] ?? null, prompt, provider: ctx.provider ?? null, inputTokens: ctx.inputTokens, outputTokens: ctx.outputTokens });
       }
     } catch (err) {
       reportFailure('[TeamClaude] Unhandled error:', err);
@@ -2149,6 +2154,7 @@ export function withRequestEvents(hooks, accountManager) {
       account, model: info.model ?? null, status: info.status ?? null,
       inputTokens: info.inputTokens ?? null, outputTokens: info.outputTokens ?? null,
       ms: entry ? Date.now() - entry.started : null,
+      client: info.client ?? null, agent: clientAgent(info.agent), prompt: info.prompt ?? null,
       message: `${info.method || ''} ${path}${label ? ` ${label}` : ''}`.trim(),
     });
     return hooks.onRequestEnd?.(id, info);

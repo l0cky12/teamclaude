@@ -15,8 +15,8 @@ function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(/** @type {import('node:net').AddressInfo} */ (server.address()).port)));
 }
 
-/** @param {any} t @param {Record<string, any>} [hooks] */
-async function fixture(t, hooks = {}) {
+/** @param {any} t @param {Record<string, any>} [hooks] @param {Record<string, any>} [proxyConfig] */
+async function fixture(t, hooks = {}, proxyConfig = {}) {
   const upstream = http.createServer(async (req, res) => {
     for await (const c of req) void c;
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -26,7 +26,7 @@ async function fixture(t, hooks = {}) {
   const am = new AccountManager([{ name: 'work', type: 'apikey', apiKey: 'fake', accountUuid: PIN_UUID }], 0.98);
   const ended = [];
   const proxy = createProxyServer(am,
-    { proxy: {}, upstream: `http://127.0.0.1:${upstreamPort}` },
+    { proxy: proxyConfig, upstream: `http://127.0.0.1:${upstreamPort}` },
     { ...hooks, onRequestEnd: (/** @type {number} */ id, /** @type {any} */ info) => ended.push({ id, ...info }) });
   const port = await listen(proxy);
   t.after(() => { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
@@ -60,6 +60,46 @@ test('a served request is a usage entry with its account, model, status and toke
   const after = await (await fetch(`${url}/teamclaude/logs?after=${page.lastId}`)).json();
   assert.deepEqual(after.events, []);
   assert.equal(after.lastId, page.lastId);
+});
+
+// A Claude Code tool loop: the last user message is a tool result, and the
+// prompt that started the turn sits behind a reminder block.
+const TOOL_LOOP = {
+  model: 'claude-fable-5-1', max_tokens: 1,
+  messages: [
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>ctx</system-reminder>' }, { type: 'text', text: 'rename the helper' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'file text' }] },
+  ],
+};
+
+/** @param {string} url @param {Record<string, string>} [headers] */
+async function sendToolLoop(url, headers = {}) {
+  const res = await fetch(`${url}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'user-agent': 'claude-cli/2.1.3 (external, cli)', ...headers },
+    body: JSON.stringify(TOOL_LOOP),
+  });
+  assert.equal(res.status, 200);
+  await res.text();
+  const page = await (await fetch(`${url}/teamclaude/logs`)).json();
+  return page.events.filter((/** @type {any} */ e) => e.kind === 'usage')[0];
+}
+
+test('a usage entry names the client but keeps no prompt by default', async t => {
+  const { url } = await fixture(t);
+  const entry = await sendToolLoop(url);
+  assert.equal(entry.agent, 'claude-cli/2.1.3');
+  assert.equal('client' in entry, false, 'no client key, so no name');
+  assert.equal('prompt' in entry, false);
+});
+
+test('with proxy.logPrompts on, a usage entry carries the prompt and the client key name', async t => {
+  const { url } = await fixture(t, {}, { logPrompts: true, clientKeys: [{ name: 'laptop', key: 'tc-laptop-test' }] });
+  const entry = await sendToolLoop(url, { 'x-api-key': 'tc-laptop-test' });
+  assert.equal(entry.prompt, 'rename the helper');
+  assert.equal(entry.client, 'laptop');
+  assert.equal(entry.agent, 'claude-cli/2.1.3');
 });
 
 test('a refused request names no account', async t => {

@@ -11,6 +11,7 @@
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
     "sessionDetail": true,
+    "logPrompts": false,
     "mcp": "off"
   },
   "upstream": "https://api.anthropic.com",

@@ -568,6 +568,7 @@ async function serverCommand() {
       // reload adds or drops one without a restart.
       config.proxy.usageDimensions = diskConfig.proxy.usageDimensions;
       config.proxy.sessionDetail = diskConfig.proxy.sessionDetail;
+      config.proxy.logPrompts = diskConfig.proxy.logPrompts;
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
