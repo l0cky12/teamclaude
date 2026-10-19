@@ -627,7 +627,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
-        const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail === true });
+        const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail !== false });
         const extra = hooks.getStatusExtra?.() || {};
         res.writeHead(200, { 'Content-Type': 'application/json' });
         // Counters only: how full the upstream admission gate is (see
