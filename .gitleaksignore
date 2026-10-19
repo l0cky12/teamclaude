@@ -1,0 +1,5 @@
+# Fingerprints (commit:file:rule:line) the CI secret scan skips. Each is a
+# historical false positive on a line of ordinary code; public constants go
+# in .gitleaks.toml instead.
+ecafb6b003a3c43d9a6bb6e27e8f26c1e0b88d29:test/tui-split-panes.test.js:generic-api-key:31
+0a96c25ec305cc85ed0bcb90937dcd97eeed2d2c:test/tui-split-panes.test.js:generic-api-key:31

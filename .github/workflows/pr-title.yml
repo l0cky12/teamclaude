@@ -1,0 +1,62 @@
+name: PR title
+
+# Pull requests are squash-merged, so the title becomes the commit message.
+# CONTRIBUTING.md asks for `type(scope): summary`; a release is a PR titled
+# exactly `Bump to X.Y.Z` that changes only the version in package.json. This
+# check enforces both so a stray title never reaches master.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: title format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history: the release check diffs against the merge base, not
+      # against master's tip, so commits that landed on master after the
+      # release branch was cut do not count against it.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The title goes through an environment variable, never into the
+      # script text: a PR author controls it.
+      - name: Check the title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$TITLE" =~ ^Bump\ to\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            echo "Release PR for $version: it may change only the version in package.json."
+            git fetch --no-tags origin "$BASE" "$HEAD"
+            base=$(git merge-base "$BASE" "$HEAD")
+            echo "Comparing against merge base $base"
+            changed=$(git diff --name-only "$base" "$HEAD")
+            if [ "$changed" != "package.json" ]; then
+              echo "::error::A release PR must change package.json only. Changed files:"; echo "$changed"; exit 1
+            fi
+            # Exactly one line removed and one added, both the version field.
+            lines=$(git diff --unified=0 "$base" "$HEAD" -- package.json | grep -E '^[-+][^-+]')
+            echo "$lines"
+            if [ "$(echo "$lines" | wc -l)" != 2 ] || echo "$lines" | grep -qvE '^[-+]\s*"version":'; then
+              echo "::error::A release PR must change only the \"version\" line of package.json."; exit 1
+            fi
+            actual=$(git show "$HEAD:package.json" | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version")
+            if [ "$actual" != "$version" ]; then
+              echo "::error::The title says $version but package.json says $actual."; exit 1
+            fi
+            echo "OK: release $version"
+          elif [[ "$TITLE" =~ ^(feat|fix|docs|test|chore)(\([A-Za-z0-9._/, -]+\))?!?:\ [^[:space:]].* ]]; then
+            echo "OK: $TITLE"
+          else
+            echo "::error::PR title must be 'type(scope): summary' with type feat, fix, docs, test or chore (scope optional), or exactly 'Bump to X.Y.Z' for a release. Got: $TITLE"
+            exit 1
+          fi
