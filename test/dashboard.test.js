@@ -137,6 +137,26 @@ test('empty primary windows hide rows, while unknown or reset windows stay visib
   assert.equal(accountQuotaExhausted({ quota: { backend: { text: '$0', utilization: null } } }, now), false);
 });
 
+test('backend exhaustion clears when all structured windows expire, without a new probe', () => {
+  const now = Date.now();
+  for (const windows of [
+    { fiveHour: { utilization: 1, resetAt: now + 100 } },
+    { fiveHour: { utilization: 1, resetAt: now + 50 }, weekly: { utilization: 1, resetAt: now + 100 } },
+  ]) {
+    const backend = { label: 'Plan', text: 'cached quota reading', utilization: 1, windows };
+    const account = { quota: { backend } };
+    assert.equal(accountQuotaExhausted(account, now), true);
+    assert.equal(accountQuotaExhausted(account, now + 100), false, 'reset alone makes the account visible again');
+    assert.deepEqual(accountMeters(account, undefined, now + 100).slots, [null, null, null]);
+    assert.deepEqual(backendQuotaRows(backend, now + 100), { rows: [], text: 'Plan: cached quota reading' });
+  }
+  assert.equal(accountQuotaExhausted({ quota: { backend: {
+    utilization: 1, windows: { fiveHour: { utilization: 1, resetAt: now }, weekly: { utilization: 1, resetAt: null } },
+  } } }, now), true, 'an unexpired weekly reading still hides the account');
+  assert.equal(accountQuotaExhausted({ quota: { backend: { utilization: 1, windows: {} } } }, now), true,
+    'aggregate-only backends keep their reading');
+});
+
 test('an account metered another way fills from the left, or says why there is nothing', () => {
   assert.deepEqual(labels(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } })), ['Tokens', null, null]);
   assert.equal(accountMeters({ quota: { tokensLimit: 100, tokensRemaining: 25 } }).slots[0].left, 0.25);

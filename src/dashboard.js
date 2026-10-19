@@ -152,7 +152,9 @@ export function backendQuotaRows(backend, now) {
     if (win.resetAt != null && win.resetAt <= at) return;
     rows.push({ label: d.label, utilization: win.utilization, resetAt: win.resetAt == null ? null : win.resetAt });
   });
-  if (!rows.length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
+  // The aggregate was measured with these windows: once they expire it must
+  // not turn back into a timeless reading that keeps the account hidden.
+  if (!Object.keys(w).length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
   return { rows: rows, text: !rows.length && b.text ? (b.label || 'Quota') + ': ' + b.text : null };
 }
 
