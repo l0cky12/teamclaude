@@ -1198,6 +1198,27 @@ test('the quota refresh picker keeps keyboard focus and coalesces steps made whi
   assert.equal(sel.value, '90');
 });
 
+test('a status poll between quota refresh saves does not replace the queued choice', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  const sel = page.byId('probeEvery');
+  sel.value = '45'; sel.fire('change');
+  sel.value = '90'; sel.fire('change');
+  // Focus leaves and the 5s poll lands while the first save is still out: it
+  // carries the old interval and must not rewrite the select or the queue.
+  page.poll();
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval', '/teamclaude/status']);
+  const save = page.requests.shift();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  assert.equal(sel.value, '90', 'a save in flight keeps the select out of the poll');
+  page.requests.unshift(save);
+  // The test's select stub reads back whatever is assigned, so pin the case
+  // the reviewer reproduced: the DOM says 30 and the queued choice is still sent.
+  sel.value = '30';
+  await page.answer(200, { ok: true, quotaProbeSeconds: 45 });
+  assert.equal(page.requests[0].init.body, '{"seconds":90}');
+});
+
 test('Show all reveals exhausted quota rows, survives polls and tabs, and can hide them again', async () => {
   const page = bootPage();
   const fleet = { accounts: [

@@ -2826,10 +2826,13 @@ ${SHARED_HELPERS}
     var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
     thrInput.disabled = !canThreshold;
     document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
-    // Rebuilt from the status unless it is open, like the threshold field, so a
-    // change made from the CLI or the TUI shows up here without a refresh.
+    // Rebuilt from the status unless it is open or saving, like the threshold
+    // field, so a change made from the CLI or the TUI shows up here without a
+    // refresh.
     var probeSel = document.getElementById('probeEvery');
-    if (document.activeElement !== probeSel) {
+    // ponytail: a status read that started before a save and lands after it
+    // still shows the old interval until the next poll; cosmetic, nothing is lost.
+    if (document.activeElement !== probeSel && !probeSaving) {
       var probeSecs = (s.probe || {}).intervalSeconds || 0;
       probeSel.textContent = '';
       probeIntervalOptions(probeSecs).forEach(function (o) {
@@ -3269,12 +3272,21 @@ ${SHARED_HELPERS}
   // blurred while it saves: either would drop keyboard focus, and arrowing
   // through the choices fires one change per step. Steps that land while a save
   // is in flight are coalesced into one save of the latest choice, so the
-  // requests can't arrive out of order and leave an earlier step on disk.
-  var probeSaving = false, probeAgain = false;
+  // requests can't arrive out of order and leave an earlier step on disk. The
+  // choice is kept in probeWanted rather than re-read from the select, which a
+  // poll may have rewritten by then (render leaves it alone only while it has
+  // focus or a save is running).
+  var probeSaving = false, probeWanted = null;
   function doProbeInterval(sel) {
-    if (probeSaving) { probeAgain = true; return; }
+    probeWanted = Number(sel.value);
+    if (!probeSaving) saveProbeInterval(sel);
+  }
+
+  function saveProbeInterval(sel) {
+    var seconds = probeWanted;
+    probeWanted = null;
     probeSaving = true;
-    var r = probeIntervalRequest(Number(sel.value), localStorage.getItem(KEY));
+    var r = probeIntervalRequest(seconds, localStorage.getItem(KEY));
     fetch(r.url, r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
@@ -3284,15 +3296,15 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = probeIntervalOutcome(json);
         note(out.kind, out.text);
-        // The poll leaves a focused select alone, so a refused choice would
+        // A focused select is left alone by the poll, so a refused choice would
         // otherwise stay on screen as if it applied. A newer pick waiting to be
         // sent is left showing instead: it is about to be saved.
-        if (!json.ok && !probeAgain) sel.value = String(((lastStatus || {}).probe || {}).intervalSeconds || 0);
+        if (!json.ok && probeWanted === null) sel.value = String(((lastStatus || {}).probe || {}).intervalSeconds || 0);
       })
       .catch(function (e) { note('error', 'quota refresh change failed: ' + e.message); })
       .finally(function () {
         probeSaving = false;
-        if (probeAgain) { probeAgain = false; doProbeInterval(sel); } else poll();
+        if (probeWanted !== null) saveProbeInterval(sel); else poll();
       });
   }
 
