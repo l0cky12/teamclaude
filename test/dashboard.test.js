@@ -215,6 +215,26 @@ test('tabs list Claude, Codex, then each backend host, with counts', () => {
   assert.equal(groupLabel('backend:__proto__'), '__proto__');
 });
 
+test('the five-hour pool uses session readings and resets independently of weekly quota', () => {
+  const now = Date.now();
+  const pool = poolSummary([
+    { name: 'a', quota: { unified5h: 0.2, unified5hReset: now + 7200000, unified7d: 0.99, unified7dReset: now + 1000 } },
+    { name: 'b', quota: { unified5h: 0.75, unified5hReset: now + 3600000, unified7d: 0.01 } },
+    { name: 'disabled', disabled: true, quota: { unified5h: 0, unified5hReset: now + 2000 } },
+    { name: 'no-session', quota: { unified7d: 0.4, sessionWindowStated: false } },
+    { name: 'unknown', provider: 'codex', quota: { unified5h: NaN, unified7d: 0.2 } },
+  ], 1, 'Fable', now);
+  assert.equal(pool.label, '5-hour limit');
+  assert.equal(pool.count, 2);
+  assert.equal(pool.left, 1.05);
+  assert.deepEqual(pool.segments, [
+    { name: 'a', left: 0.8, tone: 'ok' },
+    { name: 'b', left: 0.25, tone: 'warn' },
+  ]);
+  assert.deepEqual(pool.soonest, { name: 'b', resetAt: now + 3600000 });
+  assert.equal(pool.unknown, 1);
+});
+
 test('the Logs page offers a chip for every kind the proxy records', () => {
   assert.equal(LOG_KINDS[0].key, 'all');
   assert.deepEqual(LOG_KINDS.slice(1).map(k => k.key), [...EVENT_KINDS]);
@@ -1109,7 +1129,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   // The latest element built that matches, for a control with no label to
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
-  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, poll: () => { mark = built.length; poll(); } };
+  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
 }
 
 test('Show all reveals exhausted quota rows, survives polls and tabs, and can hide them again', async () => {
@@ -1125,6 +1145,8 @@ test('Show all reveals exhausted quota rows, survives polls and tabs, and can hi
   assert.equal(page.labelled('quota-spent-demo'), 1);
   assert.equal(page.labelled('quota-unknown-demo'), 2);
   assert.equal(page.labelled('1 exhausted account hidden'), 1);
+  assert.equal(page.labelled('100%'), 2, 'both summaries exclude the weekly-exhausted session capacity');
+  assert.equal(page.labelled('200%'), 0);
   page.click('Show all');
   assert.equal(page.labelled('quota-spent-demo'), 2);
   assert.equal(page.labelled('Weekly limit empty'), 1);
@@ -1149,6 +1171,41 @@ test('Show all reveals exhausted quota rows, survives polls and tabs, and can hi
   await fresh.answer(200, fleet);
   assert.equal(fresh.labelled('quota-ready-demo'), 1, 'a new page defaults to hiding');
   assert.equal(fresh.labelled('Show all'), 1);
+});
+
+test('Claude and Codex get adjacent five-hour cards without changing existing summaries', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'claude', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.4, unified7dFable: 0.6 } },
+      { name: 'codex', provider: 'codex', quota: { unified5h: 0.7, unified7d: 0.1 } },
+      { name: 'backend', backend: 'example.test', quota: { tokensLimit: 100, tokensRemaining: 50 } },
+    ],
+  });
+  assert.equal(page.built.filter(e => e.className === 'scard').length, 5);
+  assert.equal(page.built.filter(e => e.className === 'summary-pair').length, 2);
+  const poolLabels = () => page.built.filter(e => e.className === 'pl').map(e => e.textContent);
+  assert.deepEqual(poolLabels(), ['7-day Fable', '5-hour limit', '7-day limit', '5-hour limit', 'Tokens']);
+  assert.equal(page.labelled('80%'), 1, 'Claude session quota');
+  assert.equal(page.labelled('30%'), 1, 'Codex session quota');
+  assert.equal(page.labelled('40%'), 1, 'the original Claude headline stays Fable');
+  assert.equal(page.labelled('90%'), 1, 'the original Codex headline stays weekly');
+  page.click('Codex');
+  assert.equal(page.labelled('5-hour limit'), 2, 'the filtered group has its session card and row');
+  assert.equal(page.labelled('80%'), 0, 'Claude cards are filtered out');
+});
+
+test('five-hour cards show an unknown reading when no session window is reported', async () => {
+  const page = bootPage();
+  await page.answer(200, {
+    accounts: [
+      { name: 'claude', provider: 'anthropic', quota: { unified7d: 0.3, sessionWindowStated: false } },
+      { name: 'codex', provider: 'codex', quota: {} },
+    ],
+  });
+  assert.equal(page.built.filter(e => e.className === 'scard').length, 4);
+  assert.equal(page.labelled(' no reading yet'), 2);
+  assert.equal(page.labelled('?'), 2, 'unknown session capacity is not shown as full');
 });
 
 test('the page polls status before asking for a key, so a key-exempt browser is never prompted', async () => {

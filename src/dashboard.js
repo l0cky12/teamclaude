@@ -1286,7 +1286,8 @@ const PAGE = `<!doctype html>
   .tab:hover { color: var(--text); }
   .tab.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
   .sechead h2 { display: flex; align-items: center; gap: 8px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-bottom: 8px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); gap: 12px; margin-bottom: 8px; }
+  .summary-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .scard { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
   .scard .k { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; margin-bottom: 8px; }
   .scard .k span + span { color: var(--dim); font-weight: 400; font-size: 12px; }
@@ -1438,6 +1439,7 @@ const PAGE = `<!doctype html>
     .ctl { flex-direction: row; flex-wrap: wrap; }
   }
   @media (max-width: 760px) {
+    .summary-pair { grid-template-columns: 1fr; }
     .shell { grid-template-columns: 1fr; }
     .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px; }
     #nav { flex-direction: row; flex-wrap: wrap; }
@@ -1837,8 +1839,9 @@ ${SHARED_HELPERS}
 
   // A provider's summary card: its headline column pooled across its accounts
   // (Fable weekly for Claude, the weekly limit for Codex), and the rest behind
-  // Show, the way the rows put the less used buckets behind theirs.
-  function summaryCard(s, group, members, fable) {
+  // Show, the way the rows put the less used buckets behind theirs. The
+  // adjacent session card uses the same display for just the five-hour pool.
+  function summaryCard(s, group, members, fable, session) {
     var card = el('div', 'scard');
     var head = el('div', 'k');
     var title = el('span', '', groupLabel(group));
@@ -1849,10 +1852,11 @@ ${SHARED_HELPERS}
     head.appendChild(title);
     head.appendChild(el('span', '', members.length + (members.length === 1 ? ' account' : ' accounts')));
     card.appendChild(head);
-    var order = group === 'codex' ? [2, 1] : [0, 1, 2];
+    var order = session ? [1] : (group === 'codex' ? [2, 1] : [0, 1, 2]);
     var pools = order.map(function (i) { return poolSummary(members, i, fable); }).filter(function (p) { return p.label; });
     if (!pools.length) {
-      card.appendChild(el('div', 'r', 'no quota reading yet'));
+      if (session) card.appendChild(poolBlock({ label: '5-hour limit', count: 0, segments: [] }, false));
+      else card.appendChild(el('div', 'r', 'no quota reading yet'));
     } else {
       card.appendChild(poolBlock(pools[0], false));
       var rest = pools.slice(1);
@@ -1872,7 +1876,7 @@ ${SHARED_HELPERS}
     // Drain mode's queue, when the server reports one: the account being spent
     // first and when it resets, so "why this account" reads off the card.
     var provider = group === 'codex' ? 'codex' : 'anthropic';
-    var queue = s.drainQueue && s.drainQueue[provider];
+    var queue = !session && s.drainQueue && s.drainQueue[provider];
     var head0 = queue && queue.length ? members.filter(function (a) { return a.name === queue[0]; })[0] : null;
     if (head0) {
       var weekly = accountMeters(head0, fable).slots[2];
@@ -1926,7 +1930,12 @@ ${SHARED_HELPERS}
       var members = [];
       accounts.forEach(function (a, i) { if (accountGroup(a) === g) members.push({ a: a, i: i }); });
       var list = members.map(function (m) { return m.a; });
-      cards.appendChild(summaryCard(s, g, list, fable));
+      if (g === 'anthropic' || g === 'codex') {
+        var pair = el('div', 'summary-pair');
+        pair.appendChild(summaryCard(s, g, list, fable));
+        pair.appendChild(summaryCard(s, g, list, fable, true));
+        cards.appendChild(pair);
+      } else cards.appendChild(summaryCard(s, g, list, fable));
       var head = el('div', 'sechead');
       head.appendChild(groupHeading(g, groupLabel(g)));
       var visible = members.filter(function (m) { return showAllAccounts || !accountQuotaExhausted(m.a, at); });

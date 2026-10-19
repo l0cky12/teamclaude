@@ -286,6 +286,8 @@ Every `/teamclaude/…` route the server exposes — `status`, `quota`, `logs`, 
 
 Tabs across the top — **All**, **Claude**, **Codex**, and one per third-party backend (DeepSeek, z.ai, NanoGPT, or the backend's host name) — narrow the page to one group. Each group has a summary card: the quota left in its first column, pooled across its enabled accounts (five accounts at 80% left read `400% of 500% left`), with one bar segment per account and the soonest reset; the other columns' totals sit behind **Show**.
 
+Claude and Codex each have a **5-hour limit** card beside their existing summary. It pools the five-hour quota left across enabled accounts with a reading, with the same per-account segments and soonest reset. It uses the five-hour reset times, independently of the weekly card. Accounts without a five-hour window contribute no capacity; when none report one, the card says **no reading yet**. Provider tabs filter both cards together, and the cards stack on narrow screens.
+
 Under the cards, each account is one row with three quota columns, always in this order:
 
 1. **7-day Fable**, named for the newest Fable model the fleet has served (*7-day Fable 5.1*);
