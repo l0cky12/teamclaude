@@ -1691,7 +1691,7 @@ const PAGE = `<!doctype html>
           <button id="reload" class="btn" type="button">Reload config</button>
         </div>
         <div class="setting">
-          <div><b>Quota refresh</b><span class="tag">How often the proxy re-reads every account's quota in the background. Zero-spend, but each refresh reads the usage endpoint once per account. Saved to the config file.</span></div>
+          <div><b>Quota refresh</b><span class="tag">How often the proxy re-reads every account's quota in the background. Saved to the config file.</span></div>
           <span class="thr">
             <label for="probeEvery">Refresh</label>
             <select id="probeEvery"></select>
