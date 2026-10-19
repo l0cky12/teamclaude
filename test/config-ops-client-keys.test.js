@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { ConfigOpError, addClientKey, clientKeyNames, generateClientKey, revokeClientKey } from '../src/config-ops.js';
+import { ConfigOpError, addClientKey, clientKeyNames, generateClientKey, revokeClientKey, showClientKey } from '../src/config-ops.js';
 
 // The add and revoke steps behind the dashboard's Client keys card, as changes
 // to a config object. The endpoint wraps them in the config lock and a reload
@@ -103,4 +103,13 @@ test('the last key of a proxy without a shared key cannot be revoked', () => {
   const shared = { proxy: { apiKey: 'tc-shared', clientKeys: [{ name: 'laptop', key: 'tc-1' }] } };
   assert.equal(revokeClientKey(shared, 'laptop').removed, 1);
   assert.deepEqual(shared.proxy.clientKeys, []);
+});
+
+test('show reads back the key stored under a name, the first of a duplicate', () => {
+  const proxy = { clientKeys: [{ name: 'half' }, { name: 'laptop', key: 'tc-1' }, { name: ' laptop ', key: 'tc-2' }] };
+  assert.deepEqual(showClientKey(proxy, ' laptop'), { name: 'laptop', key: 'tc-1' });
+  refused(() => showClientKey(proxy, 'half'), /no client key is named "half"/);
+  refused(() => showClientKey(proxy, 'nope'), /no client key is named "nope"/);
+  refused(() => showClientKey(proxy, ''), /name the client key/);
+  refused(() => showClientKey(undefined, 'laptop'), /no client key/);
 });

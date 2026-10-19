@@ -703,10 +703,13 @@ export function removeOutcome(res) {
   return { kind: 'ok', text: 'Removed ' + res.name + '. TeamClaude no longer holds its sign-in; you stay signed in everywhere else.' };
 }
 
+// The start of a failed client-key step's message. A page constant too: see SHARED_CONSTS.
+const CLIENT_KEY_FAILED = { create: 'could not create the key', revoke: 'could not revoke the key', show: 'could not read the key' };
+
 /**
- * POST to create or revoke a client key (proxy.clientKeys) by name.
+ * POST to create, revoke or show a client key (proxy.clientKeys) by name.
  *
- * @param {'create'|'revoke'} step
+ * @param {'create'|'revoke'|'show'} step
  * @param {string} name
  * @param {string|null} key  the proxy key the page holds, not the client key
  */
@@ -727,12 +730,14 @@ export function clientKeyRequest(step, name, key) {
  * happens rather than when a client elsewhere starts getting 401s.
  *
  * @param {any} res
- * @param {'create'|'revoke'} step
+ * @param {'create'|'revoke'|'show'} step
  */
 export function clientKeyOutcome(res, step) {
   if (!res || !res.ok) {
-    return { kind: 'error', text: (step === 'create' ? 'could not create the key' : 'could not revoke the key') + (res && res.error ? ': ' + res.error : '') };
+    return { kind: 'error', text: CLIENT_KEY_FAILED[step] + (res && res.error ? ': ' + res.error : '') };
   }
+  // The panel that opens is the answer to a show; a line above it would repeat it.
+  if (step === 'show') return { kind: 'ok', text: '' };
   if (step === 'revoke') return { kind: 'ok', text: 'Revoked ' + res.name + '. Its usage so far stays in the table.' };
   if (res.firstKey) return { kind: 'warn', text: 'Created ' + res.name + '. It is the proxy\'s first key, so callers on other machines now need a key too.' };
   return { kind: 'ok', text: 'Created ' + res.name + '.' };
@@ -1290,6 +1295,7 @@ const SHARED_CONSTS = [
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
+  `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -2277,6 +2283,12 @@ ${SHARED_HELPERS}
       var armedAt = ckRevokeArmed[name];
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
       var td = el('td', 'num');
+      var open = issuedName === name;
+      var d = button('btn', open ? 'Hide details' : 'Show details', function () {
+        if (open) hideIssuedKey(); else doClientKey('show', name, d);
+      });
+      d.title = 'The key and the setup for Claude Code and the Codex CLI';
+      td.appendChild(d);
       var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm revoke' : 'Revoke', function () {
         if (!armed) { ckRevokeArmed[name] = Date.now(); if (lastStatus) render(lastStatus); return; }
         if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
@@ -2309,6 +2321,7 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = clientKeyOutcome(json, step);
         ckStatus(out.kind, out.text);
+        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true); if (lastStatus) render(lastStatus); return; }
         if (json.ok && step === 'create') {
           document.getElementById('ckName').value = '';
           // The proxy's first key closes a gate this page may have come in
@@ -2322,13 +2335,12 @@ ${SHARED_HELPERS}
         if (json.ok && step === 'revoke' && issuedName === json.name) hideIssuedKey();
         poll();
       })
-      .catch(function (e) { ckStatus('error', (step === 'create' ? 'could not create the key: ' : 'could not revoke the key: ') + e.message); })
+      .catch(function (e) { ckStatus('error', CLIENT_KEY_FAILED[step] + ': ' + e.message); })
       .finally(function () { btn.disabled = false; });
   }
 
-  // The new key is shown once, here, and kept only in this panel: the status
-  // endpoint never returns keys, so closing the panel is the end of it (the
-  // config file still holds it for whoever can read that).
+  // A key is shown in this panel only: the status endpoint never returns keys.
+  // A new one opens it on create; Show details reads a key back on request.
   var issuedName = null;
   // Set while a first key's panel is open on a page that holds no key: see doClientKey.
   var holdPoll = false;
@@ -2338,7 +2350,7 @@ ${SHARED_HELPERS}
     var box = document.getElementById('ckIssued');
     box.textContent = '';
     box.style.display = 'none';
-    if (holdPoll) { holdPoll = false; poll(); }
+    if (holdPoll) { holdPoll = false; poll(); } else if (lastStatus) render(lastStatus);
   }
 
   function copyField(field, btn) {
@@ -2368,13 +2380,13 @@ ${SHARED_HELPERS}
     box.appendChild(line);
   }
 
-  function showIssuedKey(name, key) {
+  function showIssuedKey(name, key, existing) {
     issuedName = name;
     var box = document.getElementById('ckIssued');
     box.textContent = '';
     var head = el('div', 'line');
     head.appendChild(el('b', '', 'Key for ' + name));
-    head.appendChild(el('span', 'hint', 'Copy it now: the dashboard will not show it again.'));
+    head.appendChild(el('span', 'hint', existing ? 'Anyone who can see this screen can use the key.' : 'Copy it now, or come back with Show details.'));
     box.appendChild(head);
     var origin = typeof location !== 'undefined' ? location.origin : '';
     var setup = clientKeySetup(origin, key);

@@ -141,9 +141,9 @@ test('a reload failure is reported as saved-but-not-applied', async () => {
 
 // A client key is a tenant: one that could mint keys could grant access the
 // operator never did, and one that could revoke could lock the others out.
-test('a client key may neither create nor revoke; the shared key may', async () => {
+test('a client key may not create, revoke or show; the shared key may', async () => {
   await withServer(async ({ port, path, reloads }) => {
-    for (const step of ['create', 'revoke']) {
+    for (const step of ['create', 'revoke', 'show']) {
       const res = await send(port, step, { name: step === 'create' ? 'other' : 'ci' }, { 'x-api-key': 'ci-key' });
       assert.equal(res.status, 403, step);
       assert.match((await res.json()).error, /client key cannot manage client keys/);
@@ -178,5 +178,27 @@ test('a client caller is told both routes are refused', async () => {
     const status = await fetch(`http://127.0.0.1:${port}/teamclaude/status`, { headers: { 'x-api-key': 'ci-key' } }).then(r => r.json());
     assert.ok(status.caller.refused.includes('/teamclaude/client-keys/create'));
     assert.ok(status.caller.refused.includes('/teamclaude/client-keys/revoke'));
+    assert.ok(status.caller.refused.includes('/teamclaude/client-keys/show'));
   }, { proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'ci', key: 'ci-key' }] } });
+});
+
+// Show details: the operator reads a key back after the create panel closed.
+test('show answers with the key under the name, uncached, and writes nothing', async () => {
+  await withServer(async ({ port, path, reloads }) => {
+    const res = await send(port, 'show', { name: 'laptop' });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('cache-control'), 'no-store', 'the reply carries a key');
+    assert.deepEqual(await res.json(), { ok: true, name: 'laptop', key: 'lap-key' });
+    assert.equal(reloads.count, 0);
+
+    const missing = await send(port, 'show', { name: 'gone' });
+    assert.equal(missing.status, 400);
+    assert.match((await missing.json()).error, /no client key is named "gone"/);
+    assert.equal((await send(port, 'show', 'not json')).status, 400);
+
+    const crossSite = await send(port, 'show', { name: 'laptop' }, { origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' });
+    assert.equal(crossSite.status, 403);
+    assert.ok(!(await crossSite.text()).includes('lap-key'));
+    assert.deepEqual(await readKeys(path), [{ name: 'ci', key: 'ci-key' }, { name: 'laptop', key: 'lap-key' }]);
+  }, { proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'ci', key: 'ci-key' }, { name: 'laptop', key: 'lap-key' }] } });
 });
