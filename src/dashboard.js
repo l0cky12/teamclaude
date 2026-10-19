@@ -752,10 +752,14 @@ export function clientKeyOutcome(res, step) {
  * @param {string} key
  */
 export function clientKeySetup(origin, key) {
+  // Show details hands back keys written into the file by hand, which may hold
+  // `$`, quotes or spaces: single-quote those for the shell, and let JSON's
+  // escapes (a subset of TOML's basic-string escapes) quote them for Codex.
+  var sh = function (/** @type {string} */ v) { return /^[A-Za-z0-9._\/:@%+=,-]+$/.test(v) ? v : "'" + v.replace(/'/g, "'\\''") + "'"; };
   return {
-    claude: 'export ANTHROPIC_BASE_URL=' + origin + '\nexport ANTHROPIC_API_KEY=' + key,
-    codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "' + origin + '/backend-api/codex"\n'
-      + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = "' + key + '" }',
+    claude: 'export ANTHROPIC_BASE_URL=' + sh(origin) + '\nexport ANTHROPIC_API_KEY=' + sh(key),
+    codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = ' + JSON.stringify(origin + '/backend-api/codex') + '\n'
+      + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = ' + JSON.stringify(key) + ' }',
   };
 }
 

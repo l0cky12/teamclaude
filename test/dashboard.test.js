@@ -2004,6 +2004,13 @@ test('the setup text points Claude Code and Codex at this proxy with the new key
   assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "tc-abc" \}$/m);
 });
 
+// Show details returns hand-written keys too, so the snippets must survive any key.
+test('the setup text quotes a hand-written key for the shell and for TOML', () => {
+  const setup = clientKeySetup('http://127.0.0.1:3456', `a$B 'c"\\`);
+  assert.equal(setup.claude.split('\n')[1], `export ANTHROPIC_API_KEY='a$B '\\''c"\\'`);
+  assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "a\$B 'c\\"\\\\" \}$/m);
+});
+
 test('a key test passes only when the server names the key\'s client', () => {
   assert.equal(clientKeyCheckOutcome(200, { caller: { kind: 'client', client: 'laptop' } }, 'laptop').kind, 'ok');
   // A loopback browser is admitted without a key: a 200 as the operator proves nothing.
