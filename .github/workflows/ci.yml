@@ -2,10 +2,22 @@ name: CI
 
 on:
   workflow_dispatch:
+  # nightly.yml runs the whole of this workflow on a schedule.
+  workflow_call:
   push:
     branches: [master]
   pull_request:
     branches: [master]
+
+# Nothing here writes to the repository, so the token gets read access only.
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the run in progress. Pushes to
+# master are never cancelled: publish.yml waits on their result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   node:
@@ -16,8 +28,11 @@ jobs:
         # Cover the whole supported range — package.json declares "node >=20".
         node: [20, 22, 24]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js ${{ matrix.node }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -61,11 +76,230 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE"
           npm run typecheck:strict -- --base "$BASE"
 
+  # What `npm publish` would ship, installed the way a user installs it: pack
+  # the tarball, install it into an empty project, and check that both
+  # binaries run and that the proxy actually starts and answers. This catches
+  # a file missing from `files`, a broken bin entry, or a module that only
+  # resolves from the source checkout.
+  package:
+    name: package install
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Pack the tarball
+        id: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkg"
+          tgz=$(npm pack --pack-destination "$RUNNER_TEMP/pkg" --silent)
+          echo "tarball=$RUNNER_TEMP/pkg/$tgz" >> "$GITHUB_OUTPUT"
+          echo "Packed $tgz:"
+          tar tzf "$RUNNER_TEMP/pkg/$tgz"
+          # `files` is ["src/"]; anything else in the tarball is a packaging bug.
+          if tar tzf "$RUNNER_TEMP/pkg/$tgz" | grep -vE '^package/(src/|package\.json$|LICENSE$|README\.md$)'; then
+            echo "::error::The tarball contains files outside src/"; exit 1
+          fi
+
+      # The freshly packed tarball is the thing under test, and there is no
+      # lockfile for it by design (see the node job), hence the zizmor ignore.
+      - name: Install into an empty project
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: | # zizmor: ignore[adhoc-packages]
+          mkdir -p "$RUNNER_TEMP/app" && cd "$RUNNER_TEMP/app"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$TARBALL"
+          # Both binaries must exist and resolve to the same CLI.
+          ./node_modules/.bin/teamclaude help >/dev/null
+          ./node_modules/.bin/teamrouter help >/dev/null
+          expected=$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+          actual=$(./node_modules/.bin/teamrouter --version)
+          [ "$actual" = "$expected" ] || { echo "::error::--version printed '$actual', package.json says '$expected'"; exit 1; }
+
+      # Start the installed proxy on a throwaway config and wait for
+      # /teamclaude/status to answer with this process's own pid.
+      - name: Start the installed proxy
+        run: |
+          cd "$RUNNER_TEMP/app"
+          cat > teamclaude.json <<'JSON'
+          {"proxy":{"port":3477},"upstreamProxy":false,"autoUpdate":false,
+           "accounts":[{"name":"demo-a@example.com","type":"apikey","apiKey":"sk-demo-1"}]}
+          JSON
+          TEAMROUTER_CONFIG="$PWD/teamclaude.json" TEAMCLAUDE_CONFIG="$PWD/teamclaude.json" \
+            ./node_modules/.bin/teamrouter server --headless > proxy.log 2>&1 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3477/teamclaude/status > status.json 2>/dev/null; then break; fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          if [ ! -s status.json ]; then
+            echo "::error::The proxy never answered on /teamclaude/status"; cat proxy.log; exit 1
+          fi
+          # shellcheck disable=SC2016 # the ${...} below are JS template literals
+          node -e '
+            const s = JSON.parse(require("fs").readFileSync("status.json", "utf8"));
+            if (s.server?.pid !== Number(process.argv[1])) throw new Error(`status came from pid ${s.server?.pid}, expected ${process.argv[1]}`);
+            console.log(`proxy ${s.server.version} answered from pid ${s.server.pid}`);
+          ' "$pid"
+
+  # The container image, built the way docker.yml builds it and then actually
+  # run: it must come up healthy on a throwaway config, and its OS packages
+  # and Node must carry no known fixable high or critical vulnerabilities.
+  container:
+    name: container smoke test and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the image
+        run: docker build --build-arg "VERSION=$(node -p "require('./package.json').version")" -t teamclaude:ci .
+
+      - name: Run the image and wait for its health check
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          cat > "$RUNNER_TEMP/data/teamclaude.json" <<'JSON'
+          {"proxy":{"port":3456},"upstreamProxy":false,"autoUpdate":false,
+           "accounts":[{"name":"demo-a@example.com","type":"apikey","apiKey":"sk-demo-1"}]}
+          JSON
+          docker run -d --name teamclaude-smoke -v "$RUNNER_TEMP/data:/data" teamclaude:ci
+          # The Dockerfile's HEALTHCHECK polls /teamclaude/status from inside
+          # the container, so "healthy" means the proxy answered on loopback.
+          for _ in $(seq 1 45); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' teamclaude-smoke)
+            [ "$status" = healthy ] && break
+            [ "$status" = unhealthy ] && break
+            sleep 2
+          done
+          echo "health: $status"
+          docker logs teamclaude-smoke
+          [ "$status" = healthy ] || { echo "::error::The container did not become healthy"; exit 1; }
+          # shellcheck disable=SC2016 # the ${...} below are JS template literals
+          docker exec teamclaude-smoke node -e '
+            fetch("http://127.0.0.1:3456/teamclaude/status").then(r => r.json()).then(s => {
+              console.log(`proxy ${s.server.version} answered from pid ${s.server.pid}`);
+            })'
+          docker rm -f teamclaude-smoke
+
+      - name: Check the CLI entry point
+        run: |
+          expected=$(node -p "require('./package.json').version")
+          actual=$(docker run --rm teamclaude:ci --version | tail -n 1)
+          [ "$actual" = "$expected" ] || { echo "::error::--version printed '$actual', package.json says '$expected'"; exit 1; }
+          docker run --rm teamclaude:ci help >/dev/null
+
+      - name: Scan the image for known vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # Fall back to a mirror when ghcr.io rate-limits the database pull.
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+        with:
+          image-ref: teamclaude:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+  # Every commit in the history, scanned for anything that looks like a
+  # credential. CONTRIBUTING.md forbids tokens, account ids and emails in the
+  # repository; this is the check. Known non-secrets are allowlisted in
+  # .gitleaks.toml and .gitleaksignore. The binary is a pinned release with
+  # its checksum verified, the same discipline as the SHA-pinned actions.
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/gitleaks.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan the history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner --verbose .'
+
+  # The workflows themselves: actionlint for syntax, expressions and the
+  # shell in `run:` blocks; zizmor for security (unpinned actions, template
+  # injection, leaked credentials, overly broad permissions).
+  workflows:
+    name: workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/actionlint.tgz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  $RUNNER_TEMP/actionlint.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tgz" -C "$RUNNER_TEMP" actionlint
+
+      - name: actionlint
+        run: '"$RUNNER_TEMP/actionlint" -color'
+
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          # Fail the job on findings instead of uploading SARIF to code
+          # scanning, so the check works whether or not that is enabled.
+          advanced-security: false
+          # Pinned like everything else: a new zizmor release can add audits.
+          version: 1.31.1
+          min-severity: low
+
+  # Dead links in the user documentation. 429s count as reachable: GitHub
+  # rate-limits anonymous link checkers, and a rate limit is not a dead page.
+  links:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: lychee
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --no-progress --accept '200..=206,429' --max-retries 3 --retry-wait-time 2 README.md CONTRIBUTING.md SECURITY.md 'docs/**/*.md'
+          fail: true
+          token: ${{ github.token }}
+
   nix:
     name: nix package
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
@@ -84,14 +318,16 @@ jobs:
   # required job did not succeed (so it is never silently "skipped").
   test:
     name: test
-    needs: [node, nix]
+    needs: [node, package, container, secrets, workflows, links, nix]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check job results
-        if: needs.node.result != 'success' || needs.nix.result != 'success'
+        env:
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          echo "Node job result: ${{ needs.node.result }}"
-          echo "Nix package result: ${{ needs.nix.result }}"
-          exit 1
-      - run: echo "All required jobs passed"
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -qE '"result": "(failure|cancelled|skipped)"'; then
+            echo "::error::A required job did not succeed"; exit 1
+          fi
+          echo "All required jobs passed"

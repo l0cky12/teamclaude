@@ -1,0 +1,49 @@
+name: Nightly
+
+# The whole CI workflow on a schedule, so breakage that arrives from outside
+# (a new Node release, a changed runner image, a dead documentation link, a
+# new vulnerability in the container's base image) shows up the next morning
+# instead of on someone's unrelated pull request. On top of CI, the test suite
+# runs on the newest Node release as an early warning for the next major; it
+# is not a supported version yet, so that job never fails the run.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    # zizmor prefers GitHub's newer `$/` self-repository syntax here, but
+    # actionlint (1.7.12) does not parse it yet. `./` resolves to the same
+    # file at the same commit for a workflow call, so nothing is lost.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
+  node-latest:
+    name: node latest (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the newest Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: latest
+          check-latest: true
+
+      - run: node --version
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Run tests
+        run: npm test

@@ -16,6 +16,15 @@ LABEL org.opencontainers.image.title="teamclaude" \
 
 RUN apk add --no-cache tini su-exec
 
+# The proxy has no runtime dependencies and the image never installs
+# packages: auto-update is off (below) and upgrades are a new image tag. The
+# npm and yarn that the base image bundles are dead weight, and their own
+# dependency trees are where image scanners find vulnerabilities, so drop
+# them. The updater copes with a missing npm (src/updater.js).
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx \
+           /usr/local/bin/corepack /usr/local/lib/node_modules/corepack \
+           /opt/yarn-v* /usr/local/bin/yarn /usr/local/bin/yarnpkg
+
 ENV NODE_ENV=production \
     TEAMCLAUDE_DISABLE_AUTOUPDATE=1 \
     TEAMCLAUDE_CONFIG=/data/teamclaude.json \

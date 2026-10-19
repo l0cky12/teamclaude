@@ -272,7 +272,11 @@ test('routing <name> <url> refuses a proxy that does not answer, and changes not
   ]);
   const res = await runCli(configPath, ['routing', 'a@example.com', `socks5://alice:s3cret@127.0.0.1:${dead}`]);
   assert.equal(res.code, 1);
-  assert.match(res.stderr, new RegExp(`Routing proxy check failed: account routing proxy socks5://alice:\\*\\*\\*@127\\.0\\.0\\.1:${dead}: .*ECONNREFUSED`));
+  // The failure names the proxy (credentials masked), whatever the reason.
+  // Usually that is ECONNREFUSED, but `node --test` runs files in parallel and
+  // a neighbour's server can take the port between closedPort() and the
+  // check; then the reason is "not a SOCKS5 proxy". Both are a failed check.
+  assert.match(res.stderr, new RegExp(`Routing proxy check failed: account routing proxy socks5://alice:\\*\\*\\*@127\\.0\\.0\\.1:${dead}: `));
   assert.match(res.stderr, /Nothing was changed\..*--no-check/);
   assert.doesNotMatch(res.stderr + res.stdout, /s3cret/);
   assert.equal((await readAccounts(configPath))[0].routing, 'socks5://working.example.com:1080', 'the routing it had is still there');
@@ -307,7 +311,8 @@ test('routing <name> --check tests the stored routing on request, and only on re
 
     const down = await runCli(configPath, ['routing', 'down@example.com', '--check']);
     assert.equal(down.code, 1);
-    assert.match(down.stderr, /Routing proxy check failed: .*ECONNREFUSED/);
+    // Not asserting ECONNREFUSED: see the test above for why the reason varies.
+    assert.match(down.stderr, new RegExp(`Routing proxy check failed: account routing proxy socks5://127\\.0\\.0\\.1:${dead}: `));
   } finally {
     origin.close(); socks.close();
   }

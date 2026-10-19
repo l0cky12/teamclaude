@@ -164,6 +164,14 @@ new file must have zero.
 - Don't set `strict: true` in `tsconfig.json`; the ratchet is how strictness
   increases.
 - GitHub Actions are pinned by SHA. Keep them pinned when you update them.
+  Binaries that CI downloads (gitleaks, actionlint in `ci.yml`) are pinned
+  the same way: an exact version plus the release's SHA-256.
+- CI lints the workflows with actionlint and zizmor (`min-severity: low`), and
+  a PR title check enforces `type(scope): summary` / `Bump to X.Y.Z`. A
+  new workflow must pass both before the PR is green.
+- CI scans the git history with gitleaks. A string that only looks like a
+  credential (a public client id, an RFC example) goes in `.gitleaks.toml`
+  as a regex; never allowlist a path.
 - `npm install --ignore-scripts` in CI, and no install step in publish, are
   supply-chain defences. Don't remove them.
 - Security issues go through [SECURITY.md](SECURITY.md), not public PRs. The

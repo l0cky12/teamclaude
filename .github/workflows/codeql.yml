@@ -1,0 +1,44 @@
+name: CodeQL
+
+# Static analysis of the JavaScript sources for injection, path traversal,
+# prototype pollution and the other patterns in CodeQL's security-extended
+# suite. Results land in the repository's code scanning alerts; a pull request
+# that introduces a new alert gets it as a check annotation.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Weekly, so new queries run against master even when nothing is pushed.
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze javascript
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write   # upload the results to code scanning
+      actions: read            # let the action read workflow metadata
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      # There is no build step: src/ is what ships, so CodeQL reads it as is.
+      - name: Analyze
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: /language:javascript-typescript
