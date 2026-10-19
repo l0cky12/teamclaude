@@ -5905,10 +5905,9 @@ export class AccountManager {
   /**
    * Return a status summary of all accounts (safe to expose, no credentials).
    */
-  // `sessionDetail` adds the per-session `sessions.items` array. Off unless the
-  // operator turns on proxy.sessionDetail: the rows name every session id,
-  // client and dimension value to anyone who can read status, and on a shared
-  // proxy that is every key holder.
+  // `sessionDetail` adds the per-session `sessions.items` array. Internal
+  // callers stay aggregate-only unless requested; the HTTP endpoint applies
+  // proxy.sessionDetail's default and the operator's explicit opt-out.
   getStatus({ sessionDetail = false } = {}) {
     // Sweep first: nothing else on the read path does, so an idle server kept
     // reporting a window whose reset had already passed — at its old percentage,

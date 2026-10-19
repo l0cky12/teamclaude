@@ -100,6 +100,7 @@ export function createDefaultConfig() {
     proxy: {
       port: 3456,
       apiKey: 'tc-' + randomBytes(24).toString('base64url'),
+      sessionDetail: true,
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 0.98,
