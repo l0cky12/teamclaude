@@ -10,6 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -1041,6 +1042,38 @@ test('the page carries the threshold control and wires it', () => {
   assert.ok(html.includes("getElementById('thrVal').addEventListener"), 'the Enter handler');
 });
 
+test('the quota refresh picker offers off and 5 to 120 seconds, plus a value set elsewhere', () => {
+  const values = cur => probeIntervalOptions(cur).map(o => o.value);
+  assert.deepEqual(values(0), [0, 5, 10, 15, 20, 30, 45, 60, 90, 120]);
+  assert.deepEqual(probeIntervalOptions(0)[0], { value: 0, label: 'off' });
+  assert.deepEqual(probeIntervalOptions(0)[1], { value: 5, label: 'every 5s' });
+  // An interval from the CLI or TUI that is not on the list is shown as it is,
+  // in order, rather than snapped to a neighbour.
+  assert.deepEqual(values(300), [0, 5, 10, 15, 20, 30, 45, 60, 90, 120, 300]);
+  assert.deepEqual(values(7), [0, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120]);
+  assert.deepEqual(values(undefined), values(0));
+});
+
+test('probeIntervalRequest posts the seconds with the key, and the outcome says what was set', () => {
+  const r = probeIntervalRequest(15, 'secret');
+  assert.equal(r.url, '/teamclaude/probe-interval');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'secret');
+  assert.equal(r.init.body, '{"seconds":15}');
+  assert.equal(probeIntervalRequest(0, null).init.headers['x-api-key'], '');
+
+  assert.deepEqual(probeIntervalOutcome({ ok: true, quotaProbeSeconds: 15 }), { kind: 'ok', text: 'quota refreshes every 15s' });
+  assert.deepEqual(probeIntervalOutcome({ ok: true, quotaProbeSeconds: 0 }), { kind: 'ok', text: 'quota refresh turned off' });
+  assert.equal(probeIntervalOutcome({ ok: false, error: 'nope' }).kind, 'error');
+  assert.match(probeIntervalOutcome({ ok: false, error: 'nope' }).text, /nope/);
+});
+
+test('the page carries the quota refresh picker and wires it', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="probeEvery"'), 'the picker');
+  assert.ok(html.includes("getElementById('probeEvery').addEventListener('change'"), 'the change handler');
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
@@ -1133,6 +1166,58 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const findLast = pred => built.slice().reverse().find(pred);
   return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
 }
+
+test('the quota refresh picker keeps keyboard focus and coalesces steps made while saving', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  const sel = page.byId('probeEvery');
+  assert.equal(sel.value, '30', 'the picker shows the running interval');
+  let blurred = false;
+  sel.blur = () => { blurred = true; };
+
+  // Arrowing down three steps: one save goes out, the later steps wait for it.
+  sel.value = '45'; sel.fire('change');
+  assert.equal(sel.disabled, false, 'a disabled select loses keyboard focus');
+  sel.value = '60'; sel.fire('change');
+  sel.value = '90'; sel.fire('change');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval']);
+  assert.equal(page.requests[0].init.body, '{"seconds":45}');
+
+  await page.answer(200, { ok: true, quotaProbeSeconds: 45 });
+  // The waiting steps become one save of the latest choice, not two more.
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval']);
+  assert.equal(page.requests[0].init.body, '{"seconds":90}');
+  await page.answer(200, { ok: true, quotaProbeSeconds: 90 });
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the page re-polls once the saves settle');
+  assert.equal(blurred, false, 'a blur would end keyboard selection');
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 90 } });
+
+  // A refused choice is put back to what the proxy is really doing.
+  sel.value = '5'; sel.fire('change');
+  await page.answer(400, { ok: false, error: 'nope' });
+  assert.equal(sel.value, '90');
+});
+
+test('a status poll between quota refresh saves does not replace the queued choice', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  const sel = page.byId('probeEvery');
+  sel.value = '45'; sel.fire('change');
+  sel.value = '90'; sel.fire('change');
+  // Focus leaves and the 5s poll lands while the first save is still out: it
+  // carries the old interval and must not rewrite the select or the queue.
+  page.poll();
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval', '/teamclaude/status']);
+  const save = page.requests.shift();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  assert.equal(sel.value, '90', 'a save in flight keeps the select out of the poll');
+  page.requests.unshift(save);
+  // The test's select stub reads back whatever is assigned, so pin the case
+  // the reviewer reproduced: the DOM says 30 and the queued choice is still sent.
+  sel.value = '30';
+  await page.answer(200, { ok: true, quotaProbeSeconds: 45 });
+  assert.equal(page.requests[0].init.body, '{"seconds":90}');
+});
 
 test('Show all reveals exhausted quota rows, survives polls and tabs, and can hide them again', async () => {
   const page = bootPage();

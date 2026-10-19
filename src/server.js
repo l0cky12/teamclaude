@@ -27,7 +27,7 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
@@ -428,6 +428,7 @@ function hasConfiguredKey(proxyConfig) {
 // See the check in createProxyServer for why a tenant may not reach these.
 const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
+  ['/teamclaude/probe-interval', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -1064,6 +1065,49 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           + (dropped.length ? ` — dropped the per-bucket thresholds (${dropped.join(', ')})` : ''));
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, switchThreshold: saved, dropped }));
+        return;
+      }
+
+      // Probe interval endpoint — the dashboard's Quota refresh picker, the web
+      // equivalent of `teamclaude probe <seconds>` and the set_probe_interval MCP
+      // tool. A setting like /threshold, so it takes the same two steps: write
+      // under the config lock, then reload (reloadAccounts reschedules the
+      // running prober). Body: {"seconds": <0 = off, or MIN..MAX>}; the range is
+      // setProbeSeconds' to say, and its refusal comes back as a 400.
+      if (req.method === 'POST' && req.url === '/teamclaude/probe-interval') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        let seconds;
+        try {
+          seconds = JSON.parse(await readControlBody(req) || '{}')?.seconds;
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          reply(tooLarge ? 413 : 400, { ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' });
+          return;
+        }
+        if (!hooks.reload) { reply(501, { ok: false, error: 'probe interval change not supported' }); return; }
+        let saved;
+        try {
+          const disk = await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setProbeSeconds(c, seconds); });
+          saved = disk.quotaProbeSeconds;
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Probe interval change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'probe interval change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a probe interval change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        console.log(`[TeamClaude] Quota probe ${saved > 0 ? `set to every ${saved}s` : 'turned off'} (dashboard)`);
+        reply(200, { ok: true, quotaProbeSeconds: saved });
         return;
       }
 

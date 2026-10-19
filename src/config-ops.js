@@ -22,6 +22,11 @@ export class ConfigOpError extends Error {}
 // ~2,147,483 s overflows to 1 ms and turns the probe into a storm.
 export const MAX_PROBE_SECONDS = 7 * 24 * 3600;
 
+// The shortest probe interval. Overlapping cycles are skipped (Prober.probeAll),
+// so a short interval never stacks requests, but every cycle still reads the
+// usage endpoint once per account: below this it would be hammered.
+export const MIN_PROBE_SECONDS = 5;
+
 export const ROUTE_COLORS = ['red', 'green', 'yellow', 'blue', 'magenta', 'cyan'];
 
 // The buckets a threshold can be keyed by: the quota windows the manager asks
@@ -76,8 +81,8 @@ function wholeSeconds(seconds, what) {
  */
 export function setProbeSeconds(config, seconds) {
   const value = wholeSeconds(seconds, 'The probe interval');
-  if (value > 0 && value < 30) {
-    throw new ConfigOpError('Minimum probe interval is 30s (to avoid hammering the usage endpoint).');
+  if (value > 0 && value < MIN_PROBE_SECONDS) {
+    throw new ConfigOpError(`Minimum probe interval is ${MIN_PROBE_SECONDS}s (to avoid hammering the usage endpoint).`);
   }
   if (value > MAX_PROBE_SECONDS) {
     throw new ConfigOpError(`Maximum probe interval is ${MAX_PROBE_SECONDS}s (7 days).`);

@@ -300,7 +300,7 @@ test('the remaining settings tools write what the CLI would', async () => {
 
   assert.deepEqual(await ok(tools, 'set_probe_interval', { seconds: 300 }), { quotaProbeSeconds: 300 });
   assert.equal((await disk()).quotaProbeSeconds, 300);
-  assert.match(await refused(tools, 'set_probe_interval', { seconds: 5 }), /Minimum probe interval/);
+  assert.match(await refused(tools, 'set_probe_interval', { seconds: 4 }), /Minimum probe interval/);
 
   assert.deepEqual(await ok(tools, 'set_warmup', { mode: 'reset', time: '15:30', timezone: 'Europe/Moscow' }), { warmupSeconds: 0, warmupSchedule: { resetTime: '15:30', timezone: 'Europe/Moscow' } });
   assert.deepEqual(await ok(tools, 'set_warmup', { seconds: 600 }), { warmupSeconds: 600, warmupSchedule: null });
