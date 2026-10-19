@@ -24,8 +24,9 @@ on: # zizmor: ignore[dangerous-triggers] workflow_run here is master-only, see b
     branches: [master]
   # Manual trigger: publish the version currently on master on demand. Useful to
   # backfill a version that was bumped before this workflow existed, or to re-run
-  # after fixing the npm Trusted Publisher setup. The npm-view check below still
-  # gates it, so a manual run on an already-published version is a safe no-op.
+  # after fixing the npm Trusted Publisher setup. It must be dispatched on
+  # master, CI must already have passed on that commit, and the npm-view check
+  # below still gates it, so a manual run on a published version is a no-op.
   workflow_dispatch:
 
 permissions: {}
@@ -36,18 +37,49 @@ jobs:
     # Only the canonical repository publishes: npm's Trusted Publisher is bound
     # to KarpelesLab/teamclaude, so a fork that bumps the version would only
     # fail here. Forks keep CI; they just never reach `npm publish`.
+    #
+    # For a workflow_run, the triggering run must be a `push` to this
+    # repository's master that succeeded. `branches` above matches the HEAD
+    # branch name only, and a pull request from a fork branch called "master"
+    # has that name too; the event and head_repository checks keep such a
+    # run's unmerged commit away from the publishing credentials.
+    # A manual run must be dispatched on master, and a step below confirms CI
+    # passed on that exact commit before anything else happens.
     if: >-
       github.repository == 'KarpelesLab/teamclaude' &&
-      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_branch == 'master' &&
+         github.event.workflow_run.head_repository.full_name == github.repository)
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write   # create the git tag + GitHub release
       id-token: write   # OIDC token for npm Trusted Publishing + provenance
+      actions: read     # list CI runs for the manual-dispatch gate
     env:
       # The commit CI passed on (or master's tip for a manual run).
       HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
     steps:
+      # A manual run gets the same gate as an automatic one: a CI run for
+      # this exact commit, triggered by a push to master, that succeeded.
+      - name: Require a successful CI run for this commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          count=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$HEAD_SHA&event=push&status=success&per_page=1"             --jq '.workflow_runs | length')
+          if [ "$count" = "0" ]; then
+            echo "::error::No successful CI run (push to master) exists for $HEAD_SHA. Wait for CI or fix it first."
+            exit 1
+          fi
+          echo "CI passed on $HEAD_SHA."
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}

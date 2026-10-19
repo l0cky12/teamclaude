@@ -17,8 +17,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Full history: the release check diffs against the merge base, not
+      # against master's tip, so commits that landed on master after the
+      # release branch was cut do not count against it.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       # The title goes through an environment variable, never into the
@@ -32,13 +36,15 @@ jobs:
           if [[ "$TITLE" =~ ^Bump\ to\ ([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             version="${BASH_REMATCH[1]}"
             echo "Release PR for $version: it may change only the version in package.json."
-            git fetch --no-tags --depth=1 origin "$BASE" "$HEAD"
-            changed=$(git diff --name-only "$BASE" "$HEAD")
+            git fetch --no-tags origin "$BASE" "$HEAD"
+            base=$(git merge-base "$BASE" "$HEAD")
+            echo "Comparing against merge base $base"
+            changed=$(git diff --name-only "$base" "$HEAD")
             if [ "$changed" != "package.json" ]; then
               echo "::error::A release PR must change package.json only. Changed files:"; echo "$changed"; exit 1
             fi
             # Exactly one line removed and one added, both the version field.
-            lines=$(git diff --unified=0 "$BASE" "$HEAD" -- package.json | grep -E '^[-+][^-+]')
+            lines=$(git diff --unified=0 "$base" "$HEAD" -- package.json | grep -E '^[-+][^-+]')
             echo "$lines"
             if [ "$(echo "$lines" | wc -l)" != 2 ] || echo "$lines" | grep -qvE '^[-+]\s*"version":'; then
               echo "::error::A release PR must change only the \"version\" line of package.json."; exit 1
