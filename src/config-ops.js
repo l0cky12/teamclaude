@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { DEFAULT_SWITCH_THRESHOLD, distributionMode } from './account-manager.js';
 import { matchAccounts } from './identity.js';
 import { THRESHOLD_BUCKET_KEYS, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -440,4 +441,96 @@ export function renameAccount(config, query, newName, spec = {}) {
     routes.push(r.name);
   }
   return { from, name, routes };
+}
+
+// ── client keys ──────────────────────────────────────────────────────────────
+//
+// proxy.clientKeys gives each of the operator's own machines or agents a key
+// and a name its usage is booked under (client-usage.js). These are the add and
+// revoke steps the dashboard's Clients page sends, so a key no longer has to be
+// made up and pasted into the file by hand.
+
+// What a client-key name may contain. The name is shown in the dashboard, in
+// `teamclaude status` and as a `[name]` prefix on activity-log lines, so it is
+// kept to characters that read the same everywhere and need no escaping.
+const CLIENT_KEY_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._@-]{0,63}$/;
+
+/**
+ * A new client key, in the same shape as the generated proxy.apiKey.
+ * @returns {string}
+ */
+export function generateClientKey() {
+  return 'tc-' + randomBytes(24).toString('base64url');
+}
+
+/**
+ * The names of the configured client keys, in file order, each once. Never the
+ * keys: this is what the status endpoint shows.
+ *
+ * @param {any} proxyConfig  config.proxy
+ * @returns {string[]}
+ */
+export function clientKeyNames(proxyConfig) {
+  const list = Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [];
+  /** @type {string[]} */
+  const names = [];
+  for (const entry of list) {
+    const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+    if (name && entry?.key && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Add a client key under a new name.
+ *
+ * A name already in use is refused rather than given a second key: two keys
+ * under one name share one usage counter, which is the thing names are for.
+ * `firstKey` says the proxy had no key at all before, so callers off this
+ * machine, which the open gate admitted until now, will need one from here on.
+ *
+ * @param {Config} config
+ * @param {unknown} rawName
+ * @param {string} [key]  the key to store; a fresh one when absent
+ * @returns {{ name: string, key: string, firstKey: boolean }}
+ */
+export function addClientKey(config, rawName, key = generateClientKey()) {
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name) throw new ConfigOpError('name the client key');
+  if (!CLIENT_KEY_NAME.test(name)) {
+    throw new ConfigOpError('A client key name is up to 64 letters, digits, spaces and . _ @ -, starting with a letter or digit.');
+  }
+  if (!config.proxy || typeof config.proxy !== 'object') config.proxy = {};
+  const proxy = config.proxy;
+  if (clientKeyNames(proxy).includes(name)) throw new ConfigOpError(`a client key named "${name}" already exists`);
+  const firstKey = !proxy.apiKey && clientKeyNames(proxy).length === 0;
+  if (!Array.isArray(proxy.clientKeys)) proxy.clientKeys = [];
+  proxy.clientKeys.push({ name, key });
+  return { name, key, firstKey };
+}
+
+/**
+ * Revoke a client key by name. Every entry under that name goes, so a key a
+ * hand edit gave a duplicate name cannot outlive the revoke. The usage booked
+ * under the name stays in the state file.
+ *
+ * The last key of a proxy without a proxy.apiKey is refused: with no key left
+ * the auth gate admits everybody, so the revoke would open the proxy to every
+ * caller, the revoked client included, rather than shut one client out.
+ *
+ * @param {Config} config
+ * @param {unknown} rawName
+ * @returns {{ name: string, removed: number }}
+ */
+export function revokeClientKey(config, rawName) {
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name) throw new ConfigOpError('name the client key');
+  const list = Array.isArray(config.proxy?.clientKeys) ? config.proxy.clientKeys : [];
+  const kept = list.filter((/** @type {any} */ e) => (typeof e?.name === 'string' ? e.name.trim() : '') !== name);
+  if (kept.length === list.length) throw new ConfigOpError(`no client key is named "${name}"`);
+  if (!config.proxy.apiKey && clientKeyNames({ clientKeys: kept }).length === 0) {
+    throw new ConfigOpError(`"${name}" is the proxy's last key and there is no proxy.apiKey: revoking it would let anyone use the proxy. Set proxy.apiKey first.`);
+  }
+  config.proxy.clientKeys = kept;
+  return { name, removed: list.length - kept.length };
 }

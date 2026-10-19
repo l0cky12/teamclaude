@@ -16,6 +16,7 @@ import {
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
+  clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1046,7 +1047,8 @@ test('the page ships the same helper implementations it is tested against', () =
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
     meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
-    providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome]) {
+    providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
+    clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -1080,7 +1082,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
     const proxy = new Proxy(target, { get: (t, p) => (p in t ? t[p] : () => stubEl()) });
     // Fire with the proxy as `this`, the way the page sees the element, so a
     // handler that touches an unstubbed property gets the absorbing stub.
-    target.fire = type => { for (const fn of listeners.get(type) || []) fn.call(proxy); };
+    target.fire = (type, event) => { for (const fn of listeners.get(type) || []) fn.call(proxy, event); };
     built.push(proxy);
     return proxy;
   };
@@ -1968,4 +1970,86 @@ test('a new sign-in the server refuses leaves the one under way on the panel', a
   assert.ok(page.findLast(e => /still finishing/.test(e.textContent)), 'the refusal is on the panel');
   assert.ok(page.findLast(e => e.textContent === 'Sign in to Codex' && e.className === 'sp'), 'which is still the Codex one');
   assert.ok(page.findLast(e => e.textContent === 'Open sign-in page'), 'with its link');
+});
+
+test('client key requests post the name to the step, with the page\'s own key', () => {
+  const r = clientKeyRequest('create', 'laptop', 'tc-operator');
+  assert.equal(r.url, '/teamclaude/client-keys/create');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-operator');
+  assert.deepEqual(JSON.parse(r.init.body), { name: 'laptop' });
+  assert.equal(clientKeyRequest('revoke', 'ci', null).url, '/teamclaude/client-keys/revoke');
+  assert.equal(clientKeyRequest('revoke', 'ci', null).init.headers['x-api-key'], '');
+});
+
+test('client key outcomes say what happened, and a first key warns', () => {
+  assert.deepEqual(clientKeyOutcome({ ok: true, name: 'laptop', key: 'tc-x', firstKey: false }, 'create'), { kind: 'ok', text: 'Created laptop.' });
+  const first = clientKeyOutcome({ ok: true, name: 'laptop', key: 'tc-x', firstKey: true }, 'create');
+  assert.equal(first.kind, 'warn');
+  assert.match(first.text, /other machines now need a key/);
+  assert.match(clientKeyOutcome({ ok: true, name: 'ci', removed: 1 }, 'revoke').text, /^Revoked ci\./);
+  assert.deepEqual(clientKeyOutcome({ ok: false, error: 'a client key named "ci" already exists' }, 'create'),
+    { kind: 'error', text: 'could not create the key: a client key named "ci" already exists' });
+  assert.equal(clientKeyOutcome(null, 'revoke').text, 'could not revoke the key');
+});
+
+test('the setup text points Claude Code and Codex at this proxy with the new key', () => {
+  const setup = clientKeySetup('http://100.64.0.2:3456', 'tc-abc');
+  assert.equal(setup.claude, 'export ANTHROPIC_BASE_URL=http://100.64.0.2:3456\nexport ANTHROPIC_API_KEY=tc-abc');
+  assert.match(setup.codex, /^model_provider = "teamclaude"$/m);
+  assert.match(setup.codex, /^base_url = "http:\/\/100\.64\.0\.2:3456\/backend-api\/codex"$/m);
+  assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "tc-abc" \}$/m);
+});
+
+test('a key test passes only when the server names the key\'s client', () => {
+  assert.equal(clientKeyCheckOutcome(200, { caller: { kind: 'client', client: 'laptop' } }, 'laptop').kind, 'ok');
+  // A loopback browser is admitted without a key: a 200 as the operator proves nothing.
+  assert.equal(clientKeyCheckOutcome(200, { caller: { kind: 'operator', client: null } }, 'laptop').kind, 'error');
+  assert.equal(clientKeyCheckOutcome(200, { caller: { kind: 'client', client: 'other' } }, 'laptop').kind, 'error');
+  assert.deepEqual(clientKeyCheckOutcome(401, null, 'laptop'), { kind: 'error', text: 'The proxy refused the key.' });
+  assert.match(clientKeyCheckOutcome(500, null, 'laptop').text, /status 500/);
+});
+
+test('the Clients page carries the client key form, kept to the operator', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="ckForm"') && html.includes('id="ckName"') && html.includes('id="ckCreate"'));
+  assert.ok(html.includes("callerCan(s.caller, '/teamclaude/client-keys/create')"), 'hidden for a caller that would be refused');
+  assert.ok(callerView('ci').refused.includes('/teamclaude/client-keys/create'));
+  assert.ok(callerView('ci').refused.includes('/teamclaude/client-keys/revoke'));
+});
+
+// The proxy's first key closes the gate this page came in through. Its next
+// poll would be refused and the key box would cover the one-time key panel
+// before the key was copied, so polling waits for Done.
+test('creating the proxy\'s first key from a key-less page keeps the key on screen until Done', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], clientKeys: [], caller: { kind: 'operator', client: null, refused: [] } });
+  page.byId('ckName').value = 'laptop';
+  page.byId('ckForm').fire('submit', { preventDefault() {} });
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/client-keys/create');
+  await page.answer(200, { ok: true, name: 'laptop', key: 'tc-new', firstKey: true });
+
+  assert.equal(page.requests.length, 0, 'no status poll while the new key is on screen');
+  assert.equal(page.byId('ckIssued').style.display, '');
+  assert.notEqual(page.byId('keybox').style.display, 'block');
+  assert.ok(page.findLast(e => e.value === 'tc-new'), 'the key is shown');
+  assert.ok(page.findLast(e => /Copy the key before you press Done/.test(e.textContent)), 'the page says what happens next');
+
+  page.click('Done');
+  assert.equal(page.requests.length, 1, 'Done resumes polling');
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(401);
+  assert.equal(page.byId('keybox').style.display, 'block');
+});
+
+test('a key created by a page that already holds one keeps polling', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], clientKeys: [], caller: { kind: 'operator', client: null, refused: [] } });
+  page.byId('ckName').value = 'laptop';
+  page.byId('ckForm').fire('submit', { preventDefault() {} });
+  await page.answer(200, { ok: true, name: 'laptop', key: 'tc-new', firstKey: false });
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
 });

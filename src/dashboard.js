@@ -704,6 +704,75 @@ export function removeOutcome(res) {
 }
 
 /**
+ * POST to create or revoke a client key (proxy.clientKeys) by name.
+ *
+ * @param {'create'|'revoke'} step
+ * @param {string} name
+ * @param {string|null} key  the proxy key the page holds, not the client key
+ */
+export function clientKeyRequest(step, name, key) {
+  return {
+    url: '/teamclaude/client-keys/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name }),
+    },
+  };
+}
+
+/**
+ * What to tell the operator after a create or revoke. A first key closes a gate
+ * that admitted everybody until now, which is worth saying at the moment it
+ * happens rather than when a client elsewhere starts getting 401s.
+ *
+ * @param {any} res
+ * @param {'create'|'revoke'} step
+ */
+export function clientKeyOutcome(res, step) {
+  if (!res || !res.ok) {
+    return { kind: 'error', text: (step === 'create' ? 'could not create the key' : 'could not revoke the key') + (res && res.error ? ': ' + res.error : '') };
+  }
+  if (step === 'revoke') return { kind: 'ok', text: 'Revoked ' + res.name + '. Its usage so far stays in the table.' };
+  if (res.firstKey) return { kind: 'warn', text: 'Created ' + res.name + '. It is the proxy\'s first key, so callers on other machines now need a key too.' };
+  return { kind: 'ok', text: 'Created ' + res.name + '.' };
+}
+
+/**
+ * What to paste into a client to use a new key: Claude Code's environment and
+ * the Codex CLI's provider block. `origin` is the address this page was opened
+ * at, which is the proxy as this browser reaches it.
+ *
+ * @param {string} origin
+ * @param {string} key
+ */
+export function clientKeySetup(origin, key) {
+  return {
+    claude: 'export ANTHROPIC_BASE_URL=' + origin + '\nexport ANTHROPIC_API_KEY=' + key,
+    codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "' + origin + '/backend-api/codex"\n'
+      + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = "' + key + '" }',
+  };
+}
+
+/**
+ * Whether a status read made with the new key came back as that client. A
+ * loopback browser is admitted without a key, so a 200 alone proves nothing:
+ * the caller the server reports has to be the key's name.
+ *
+ * @param {number} httpStatus
+ * @param {any} body  the parsed /teamclaude/status reply, or null
+ * @param {string} name
+ */
+export function clientKeyCheckOutcome(httpStatus, body, name) {
+  if (httpStatus === 401) return { kind: 'error', text: 'The proxy refused the key.' };
+  var caller = body && body.caller;
+  if (httpStatus === 200 && caller && caller.kind === 'client' && caller.client === name) {
+    return { kind: 'ok', text: 'The key works: the proxy counts its requests under ' + name + '.' };
+  }
+  return { kind: 'error', text: 'The proxy did not recognise the key as ' + name + (httpStatus === 200 ? '.' : ' (status ' + httpStatus + ').') };
+}
+
+/**
  * Whether the caller may use the control behind `path`. A status without the
  * `caller` field keeps every control: the server still refuses what it must.
  *
@@ -1203,6 +1272,7 @@ const SHARED_HELPERS = [
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
+  clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1375,6 +1445,17 @@ const PAGE = `<!doctype html>
   .signin a.btn { text-decoration: none; display: inline-block; }
   .signin .st { font-size: 12px; color: var(--dim); margin-top: 10px; }
   .signin .st.ok { color: var(--ok); } .signin .st.warn { color: var(--warn); } .signin .st.error { color: var(--bad); }
+  .ckeys .ckh { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+  .ckeys .ckh .hint { margin-left: 0; }
+  .ckeys form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 0; }
+  .ckeys input, .ckeys textarea { flex: 1 1 260px; min-width: 0; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .ckeys textarea { width: 100%; box-sizing: border-box; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre; }
+  .ckeys .issued { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .ckeys .issued .line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .ckeys .issued .lbl { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  .ckeys .st { font-size: 12px; color: var(--dim); }
+  .ckeys .st.ok { color: var(--ok); } .ckeys .st.warn { color: var(--warn); } .ckeys .st.error { color: var(--bad); }
+  .ckeys table { margin-top: 8px; }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
@@ -1508,7 +1589,17 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-clients" style="display:none">
-      <p class="sub" id="clientsEmpty" style="display:none">No client usage yet. Requests are counted here per client key (proxy.clientKeys) and per configured usage dimension.</p>
+      <div id="clientKeys" class="card ckeys" style="display:none">
+        <div class="ckh"><b>Client keys</b><span class="hint">One per machine or agent of yours. Requests made with a key are counted here under its name.</span></div>
+        <form id="ckForm" autocomplete="off">
+          <input id="ckName" maxlength="64" placeholder="Name, e.g. laptop or ci-agent" aria-label="Client key name">
+          <button id="ckCreate" class="btn primary" type="submit">Generate key</button>
+        </form>
+        <div id="ckStatus" class="st" style="display:none"></div>
+        <div id="ckIssued" class="issued" style="display:none"></div>
+        <table id="ckList"></table>
+      </div>
+      <p class="sub" id="clientsEmpty" style="display:none">No client usage yet. Requests made with a client key are counted here under the key's name, and per configured usage dimension (proxy.usageDimensions).</p>
       <div id="usageViewWrap" class="actions" style="display:none"></div>
       <div id="clientsWrap" style="display:none">
         <h2 id="clientsHeading">Clients</h2>
@@ -2159,6 +2250,165 @@ ${SHARED_HELPERS}
     });
   }
 
+  // Client keys: the form and the panel holding a new key are static, so a name
+  // being typed and a key not yet copied survive the poll; only the list of
+  // configured names is rebuilt. Revoke is armed by a first click, like Remove.
+  // No prototype: a key named __proto__ would otherwise set it.
+  var ckRevokeArmed = Object.create(null);
+
+  function renderClientKeys(s) {
+    var card = document.getElementById('clientKeys');
+    var can = callerCan(s.caller, '/teamclaude/client-keys/create');
+    card.style.display = can ? '' : 'none';
+    if (!can) return;
+    var names = Array.isArray(s.clientKeys) ? s.clientKeys : [];
+    var clients = s.clients || {};
+    var table = document.getElementById('ckList');
+    table.textContent = '';
+    if (!names.length) return;
+    var hr = el('tr');
+    ['Key name', 'Last used', ''].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' : '', h)); });
+    table.appendChild(hr);
+    names.forEach(function (name) {
+      var tr = el('tr');
+      tr.appendChild(el('td', '', name));
+      var used = clients[name] && clients[name].lastUsed;
+      tr.appendChild(el('td', 'num', used ? fmtAgo(used) : 'not used yet'));
+      var armedAt = ckRevokeArmed[name];
+      var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+      var td = el('td', 'num');
+      var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm revoke' : 'Revoke', function () {
+        if (!armed) { ckRevokeArmed[name] = Date.now(); if (lastStatus) render(lastStatus); return; }
+        if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
+        delete ckRevokeArmed[name];
+        doClientKey('revoke', name, b);
+      });
+      b.title = armed ? 'Click again: clients using this key are refused from now on' : 'Stop accepting this key';
+      td.appendChild(b);
+      tr.appendChild(td);
+      table.appendChild(tr);
+    });
+  }
+
+  function ckStatus(kind, text) {
+    var st = document.getElementById('ckStatus');
+    st.className = 'st ' + kind;
+    st.textContent = text;
+    st.style.display = text ? '' : 'none';
+  }
+
+  function doClientKey(step, name, btn) {
+    btn.disabled = true;
+    var r = clientKeyRequest(step, name, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = clientKeyOutcome(json, step);
+        ckStatus(out.kind, out.text);
+        if (json.ok && step === 'create') {
+          document.getElementById('ckName').value = '';
+          // The proxy's first key closes a gate this page may have come in
+          // through without a key. Its next poll would then be refused and
+          // the key box would cover the panel before the key was copied, so
+          // polling waits for Done.
+          holdPoll = !!json.firstKey && !localStorage.getItem(KEY);
+          showIssuedKey(json.name, json.key);
+        }
+        // A revoked key's panel would offer setup for a key that no longer works.
+        if (json.ok && step === 'revoke' && issuedName === json.name) hideIssuedKey();
+        poll();
+      })
+      .catch(function (e) { ckStatus('error', (step === 'create' ? 'could not create the key: ' : 'could not revoke the key: ') + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The new key is shown once, here, and kept only in this panel: the status
+  // endpoint never returns keys, so closing the panel is the end of it (the
+  // config file still holds it for whoever can read that).
+  var issuedName = null;
+  // Set while a first key's panel is open on a page that holds no key: see doClientKey.
+  var holdPoll = false;
+
+  function hideIssuedKey() {
+    issuedName = null;
+    var box = document.getElementById('ckIssued');
+    box.textContent = '';
+    box.style.display = 'none';
+    if (holdPoll) { holdPoll = false; poll(); }
+  }
+
+  function copyField(field, btn) {
+    var done = function () { btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 1500); };
+    // The async clipboard needs a secure context, which a dashboard opened at
+    // a plain-http LAN address is not; selecting the text still leaves it one
+    // keystroke away.
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(field.value).then(done, function () { field.focus(); field.select(); });
+      return;
+    }
+    field.focus();
+    field.select();
+    try { if (document.execCommand('copy')) done(); } catch (e) { /* the text stays selected */ }
+  }
+
+  function snippet(box, label, text, rows) {
+    box.appendChild(el('div', 'lbl', label));
+    var line = el('div', 'line');
+    var field = rows ? el('textarea') : el('input');
+    field.readOnly = true;
+    field.value = text;
+    if (rows) field.rows = rows;
+    line.appendChild(field);
+    var copy = button('btn', 'Copy', function () { copyField(field, copy); });
+    line.appendChild(copy);
+    box.appendChild(line);
+  }
+
+  function showIssuedKey(name, key) {
+    issuedName = name;
+    var box = document.getElementById('ckIssued');
+    box.textContent = '';
+    var head = el('div', 'line');
+    head.appendChild(el('b', '', 'Key for ' + name));
+    head.appendChild(el('span', 'hint', 'Copy it now: the dashboard will not show it again.'));
+    box.appendChild(head);
+    var origin = typeof location !== 'undefined' ? location.origin : '';
+    var setup = clientKeySetup(origin, key);
+    snippet(box, 'Key', key, 0);
+    snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
+    snippet(box, 'Codex CLI: add to ~/.codex/config.toml', setup.codex, 7);
+    if (isLoopbackHost(pageHost())) {
+      box.appendChild(el('div', 'lbl', 'This page is open at ' + origin + '. A client on another machine needs an address of this one it can reach instead.'));
+    }
+    if (holdPoll) {
+      box.appendChild(el('div', 'st warn', 'The proxy now asks every caller off its own machine for a key, this page included. Copy the key before you press Done: the page will then ask for one. To manage keys from here again, set proxy.apiKey.'));
+    }
+    var actions = el('div', 'line');
+    var check = el('span', 'st');
+    var test = button('btn', 'Test key', function () {
+      test.disabled = true;
+      check.className = 'st';
+      check.textContent = 'Testing…';
+      // Its own fetch, with the new key and not the page's: a 401 here says
+      // the new key is refused and must not throw away the key the page holds.
+      fetch('/teamclaude/status', { headers: { 'x-api-key': key } })
+        .then(function (res) {
+          return res.json().catch(function () { return null; }).then(function (body) { return clientKeyCheckOutcome(res.status, body, name); });
+        })
+        .catch(function (e) { return { kind: 'error', text: 'The test could not reach the proxy: ' + e.message }; })
+        .then(function (out) { check.className = 'st ' + out.kind; check.textContent = out.text; test.disabled = false; });
+    });
+    actions.appendChild(test);
+    actions.appendChild(button('btn', 'Done', hideIssuedKey));
+    actions.appendChild(check);
+    box.appendChild(actions);
+    box.style.display = '';
+  }
+
   // The window buttons, built once: the windows are fixed by the server that
   // served this page. Visibility is decided per render, since the control only
   // means something when there is a usage table under it.
@@ -2566,6 +2816,7 @@ ${SHARED_HELPERS}
     renderAccountsPage(s);
     renderProblems(s);
     renderRouting(s);
+    renderClientKeys(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     // The control means nothing with no usage table under it. The payload
@@ -2979,6 +3230,7 @@ ${SHARED_HELPERS}
   }
 
   function poll() {
+    if (holdPoll) return;
     fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -3104,6 +3356,12 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') document.getElementById('thrSet').click();
   });
   buildUsageViews();
+  document.getElementById('ckForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var name = document.getElementById('ckName').value.trim();
+    if (!name) { ckStatus('error', 'Name the key first: the machine or agent that will use it.'); return; }
+    doClientKey('create', name, document.getElementById('ckCreate'));
+  });
   buildLogFilters();
   buildNav();
 
