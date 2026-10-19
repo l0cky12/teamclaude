@@ -161,6 +161,12 @@ test('requestPrompt reads the last user text of a Messages or Responses body', (
     { role: 'user', content: 'old prompt' },
     { role: 'user', content: [{ type: 'text', text: '<system-reminder>context</system-reminder>\nfix the new bug' }] },
   ] })), 'fix the new bug');
+  // An opening tag that never closes is text like any other, and so is what
+  // follows it; a later wrapper that does close is still cut.
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: '<system-reminder> a <system-reminder> b' }] })), '<system-reminder> a <system-reminder> b');
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: '<system-reminder> x <user_instructions>y</user_instructions> z' }] })), '<system-reminder> x z');
+  const unclosed = '<system-reminder>'.repeat(20_000);
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: `${unclosed} go` }] })), `${unclosed} go`);
   assert.equal(requestPrompt(Buffer.from('not json')), null);
   assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: [{ type: 'image' }] }] })), null);
 });

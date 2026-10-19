@@ -13,29 +13,31 @@ test('a reload without a proxy section stops recording prompts', async () => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ id: 'msg', type: 'message', usage: { input_tokens: 1, output_tokens: 1 } }));
   });
-  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
-  const server = await spawnServer({
-    config: () => ({
-      proxy: { apiKey: 'tc-test', logPrompts: true },
-      upstream: `http://127.0.0.1:${upstreamPort}`,
-      upstreamProxy: false,
-      autoUpdate: false,
-      accounts: [{ name: 'work', type: 'apikey', apiKey: 'k1' }],
-    }),
-  });
-  const base = `http://127.0.0.1:${server.port}`;
-  const send = async (/** @type {string} */ text) => {
-    const res = await fetch(`${base}/v1/messages`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'claude-fable-5-1', max_tokens: 1, messages: [{ role: 'user', content: text }] }),
-    });
-    await res.text();
-  };
-  const prompts = async () => (await (await fetch(`${base}/teamclaude/logs`)).json()).events
-    .filter((/** @type {any} */ e) => e.kind === 'usage').map((/** @type {any} */ e) => e.prompt ?? null);
+  /** @type {Awaited<ReturnType<typeof spawnServer>>|null} */
+  let server = null;
   try {
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
+    server = await spawnServer({
+      config: () => ({
+        proxy: { apiKey: 'tc-test', logPrompts: true },
+        upstream: `http://127.0.0.1:${upstreamPort}`,
+        upstreamProxy: false,
+        autoUpdate: false,
+        accounts: [{ name: 'work', type: 'apikey', apiKey: 'k1' }],
+      }),
+    });
+    const base = `http://127.0.0.1:${server.port}`;
+    const send = async (/** @type {string} */ text) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-fable-5-1', max_tokens: 1, messages: [{ role: 'user', content: text }] }),
+      });
+      await res.text();
+    };
+    const prompts = async () => (await (await fetch(`${base}/teamclaude/logs`)).json()).events
+      .filter((/** @type {any} */ e) => e.kind === 'usage').map((/** @type {any} */ e) => e.prompt ?? null);
     await send('kept');
     const config = JSON.parse(await readFile(server.configPath, 'utf8'));
     delete config.proxy;
@@ -44,7 +46,7 @@ test('a reload without a proxy section stops recording prompts', async () => {
     await send('not kept');
     assert.deepEqual(await prompts(), ['kept', null]);
   } finally {
-    await server.stop();
+    await server?.stop();
     upstream.closeAllConnections();
     upstream.close();
   }

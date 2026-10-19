@@ -234,9 +234,35 @@ export function clientAgent(userAgent) {
 }
 
 // Text a client wraps around a prompt rather than text a person wrote: Claude
-// Code's reminders and Codex's environment and instructions preambles. Cut
-// out span by span, since a client may put one in the same block as the prompt.
-const WRAPPER = /<(system-reminder|environment_context|user_instructions)\b[^>]*>[\s\S]*?<\/\1>/g;
+// Code's reminders and Codex's environment and instructions preambles.
+const WRAPPER_OPEN = /<(system-reminder|environment_context|user_instructions)\b/g;
+
+/**
+ * Cut each wrapper span (opening tag through its closing tag) out of a text
+ * block, keeping whatever surrounds it: a client may put one in the same block
+ * as the prompt. In one pass rather than a lazy regex, which re-searches the
+ * rest of the text for every opening tag that never closes. A tag whose
+ * closer is missing is not looked for again, so each character is searched
+ * at most once per tag name.
+ * @param {string} text
+ * @returns {string}
+ */
+function stripWrappers(text) {
+  let out = '';
+  let at = 0;
+  const unclosed = new Set();
+  WRAPPER_OPEN.lastIndex = 0;
+  for (let m; (m = WRAPPER_OPEN.exec(text));) {
+    if (unclosed.has(m[1])) continue;
+    const close = `</${m[1]}>`;
+    const end = text.indexOf(close, m.index);
+    if (end < 0) { unclosed.add(m[1]); continue; }
+    out += `${text.slice(at, m.index)} `;
+    at = end + close.length;
+    WRAPPER_OPEN.lastIndex = at;
+  }
+  return out + text.slice(at);
+}
 
 /**
  * The text of a message's content: a string, or the text of its text blocks
@@ -249,7 +275,7 @@ function userText(content) {
   const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
   return blocks
     .filter((b) => (b?.type === 'text' || b?.type === 'input_text') && typeof b.text === 'string')
-    .map((b) => b.text.replace(WRAPPER, ' ').trim())
+    .map((b) => stripWrappers(b.text).replace(/\s+/g, ' ').trim())
     .filter(Boolean)
     .join(' ')
     .trim();
