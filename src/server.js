@@ -27,7 +27,7 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
@@ -428,6 +428,7 @@ function hasConfiguredKey(proxyConfig) {
 // See the check in createProxyServer for why a tenant may not reach these.
 const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
+  ['/teamclaude/probe-interval', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -435,6 +436,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // granted, and one that could revoke could lock the other clients out.
   ['/teamclaude/client-keys/create', 'a client key cannot manage client keys'],
   ['/teamclaude/client-keys/revoke', 'a client key cannot manage client keys'],
+  // Show hands out another client's key, which would let one client spend as another.
+  ['/teamclaude/client-keys/show', 'a client key cannot manage client keys'],
   // Every step of a dashboard sign-in, the read included: the status names the
   // account the tokens went to, and a code pasted into another caller's
   // sign-in would add an account all the same.
@@ -1065,6 +1068,49 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // Probe interval endpoint — the dashboard's Quota refresh picker, the web
+      // equivalent of `teamclaude probe <seconds>` and the set_probe_interval MCP
+      // tool. A setting like /threshold, so it takes the same two steps: write
+      // under the config lock, then reload (reloadAccounts reschedules the
+      // running prober). Body: {"seconds": <0 = off, or MIN..MAX>}; the range is
+      // setProbeSeconds' to say, and its refusal comes back as a 400.
+      if (req.method === 'POST' && req.url === '/teamclaude/probe-interval') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        let seconds;
+        try {
+          seconds = JSON.parse(await readControlBody(req) || '{}')?.seconds;
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          reply(tooLarge ? 413 : 400, { ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' });
+          return;
+        }
+        if (!hooks.reload) { reply(501, { ok: false, error: 'probe interval change not supported' }); return; }
+        let saved;
+        try {
+          const disk = await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setProbeSeconds(c, seconds); });
+          saved = disk.quotaProbeSeconds;
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Probe interval change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'probe interval change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a probe interval change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        console.log(`[TeamClaude] Quota probe ${saved > 0 ? `set to every ${saved}s` : 'turned off'} (dashboard)`);
+        reply(200, { ok: true, quotaProbeSeconds: saved });
+        return;
+      }
+
       // Client keys — what the dashboard's Clients page sends to make a key for
       // one of the operator's machines or agents, or to revoke one. `create`
       // {"name"} answers with the generated key, the only time the server says
@@ -1107,6 +1153,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // The name only: the key never reaches the log.
         console.log(`[TeamClaude] ${isCreate ? 'Created' : 'Revoked'} client key "${safeLine(result.name, 80)}" (control endpoint)`);
         // no-store: the create reply carries the key itself.
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+        return;
+      }
+
+      // Show details: `{"name"}` answers with the key stored under that name,
+      // so the operator can set up a client after the create panel is closed.
+      // The key is in the config file already; this is no more than create
+      // gave the same caller. A read of the running config: nothing is written.
+      if (req.method === 'POST' && req.url === '/teamclaude/client-keys/show') {
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        /** @type {{ name: string, key: string }} */ let result;
+        try {
+          result = showClientKey(config.proxy, body.name);
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: /** @type {Error} */ (err).message }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, ...result }));
         return;

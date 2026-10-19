@@ -483,6 +483,43 @@ export function thresholdOutcome(res) {
   return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
 }
 
+// The Quota refresh picker's choices: off, or 5 to 120 seconds. An interval set
+// elsewhere (CLI, TUI, a hand edit) that is not on the list is added as its own
+// choice, so the picker always shows what the proxy is really doing instead of
+// snapping to a neighbour and inviting a save that changes the setting.
+/** @param {unknown} current  status.probe.intervalSeconds */
+export function probeIntervalOptions(current) {
+  var choices = [0, 5, 10, 15, 20, 30, 45, 60, 90, 120];
+  var cur = typeof current === 'number' && isFinite(current) && current >= 0 ? Math.round(current) : 0;
+  if (choices.indexOf(cur) < 0) choices.push(cur);
+  choices.sort(function (a, b) { return a - b; });
+  return choices.map(function (v) { return { value: v, label: v ? 'every ' + v + 's' : 'off' }; });
+}
+
+/**
+ * @param {number} seconds  0 turns the probe off
+ * @param {string|null|undefined} key
+ */
+export function probeIntervalRequest(seconds, key) {
+  return {
+    url: '/teamclaude/probe-interval',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ seconds: seconds }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function probeIntervalOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'quota refresh change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.quotaProbeSeconds > 0 ? 'quota refreshes every ' + res.quotaProbeSeconds + 's' : 'quota refresh turned off' };
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
@@ -703,10 +740,13 @@ export function removeOutcome(res) {
   return { kind: 'ok', text: 'Removed ' + res.name + '. TeamClaude no longer holds its sign-in; you stay signed in everywhere else.' };
 }
 
+// The start of a failed client-key step's message. A page constant too: see SHARED_CONSTS.
+const CLIENT_KEY_FAILED = { create: 'could not create the key', revoke: 'could not revoke the key', show: 'could not read the key' };
+
 /**
- * POST to create or revoke a client key (proxy.clientKeys) by name.
+ * POST to create, revoke or show a client key (proxy.clientKeys) by name.
  *
- * @param {'create'|'revoke'} step
+ * @param {'create'|'revoke'|'show'} step
  * @param {string} name
  * @param {string|null} key  the proxy key the page holds, not the client key
  */
@@ -727,12 +767,14 @@ export function clientKeyRequest(step, name, key) {
  * happens rather than when a client elsewhere starts getting 401s.
  *
  * @param {any} res
- * @param {'create'|'revoke'} step
+ * @param {'create'|'revoke'|'show'} step
  */
 export function clientKeyOutcome(res, step) {
   if (!res || !res.ok) {
-    return { kind: 'error', text: (step === 'create' ? 'could not create the key' : 'could not revoke the key') + (res && res.error ? ': ' + res.error : '') };
+    return { kind: 'error', text: CLIENT_KEY_FAILED[step] + (res && res.error ? ': ' + res.error : '') };
   }
+  // The panel that opens is the answer to a show; a line above it would repeat it.
+  if (step === 'show') return { kind: 'ok', text: '' };
   if (step === 'revoke') return { kind: 'ok', text: 'Revoked ' + res.name + '. Its usage so far stays in the table.' };
   if (res.firstKey) return { kind: 'warn', text: 'Created ' + res.name + '. It is the proxy\'s first key, so callers on other machines now need a key too.' };
   return { kind: 'ok', text: 'Created ' + res.name + '.' };
@@ -747,10 +789,14 @@ export function clientKeyOutcome(res, step) {
  * @param {string} key
  */
 export function clientKeySetup(origin, key) {
+  // Show details hands back keys written into the file by hand, which may hold
+  // `$`, quotes or spaces: single-quote those for the shell, and let JSON's
+  // escapes (a subset of TOML's basic-string escapes) quote them for Codex.
+  var sh = function (/** @type {string} */ v) { return /^[A-Za-z0-9._\/:@%+=,-]+$/.test(v) ? v : "'" + v.replace(/'/g, "'\\''") + "'"; };
   return {
-    claude: 'export ANTHROPIC_BASE_URL=' + origin + '\nexport ANTHROPIC_API_KEY=' + key,
-    codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "' + origin + '/backend-api/codex"\n'
-      + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = "' + key + '" }',
+    claude: 'export ANTHROPIC_BASE_URL=' + sh(origin) + '\nexport ANTHROPIC_API_KEY=' + sh(key),
+    codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = ' + JSON.stringify(origin + '/backend-api/codex') + '\n'
+      + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = ' + JSON.stringify(key) + ' }',
   };
 }
 
@@ -1275,6 +1321,7 @@ export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
@@ -1298,6 +1345,7 @@ const SHARED_CONSTS = [
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
+  `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1464,6 +1512,8 @@ const PAGE = `<!doctype html>
   .ckeys .st { font-size: 12px; color: var(--dim); }
   .ckeys .st.ok { color: var(--ok); } .ckeys .st.warn { color: var(--warn); } .ckeys .st.error { color: var(--bad); }
   .ckeys table { margin-top: 8px; }
+  /* Show details and Revoke stack on a phone; keep them apart there too. */
+  .ckeys td .btn + .btn { margin-top: 4px; }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
@@ -1661,6 +1711,13 @@ const PAGE = `<!doctype html>
         <div class="setting">
           <div><b>Config</b><span class="tag">Re-read the config file, as after a hand edit or a sign-in in another terminal.</span></div>
           <button id="reload" class="btn" type="button">Reload config</button>
+        </div>
+        <div class="setting">
+          <div><b>Quota refresh</b><span class="tag">How often the proxy re-reads every account's quota in the background. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="probeEvery">Refresh</label>
+            <select id="probeEvery"></select>
+          </span>
         </div>
         <div class="setting">
           <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
@@ -2287,6 +2344,12 @@ ${SHARED_HELPERS}
       var armedAt = ckRevokeArmed[name];
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
       var td = el('td', 'num');
+      var open = issuedName === name;
+      var d = button('btn', open ? 'Hide details' : 'Show details', function () {
+        if (open) hideIssuedKey(); else doClientKey('show', name, d);
+      });
+      d.title = 'The key and the setup for Claude Code and the Codex CLI';
+      td.appendChild(d);
       var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm revoke' : 'Revoke', function () {
         if (!armed) { ckRevokeArmed[name] = Date.now(); if (lastStatus) render(lastStatus); return; }
         if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
@@ -2319,6 +2382,7 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = clientKeyOutcome(json, step);
         ckStatus(out.kind, out.text);
+        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true); if (lastStatus) render(lastStatus); return; }
         if (json.ok && step === 'create') {
           document.getElementById('ckName').value = '';
           // The proxy's first key closes a gate this page may have come in
@@ -2332,13 +2396,12 @@ ${SHARED_HELPERS}
         if (json.ok && step === 'revoke' && issuedName === json.name) hideIssuedKey();
         poll();
       })
-      .catch(function (e) { ckStatus('error', (step === 'create' ? 'could not create the key: ' : 'could not revoke the key: ') + e.message); })
+      .catch(function (e) { ckStatus('error', CLIENT_KEY_FAILED[step] + ': ' + e.message); })
       .finally(function () { btn.disabled = false; });
   }
 
-  // The new key is shown once, here, and kept only in this panel: the status
-  // endpoint never returns keys, so closing the panel is the end of it (the
-  // config file still holds it for whoever can read that).
+  // A key is shown in this panel only: the status endpoint never returns keys.
+  // A new one opens it on create; Show details reads a key back on request.
   var issuedName = null;
   // Set while a first key's panel is open on a page that holds no key: see doClientKey.
   var holdPoll = false;
@@ -2348,7 +2411,7 @@ ${SHARED_HELPERS}
     var box = document.getElementById('ckIssued');
     box.textContent = '';
     box.style.display = 'none';
-    if (holdPoll) { holdPoll = false; poll(); }
+    if (holdPoll) { holdPoll = false; poll(); } else if (lastStatus) render(lastStatus);
   }
 
   function copyField(field, btn) {
@@ -2378,13 +2441,13 @@ ${SHARED_HELPERS}
     box.appendChild(line);
   }
 
-  function showIssuedKey(name, key) {
+  function showIssuedKey(name, key, existing) {
     issuedName = name;
     var box = document.getElementById('ckIssued');
     box.textContent = '';
     var head = el('div', 'line');
     head.appendChild(el('b', '', 'Key for ' + name));
-    head.appendChild(el('span', 'hint', 'Copy it now: the dashboard will not show it again.'));
+    head.appendChild(el('span', 'hint', existing ? 'Anyone who can see this screen can use the key.' : 'Copy it now, or come back with Show details.'));
     box.appendChild(head);
     var origin = typeof location !== 'undefined' ? location.origin : '';
     var setup = clientKeySetup(origin, key);
@@ -2794,6 +2857,23 @@ ${SHARED_HELPERS}
     var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
     thrInput.disabled = !canThreshold;
     document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    // Rebuilt from the status unless it is open or saving, like the threshold
+    // field, so a change made from the CLI or the TUI shows up here without a
+    // refresh.
+    var probeSel = document.getElementById('probeEvery');
+    // ponytail: a status read that started before a save and lands after it
+    // still shows the old interval until the next poll; cosmetic, nothing is lost.
+    if (document.activeElement !== probeSel && !probeSaving) {
+      var probeSecs = (s.probe || {}).intervalSeconds || 0;
+      probeSel.textContent = '';
+      probeIntervalOptions(probeSecs).forEach(function (o) {
+        var opt = el('option', '', o.label);
+        opt.value = String(o.value);
+        probeSel.appendChild(opt);
+      });
+      probeSel.value = String(probeSecs);
+    }
+    probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -3218,6 +3298,47 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  // Saved on pick: a select has no half-entered state to protect, so a Set
+  // button would only be a second click. The select is neither disabled nor
+  // blurred while it saves: either would drop keyboard focus, and arrowing
+  // through the choices fires one change per step. Steps that land while a save
+  // is in flight are coalesced into one save of the latest choice, so the
+  // requests can't arrive out of order and leave an earlier step on disk. The
+  // choice is kept in probeWanted rather than re-read from the select, which a
+  // poll may have rewritten by then (render leaves it alone only while it has
+  // focus or a save is running).
+  var probeSaving = false, probeWanted = null;
+  function doProbeInterval(sel) {
+    probeWanted = Number(sel.value);
+    if (!probeSaving) saveProbeInterval(sel);
+  }
+
+  function saveProbeInterval(sel) {
+    var seconds = probeWanted;
+    probeWanted = null;
+    probeSaving = true;
+    var r = probeIntervalRequest(seconds, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = probeIntervalOutcome(json);
+        note(out.kind, out.text);
+        // A focused select is left alone by the poll, so a refused choice would
+        // otherwise stay on screen as if it applied. A newer pick waiting to be
+        // sent is left showing instead: it is about to be saved.
+        if (!json.ok && probeWanted === null) sel.value = String(((lastStatus || {}).probe || {}).intervalSeconds || 0);
+      })
+      .catch(function (e) { note('error', 'quota refresh change failed: ' + e.message); })
+      .finally(function () {
+        probeSaving = false;
+        if (probeWanted !== null) saveProbeInterval(sel); else poll();
+      });
+  }
+
   function doControl(path, label, btn) {
     btn.disabled = true;
     fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
@@ -3360,6 +3481,7 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }
