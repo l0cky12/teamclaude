@@ -10,6 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -1039,6 +1040,38 @@ test('the page carries the threshold control and wires it', () => {
   // Enter in the field is the same action: a number typed and left alone would
   // otherwise look applied without being saved.
   assert.ok(html.includes("getElementById('thrVal').addEventListener"), 'the Enter handler');
+});
+
+test('the quota refresh picker offers off and 5 to 120 seconds, plus a value set elsewhere', () => {
+  const values = cur => probeIntervalOptions(cur).map(o => o.value);
+  assert.deepEqual(values(0), [0, 5, 10, 15, 20, 30, 45, 60, 90, 120]);
+  assert.deepEqual(probeIntervalOptions(0)[0], { value: 0, label: 'off' });
+  assert.deepEqual(probeIntervalOptions(0)[1], { value: 5, label: 'every 5s' });
+  // An interval from the CLI or TUI that is not on the list is shown as it is,
+  // in order, rather than snapped to a neighbour.
+  assert.deepEqual(values(300), [0, 5, 10, 15, 20, 30, 45, 60, 90, 120, 300]);
+  assert.deepEqual(values(7), [0, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120]);
+  assert.deepEqual(values(undefined), values(0));
+});
+
+test('probeIntervalRequest posts the seconds with the key, and the outcome says what was set', () => {
+  const r = probeIntervalRequest(15, 'secret');
+  assert.equal(r.url, '/teamclaude/probe-interval');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'secret');
+  assert.equal(r.init.body, '{"seconds":15}');
+  assert.equal(probeIntervalRequest(0, null).init.headers['x-api-key'], '');
+
+  assert.deepEqual(probeIntervalOutcome({ ok: true, quotaProbeSeconds: 15 }), { kind: 'ok', text: 'quota refreshes every 15s' });
+  assert.deepEqual(probeIntervalOutcome({ ok: true, quotaProbeSeconds: 0 }), { kind: 'ok', text: 'quota refresh turned off' });
+  assert.equal(probeIntervalOutcome({ ok: false, error: 'nope' }).kind, 'error');
+  assert.match(probeIntervalOutcome({ ok: false, error: 'nope' }).text, /nope/);
+});
+
+test('the page carries the quota refresh picker and wires it', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="probeEvery"'), 'the picker');
+  assert.ok(html.includes("getElementById('probeEvery').addEventListener('change'"), 'the change handler');
 });
 
 test('the page ships the same helper implementations it is tested against', () => {

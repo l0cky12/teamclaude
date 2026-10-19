@@ -483,6 +483,43 @@ export function thresholdOutcome(res) {
   return { kind: 'ok', text: 'switch threshold set to ' + pct + '%' };
 }
 
+// The Quota refresh picker's choices: off, or 5 to 120 seconds. An interval set
+// elsewhere (CLI, TUI, a hand edit) that is not on the list is added as its own
+// choice, so the picker always shows what the proxy is really doing instead of
+// snapping to a neighbour and inviting a save that changes the setting.
+/** @param {unknown} current  status.probe.intervalSeconds */
+export function probeIntervalOptions(current) {
+  var choices = [0, 5, 10, 15, 20, 30, 45, 60, 90, 120];
+  var cur = typeof current === 'number' && isFinite(current) && current >= 0 ? Math.round(current) : 0;
+  if (choices.indexOf(cur) < 0) choices.push(cur);
+  choices.sort(function (a, b) { return a - b; });
+  return choices.map(function (v) { return { value: v, label: v ? 'every ' + v + 's' : 'off' }; });
+}
+
+/**
+ * @param {number} seconds  0 turns the probe off
+ * @param {string|null|undefined} key
+ */
+export function probeIntervalRequest(seconds, key) {
+  return {
+    url: '/teamclaude/probe-interval',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ seconds: seconds }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function probeIntervalOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'quota refresh change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.quotaProbeSeconds > 0 ? 'quota refreshes every ' + res.quotaProbeSeconds + 's' : 'quota refresh turned off' };
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
@@ -1267,6 +1304,7 @@ export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
@@ -1651,6 +1689,13 @@ const PAGE = `<!doctype html>
         <div class="setting">
           <div><b>Config</b><span class="tag">Re-read the config file, as after a hand edit or a sign-in in another terminal.</span></div>
           <button id="reload" class="btn" type="button">Reload config</button>
+        </div>
+        <div class="setting">
+          <div><b>Quota refresh</b><span class="tag">How often the proxy re-reads every account's quota in the background. Zero-spend, but each refresh reads the usage endpoint once per account. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="probeEvery">Refresh</label>
+            <select id="probeEvery"></select>
+          </span>
         </div>
         <div class="setting">
           <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
@@ -2781,6 +2826,20 @@ ${SHARED_HELPERS}
     var canThreshold = callerCan(s.caller, '/teamclaude/threshold');
     thrInput.disabled = !canThreshold;
     document.getElementById('thrSet').style.display = canThreshold ? '' : 'none';
+    // Rebuilt from the status unless it is open, like the threshold field, so a
+    // change made from the CLI or the TUI shows up here without a refresh.
+    var probeSel = document.getElementById('probeEvery');
+    if (document.activeElement !== probeSel) {
+      var probeSecs = (s.probe || {}).intervalSeconds || 0;
+      probeSel.textContent = '';
+      probeIntervalOptions(probeSecs).forEach(function (o) {
+        var opt = el('option', '', o.label);
+        opt.value = String(o.value);
+        probeSel.appendChild(opt);
+      });
+      probeSel.value = String(probeSecs);
+    }
+    probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -3205,6 +3264,25 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  // Saved on pick: a select has no half-entered state to protect, so a Set
+  // button would only be a second click.
+  function doProbeInterval(sel) {
+    sel.disabled = true;
+    var r = probeIntervalRequest(Number(sel.value), localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = probeIntervalOutcome(json);
+        note(out.kind, out.text);
+      })
+      .catch(function (e) { note('error', 'quota refresh change failed: ' + e.message); })
+      .finally(function () { sel.disabled = false; sel.blur(); poll(); });
+  }
+
   function doControl(path, label, btn) {
     btn.disabled = true;
     fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
@@ -3347,6 +3425,7 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }

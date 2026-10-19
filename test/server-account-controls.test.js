@@ -247,7 +247,7 @@ test('status reports the caller, and its refused list is what the gate refuses',
       '/teamclaude/client-keys/create', '/teamclaude/client-keys/revoke',
       '/teamclaude/disable',
       '/teamclaude/login/cancel', '/teamclaude/login/code', '/teamclaude/login/start', '/teamclaude/login/status',
-      '/teamclaude/priority', '/teamclaude/remove', '/teamclaude/threshold',
+      '/teamclaude/priority', '/teamclaude/probe-interval', '/teamclaude/remove', '/teamclaude/threshold',
     ]);
     for (const path of client.refused) {
       const res = await post(port, path, {}, { 'x-api-key': CLIENT_KEY });

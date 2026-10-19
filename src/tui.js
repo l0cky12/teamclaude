@@ -20,7 +20,7 @@ import { describeRouting, parseRoutingUrl, routingToUrl, checkRouting } from './
 import { sanitizeText, safeLine } from './safe-text.js';
 // The setting rules live in one module; the CLI, the MCP tools and this screen
 // all read them from there, so they cannot drift apart (#426).
-import { MAX_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
+import { MAX_PROBE_SECONDS, MIN_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 import { hyperlink, clipboardSequence } from './osc.js';
 /** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
@@ -1308,7 +1308,7 @@ export class TUI {
       },
       left: () => this._nudgeProbe(-30),
       right: () => this._nudgeProbe(+30),
-      enter: () => this._promptInput('Quota probe seconds (0=off, min 30)', v => this._doSetProbe(v.trim())),
+      enter: () => this._promptInput(`Quota probe seconds (0=off, min ${MIN_PROBE_SECONDS})`, v => this._doSetProbe(v.trim())),
     });
 
     fields.push({
@@ -1586,7 +1586,7 @@ export class TUI {
     if (secs > MAX_PROBE_SECONDS) {
       this._addLog(`Invalid interval — at most ${MAX_PROBE_SECONDS}s (7 days)`); this.mode = 'settings'; if (this.running) this.render(); return;
     }
-    if (secs > 0 && secs < 30) secs = 30; // match the CLI minimum (don't hammer the usage endpoint)
+    if (secs > 0 && secs < MIN_PROBE_SECONDS) secs = MIN_PROBE_SECONDS; // match the CLI minimum (don't hammer the usage endpoint)
     this.config.quotaProbeSeconds = secs;
     try { await this.saveConfig(this.config); }
     catch (e) { this._addLog(`Failed to save: ${e.message}`); }
