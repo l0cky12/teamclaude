@@ -33,7 +33,10 @@ test('the probe interval is off, or between the floor and the ceiling', () => {
   setProbeSeconds(config, MAX_PROBE_SECONDS);
   assert.equal(config.quotaProbeSeconds, MAX_PROBE_SECONDS);
 
-  refused(() => setProbeSeconds(config, 29), /Minimum probe interval is 30s/);
+  setProbeSeconds(config, 5);
+  assert.equal(config.quotaProbeSeconds, 5);
+  refused(() => setProbeSeconds(config, 4), /Minimum probe interval is 5s/);
+  setProbeSeconds(config, MAX_PROBE_SECONDS);
   refused(() => setProbeSeconds(config, MAX_PROBE_SECONDS + 1), /Maximum probe interval/);
   refused(() => setProbeSeconds(config, -1), /whole number of seconds/);
   refused(() => setProbeSeconds(config, 1.5), /whole number of seconds/);
