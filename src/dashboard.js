@@ -152,7 +152,9 @@ export function backendQuotaRows(backend, now) {
     if (win.resetAt != null && win.resetAt <= at) return;
     rows.push({ label: d.label, utilization: win.utilization, resetAt: win.resetAt == null ? null : win.resetAt });
   });
-  if (!rows.length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
+  // The aggregate was measured with these windows: once they expire it must
+  // not turn back into a timeless reading that keeps the account hidden.
+  if (!Object.keys(w).length && b.utilization != null) rows.push({ label: b.label || 'Quota', utilization: b.utilization, resetAt: null });
   return { rows: rows, text: !rows.length && b.text ? (b.label || 'Quota') + ': ' + b.text : null };
 }
 
@@ -944,6 +946,12 @@ export function quotaMeter(label, utilization, resetAt) {
   return { label: label, used: used, left: used == null ? null : 1 - used, resetAt: resetAt == null ? null : resetAt, tone: meterTone(used) };
 }
 
+// An old, spent reading stops hiding an account once its window resets.
+/** @param {any} meter @param {number} now */
+export function exhaustedMeter(meter, now) {
+  return !!meter && meter.left === 0 && (meter.resetAt == null || meter.resetAt > now);
+}
+
 // The Fable model the fleet served most recently, as a person names it
 // ("Fable 5.1"), for the Fable column's label. Upstream meters the family, not
 // the version, so this only names the column: the newest Fable id any account
@@ -978,6 +986,7 @@ export function fableLabel(accounts) {
 export function accountMeters(account, fable, now) {
   var a = account || {};
   var q = a.quota || {};
+  var at = now == null ? Date.now() : now;
   /** @type {Array<any>} */
   var slots = [null, null, null];
   /** @type {Array<any>} */
@@ -993,6 +1002,13 @@ export function accountMeters(account, fable, now) {
     }
     if (a.provider === 'codex' ? q.unified5h != null : showSessionRow(q)) slots[1] = quotaMeter('5-hour limit', q.unified5h, q.unified5hReset);
     slots[2] = quotaMeter('7-day limit', q.unified7d, q.unified7dReset);
+    // Show usable session capacity: a fresh session cannot bypass an empty
+    // weekly bucket. Keep upstream's reading intact for routing and persistence.
+    var weekly = [slots[0], slots[2]].filter(function (m) { return exhaustedMeter(m, at); });
+    if (slots[1] && weekly.length) {
+      slots[1] = quotaMeter(slots[1].label, 1, null);
+      slots[1].note = 'Weekly limit empty';
+    }
   } else if (q.tokensLimit != null && q.tokensRemaining != null) {
     slots[0] = quotaMeter('Tokens', 1 - q.tokensRemaining / q.tokensLimit, q.resetsAt);
   } else if (q.backend && (q.backend.text || q.backend.utilization != null)) {
@@ -1003,6 +1019,15 @@ export function accountMeters(account, fable, now) {
     text = 'quota unknown (no traffic observed yet)';
   }
   return { slots: slots, extra: extra, text: text };
+}
+
+// Hide only rows with a known empty main window, keeping unknown quota and
+// model-specific buckets behind Show from making an account disappear.
+/** @param {any} account @param {number} [now] */
+export function accountQuotaExhausted(account, now) {
+  var at = now == null ? Date.now() : now;
+  var meters = accountMeters(account, undefined, at);
+  return meters.slots.some(function (m) { return exhaustedMeter(m, at); });
 }
 
 // One provider's quota pooled, for its summary card: how much of one column is
@@ -1175,7 +1200,7 @@ const SHARED_HELPERS = [
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-  meterTone, quotaMeter, fableLabel, accountMeters, poolSummary, accountGroup, groupLabel, providerTabs,
+  meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
 ].map(fn => fn.toString()).join('\n\n');
@@ -1464,6 +1489,7 @@ const PAGE = `<!doctype html>
     <section id="page-quota">
       <div id="tabs" class="tabs"></div>
       <div id="summaryCards" class="cards"></div>
+      <div id="quotaVisibility" class="filters"></div>
       <div id="accounts"></div>
     </section>
 
@@ -1584,6 +1610,7 @@ const PAGE = `<!doctype html>
   var navCounts = {};
   // Which provider tab the quota page is showing; kept across polls.
   var currentTab = 'all';
+  var showAllAccounts = false;
   // Open "Show" expanders, by card or row. No prototype: an account named
   // __proto__ would otherwise set it.
   var expanded = Object.create(null);
@@ -1694,7 +1721,7 @@ ${SHARED_HELPERS}
     fill.style.width = (m.left == null ? 0 : m.left * 100) + '%';
     bar.appendChild(fill);
     box.appendChild(bar);
-    box.appendChild(el('div', 'rs', resetText(m.resetAt)));
+    box.appendChild(el('div', 'rs', m.note || resetText(m.resetAt)));
     return box;
   }
 
@@ -1876,6 +1903,20 @@ ${SHARED_HELPERS}
     });
     var fable = fableLabel(accounts);
     var groups = tabs.slice(1).map(function (t) { return t.key; }).filter(function (g) { return currentTab === 'all' || g === currentTab; });
+    var at = Date.now();
+    var selected = accounts.filter(function (a) { return currentTab === 'all' || accountGroup(a) === currentTab; });
+    var hidden = selected.filter(function (a) { return accountQuotaExhausted(a, at); }).length;
+    var visibility = document.getElementById('quotaVisibility');
+    visibility.textContent = '';
+    if (hidden || showAllAccounts) {
+      visibility.appendChild(el('span', 'hint', hidden + ' exhausted account' + (hidden === 1 ? '' : 's') + (showAllAccounts ? ' shown' : ' hidden')));
+      var toggle = button('btn', showAllAccounts ? 'Hide exhausted' : 'Show all', function () {
+        showAllAccounts = !showAllAccounts;
+        if (lastStatus) render(lastStatus);
+      });
+      toggle.setAttribute('aria-pressed', String(showAllAccounts));
+      visibility.appendChild(toggle);
+    }
     var cards = document.getElementById('summaryCards');
     cards.textContent = '';
     var acc = document.getElementById('accounts');
@@ -1897,12 +1938,14 @@ ${SHARED_HELPERS}
       } else cards.appendChild(summaryCard(s, g, list, fable));
       var head = el('div', 'sechead');
       head.appendChild(groupHeading(g, groupLabel(g)));
-      head.appendChild(el('span', 'count', String(members.length)));
+      var visible = members.filter(function (m) { return showAllAccounts || !accountQuotaExhausted(m.a, at); });
+      head.appendChild(el('span', 'count', visible.length + ' of ' + members.length));
       var cur = currentIn(s, g, list);
       if (cur) head.appendChild(el('span', 'tag', 'current: ' + cur));
       acc.appendChild(head);
       var rows = el('div', 'rows ' + providerTone(g));
-      members.forEach(function (m) {
+      if (!visible.length) rows.appendChild(el('div', 'empty', 'All accounts in this group have an exhausted limit. Use Show all to see them.'));
+      visible.forEach(function (m) {
         // The probe's list is the fleet in the same order; the name check keeps a
         // payload that ever differs from pairing a row with another account's entry.
         var pe = probeAccounts[m.i] && probeAccounts[m.i].name === m.a.name ? probeAccounts[m.i] : null;
