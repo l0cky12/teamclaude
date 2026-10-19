@@ -84,3 +84,23 @@ test('the listed names are the usable entries, once each, and never a key', () =
   assert.deepEqual(clientKeyNames(undefined), []);
   assert.deepEqual(clientKeyNames({ clientKeys: 'nope' }), []);
 });
+
+test('the last key of a proxy without a shared key cannot be revoked', () => {
+  // With no key left the gate admits everybody: the revoke would open the
+  // proxy rather than shut one client out.
+  const config = { proxy: { clientKeys: [{ name: 'laptop', key: 'tc-1' }, { name: 'laptop', key: 'tc-2' }] } };
+  refused(() => revokeClientKey(config, 'laptop'), /last key.*proxy\.apiKey/);
+  assert.equal(config.proxy.clientKeys.length, 2, 'nothing is removed');
+
+  // An entry the gate ignores (no key) does not count as a remaining key.
+  const halves = { proxy: { clientKeys: [{ name: 'laptop', key: 'tc-1' }, { name: 'half' }] } };
+  refused(() => revokeClientKey(halves, 'laptop'), /last key/);
+
+  // Another usable key, or the shared key, keeps the gate closed.
+  const two = { proxy: { clientKeys: [{ name: 'laptop', key: 'tc-1' }, { name: 'ci', key: 'tc-2' }] } };
+  assert.equal(revokeClientKey(two, 'laptop').removed, 1);
+  refused(() => revokeClientKey(two, 'ci'), /last key/);
+  const shared = { proxy: { apiKey: 'tc-shared', clientKeys: [{ name: 'laptop', key: 'tc-1' }] } };
+  assert.equal(revokeClientKey(shared, 'laptop').removed, 1);
+  assert.deepEqual(shared.proxy.clientKeys, []);
+});

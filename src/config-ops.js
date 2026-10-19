@@ -514,6 +514,10 @@ export function addClientKey(config, rawName, key = generateClientKey()) {
  * hand edit gave a duplicate name cannot outlive the revoke. The usage booked
  * under the name stays in the state file.
  *
+ * The last key of a proxy without a proxy.apiKey is refused: with no key left
+ * the auth gate admits everybody, so the revoke would open the proxy to every
+ * caller, the revoked client included, rather than shut one client out.
+ *
  * @param {Config} config
  * @param {unknown} rawName
  * @returns {{ name: string, removed: number }}
@@ -524,6 +528,9 @@ export function revokeClientKey(config, rawName) {
   const list = Array.isArray(config.proxy?.clientKeys) ? config.proxy.clientKeys : [];
   const kept = list.filter((/** @type {any} */ e) => (typeof e?.name === 'string' ? e.name.trim() : '') !== name);
   if (kept.length === list.length) throw new ConfigOpError(`no client key is named "${name}"`);
+  if (!config.proxy.apiKey && clientKeyNames({ clientKeys: kept }).length === 0) {
+    throw new ConfigOpError(`"${name}" is the proxy's last key and there is no proxy.apiKey: revoking it would let anyone use the proxy. Set proxy.apiKey first.`);
+  }
   config.proxy.clientKeys = kept;
   return { name, removed: list.length - kept.length };
 }

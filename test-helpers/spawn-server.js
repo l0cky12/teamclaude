@@ -143,7 +143,10 @@ export async function spawnServer({ config: buildConfig, dir, env = {}, args = [
 
 function spawnChild(configPath, extraEnv, args) {
   // The child must not inherit a proxy from the shell: see test/README.md.
-  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...extraEnv };
+  // Both config variables point at the fixture: TEAMROUTER_CONFIG wins over
+  // TEAMCLAUDE_CONFIG, so one inherited from the shell would otherwise load
+  // the operator's real config into the test's server.
+  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMROUTER_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...extraEnv };
   for (const key of Object.keys(env)) if (/^(https?|all|no)_proxy$/i.test(key)) delete env[key];
   const child = spawn(process.execPath, [cliPath, 'server', '--headless', ...args], {
     env,
