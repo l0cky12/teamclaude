@@ -1167,6 +1167,37 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
 }
 
+test('the quota refresh picker keeps keyboard focus and coalesces steps made while saving', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
+  const sel = page.byId('probeEvery');
+  assert.equal(sel.value, '30', 'the picker shows the running interval');
+  let blurred = false;
+  sel.blur = () => { blurred = true; };
+
+  // Arrowing down three steps: one save goes out, the later steps wait for it.
+  sel.value = '45'; sel.fire('change');
+  assert.equal(sel.disabled, false, 'a disabled select loses keyboard focus');
+  sel.value = '60'; sel.fire('change');
+  sel.value = '90'; sel.fire('change');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval']);
+  assert.equal(page.requests[0].init.body, '{"seconds":45}');
+
+  await page.answer(200, { ok: true, quotaProbeSeconds: 45 });
+  // The waiting steps become one save of the latest choice, not two more.
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/probe-interval']);
+  assert.equal(page.requests[0].init.body, '{"seconds":90}');
+  await page.answer(200, { ok: true, quotaProbeSeconds: 90 });
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'the page re-polls once the saves settle');
+  assert.equal(blurred, false, 'a blur would end keyboard selection');
+  await page.answer(200, { accounts: [], probe: { intervalSeconds: 90 } });
+
+  // A refused choice is put back to what the proxy is really doing.
+  sel.value = '5'; sel.fire('change');
+  await page.answer(400, { ok: false, error: 'nope' });
+  assert.equal(sel.value, '90');
+});
+
 test('Show all reveals exhausted quota rows, survives polls and tabs, and can hide them again', async () => {
   const page = bootPage();
   const fleet = { accounts: [

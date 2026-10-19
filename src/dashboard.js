@@ -3265,9 +3265,15 @@ ${SHARED_HELPERS}
   }
 
   // Saved on pick: a select has no half-entered state to protect, so a Set
-  // button would only be a second click.
+  // button would only be a second click. The select is neither disabled nor
+  // blurred while it saves: either would drop keyboard focus, and arrowing
+  // through the choices fires one change per step. Steps that land while a save
+  // is in flight are coalesced into one save of the latest choice, so the
+  // requests can't arrive out of order and leave an earlier step on disk.
+  var probeSaving = false, probeAgain = false;
   function doProbeInterval(sel) {
-    sel.disabled = true;
+    if (probeSaving) { probeAgain = true; return; }
+    probeSaving = true;
     var r = probeIntervalRequest(Number(sel.value), localStorage.getItem(KEY));
     fetch(r.url, r.init)
       .then(function (res) {
@@ -3278,9 +3284,16 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = probeIntervalOutcome(json);
         note(out.kind, out.text);
+        // The poll leaves a focused select alone, so a refused choice would
+        // otherwise stay on screen as if it applied. A newer pick waiting to be
+        // sent is left showing instead: it is about to be saved.
+        if (!json.ok && !probeAgain) sel.value = String(((lastStatus || {}).probe || {}).intervalSeconds || 0);
       })
       .catch(function (e) { note('error', 'quota refresh change failed: ' + e.message); })
-      .finally(function () { sel.disabled = false; sel.blur(); poll(); });
+      .finally(function () {
+        probeSaving = false;
+        if (probeAgain) { probeAgain = false; doProbeInterval(sel); } else poll();
+      });
   }
 
   function doControl(path, label, btn) {
