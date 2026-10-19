@@ -276,6 +276,8 @@ jobs:
 
   # Dead links in the user documentation. 429s count as reachable: GitHub
   # rate-limits anonymous link checkers, and a rate limit is not a dead page.
+  # npmjs.com answers 403 to anything that is not a browser, so its links are
+  # skipped; publish.yml checks the package name against the registry anyway.
   links:
     name: docs links
     runs-on: ubuntu-latest
@@ -288,7 +290,7 @@ jobs:
       - name: lychee
         uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
         with:
-          args: --no-progress --accept '200..=206,429' --max-retries 3 --retry-wait-time 2 README.md CONTRIBUTING.md SECURITY.md 'docs/**/*.md'
+          args: --no-progress --accept '200..=206,429' --max-retries 3 --retry-wait-time 2 --exclude '^https://www\.npmjs\.com/' README.md CONTRIBUTING.md SECURITY.md 'docs/**/*.md'
           fail: true
           token: ${{ github.token }}
 

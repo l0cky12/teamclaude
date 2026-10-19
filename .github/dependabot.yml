@@ -16,5 +16,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Wait a week after an action's release before proposing it. A compromised
+    # release is usually noticed and pulled within days; the delay keeps CI
+    # from picking it up in that window.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "chore(ci)"
