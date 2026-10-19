@@ -27,7 +27,7 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setProbeSeconds, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
@@ -436,6 +436,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // granted, and one that could revoke could lock the other clients out.
   ['/teamclaude/client-keys/create', 'a client key cannot manage client keys'],
   ['/teamclaude/client-keys/revoke', 'a client key cannot manage client keys'],
+  // Show hands out another client's key, which would let one client spend as another.
+  ['/teamclaude/client-keys/show', 'a client key cannot manage client keys'],
   // Every step of a dashboard sign-in, the read included: the status names the
   // account the tokens went to, and a code pasted into another caller's
   // sign-in would add an account all the same.
@@ -1151,6 +1153,26 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // The name only: the key never reaches the log.
         console.log(`[TeamClaude] ${isCreate ? 'Created' : 'Revoked'} client key "${safeLine(result.name, 80)}" (control endpoint)`);
         // no-store: the create reply carries the key itself.
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ...result }));
+        return;
+      }
+
+      // Show details: `{"name"}` answers with the key stored under that name,
+      // so the operator can set up a client after the create panel is closed.
+      // The key is in the config file already; this is no more than create
+      // gave the same caller. A read of the running config: nothing is written.
+      if (req.method === 'POST' && req.url === '/teamclaude/client-keys/show') {
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        /** @type {{ name: string, key: string }} */ let result;
+        try {
+          result = showClientKey(config.proxy, body.name);
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: /** @type {Error} */ (err).message }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, ...result }));
         return;

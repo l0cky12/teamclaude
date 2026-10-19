@@ -2065,6 +2065,7 @@ test('client key requests post the name to the step, with the page\'s own key', 
   assert.deepEqual(JSON.parse(r.init.body), { name: 'laptop' });
   assert.equal(clientKeyRequest('revoke', 'ci', null).url, '/teamclaude/client-keys/revoke');
   assert.equal(clientKeyRequest('revoke', 'ci', null).init.headers['x-api-key'], '');
+  assert.equal(clientKeyRequest('show', 'ci', null).url, '/teamclaude/client-keys/show');
 });
 
 test('client key outcomes say what happened, and a first key warns', () => {
@@ -2076,6 +2077,8 @@ test('client key outcomes say what happened, and a first key warns', () => {
   assert.deepEqual(clientKeyOutcome({ ok: false, error: 'a client key named "ci" already exists' }, 'create'),
     { kind: 'error', text: 'could not create the key: a client key named "ci" already exists' });
   assert.equal(clientKeyOutcome(null, 'revoke').text, 'could not revoke the key');
+  assert.deepEqual(clientKeyOutcome({ ok: true, name: 'ci', key: 'tc-x' }, 'show'), { kind: 'ok', text: '' });
+  assert.equal(clientKeyOutcome({ ok: false, error: 'no client key is named "ci"' }, 'show').text, 'could not read the key: no client key is named "ci"');
 });
 
 test('the setup text points Claude Code and Codex at this proxy with the new key', () => {
@@ -2084,6 +2087,13 @@ test('the setup text points Claude Code and Codex at this proxy with the new key
   assert.match(setup.codex, /^model_provider = "teamclaude"$/m);
   assert.match(setup.codex, /^base_url = "http:\/\/100\.64\.0\.2:3456\/backend-api\/codex"$/m);
   assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "tc-abc" \}$/m);
+});
+
+// Show details returns hand-written keys too, so the snippets must survive any key.
+test('the setup text quotes a hand-written key for the shell and for TOML', () => {
+  const setup = clientKeySetup('http://127.0.0.1:3456', `a$B 'c"\\`);
+  assert.equal(setup.claude.split('\n')[1], `export ANTHROPIC_API_KEY='a$B '\\''c"\\'`);
+  assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "a\$B 'c\\"\\\\" \}$/m);
 });
 
 test('a key test passes only when the server names the key\'s client', () => {
@@ -2137,4 +2147,36 @@ test('a key created by a page that already holds one keeps polling', async () =>
   assert.equal(page.requests.length, 1);
   assert.equal(page.requests[0].url, '/teamclaude/status');
   assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
+});
+
+// Show details reopens the setup panel for a key whose create panel is long gone.
+test('Show details reads a key back into the setup panel, and Hide details closes it', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  const status = { accounts: [], clientKeys: ['laptop'], caller: { kind: 'operator', client: null, refused: [] } };
+  await page.answer(200, status);
+  page.click('Show details');
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.requests[0].url, '/teamclaude/client-keys/show');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { name: 'laptop' });
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
+  await page.answer(200, { ok: true, name: 'laptop', key: 'tc-old' });
+
+  assert.equal(page.byId('ckIssued').style.display, '');
+  assert.ok(page.findLast(e => e.value === 'tc-old'), 'the key is shown');
+  assert.ok(page.findLast(e => typeof e.value === 'string' && e.value.includes('ANTHROPIC_API_KEY=tc-old')), 'with the Claude Code setup');
+  assert.ok(page.findLast(e => /Anyone who can see this screen/.test(e.textContent)));
+  assert.equal(page.byId('ckStatus').style.display, 'none', 'no status line repeats the panel');
+
+  page.click('Hide details');
+  assert.equal(page.byId('ckIssued').style.display, 'none');
+  assert.ok(page.findLast(e => e.textContent === 'Show details'), 'the row offers it again');
+});
+
+test('a key Show details cannot read leaves the panel shut and says why', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], clientKeys: ['laptop'], caller: { kind: 'operator', client: null, refused: [] } });
+  page.click('Show details');
+  await page.answer(400, { ok: false, error: 'no client key is named "laptop"' });
+  assert.notEqual(page.byId('ckIssued').style.display, '', 'the panel never opened');
+  assert.match(page.byId('ckStatus').textContent, /could not read the key: no client key is named "laptop"/);
 });

@@ -487,6 +487,23 @@ export function clientKeyNames(proxyConfig) {
 }
 
 /**
+ * The key stored under a name, for the dashboard's Show details. A name a hand
+ * edit gave two keys shows the first; both still work at the gate.
+ *
+ * @param {any} proxyConfig  config.proxy
+ * @param {unknown} rawName
+ * @returns {{ name: string, key: string }}
+ */
+export function showClientKey(proxyConfig, rawName) {
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name) throw new ConfigOpError('name the client key');
+  const list = Array.isArray(proxyConfig?.clientKeys) ? proxyConfig.clientKeys : [];
+  const entry = list.find((/** @type {any} */ e) => typeof e?.name === 'string' && e.name.trim() === name && e.key);
+  if (!entry) throw new ConfigOpError(`no client key is named "${name}"`);
+  return { name, key: String(entry.key) };
+}
+
+/**
  * Add a client key under a new name.
  *
  * A name already in use is refused rather than given a second key: two keys
