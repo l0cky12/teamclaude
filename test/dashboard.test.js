@@ -15,7 +15,7 @@ import {
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
 } from '../src/dashboard.js';
@@ -2179,4 +2179,10 @@ test('a key Show details cannot read leaves the panel shut and says why', async 
   await page.answer(400, { ok: false, error: 'no client key is named "laptop"' });
   assert.notEqual(page.byId('ckIssued').style.display, '', 'the panel never opened');
   assert.match(page.byId('ckStatus').textContent, /could not read the key: no client key is named "laptop"/);
+});
+
+test('logEventClient names the client key and the program that sent a request', () => {
+  assert.equal(logEventClient({ client: 'laptop', agent: 'claude-cli/2.1.3' }), 'laptop · claude-cli/2.1.3');
+  assert.equal(logEventClient({ agent: 'codex_cli_rs/0.46.0' }), 'codex_cli_rs/0.46.0');
+  assert.equal(logEventClient({ kind: 'signin' }), '');
 });

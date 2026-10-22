@@ -16,6 +16,10 @@
 // configured name (never an email the upstream reported, a token or an org
 // id), a model, a status code, token counts and latency, and a short reason.
 // Reasons are codes or one-line messages written here, never a response body.
+// A request entry also names the client that sent it: the client key's name
+// and the first token of its User-Agent (`claude-cli/2.1.3`). The prompt it
+// carried is kept only when the operator opted in (`proxy.logPrompts`): it is
+// the one field that holds what a person wrote, and every key holder reads it.
 
 import { randomUUID } from 'node:crypto';
 import { safeLine } from './safe-text.js';
@@ -51,11 +55,17 @@ export const EVENT_KINDS = /** @type {const} */ (['usage', 'signin', 'auth', 'ro
  * @property {number|null} [outputTokens]
  * @property {number|null} [ms]
  * @property {string|null} [reason]  a short machine-readable code
+ * @property {string|null} [client]  the client key's name, for a request
+ * @property {string|null} [agent]   the first token of the client's User-Agent
+ * @property {string|null} [prompt]  the request's last user text, with proxy.logPrompts on
  */
+
+/** How much of a prompt an entry keeps: enough to tell requests apart. */
+export const PROMPT_MAX = 300;
 
 /** Fields an entry may carry beyond the fixed ones, and how each is kept. */
 const NUMBER_FIELDS = /** @type {const} */ (['status', 'inputTokens', 'outputTokens', 'ms']);
-const TEXT_FIELDS = /** @type {const} */ ([['model', 80], ['reason', 60]]);
+const TEXT_FIELDS = /** @type {const} */ ([['model', 80], ['reason', 60], ['client', 80], ['agent', 60], ['prompt', PROMPT_MAX]]);
 
 /**
  * A non-negative finite number, or null.
@@ -210,4 +220,86 @@ export function signInEvent(step, { provider, account = null, via, error = null,
   if (err?.name === 'AbortError') return { ...base, type: 'signin_cancelled', reason: 'cancelled', message: `Sign-in cancelled (${via})` };
   if (/timed out/i.test(String(err?.message ?? ''))) return { ...base, type: 'signin_timeout', reason: 'timeout', message: `Sign-in timed out (${via})` };
   return { ...base, type: 'signin_failed', reason: 'failed', message: `Sign-in failed (${via}): ${briefError(error)}` };
+}
+
+/**
+ * The client's name for itself, from its User-Agent: the first token only
+ * (`claude-cli/2.1.3`, `codex_cli_rs/0.46.0`). The rest is the OS and
+ * terminal, which says more about the machine than the log needs to.
+ * @param {unknown} userAgent
+ * @returns {string|null}
+ */
+export function clientAgent(userAgent) {
+  return typeof userAgent === 'string' ? userAgent.trim().split(/\s+/)[0] || null : null;
+}
+
+// Text a client wraps around a prompt rather than text a person wrote: Claude
+// Code's reminders and Codex's environment and instructions preambles.
+const WRAPPER_OPEN = /<(system-reminder|environment_context|user_instructions)\b/g;
+
+/**
+ * Cut each wrapper span (opening tag through its closing tag) out of a text
+ * block, keeping whatever surrounds it: a client may put one in the same block
+ * as the prompt. In one pass rather than a lazy regex, which re-searches the
+ * rest of the text for every opening tag that never closes. A tag whose
+ * closer is missing is not looked for again, so each character is searched
+ * at most once per tag name.
+ * @param {string} text
+ * @returns {string}
+ */
+function stripWrappers(text) {
+  let out = '';
+  let at = 0;
+  const unclosed = new Set();
+  WRAPPER_OPEN.lastIndex = 0;
+  for (let m; (m = WRAPPER_OPEN.exec(text));) {
+    if (unclosed.has(m[1])) continue;
+    const close = `</${m[1]}>`;
+    const end = text.indexOf(close, m.index);
+    if (end < 0) { unclosed.add(m[1]); continue; }
+    out += `${text.slice(at, m.index)} `;
+    at = end + close.length;
+    WRAPPER_OPEN.lastIndex = at;
+  }
+  return out + text.slice(at);
+}
+
+/**
+ * The text of a message's content: a string, or the text of its text blocks
+ * (`text` on Anthropic Messages, `input_text` on Codex Responses) that are
+ * not client wrappers. Tool results and images carry no text here.
+ * @param {unknown} content
+ * @returns {string}
+ */
+function userText(content) {
+  const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
+  return blocks
+    .filter((b) => (b?.type === 'text' || b?.type === 'input_text') && typeof b.text === 'string')
+    .map((b) => stripWrappers(b.text).replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+/**
+ * What a request's prompt says: the last user message that holds text a
+ * person wrote, from an Anthropic `messages` or a Codex `input` body. A tool
+ * loop's later requests end in tool results, so this walks back to the
+ * prompt that started the turn. Null for a body that is not JSON or names none.
+ * @param {Buffer|string} body
+ * @returns {string|null}
+ */
+export function requestPrompt(body) {
+  let parsed;
+  // ponytail: a full parse of a body that can run to megabytes; only done
+  // with proxy.logPrompts on. A streaming finder like model.js's if it shows.
+  try { parsed = JSON.parse(String(body)); } catch { return null; }
+  if (typeof parsed?.input === 'string') return parsed.input.trim() || null;
+  const messages = Array.isArray(parsed?.messages) ? parsed.messages : Array.isArray(parsed?.input) ? parsed.input : [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== 'user') continue;
+    const text = userText(messages[i].content);
+    if (text) return text;
+  }
+  return null;
 }

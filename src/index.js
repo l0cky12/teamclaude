@@ -578,6 +578,8 @@ async function serverCommand() {
     // the endpoint to be off as surely as one who deletes the key, and leaving
     // the old mode in memory would keep it served.
     if (config.proxy) config.proxy.mcp = diskConfig.proxy?.mcp;
+    // Prompt capture likewise: deleting the section must turn it off.
+    if (config.proxy) config.proxy.logPrompts = diskConfig.proxy?.logPrompts;
     // Pick up route table edits (teamclaude route …, TUI editor, or a hand edit).
     config.routes = diskConfig.routes || [];
     accountManager.setRoutes(config.routes);

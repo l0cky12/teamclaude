@@ -2,7 +2,7 @@
 // entry may carry, and the account-manager decisions that record into it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { EventLog, logsAfter, briefError, signInEvent, EVENT_LOG_PAGE } from '../src/event-log.js';
+import { EventLog, logsAfter, briefError, signInEvent, clientAgent, requestPrompt, EVENT_LOG_PAGE, PROMPT_MAX } from '../src/event-log.js';
 import { AccountManager } from '../src/account-manager.js';
 
 const NOW = 1_000_000_000_000;
@@ -139,4 +139,45 @@ test('a manager given an event log records into that one', () => {
   const events = new EventLog();
   const am = new AccountManager([oauthAccount()], 0.98, { events });
   assert.equal(am.events, events);
+});
+
+test('requestPrompt reads the last user text of a Messages or Responses body', () => {
+  const body = (/** @type {any} */ b) => Buffer.from(JSON.stringify(b));
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'second' }] })), 'second');
+  // A tool result carries no prompt; a reminder block is not one either.
+  assert.equal(requestPrompt(body({ messages: [
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>x</system-reminder>' }, { type: 'text', text: 'fix it' }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'out' }] },
+  ] })), 'fix it');
+  // Codex Responses: a plain string, or input items with input_text blocks.
+  assert.equal(requestPrompt(body({ input: 'hello codex' })), 'hello codex');
+  assert.equal(requestPrompt(body({ input: [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>cwd</environment_context>' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'add a test' }] },
+    { type: 'function_call_output', call_id: 'c', output: 'done' },
+  ] })), 'add a test');
+  // A wrapper sharing a block with the prompt is cut out, not the whole block.
+  assert.equal(requestPrompt(body({ messages: [
+    { role: 'user', content: 'old prompt' },
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>context</system-reminder>\nfix the new bug' }] },
+  ] })), 'fix the new bug');
+  // An opening tag that never closes is text like any other, and so is what
+  // follows it; a later wrapper that does close is still cut.
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: '<system-reminder> a <system-reminder> b' }] })), '<system-reminder> a <system-reminder> b');
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: '<system-reminder> x <user_instructions>y</user_instructions> z' }] })), '<system-reminder> x z');
+  const unclosed = '<system-reminder>'.repeat(20_000);
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: `${unclosed} go` }] })), `${unclosed} go`);
+  assert.equal(requestPrompt(Buffer.from('not json')), null);
+  assert.equal(requestPrompt(body({ messages: [{ role: 'user', content: [{ type: 'image' }] }] })), null);
+});
+
+test('an entry keeps a prompt as one bounded line, and the client as the User-Agent product', () => {
+  const log = new EventLog({ now: () => NOW });
+  const e = log.add({ kind: 'usage', type: 'request', message: 'POST /v1/messages', prompt: 'line one\nline two ' + 'x'.repeat(PROMPT_MAX), agent: clientAgent('codex_cli_rs/0.46.0 (Ubuntu 24.04; x86_64) xterm') });
+  assert.ok(e);
+  assert.equal(e.prompt?.length, PROMPT_MAX);
+  assert.ok(e.prompt?.startsWith('line one line two'));
+  assert.equal(e.agent, 'codex_cli_rs/0.46.0');
+  assert.equal(clientAgent(undefined), null);
+  assert.equal(clientAgent('  '), null);
 });

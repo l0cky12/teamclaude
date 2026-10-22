@@ -1271,6 +1271,14 @@ export function logEventDetail(event) {
   return parts.join(' · ');
 }
 
+// The Client column of a log row: the client key that sent a request and the
+// program it named itself as (`claude-cli/2.1.3`). Empty for any other event.
+/** @param {any} event */
+export function logEventClient(event) {
+  var e = event || {};
+  return [e.client, e.agent].filter(Boolean).join(' · ');
+}
+
 // How loudly a log row is drawn: red for what lost an account or a request,
 // amber for what will clear on its own, green for a sign-in that worked.
 /** @param {any} event */
@@ -1317,7 +1325,7 @@ const SHARED_HELPERS = [
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+  mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
 ].map(fn => fn.toString()).join('\n\n');
@@ -1556,6 +1564,8 @@ const PAGE = `<!doctype html>
   td.kind { white-space: nowrap; font-size: 12px; color: var(--dim); }
   tr.bad td.ev { color: var(--bad); } tr.warn td.ev { color: var(--warn); } tr.ok td.ev { color: var(--ok); }
   td.detail { color: var(--dim); font-size: 12px; }
+  td.client { color: var(--dim); font-size: 12px; }
+  td.ev .prompt { color: var(--dim); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
   .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
   .plist .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
   .plist .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
@@ -2785,12 +2795,12 @@ ${SHARED_HELPERS}
     var table = document.getElementById('logs');
     table.textContent = '';
     var hr = el('tr');
-    ['Time', 'Kind', 'Account', 'Event', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    ['Time', 'Kind', 'Account', 'Client', 'Event', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
     table.appendChild(hr);
     if (!rows.length) {
       var tr0 = el('tr');
       var td0 = el('td', 'dim', logState.events.length ? 'No events match these filters.' : 'No events yet.');
-      td0.colSpan = 5;
+      td0.colSpan = 6;
       tr0.appendChild(td0);
       table.appendChild(tr0);
       return;
@@ -2801,7 +2811,10 @@ ${SHARED_HELPERS}
       var kind = LOG_KINDS.filter(function (k) { return k.key === e.kind; })[0];
       tr.appendChild(el('td', 'kind', (kind ? kind.label : e.kind) + (e.provider ? ' · ' + providerLabel(e.provider) : '')));
       tr.appendChild(el('td', '', e.account || '—'));
-      tr.appendChild(el('td', 'ev', e.message));
+      tr.appendChild(el('td', 'client', logEventClient(e) || '—'));
+      var ev = el('td', 'ev', e.message);
+      if (e.prompt) ev.appendChild(el('div', 'prompt', '“' + e.prompt + '”'));
+      tr.appendChild(ev);
       tr.appendChild(el('td', 'detail', logEventDetail(e)));
       table.appendChild(tr);
     });
