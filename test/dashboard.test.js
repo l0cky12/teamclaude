@@ -2248,3 +2248,15 @@ test('a picked name that is gone from the config is never asked for', async () =
   assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
   assert.equal(page.requests.length, 0, 'nothing went out under the stale name');
 });
+
+test('a linked instance at a loopback address still signs in the remote way', async () => {
+  const page = bootPage({ storedInstance: 'tunnel' });
+  await page.answer(200, { peers: [{ name: 'tunnel', url: 'http://127.0.0.1:9999', state: 'online' }] });
+  await page.answer(200, { accounts: [] });
+  page.click('Sign in to Claude');
+  assert.equal(page.requests[0].url, '/teamclaude/peers/tunnel/login/start');
+  await page.answer(200, { ok: true, id: 'abc', provider: 'claude', url: 'https://claude.ai/x?r=code-page', browserUrl: 'http://localhost:9/x', listening: true });
+  // The callback listener is on the linked machine, so the code page it is.
+  assert.equal(page.findLast(e => e.textContent === 'Open sign-in page').href, 'https://claude.ai/x?r=code-page');
+  assert.ok(page.findLast(e => e.placeholder === 'Paste the code here'));
+});

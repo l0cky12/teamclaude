@@ -3052,7 +3052,10 @@ ${SHARED_HELPERS}
   var SIGN_IN_LABEL = { claude: 'Claude', codex: 'Codex' };
 
   function pageHost() {
-    if (peer) { try { return new URL(peerUrl).hostname; } catch (e) { return ''; } }
+    // A linked instance is another machine whatever its address says: one
+    // reached over an SSH tunnel at 127.0.0.1 still runs its sign-in callback
+    // listener over there, out of this browser's reach.
+    if (peer) return '';
     return typeof location !== 'undefined' ? location.hostname : '';
   }
 
