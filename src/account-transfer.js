@@ -25,6 +25,7 @@
 // newer one (later `expiresAt`, the rule credential-sync.js uses too).
 
 import { scrypt, randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
+import { open, rename, unlink } from 'node:fs/promises';
 import { findUpsertTarget, updateAccountEntry } from './identity.js';
 import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
@@ -70,7 +71,7 @@ export class TransferError extends Error {}
  * @param {Array<Record<string, any>>} accounts
  * @param {{ readClaude?: typeof importCredentials, readCodex?: typeof importCodexCredentials }} [readers] - test seams
  * @returns {Promise<{ accounts: Array<Record<string, any>>, ids: string[], fileBacked: string[], skipped: Array<{ name: string, reason: string }> }>}
- *   `ids` are the exported entries' own ids on this machine, for --disable-source.
+ *   `ids[i]` is the entry id of `accounts[i]` on this machine, for --disable-source.
  */
 export async function collectExportAccounts(accounts, { readClaude = importCredentials, readCodex = importCodexCredentials } = {}) {
   /** @type {Array<Record<string, any>>} */
@@ -97,13 +98,16 @@ export async function collectExportAccounts(accounts, { readClaude = importCrede
         continue;
       }
     }
-    if (!entry.accessToken && !entry.apiKey) {
-      skipped.push({ name: acct.name, reason: 'no credential stored' });
+    for (const k of LOCAL_FIELDS) delete entry[k];
+    // The importing side refuses a file holding one record it cannot use, so
+    // such a record is left out here, where the operator can see why.
+    const why = invalidAccount(entry);
+    if (why) {
+      skipped.push({ name: acct.name, reason: why });
       continue;
     }
-    for (const k of LOCAL_FIELDS) delete entry[k];
     out.push(entry);
-    if (acct.id) ids.push(acct.id);
+    ids.push(acct.id);
   }
   return { accounts: out, ids, fileBacked, skipped };
 }
@@ -207,11 +211,19 @@ export async function openBundle(bundle, passphrase) {
       throw new TransferError('The export\'s key-derivation settings are out of range.');
     }
     if (passphrase == null || passphrase === '') throw new TransferError('This export is encrypted: a passphrase is needed.');
-    const key = await deriveKey(passphrase, Buffer.from(e.salt, 'base64'), e);
+    // GCM in Node accepts a tag as short as 4 bytes unless told otherwise, and
+    // a 4-byte tag is 32 bits of authentication: the length is pinned, here and
+    // on the decipher.
+    const iv = Buffer.from(String(e.iv), 'base64');
+    const tag = Buffer.from(String(e.tag), 'base64');
+    if (iv.length !== 12 || tag.length !== 16 || typeof bundle.data !== 'string') {
+      throw new TransferError('Wrong passphrase, or the file was changed after it was exported.');
+    }
+    const key = await deriveKey(passphrase, Buffer.from(String(e.salt), 'base64'), e);
     try {
-      const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(e.iv, 'base64'));
+      const decipher = createDecipheriv('aes-256-gcm', key, iv, { authTagLength: 16 });
       decipher.setAAD(associatedData(bundle));
-      decipher.setAuthTag(Buffer.from(e.tag, 'base64'));
+      decipher.setAuthTag(tag);
       const plain = Buffer.concat([decipher.update(Buffer.from(bundle.data, 'base64')), decipher.final()]);
       accounts = JSON.parse(plain.toString('utf8')).accounts;
     } catch {
@@ -219,7 +231,54 @@ export async function openBundle(bundle, passphrase) {
     }
   }
   if (!Array.isArray(accounts)) throw new TransferError('The export holds no account list.');
-  return accounts.filter(a => a && typeof a === 'object' && typeof a.name === 'string' && a.name !== '' && typeof a.type === 'string');
+  // All or nothing: one bad record refuses the file, so an import never leaves
+  // half of it applied or an entry the rest of the program trips over later.
+  const problems = accounts.map((a, i) => {
+    const why = invalidAccount(a);
+    return why && `  #${i + 1}${typeof a?.name === 'string' ? ` "${a.name}"` : ''}: ${why}`;
+  }).filter(Boolean);
+  if (problems.length) throw new TransferError(`The export holds account records this TeamClaude cannot use:\n${problems.join('\n')}`);
+  return accounts;
+}
+
+/** Fields that, when present, must be a string (or null). */
+const STRING_FIELDS = ['provider', 'upstream', 'refreshToken', 'email', 'accountUuid', 'orgUuid', 'orgName', 'accountId', 'userId', 'organizationType', 'rateLimitTier', 'seatTier'];
+
+/**
+ * Why an imported record cannot become a config entry, or null when it can.
+ * Checks what the rest of the program relies on: a known type, the credential
+ * that type needs, and the shape of the fields read without a guard.
+ * @param {any} a
+ * @returns {string|null}
+ */
+export function invalidAccount(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return 'not an account record';
+  if (typeof a.name !== 'string' || a.name.trim() === '') return 'no name';
+  if (a.type === 'oauth') {
+    if (typeof a.accessToken !== 'string' || a.accessToken === '') return 'no access token';
+  } else if (a.type === 'apikey') {
+    if (typeof a.apiKey !== 'string' || a.apiKey === '') return 'no API key';
+  } else {
+    return `unknown account type ${JSON.stringify(a.type)}`;
+  }
+  for (const k of STRING_FIELDS) {
+    if (a[k] != null && typeof a[k] !== 'string') return `${k} is not a string`;
+  }
+  if (a.expiresAt != null && !Number.isFinite(a.expiresAt)) return 'expiresAt is not a number';
+  if (a.priority != null && !Number.isFinite(a.priority)) return 'priority is not a number';
+  if (a.disabled != null && typeof a.disabled !== 'boolean') return 'disabled is not true or false';
+  return null;
+}
+
+/**
+ * What kind of account a record is: its type, provider, and whether it is a
+ * third-party backend. Records of different kinds are never one account, even
+ * under one name: an OAuth token stored on an API-key entry would be sent as
+ * an `x-api-key`, and the other way round the old credential would linger.
+ * @param {Record<string, any>} a
+ */
+function accountKind(a) {
+  return `${a?.type}|${providerOf(a)}|${a?.upstream ? 'backend' : ''}`;
 }
 
 /**
@@ -275,7 +334,11 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
   for (const raw of incoming) {
     const acct = { ...raw };
     for (const k of LOCAL_FIELDS) delete acct[k];
-    const idx = findUpsertTarget(config.accounts, acct);
+    // Matched among entries of the same kind only (see accountKind).
+    const kind = accountKind(acct);
+    const sameKind = config.accounts.map((a, i) => ({ a, i })).filter(({ a }) => accountKind(a) === kind);
+    const hit = findUpsertTarget(sameKind.map(({ a }) => a), acct);
+    const idx = hit < 0 ? -1 : sameKind[hit].i;
     if (idx < 0) {
       acct.name = freeName(config.accounts, acct);
       acct.source = 'transfer';
@@ -314,4 +377,57 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
     updated.push(prev.name);
   }
   return { added, updated, skipped };
+}
+
+/**
+ * Names of exported accounts whose login on disk is no longer the one in the
+ * export (or whose row is gone): something renewed it after the snapshot, and
+ * the copy in the file is dead.
+ * @param {Array<Record<string, any>>} exported
+ * @param {string[]} ids - parallel to `exported`
+ * @param {Array<Record<string, any>>} diskAccounts
+ * @returns {string[]}
+ */
+export function changedSinceExport(exported, ids, diskAccounts) {
+  /** @type {string[]} */
+  const changed = [];
+  exported.forEach((acct, i) => {
+    const row = diskAccounts.find(a => a?.id === ids[i]);
+    // A file-backed row stores no token of its own to compare.
+    if (row?.importFrom || (row && !row.accessToken && !row.apiKey && providerOf(row) === 'codex')) return;
+    if (!row || !sameCredential(row, acct)) changed.push(acct.name);
+  });
+  return changed;
+}
+
+/**
+ * Write `text` to `path`, readable by the owner only from its first byte.
+ *
+ * A new file is created exclusively at 0600. With `force`, an existing file
+ * is replaced through a private temporary file and a rename, not opened for
+ * writing: opening it keeps the mode it had, so a world-readable file would
+ * be readable while the tokens went in.
+ * @param {string} path
+ * @param {string} text
+ * @param {{ force?: boolean }} [opts]
+ */
+export async function writePrivateFile(path, text, { force = false } = {}) {
+  const target = force ? `${path}.${randomBytes(6).toString('hex')}.tmp` : path;
+  const handle = await open(target, 'wx', 0o600);
+  try {
+    await handle.writeFile(text);
+    await handle.sync();
+  } catch (err) {
+    await handle.close().catch(() => {});
+    await unlink(target).catch(() => {});
+    throw err;
+  }
+  await handle.close();
+  if (!force) return;
+  try {
+    await rename(target, path);
+  } catch (err) {
+    await unlink(target).catch(() => {});
+    throw err;
+  }
 }

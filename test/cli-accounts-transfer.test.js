@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import { mkdtemp, writeFile, readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,12 +15,15 @@ const cliPath = fileURLToPath(new URL('../src/index.js', import.meta.url));
 
 const PROXY_ENV = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy'];
 
-/** @param {Array<Record<string, any>>} accounts */
-async function writeConfig(accounts) {
+/**
+ * @param {Array<Record<string, any>>} accounts
+ * @param {number} [port]
+ */
+async function writeConfig(accounts, port = 3) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-transfer-'));
   const path = join(dir, 'config.json');
   await writeFile(path, JSON.stringify({
-    proxy: { port: 3, apiKey: 'tc-test' },
+    proxy: { port, apiKey: 'tc-test' },
     upstream: 'https://api.anthropic.com',
     upstreamProxy: false,
     autoUpdate: false,
@@ -35,10 +39,13 @@ async function writeConfig(accounts) {
  */
 function runCli(configPath, cliArgs, extraEnv = {}) {
   /** @type {Record<string, string|undefined>} */
-  const env = { ...process.env, TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1', ...extraEnv };
-  // TEAMROUTER_* wins over TEAMCLAUDE_*: an inherited one would point at a real config.
+  const env = { ...process.env };
+  // TEAMROUTER_* wins over TEAMCLAUDE_*: an inherited one would point at a real
+  // config. And an operator's own export passphrase must not reach a test that
+  // checks what happens without one.
   for (const k of Object.keys(env)) if (k.startsWith('TEAMROUTER_')) delete env[k];
-  for (const k of PROXY_ENV) delete env[k];
+  for (const k of [...PROXY_ENV, 'TEAMCLAUDE_EXPORT_PASSPHRASE']) delete env[k];
+  Object.assign(env, { TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' }, extraEnv);
   const child = spawn(process.execPath, [cliPath, ...cliArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
@@ -129,4 +136,37 @@ test('--disable-source disables the exported accounts here; --plain writes reada
   const bundle = JSON.parse(await readFile(file, 'utf8'));
   assert.equal(bundle.encryption, null);
   assert.equal(bundle.accounts[0].disabled, undefined, 'the export carries the state from before it disabled them');
+});
+
+test('--disable-source is refused while a server listens on the proxy port', async () => {
+  // Any listener on the port reads as a running server; nothing is sent to it
+  // beyond the connect.
+  const listener = net.createServer(sock => sock.destroy());
+  await new Promise(resolve => listener.listen(0, '127.0.0.1', () => resolve(undefined)));
+  try {
+    const port = /** @type {import('node:net').AddressInfo} */ (listener.address()).port;
+    const source = await writeConfig(SOURCE_ACCOUNTS, port);
+    const file = join(source.dir, 'accounts.tcx');
+    const res = await runCli(source.path, ['accounts', 'export', file, '--disable-source'], PASS);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /server is running/);
+    await assert.rejects(stat(file), { code: 'ENOENT' });
+    const after = JSON.parse(await readFile(source.path, 'utf8')).accounts;
+    assert.deepEqual(after.map((/** @type {any} */ a) => a.disabled), [undefined, undefined]);
+  } finally {
+    await new Promise(resolve => listener.close(() => resolve(undefined)));
+  }
+});
+
+test('a file with a malformed record leaves the destination unchanged', async () => {
+  const target = await writeConfig([]);
+  const file = join(target.dir, 'bad.json');
+  await writeFile(file, JSON.stringify({
+    format: 'teamrouter-accounts', v: 1, exportedAt: 'x', count: 2, encryption: null,
+    accounts: [SOURCE_ACCOUNTS[0], { name: 'broken', type: 'apikey', apiKey: { nested: true } }],
+  }));
+  const res = await runCli(target.path, ['accounts', 'import', file]);
+  assert.equal(res.code, 1);
+  assert.match(res.stderr, /"broken": no API key/);
+  assert.deepEqual(JSON.parse(await readFile(target.path, 'utf8')).accounts, []);
 });

@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, readFile, stat, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   collectExportAccounts, createBundle, openBundle, mergeImportedAccounts, checkBundle, isEncryptedBundle, TransferError,
-  BUNDLE_FORMAT, BUNDLE_VERSION,
+  invalidAccount, changedSinceExport, writePrivateFile, BUNDLE_FORMAT, BUNDLE_VERSION,
 } from '../src/account-transfer.js';
 
 // A cheap scrypt cost so the suite does not pay for the real one per test.
@@ -144,4 +147,62 @@ test('a different account with a taken name gets a free one', () => {
   const res = mergeImportedAccounts(config, [claude()]);
   assert.deepEqual(res.added, ['demo-a@example.com (Demo Org)']);
   assert.equal(config.accounts.length, 2);
+});
+
+test('a truncated GCM tag is refused, not accepted as a shorter one', async () => {
+  const bundle = await createBundle([claude()], 'correct horse', { kdf: FAST_KDF });
+  const short = Buffer.from(bundle.encryption.tag, 'base64').subarray(0, 4).toString('base64');
+  await assert.rejects(openBundle({ ...bundle, encryption: { ...bundle.encryption, tag: short } }, 'correct horse'), TransferError);
+});
+
+test('a record that is not a usable account refuses the whole file', async () => {
+  assert.equal(invalidAccount(claude()), null);
+  assert.equal(invalidAccount(apikey()), null);
+  assert.match(String(invalidAccount(apikey({ apiKey: { nested: true } }))), /API key/);
+  assert.match(String(invalidAccount({ name: 'x', type: 'weird', accessToken: 't' })), /unknown account type/);
+  assert.match(String(invalidAccount(claude({ accessToken: undefined }))), /access token/);
+  assert.match(String(invalidAccount(claude({ expiresAt: 'soon' }))), /expiresAt/);
+  assert.match(String(invalidAccount(claude({ orgUuid: 42 }))), /orgUuid/);
+  const bundle = await createBundle([claude(), apikey({ apiKey: { nested: true } })], null);
+  await assert.rejects(openBundle(bundle, null), /#2 "key-demo": no API key/);
+});
+
+test('export leaves out a record the import side would refuse', async () => {
+  const { accounts, skipped } = await collectExportAccounts([claude(), { name: 'odd', type: 'weird', accessToken: 't' }]);
+  assert.deepEqual(accounts.map(a => a.name), ['demo-a@example.com']);
+  assert.match(skipped[0].reason, /unknown account type/);
+});
+
+test('an OAuth login and an API key under one name stay two accounts, both ways', () => {
+  const keyHere = { accounts: [apikey({ name: 'shared' })] };
+  const r1 = mergeImportedAccounts(keyHere, [claude({ name: 'shared', accountUuid: undefined, orgUuid: undefined })], { force: true });
+  assert.deepEqual(r1.added, ['shared (Demo Org)']);
+  assert.equal(keyHere.accounts[0].apiKey, 'sk-demo-1');
+  assert.equal('accessToken' in keyHere.accounts[0], false);
+
+  const oauthHere = { accounts: [claude({ name: 'shared' })] };
+  const r2 = mergeImportedAccounts(oauthHere, [apikey({ name: 'shared' })], { force: true });
+  assert.deepEqual(r2.added, ['shared (2)']);
+  assert.equal(oauthHere.accounts[0].type, 'oauth');
+  assert.equal('apiKey' in oauthHere.accounts[0], false);
+  assert.equal(oauthHere.accounts[1].type, 'apikey');
+});
+
+test('changedSinceExport names a login renewed after the snapshot', async () => {
+  const { accounts, ids } = await collectExportAccounts([claude(), codex()]);
+  assert.deepEqual(changedSinceExport(accounts, ids, [claude(), codex()]), []);
+  assert.deepEqual(changedSinceExport(accounts, ids, [claude({ refreshToken: 'rotated' }), codex()]), ['demo-a@example.com']);
+  assert.deepEqual(changedSinceExport(accounts, ids, [codex()]), ['demo-a@example.com'], 'a row gone since is changed too');
+});
+
+test('writePrivateFile never replaces a file without force, and with it replaces a 0644 one at 0600', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-private-'));
+  const path = join(dir, 'export.json');
+  await writeFile(path, 'old', { mode: 0o644 });
+  await assert.rejects(writePrivateFile(path, 'new'), { code: 'EEXIST' });
+  assert.equal(await readFile(path, 'utf8'), 'old');
+  await writePrivateFile(path, 'new', { force: true });
+  assert.equal(await readFile(path, 'utf8'), 'new');
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(dir), ['export.json'], 'no temporary file is left behind');
 });

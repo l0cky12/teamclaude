@@ -160,14 +160,14 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 Setting up another of your machines doesn't have to mean signing in to every account again. Export the accounts from a machine that already has them, copy the file over, and import it:
 
 ```bash
-# on the machine that is already set up
+# on the machine that is already set up (stop its server first)
 teamclaude accounts export ~/teamclaude-accounts.tcx --disable-source
 
 # on the new machine
 teamclaude accounts import ~/teamclaude-accounts.tcx
 ```
 
-Both commands ask for a passphrase on the terminal: export asks twice and wants at least 8 characters. For a script, set `TEAMCLAUDE_EXPORT_PASSPHRASE` instead. The file is written with mode `0600` and an existing file is never overwritten unless you pass `--force`. Delete the file once the new machine is set up. It holds live logins.
+Both commands ask for a passphrase on the terminal: export asks twice and wants at least 8 characters. For a script, set `TEAMCLAUDE_EXPORT_PASSPHRASE` instead. The file is written with mode `0600`, and an existing file is never overwritten unless you pass `--force`. Even then it's replaced through a new private file, never by writing into the old one, so an old file's looser permissions don't apply. Delete the file once the new machine is set up. It holds live logins.
 
 **What goes into the file.** Every account that has a stored login: Claude and Codex OAuth accounts, API keys and [third-party backends](#third-party-backend-accounts). For each one, the file holds its identity, its tokens or key, and the settings that mean the same thing on any machine (`priority`, `disabled`, `switchThreshold`, `modelMap`, spending caps and so on). What stays behind is what belongs to the machine: the entry `id`, `source`, per-account [`routing`](#per-account-routing-routing) (it names a proxy, often with a password, that the new machine may not reach) and quota readings, which are learned again from traffic. An [`importFrom`](#delegating-credentials-to-a-file-importfrom) account, or a Codex account that reads `~/.codex/auth.json`, has its tokens read from that file and written into the export, since the path means nothing on the other machine.
 
@@ -175,13 +175,14 @@ Both commands ask for a passphrase on the terminal: export asks twice and wants 
 
 **Import never signs anything in or out.** It reads the file, merges it into the config under the config lock, and tells a running server to reload. It doesn't refresh a token, fetch a profile or talk to callback.net, so it spends no quota and rotates no tokens. Matching works as for `login`: identity first (account and organization for Claude, ChatGPT account and user for Codex), the display name only when nothing contradicts it.
 
-- An account the new machine doesn't have is added under its exported name. A name already taken by a different account gets the organization or a number appended.
+- The whole file is checked first. If any record lacks the credential its type needs, has an unknown type, or holds a field of the wrong shape, nothing is imported and the bad records are listed.
+- An account the new machine doesn't have is added under its exported name. A name already taken by a different account gets the organization or a number appended. An OAuth login and an API key (or a Claude and a Codex login, or a backend) are never treated as one account, even when they share a name.
 - An account it already has is updated only when the imported token is newer (a later `expiresAt`). Only the login and identity are updated: the name, priority, routing and other settings stay this machine's own. `--force` replaces the login even when this machine's own is newer, or when there's nothing to compare, such as two different API keys.
 - An account that reads its login from a file here (`importFrom`) is left alone. The next reload would read that file again over anything written to it.
 
 The summary lists each account as added, updated or skipped, with the reason for every skip.
 
-**One login, one machine.** Claude and Codex both rotate the refresh token on every renewal. Two machines renewing the same copied login sign each other out of that account, and it lands in `error` ("needs re-login") on whichever renews second. So after exporting, stop using the accounts on the old machine. `--disable-source` does that for you: it [disables](#managing-accounts) the exported accounts on the old machine once the file is written (`teamclaude enable <name>` undoes it). It disables them rather than removing them, so a callback.net tombstone can't follow the accounts to the new machine. An `importFrom` account's login is also still held by Claude Code or the Codex CLI on the old machine, and the export says so.
+**One login, one machine.** Claude and Codex both rotate the refresh token on every renewal. Two machines renewing the same copied login sign each other out of that account, and it lands in `error` ("needs re-login") on whichever renews second. So after exporting, stop using the accounts on the old machine. `--disable-source` does that for you: it [disables](#managing-accounts) the exported accounts on the old machine once the file is written (`teamclaude enable <name>` undoes it). It refuses to run while that machine's server is up, because a running server can renew a login between the snapshot and the disable. Then the file would hold a dead login while the live one sat disabled. If a login still changes before the disable (another `teamclaude` command renewing it, say), the file is deleted, nothing is disabled, and you're asked to run the export again. It disables them rather than removing them, so a callback.net tombstone can't follow the accounts to the new machine. An `importFrom` account's login is also still held by Claude Code or the Codex CLI on the old machine, and the export says so.
 
 If you want the same accounts live on several machines at once, use [callback.net sync](#syncing-accounts-across-machines-callbacknet) instead. It hands renewals between installs through a lock, so they never sign each other out. The two work together: import onto a new machine, then sign it in to callback.net.
 

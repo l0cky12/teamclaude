@@ -3,9 +3,9 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
-import { readFile, open as openFile, chmod } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -60,7 +60,7 @@ import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
-import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, TransferError } from './account-transfer.js';
+import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -186,8 +186,9 @@ const TRANSFER_USAGE = [
   '(asked for on the terminal, or TEAMCLAUDE_EXPORT_PASSPHRASE); --plain skips',
   'that. --force on export overwrites an existing file; on import it replaces',
   'logins this machine already has even when its own are newer.',
-  '--disable-source disables the exported accounts here once the file is written:',
-  'two machines renewing the same login sign each other out of it.',
+  '--disable-source disables the exported accounts here once the file is written',
+  '(stop the server first): two machines renewing the same login sign each other',
+  'out of it.',
 ].join('\n');
 
 const args = process.argv.slice(2);
@@ -2191,32 +2192,37 @@ async function accountsExportCommand() {
   const disableSource = args.includes('--disable-source');
 
   const config = await loadOrCreateConfig();
+  // A running server renews tokens at any moment, and a renewal between the
+  // snapshot and the disable would leave the file holding a dead login while
+  // the live one sits disabled here. Stopped, nothing renews them.
+  if (disableSource && config.proxy?.port && await isProxyUp(config.proxy.port)) {
+    console.error(`A TeamClaude server is running on port ${config.proxy.port}. Stop it first (quit the TUI, or 'teamclaude service uninstall'),`);
+    console.error('then export with --disable-source: a running server can renew a login after it is written to the file.');
+    process.exit(1);
+  }
+  // Asked before the snapshot, so the tokens are read the moment before they are written.
+  const passphrase = plain ? null : await transferPassphrase({ confirm: true });
   // --disable-source pairs the exported rows by entry id on a fresh read.
   await persistMintedAccountIds(config);
-  const { accounts, ids, fileBacked, skipped } = await collectExportAccounts(config.accounts);
+  /** @type {Awaited<ReturnType<typeof collectExportAccounts>>} */
+  let snapshot = { accounts: [], ids: [], fileBacked: [], skipped: [] };
+  await withConfigLock(getConfigPath(), async () => {
+    snapshot = await collectExportAccounts((await loadConfig() || config).accounts);
+  });
+  const { accounts, ids, fileBacked, skipped } = snapshot;
   for (const s of skipped) console.error(`Skipped "${s.name}": ${s.reason}`);
   if (accounts.length === 0) {
     console.error('No accounts with a stored login to export.');
     process.exit(1);
   }
 
-  const passphrase = plain ? null : await transferPassphrase({ confirm: true });
   const bundle = await createBundle(accounts, passphrase);
-  let handle;
   try {
-    // 'wx' so an existing file (maybe an earlier export) is never replaced by accident.
-    handle = await openFile(file, force ? 'w' : 'wx', 0o600);
+    await writePrivateFile(file, JSON.stringify(bundle, null, 2) + '\n', { force });
   } catch (/** @type {any} */ err) {
     console.error(err?.code === 'EEXIST' ? `${file} already exists (--force to overwrite it).` : `Cannot write ${file}: ${err?.message || err}`);
     process.exit(1);
   }
-  try {
-    await handle.writeFile(JSON.stringify(bundle, null, 2) + '\n');
-  } finally {
-    await handle.close();
-  }
-  // An overwritten file keeps the mode it had; tokens are owner-only either way.
-  await chmod(file, 0o600).catch(() => {});
 
   console.log(`Exported ${accounts.length} account${accounts.length === 1 ? '' : 's'} (${transferBreakdown(accounts)}) to ${file}`);
   if (plain) console.error('Warning: the file is NOT encrypted. Anyone who reads it can use these accounts. Delete it once imported.');
@@ -2229,11 +2235,21 @@ async function accountsExportCommand() {
   if (disableSource) {
     const wanted = new Set(ids);
     let disabled = 0;
+    /** @type {string[]} */
+    let changed = [];
     const updated = await atomicConfigUpdate((/** @type {{ accounts: Array<Record<string, any>> }} */ disk) => {
+      // Disable only what the file still holds the live login for.
+      changed = changedSinceExport(accounts, ids, disk.accounts);
+      if (changed.length) return;
       for (const a of disk.accounts) {
         if (wanted.has(a.id) && !a.disabled) { a.disabled = true; disabled++; }
       }
     });
+    if (changed.length) {
+      await unlink(file).catch(() => {});
+      console.error(`${changed.join(', ')} renewed while the export was written, so the file held a dead login. It was deleted and nothing was disabled. Run the export again.`);
+      process.exit(1);
+    }
     console.log(`Disabled ${disabled} account${disabled === 1 ? '' : 's'} on this machine (teamclaude enable <name> undoes it).`);
     await notifyRunningServer(updated);
   } else {
