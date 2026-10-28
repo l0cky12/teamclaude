@@ -206,3 +206,32 @@ test('writePrivateFile never replaces a file without force, and with it replaces
   assert.equal((await stat(path)).mode & 0o777, 0o600);
   assert.deepEqual(await readdir(dir), ['export.json'], 'no temporary file is left behind');
 });
+
+test('two backends sharing a name stay apart unless they are the same service', () => {
+  const deepseek = { name: 'fallback', type: 'oauth', upstream: 'https://api.deepseek.com/anthropic', accessToken: 'ds-key' };
+  const zai = { name: 'fallback', type: 'oauth', upstream: 'https://api.z.ai/api/anthropic', accessToken: 'zai-key' };
+  const config = { accounts: [{ ...deepseek }] };
+  const res = mergeImportedAccounts(config, [zai], { force: true });
+  assert.deepEqual(res.added, ['fallback (2)']);
+  assert.equal(config.accounts[0].accessToken, 'ds-key', 'the DeepSeek key is not replaced by the z.ai one');
+  assert.equal(config.accounts[1].upstream, zai.upstream);
+
+  const same = mergeImportedAccounts(config, [{ ...deepseek, upstream: 'https://API.DeepSeek.com/anthropic/', accessToken: 'ds-key-2' }], { force: true });
+  assert.deepEqual(same.updated, ['fallback'], 'host case and a trailing slash are the same service');
+  assert.equal(config.accounts[0].accessToken, 'ds-key-2');
+});
+
+test('a setting with the wrong shape refuses the file; fields this version does not know stay behind', async () => {
+  assert.match(String(invalidAccount(claude({ models: { bad: true } }))), /models has the wrong shape/);
+  assert.match(String(invalidAccount(claude({ modelMap: { a: 1 } }))), /modelMap/);
+  assert.match(String(invalidAccount(claude({ switchThreshold: 'high' }))), /switchThreshold/);
+  assert.match(String(invalidAccount(claude({ stripRequestFields: 'context_management' }))), /stripRequestFields/);
+  assert.equal(invalidAccount(claude({ switchThreshold: { default: 0.9, unified7d: 0.8 }, models: ['claude-x'], modelMap: { a: 'b' } })), null);
+  await assert.rejects(openBundle(await createBundle([claude({ models: { bad: true } })], null), null), /models has the wrong shape/);
+
+  const { accounts } = await collectExportAccounts([claude({ someFutureField: { x: 1 } })]);
+  assert.equal('someFutureField' in accounts[0], false);
+  const config = { accounts: [] };
+  mergeImportedAccounts(config, [{ ...claude(), someFutureField: 1 }]);
+  assert.equal('someFutureField' in config.accounts[0], false);
+});

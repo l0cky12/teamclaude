@@ -11,7 +11,8 @@
 // cipher's associated data, so editing it fails the decrypt instead of being
 // believed. Only `node:crypto`: no dependencies.
 //
-// What does NOT travel is what belongs to the machine: the entry id (the
+// Only the fields listed in PORTABLE travel, each checked against the shape
+// its readers assume. What belongs to the machine stays: the entry id (the
 // running server pairs accounts by it), `source`, an `importFrom` path (its
 // tokens are read from the file and inlined instead) and per-account `routing`,
 // which names a proxy, often with its credentials, that the other machine may
@@ -43,8 +44,54 @@ const KDF_MAXMEM = 256 * 1024 * 1024;
 // unbounded N would let a crafted one hold the CPU and memory hostage.
 const MAX_LOG2_N = 20;
 
-/** Fields that belong to this machine and never leave it. */
-const LOCAL_FIELDS = ['id', 'source', 'importFrom', 'routing'];
+/** @param {any} v */
+const isString = (v) => typeof v === 'string';
+/** @param {any} v */
+const isBool = (v) => typeof v === 'boolean';
+/** @param {any} v */
+const isNumber = (v) => Number.isFinite(v);
+/** @param {any} v */
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+/** A number, or a per-bucket table of numbers (`switchThreshold`, `maxUsage`). @param {any} v */
+const isNumberOrTable = (v) => isNumber(v) || (isPlainObject(v) && Object.values(v).every(isNumber));
+/** @param {any} v */
+const isStringList = (v) => Array.isArray(v) && v.every(isString);
+/** @param {any} v */
+const isStringMap = (v) => isPlainObject(v) && Object.values(v).every(isString);
+
+/**
+ * The fields that travel, each with the shape its readers rely on. Anything
+ * else on an entry stays on the machine it is on: the machine's own fields
+ * (id, source, importFrom, routing) by omission, and fields this version does
+ * not know because it cannot vouch for them. A listed field with the wrong
+ * shape refuses the file (see invalidAccount): `models: {}` read as an array,
+ * for one, throws in the routing pass that scans every account.
+ * @type {Record<string, (v: any) => boolean>}
+ */
+const PORTABLE = {
+  name: isString, type: isString, provider: isString, upstream: isString,
+  accessToken: isString, refreshToken: isString, expiresAt: isNumber, apiKey: isString,
+  accountUuid: isString, orgUuid: isString, orgName: isString, email: isString,
+  accountId: isString, userId: isString, organizationType: isString,
+  rateLimitTier: isString, seatTier: isString, hasClaudeMax: isBool, hasClaudePro: isBool,
+  priority: isNumber, disabled: isBool, displayOrder: isNumber,
+  switchThreshold: isNumberOrTable, maxUsage: isNumberOrTable, maxSpend: isNumber,
+  allowExtraUsage: isBool, autoRedeemReset: isBool, messageThreads: isBool,
+  modelMap: isStringMap, models: isStringList, stripRequestFields: isStringList,
+};
+
+/**
+ * The portable fields of an entry: those in PORTABLE, with null and undefined
+ * values left out (an absent field and a null one read the same everywhere).
+ * @param {Record<string, any>} acct
+ * @returns {Record<string, any>}
+ */
+function portableFields(acct) {
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const k of Object.keys(PORTABLE)) if (acct[k] != null) out[k] = acct[k];
+  return out;
+}
 
 /** The credential fields: what an import replaces on an account already here. */
 const CREDENTIAL_FIELDS = ['accessToken', 'refreshToken', 'expiresAt', 'apiKey'];
@@ -84,21 +131,20 @@ export async function collectExportAccounts(accounts, { readClaude = importCrede
   const skipped = [];
   for (const acct of accounts || []) {
     if (!acct || typeof acct !== 'object') continue;
-    const entry = { ...acct };
+    const entry = portableFields(acct);
     const isCodex = providerOf(acct) === 'codex';
     const from = acct.importFrom || (isCodex && acct.type === 'oauth' && !acct.accessToken ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
     if (from) {
       try {
         const creds = isCodex ? await readCodex(from) : await readClaude(from);
         if (!creds?.accessToken) throw new Error(`no token in ${from}`);
-        for (const [k, v] of Object.entries(creds)) if (v != null) entry[k] = v;
+        for (const [k, v] of Object.entries(portableFields(creds))) entry[k] = v;
         fileBacked.push(acct.name);
       } catch (/** @type {any} */ err) {
         skipped.push({ name: acct.name, reason: `could not read ${from}: ${err?.message || err}` });
         continue;
       }
     }
-    for (const k of LOCAL_FIELDS) delete entry[k];
     // The importing side refuses a file holding one record it cannot use, so
     // such a record is left out here, where the operator can see why.
     const why = invalidAccount(entry);
@@ -241,13 +287,10 @@ export async function openBundle(bundle, passphrase) {
   return accounts;
 }
 
-/** Fields that, when present, must be a string (or null). */
-const STRING_FIELDS = ['provider', 'upstream', 'refreshToken', 'email', 'accountUuid', 'orgUuid', 'orgName', 'accountId', 'userId', 'organizationType', 'rateLimitTier', 'seatTier'];
-
 /**
  * Why an imported record cannot become a config entry, or null when it can.
  * Checks what the rest of the program relies on: a known type, the credential
- * that type needs, and the shape of the fields read without a guard.
+ * that type needs, and the shape of every field that travels (PORTABLE).
  * @param {any} a
  * @returns {string|null}
  */
@@ -261,12 +304,9 @@ export function invalidAccount(a) {
   } else {
     return `unknown account type ${JSON.stringify(a.type)}`;
   }
-  for (const k of STRING_FIELDS) {
-    if (a[k] != null && typeof a[k] !== 'string') return `${k} is not a string`;
+  for (const [k, ok] of Object.entries(PORTABLE)) {
+    if (a[k] != null && !ok(a[k])) return `${k} has the wrong shape (${JSON.stringify(a[k])})`;
   }
-  if (a.expiresAt != null && !Number.isFinite(a.expiresAt)) return 'expiresAt is not a number';
-  if (a.priority != null && !Number.isFinite(a.priority)) return 'priority is not a number';
-  if (a.disabled != null && typeof a.disabled !== 'boolean') return 'disabled is not true or false';
   return null;
 }
 
@@ -278,7 +318,24 @@ export function invalidAccount(a) {
  * @param {Record<string, any>} a
  */
 function accountKind(a) {
-  return `${a?.type}|${providerOf(a)}|${a?.upstream ? 'backend' : ''}`;
+  return `${a?.type}|${providerOf(a)}|${backendKey(a?.upstream)}`;
+}
+
+/**
+ * A third-party backend's upstream, normalized: the same service whatever the
+ * case of its host or a trailing slash, and two services never one. Two
+ * backends sharing a name are different accounts when they point at different
+ * services, and a DeepSeek key sent to z.ai is a key handed to the wrong party.
+ * @param {any} upstream
+ */
+function backendKey(upstream) {
+  if (!upstream) return '';
+  try {
+    const u = new URL(String(upstream));
+    return `${u.protocol}//${u.host.toLowerCase()}${u.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return String(upstream);
+  }
 }
 
 /**
@@ -332,8 +389,7 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
   /** @type {Array<{ name: string, reason: string }>} */
   const skipped = [];
   for (const raw of incoming) {
-    const acct = { ...raw };
-    for (const k of LOCAL_FIELDS) delete acct[k];
+    const acct = portableFields(raw);
     // Matched among entries of the same kind only (see accountKind).
     const kind = accountKind(acct);
     const sameKind = config.accounts.map((a, i) => ({ a, i })).filter(({ a }) => accountKind(a) === kind);

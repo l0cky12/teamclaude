@@ -44,7 +44,7 @@ function runCli(configPath, cliArgs, extraEnv = {}) {
   // config. And an operator's own export passphrase must not reach a test that
   // checks what happens without one.
   for (const k of Object.keys(env)) if (k.startsWith('TEAMROUTER_')) delete env[k];
-  for (const k of [...PROXY_ENV, 'TEAMCLAUDE_EXPORT_PASSPHRASE']) delete env[k];
+  for (const k of [...PROXY_ENV, 'TEAMCLAUDE_EXPORT_PASSPHRASE', 'TEAMCLAUDE_HOST']) delete env[k];
   Object.assign(env, { TEAMCLAUDE_CONFIG: configPath, TEAMCLAUDE_DISABLE_AUTOUPDATE: '1' }, extraEnv);
   const child = spawn(process.execPath, [cliPath, ...cliArgs], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
@@ -158,15 +158,47 @@ test('--disable-source is refused while a server listens on the proxy port', asy
   }
 });
 
-test('a file with a malformed record leaves the destination unchanged', async () => {
-  const target = await writeConfig([]);
-  const file = join(target.dir, 'bad.json');
-  await writeFile(file, JSON.stringify({
-    format: 'teamrouter-accounts', v: 1, exportedAt: 'x', count: 2, encryption: null,
-    accounts: [SOURCE_ACCOUNTS[0], { name: 'broken', type: 'apikey', apiKey: { nested: true } }],
-  }));
-  const res = await runCli(target.path, ['accounts', 'import', file]);
-  assert.equal(res.code, 1);
-  assert.match(res.stderr, /"broken": no API key/);
-  assert.deepEqual(JSON.parse(await readFile(target.path, 'utf8')).accounts, []);
+for (const [label, broken, why] of [
+  ['a malformed credential', { name: 'broken', type: 'apikey', apiKey: { nested: true } }, /"broken": no API key/],
+  ['a malformed setting', { name: 'broken', type: 'apikey', apiKey: 'sk-demo-1', models: { bad: true } }, /"broken": models has the wrong shape/],
+]) {
+  test(`a file with ${label} leaves the destination unchanged`, async () => {
+    const target = await writeConfig([]);
+    const file = join(target.dir, 'bad.json');
+    await writeFile(file, JSON.stringify({
+      format: 'teamrouter-accounts', v: 1, exportedAt: 'x', count: 2, encryption: null,
+      accounts: [SOURCE_ACCOUNTS[0], broken],
+    }));
+    const res = await runCli(target.path, ['accounts', 'import', file]);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, why);
+    assert.deepEqual(JSON.parse(await readFile(target.path, 'utf8')).accounts, []);
+  });
+}
+
+test('--disable-source finds a server bound to a configured host, not just 127.0.0.1', async (t) => {
+  const listener = net.createServer(sock => sock.destroy());
+  try {
+    await new Promise((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(0, '127.0.0.2', () => resolve(undefined));
+    });
+  } catch {
+    t.skip('127.0.0.2 is not a local address here');
+    return;
+  }
+  try {
+    const port = /** @type {import('node:net').AddressInfo} */ (listener.address()).port;
+    const source = await writeConfig(SOURCE_ACCOUNTS, port);
+    const config = JSON.parse(await readFile(source.path, 'utf8'));
+    config.proxy.host = '127.0.0.2';
+    await writeFile(source.path, JSON.stringify(config));
+    const file = join(source.dir, 'accounts.tcx');
+    const res = await runCli(source.path, ['accounts', 'export', file, '--disable-source'], PASS);
+    assert.equal(res.code, 1);
+    assert.match(res.stderr, /server is running/);
+    await assert.rejects(stat(file), { code: 'ENOENT' });
+  } finally {
+    await new Promise(resolve => listener.close(() => resolve(undefined)));
+  }
 });

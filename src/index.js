@@ -2192,16 +2192,17 @@ async function accountsExportCommand() {
   const disableSource = args.includes('--disable-source');
 
   const config = await loadOrCreateConfig();
+  // Asked before the snapshot, so the tokens are read the moment before they are written.
+  const passphrase = plain ? null : await transferPassphrase({ confirm: true });
   // A running server renews tokens at any moment, and a renewal between the
   // snapshot and the disable would leave the file holding a dead login while
-  // the live one sits disabled here. Stopped, nothing renews them.
-  if (disableSource && config.proxy?.port && await isProxyUp(config.proxy.port)) {
+  // the live one sits disabled here. Stopped, nothing renews them. Checked
+  // after the prompt, which can take as long as the operator likes.
+  if (disableSource && config.proxy?.port && await isServerUp(config)) {
     console.error(`A TeamClaude server is running on port ${config.proxy.port}. Stop it first (quit the TUI, or 'teamclaude service uninstall'),`);
     console.error('then export with --disable-source: a running server can renew a login after it is written to the file.');
     process.exit(1);
   }
-  // Asked before the snapshot, so the tokens are read the moment before they are written.
-  const passphrase = plain ? null : await transferPassphrase({ confirm: true });
   // --disable-source pairs the exported rows by entry id on a fresh read.
   await persistMintedAccountIds(config);
   /** @type {Awaited<ReturnType<typeof collectExportAccounts>>} */
@@ -3511,15 +3512,28 @@ async function notifyRunningServer(config) {
 // Quick liveness probe: is something listening on the local proxy port?
 // A successful TCP connect is enough (the proxy is local). Times out fast so a
 // down proxy doesn't add noticeable latency to `claude` launches via the alias.
-function isProxyUp(port, timeout = 600) {
+function isProxyUp(port, timeout = 600, host = '127.0.0.1') {
   return new Promise(resolve => {
-    const socket = net.connect({ host: '127.0.0.1', port });
+    const socket = net.connect({ host, port });
     const done = up => { socket.destroy(); resolve(up); };
     socket.setTimeout(timeout);
     socket.once('connect', () => done(true));
     socket.once('timeout', () => done(false));
     socket.once('error', () => resolve(false));
   });
+}
+
+/**
+ * Whether this config's server is listening where it binds: TEAMCLAUDE_HOST or
+ * proxy.host when set (see serverCommand), else loopback. A wildcard bind is
+ * not an address to dial, so both loopbacks are tried for it.
+ * @param {Record<string, any>} config
+ */
+async function isServerUp(config) {
+  const bound = envVar('HOST') || config.proxy?.host || '127.0.0.1';
+  const hosts = (bound === '0.0.0.0' || bound === '::') ? ['127.0.0.1', '::1'] : [String(bound).replace(/^\[|\]$/g, '')];
+  const up = await Promise.all(hosts.map(h => isProxyUp(config.proxy.port, 600, h)));
+  return up.includes(true);
 }
 
 function handleServerListenError(err, port) {
