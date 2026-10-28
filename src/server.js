@@ -32,6 +32,7 @@ import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
+import { createPeerDirectory, parsePeerUrl, relayToPeer } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -479,6 +480,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   const boundHost = () => bindHost || config.proxy?.host;
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
+  const peerDirectory = createPeerDirectory();
 
   // The log directory is made up front and synchronously, so a path that
   // cannot be a directory (a file sitting there, no permission) is reported
@@ -632,6 +634,24 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
       }
 
+      // Linked instances (peers.js): the list, and the relay to one of them.
+      // Operator only: the relay presents the peer's own proxy key, and a
+      // client key is a tenant of this proxy, not of the operator's others.
+      // Below the gates above, so a relayed write passed the same
+      // cross-origin and DNS-rebinding checks a local one does.
+      const peerRoute = req.url === '/teamclaude/peers' ? null : parsePeerUrl(req.url || '');
+      if (peerRoute || (req.method === 'GET' && req.url === '/teamclaude/peers')) {
+        if (req.tcClient) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'a client key cannot reach linked instances' }));
+          return;
+        }
+        if (peerRoute) { await relayToPeer(req, res, config, peerRoute); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ peers: peerDirectory.list(config) }));
+        return;
+      }
+
       // Status endpoint
       if (req.method === 'GET' && req.url === '/teamclaude/status') {
         const status = accountManager.getStatus({ sessionDetail: config.proxy?.sessionDetail !== false });
@@ -642,7 +662,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // `clientKeys` names the configured keys, never the keys themselves: the
         // Clients page lists a key that has not been used yet, which the usage
         // table cannot, since it only holds names that spent something.
-        res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus() }, null, 2));
+        res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus(),
+          // The dashboard's instance picker. Names and addresses only, never
+          // the keys, and only for the operator, who is the one who may use them.
+          ...(req.tcClient ? {} : { peers: peerDirectory.list(config) }) }, null, 2));
         return;
       }
 

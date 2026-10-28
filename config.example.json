@@ -84,5 +84,12 @@
     "checkUrl": "https://api.ipify.org",
     "ttlSeconds": 30,
     "holdSeconds": 120
-  }
+  },
+  "peers": [
+    {
+      "name": "server",
+      "url": "http://100.64.0.2:3456",
+      "apiKey": "your-server-proxy-key"
+    }
+  ]
 }

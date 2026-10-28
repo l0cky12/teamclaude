@@ -1095,7 +1095,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, storedTheme = null } = {}) {
+function bootPage({ storedKey = null, storedTheme = null, storedInstance = null } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
   // kept, so a test can drive a control the page created for itself — the
@@ -1123,6 +1123,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const store = new Map([
     ...(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []),
     ...(storedTheme ? [['teamclaude-dashboard-theme', storedTheme]] : []),
+    ...(storedInstance ? [['teamclaude-dashboard-instance', storedInstance]] : []),
   ]);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
@@ -1448,7 +1449,7 @@ test('dashboard page is self-contained: no external resources', () => {
   assert.doesNotMatch(html, /href\s*=\s*["']https?:/i);
   assert.doesNotMatch(html, /@import/i);
   // The data fetch targets the gated status endpoint, same origin.
-  assert.match(html, /fetch\('\/teamclaude\/status'/);
+  assert.match(html, /fetch\(at\('\/teamclaude\/status'\)/);
 });
 
 test('GET /teamclaude/dashboard serves HTML without a key; other methods are a local 404', async () => {
@@ -2185,4 +2186,32 @@ test('logEventClient names the client key and the program that sent a request', 
   assert.equal(logEventClient({ client: 'laptop', agent: 'claude-cli/2.1.3' }), 'laptop · claude-cli/2.1.3');
   assert.equal(logEventClient({ agent: 'codex_cli_rs/0.46.0' }), 'codex_cli_rs/0.46.0');
   assert.equal(logEventClient({ kind: 'signin' }), '');
+});
+
+test('a page showing a linked instance asks it through the relay, and this machine for the picker', async () => {
+  const page = bootPage({ storedInstance: 'my server' });
+  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/status');
+  await page.answer(200, { accounts: [] });
+  // The picker lists THIS machine's peers, not the ones the instance shown has.
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { peers: [{ name: 'my server', url: 'http://100.64.0.2:3456', state: 'online' }] });
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, '');
+  assert.match(page.byId('instanceText').textContent, /my server \(http:\/\/100\.64\.0\.2:3456\)/);
+
+  // Controls go to the instance shown too.
+  page.byId('reload').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/reload');
+});
+
+test('a page on this machine hides the picker until a peer is configured', async () => {
+  const page = bootPage();
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(200, { accounts: [], peers: [] });
+  assert.equal(page.byId('instances').style.display, 'none');
+  page.poll();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'offline' }] });
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, 'none');
+  assert.equal(page.requests.length, 0, 'the picker came with the status read');
 });
