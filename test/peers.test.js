@@ -25,7 +25,7 @@ function call(port, method, path, { headers = {}, body } = {}) {
 }
 
 /** A stand-in peer that records what it was asked and answers `reply`. */
-async function fakePeer(reply = () => [200, { ok: true }]) {
+async function fakePeer(reply = () => [200, { ok: true }], contentType = 'application/json') {
   const seen = [];
   const server = http.createServer((req, res) => {
     let body = '';
@@ -33,8 +33,8 @@ async function fakePeer(reply = () => [200, { ok: true }]) {
     req.on('end', () => {
       seen.push({ method: req.method, url: req.url, key: req.headers['x-api-key'], body });
       const [status, json] = reply(req);
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(json));
+      res.writeHead(status, { 'Content-Type': contentType });
+      res.end(typeof json === 'string' ? json : JSON.stringify(json));
     });
   });
   return { server, seen, port: await listen(server) };
@@ -67,8 +67,18 @@ test('configuredPeers skips unusable entries and duplicate names', () => {
     { name: 'badurl', url: 'ftp://x', apiKey: 'c' },
     { url: 'http://x:1', apiKey: 'd' },
     null,
+    // Dot segments: a browser would fold the relay path onto a local route.
+    { name: '.', url: 'http://x:1', apiKey: 'e' },
+    { name: '..', url: 'http://x:1', apiKey: 'e' },
+    // A query or fragment would swallow the control path appended after it.
+    { name: 'query', url: 'http://x:1/other?x=1', apiKey: 'f' },
+    { name: 'fragment', url: 'http://x:1/#f', apiKey: 'f' },
+    { name: 'based', url: 'http://x:1/base/?', apiKey: 'g' },
   ] });
-  assert.deepEqual(peers, [{ name: 'server', url: 'http://100.64.0.2:3456', apiKey: 'a' }]);
+  assert.deepEqual(peers, [
+    { name: 'server', url: 'http://100.64.0.2:3456', apiKey: 'a' },
+    { name: 'based', url: 'http://x:1/base', apiKey: 'g' },
+  ]);
   assert.deepEqual(configuredPeers({}), []);
 });
 
@@ -174,4 +184,28 @@ test('the peer directory answers from what it last saw and re-checks only when s
   config.peers[0].apiKey = 'k2';
   assert.equal(dir.list(config)[0].state, 'checking');
   assert.equal(checks.length, 3);
+});
+
+test('a peer behind a base path is asked under it, with the route\'s query kept apart', async () => {
+  const peer = await fakePeer();
+  try {
+    await withProxy([{ name: 'server', url: `http://127.0.0.1:${peer.port}/base/`, apiKey: 'peer-key' }], async (port) => {
+      assert.equal((await call(port, 'GET', '/teamclaude/peers/server/logs?after=3')).status, 200);
+      assert.deepEqual(peer.seen.map(r => r.url), ['/base/teamclaude/logs?after=3']);
+    });
+  } finally { peer.server.close(); }
+});
+
+test('a peer\'s reply reaches the browser as inert JSON, whatever it claims to be', async () => {
+  const peer = await fakePeer(() => [200, '<script>alert(localStorage.length)</script>'], 'text/html');
+  try {
+    await withProxy([{ name: 'server', url: `http://127.0.0.1:${peer.port}`, apiKey: 'peer-key' }], async (port) => {
+      const res = await fetch(`http://127.0.0.1:${port}/teamclaude/peers/server/status`);
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('content-type'), 'application/json');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.match(res.headers.get('content-security-policy'), /default-src 'none'; sandbox/);
+      assert.equal(await res.text(), '<script>alert(localStorage.length)</script>');
+    });
+  } finally { peer.server.close(); }
 });

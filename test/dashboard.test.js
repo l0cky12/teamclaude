@@ -2190,11 +2190,11 @@ test('logEventClient names the client key and the program that sent a request', 
 
 test('a page showing a linked instance asks it through the relay, and this machine for the picker', async () => {
   const page = bootPage({ storedInstance: 'my server' });
-  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/status');
-  await page.answer(200, { accounts: [] });
-  // The picker lists THIS machine's peers, not the ones the instance shown has.
+  // This machine first: it proves the key and lists what there is to pick.
   assert.equal(page.requests[0].url, '/teamclaude/peers');
   await page.answer(200, { peers: [{ name: 'my server', url: 'http://100.64.0.2:3456', state: 'online' }] });
+  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/status');
+  await page.answer(200, { accounts: [] });
   assert.equal(page.byId('instances').style.display, '');
   assert.equal(page.byId('instanceNote').style.display, '');
   assert.match(page.byId('instanceText').textContent, /my server \(http:\/\/100\.64\.0\.2:3456\)/);
@@ -2214,4 +2214,37 @@ test('a page on this machine hides the picker until a peer is configured', async
   assert.equal(page.byId('instances').style.display, '');
   assert.equal(page.byId('instanceNote').style.display, 'none');
   assert.equal(page.requests.length, 0, 'the picker came with the status read');
+});
+
+test('a linked instance that is down never hides the way back, even across a key prompt', async () => {
+  const page = bootPage({ storedInstance: 'server' });
+  await page.answer(401, {});
+  assert.equal(page.byId('keybox').style.display, 'block');
+  page.byId('key').value = 'tc-local';
+  page.byId('go').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { peers: [{ name: 'server', url: 'http://100.64.0.2:3456', state: 'offline' }] });
+  await page.answer(502, { ok: false, unreachable: true, error: 'server is unreachable (connect ECONNREFUSED)' });
+  assert.equal(page.byId('keybox').style.display, 'none');
+  assert.equal(page.byId('app').style.display, '');
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, '');
+  assert.match(page.byId('err').textContent, /server is unreachable/);
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-local', 'the local key was never at fault');
+});
+
+test('a client key with a linked instance still picked goes back to this machine and keeps its key', async () => {
+  const page = bootPage({ storedKey: 'tc-client', storedInstance: 'server' });
+  await page.answer(403, { ok: false, error: 'a client key cannot reach linked instances' });
+  assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  page.poll();
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+});
+
+test('a picked name that is gone from the config is never asked for', async () => {
+  const page = bootPage({ storedInstance: '..' });
+  await page.answer(200, { peers: [{ name: 'server', url: 'http://h:1', state: 'online' }] });
+  assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+  assert.equal(page.requests.length, 0, 'nothing went out under the stale name');
 });

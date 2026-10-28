@@ -49,10 +49,16 @@ export function configuredPeers(config) {
   for (const p of Array.isArray(config?.peers) ? config.peers : []) {
     if (!p || typeof p.name !== 'string' || !p.name.trim() || typeof p.apiKey !== 'string' || !p.apiKey) continue;
     const name = p.name.trim();
-    if (seen.has(name) || !/^https?:\/\/[^/]/i.test(String(p.url))) continue;
-    try { new URL(p.url); } catch { continue; }
+    // `.` and `..` would be dot segments in the relay path: a browser folds
+    // /teamclaude/peers/../reload into a LOCAL /teamclaude/reload.
+    if (seen.has(name) || name === '.' || name === '..' || !/^https?:\/\/[^/]/i.test(String(p.url))) continue;
+    let u;
+    try { u = new URL(p.url); } catch { continue; }
+    // A query or fragment would swallow the control path appended after it.
+    if (u.search || u.hash) continue;
+    u.search = ''; u.hash = '';
     seen.add(name);
-    out.push({ name, url: String(p.url).replace(/\/+$/, ''), apiKey: p.apiKey });
+    out.push({ name, url: u.href.replace(/\/+$/, ''), apiKey: p.apiKey });
   }
   return out;
 }
@@ -87,10 +93,15 @@ function shownUrl(url) {
  * @param {Peer} peer
  * @param {string} rest  route under /teamclaude/, with any query
  * @param {{ method?: string, body?: Buffer | null, contentType?: string, timeoutMs?: number }} [opts]
- * @returns {Promise<{ status: number, contentType: string, body: Buffer }>}
+ * @returns {Promise<{ status: number, body: Buffer }>}
  */
 export function peerRequest(peer, rest, { method = 'GET', body = null, contentType, timeoutMs = RELAY_TIMEOUT_MS } = {}) {
-  const target = new URL(peer.url + '/teamclaude/' + rest);
+  // Built from parsed fields, so the control path lands in the path and the
+  // route's query in the query, whatever the configured address looks like.
+  const target = new URL(peer.url);
+  const q = rest.indexOf('?');
+  target.pathname = target.pathname.replace(/\/+$/, '') + '/teamclaude/' + (q < 0 ? rest : rest.slice(0, q));
+  target.search = q < 0 ? '' : rest.slice(q);
   const lib = target.protocol === 'https:' ? https : http;
   /** @type {Record<string, string | number>} */
   const headers = { 'x-api-key': peer.apiKey };
@@ -105,7 +116,7 @@ export function peerRequest(peer, rest, { method = 'GET', body = null, contentTy
         if (size > MAX_REPLY_BYTES) { req.destroy(new Error('reply too large')); return; }
         chunks.push(c);
       });
-      res.on('end', () => resolve({ status: res.statusCode || 502, contentType: String(res.headers['content-type'] || 'application/json'), body: Buffer.concat(chunks) }));
+      res.on('end', () => resolve({ status: res.statusCode || 502, body: Buffer.concat(chunks) }));
       res.on('error', reject);
     });
     req.on('timeout', () => req.destroy(new Error('timed out')));
@@ -159,7 +170,15 @@ export async function relayToPeer(req, res, config, route) {
     } catch { /* not JSON: the status says enough */ }
     return reply(502, { ok: false, error: `${peer.name} refused the request (${out.status}${why ? ': ' + why : ''}); check its key in peers` });
   }
-  res.writeHead(out.status, { 'Content-Type': out.contentType, 'Cache-Control': 'no-store' });
+  // Whatever the peer says its reply is, it reaches the browser as inert
+  // JSON: the control plane answers nothing else, and a peer's HTML served
+  // from this origin would run beside the key the dashboard keeps here.
+  res.writeHead(out.status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
+  });
   res.end(out.body);
 }
 

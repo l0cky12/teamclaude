@@ -1785,7 +1785,8 @@ const PAGE = `<!doctype html>
   }
   function pickInstance(name) {
     if (name) localStorage.setItem(INSTANCE, name); else localStorage.removeItem(INSTANCE);
-    location.reload();
+    peer = name;
+    if (typeof location !== 'undefined') location.reload();
   }
   var navButtons = {};
   var navCounts = {};
@@ -3411,11 +3412,33 @@ ${SHARED_HELPERS}
     if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through this machine.';
   }
 
+  // Showing a linked instance, this machine is asked first: that read is what
+  // proves the key the page holds, and it lists the instances to pick from, so
+  // the picker (and the way back) is there even while the one shown is down.
+  // Resolves whether the instance shown should be asked next.
   function pollInstances() {
-    fetch('/teamclaude/peers', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
-      .then(function (res) { return res.ok ? res.json() : null; })
-      .then(function (j) { if (j) renderInstances(j.peers); })
-      .catch(function () {});
+    return fetch('/teamclaude/peers', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return false; }
+        // A valid key that may not reach linked instances (a client key), or
+        // the loopback exemption refusing a key-less page: either way this
+        // machine's own page is the one to show, and it handles the rest.
+        if (res.status === 403) { pickInstance(''); return false; }
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json().then(function (j) {
+          document.getElementById('keybox').style.display = 'none';
+          document.getElementById('app').style.display = '';
+          renderInstances(j.peers);
+          return !!peer;
+        });
+      })
+      .catch(function (e) {
+        var err = document.getElementById('err');
+        err.style.display = 'block';
+        err.textContent = 'Cannot reach the proxy: ' + e.message;
+        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
+        return false;
+      });
   }
 
   function showKeybox() {
@@ -3427,6 +3450,11 @@ ${SHARED_HELPERS}
 
   function poll() {
     if (holdPoll) return;
+    if (peer) { pollInstances().then(function (ok) { if (ok) pollStatus(); }); return; }
+    pollStatus();
+  }
+
+  function pollStatus() {
     fetch(at('/teamclaude/status'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -3441,7 +3469,7 @@ ${SHARED_HELPERS}
       .then(function (s) {
         if (!s) return;
         // A linked instance's status lists ITS peers; the picker lists ours.
-        if (peer) pollInstances(); else renderInstances(s.peers);
+        if (!peer) renderInstances(s.peers);
         document.getElementById('keybox').style.display = 'none';
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
@@ -3452,7 +3480,6 @@ ${SHARED_HELPERS}
         var err = document.getElementById('err');
         err.style.display = 'block';
         err.textContent = peer ? e.message : 'Cannot reach the proxy: ' + e.message;
-        if (peer) pollInstances();
         // The banner lives inside #app, which stays hidden until a first
         // status lands; without this a first poll that fails is a blank page.
         if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
