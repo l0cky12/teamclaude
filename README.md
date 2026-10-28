@@ -52,6 +52,7 @@ teamclaude status            # live proxy status, needs a running server
 teamclaude disable <name>    # pause an account without removing it
 teamclaude priority <name> 1 # rotation order, lower = preferred
 teamclaude alias --install   # make plain `claude` go through the proxy
+teamclaude accounts export f # move your logins to a new machine (then: accounts import f)
 teamclaude help              # everything else
 ```
 
@@ -77,7 +78,7 @@ Step-by-step lifecycle: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 | Page | Contents |
 | --- | --- |
-| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, syncing tokens across machines via callback.net, per-account proxy routing, Codex accounts, third-party backends |
+| [Accounts](docs/accounts.md) | OAuth login, import, API keys, multiple orgs, moving accounts to a new machine (export/import), syncing tokens across machines via callback.net, per-account proxy routing, Codex accounts, third-party backends |
 | [Usage](docs/usage.md) | Server and TUI, running Claude Code, shell alias, command reference, browser dashboard, MCP endpoint, logging |
 | [Routing](docs/routing.md) | Rotation, the two kinds of 429, storm control, model routes, session spreading, pinning, prompt cache |
 | [Quota](docs/quota.md) | Quota probe, keep-warm, holding on exhaustion |

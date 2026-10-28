@@ -3,9 +3,9 @@
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createWriteStream } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -60,6 +60,7 @@ import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
+import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
 // account on disk talks to the store through a sync of its own instead.
@@ -174,6 +175,20 @@ const CALLBACK_USAGE = [
   '       teamclaude callback status                            Show who is signed in',
   '       teamclaude callback sync                              Reconcile the running server with the credential store now',
   '       teamclaude callback logout                            Revoke the session and forget it',
+].join('\n');
+
+const TRANSFER_USAGE = [
+  'Usage: teamclaude accounts export <file> [--plain] [--force] [--disable-source]',
+  '       teamclaude accounts import <file> [--force]',
+  '',
+  'Move your own accounts to another of your machines without signing in again.',
+  'The file holds live login tokens and is encrypted with a passphrase you choose',
+  '(asked for on the terminal, or TEAMCLAUDE_EXPORT_PASSPHRASE); --plain skips',
+  'that. --force on export overwrites an existing file; on import it replaces',
+  'logins this machine already has even when its own are newer.',
+  '--disable-source disables the exported accounts here once the file is written',
+  '(stop the server first): two machines renewing the same login sign each other',
+  'out of it.',
 ].join('\n');
 
 const args = process.argv.slice(2);
@@ -1920,6 +1935,8 @@ async function switchCommand() {
 // ── accounts ────────────────────────────────────────────────
 
 async function accountsCommand() {
+  if (args[1] === 'export') return accountsExportCommand();
+  if (args[1] === 'import') return accountsImportCommand();
   const config = await loadOrCreateConfig();
   const verbose = args.includes('-v') || args.includes('--verbose');
 
@@ -2076,6 +2093,213 @@ async function accountsCommand() {
       }
     }
   }
+}
+
+// ── accounts export / import ────────────────────────────────
+
+/** The first argument after `accounts <sub>` that is not a flag. */
+function transferFileArg() {
+  return args.slice(2).find(a => !a.startsWith('-')) || null;
+}
+
+/**
+ * Read one line from the terminal without echoing it.
+ * @param {string} prompt
+ * @returns {Promise<string>}
+ */
+function readHiddenLine(prompt) {
+  const input = process.stdin;
+  process.stderr.write(prompt);
+  input.setRawMode(true);
+  input.setEncoding('utf8');
+  input.resume();
+  return new Promise((resolve) => {
+    let value = '';
+    const finish = () => {
+      input.off('data', onData);
+      input.setRawMode(false);
+      input.pause();
+      process.stderr.write('\n');
+      resolve(value);
+    };
+    /** @param {string} chunk */
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n' || ch === '\u0004') return finish();
+        if (ch === '\u0003') { // Ctrl-C: raw mode swallows the signal, so act on it
+          input.setRawMode(false);
+          process.stderr.write('\n');
+          process.exit(130);
+        }
+        if (ch === '\u007f' || ch === '\b') { value = value.slice(0, -1); continue; }
+        if (ch >= ' ') value += ch; // drops escape sequences a paste can carry
+      }
+    };
+    input.on('data', onData);
+  });
+}
+
+/**
+ * The passphrase for an export or import: TEAMCLAUDE_EXPORT_PASSPHRASE, else
+ * asked for on the terminal (twice for an export, so a typo cannot lock the
+ * file). Exits when there is no way to get one.
+ * @param {{ confirm: boolean }} opts
+ */
+async function transferPassphrase({ confirm }) {
+  let passphrase = envVar('EXPORT_PASSPHRASE') || null;
+  if (!passphrase) {
+    if (!process.stdin.isTTY) {
+      console.error('A passphrase is needed: run this in a terminal, or set TEAMCLAUDE_EXPORT_PASSPHRASE.');
+      if (confirm) console.error('(--plain writes the file unencrypted instead.)');
+      process.exit(1);
+    }
+    passphrase = await readHiddenLine(confirm ? 'Choose a passphrase for the export file: ' : 'Passphrase: ');
+    if (confirm && passphrase.length >= 8 && await readHiddenLine('Repeat it: ') !== passphrase) {
+      console.error('The passphrases did not match. Nothing was written.');
+      process.exit(1);
+    }
+  }
+  if (confirm && passphrase.length < 8) {
+    console.error('Use a passphrase of at least 8 characters: the file holds live login tokens.');
+    process.exit(1);
+  }
+  return passphrase;
+}
+
+/** "Claude", "Codex", "API key" or "backend": how an account is counted in a summary. */
+function transferKind(/** @type {Record<string, any>} */ a) {
+  if (a.type === 'apikey') return 'API key';
+  if (a.upstream) return 'backend';
+  return providerOf(a) === 'codex' ? 'Codex' : 'Claude';
+}
+
+/** "12 Claude, 3 Codex" for a list of accounts. */
+function transferBreakdown(/** @type {Array<Record<string, any>>} */ accounts) {
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+  for (const a of accounts) counts.set(transferKind(a), (counts.get(transferKind(a)) || 0) + 1);
+  return [...counts].map(([k, n]) => `${n} ${k}`).join(', ');
+}
+
+async function accountsExportCommand() {
+  const file = transferFileArg();
+  if (!file) {
+    console.error(TRANSFER_USAGE);
+    process.exit(1);
+  }
+  const plain = args.includes('--plain');
+  const force = args.includes('--force');
+  const disableSource = args.includes('--disable-source');
+
+  const config = await loadOrCreateConfig();
+  // Asked before the snapshot, so the tokens are read the moment before they are written.
+  const passphrase = plain ? null : await transferPassphrase({ confirm: true });
+  // A running server renews tokens at any moment, and a renewal between the
+  // snapshot and the disable would leave the file holding a dead login while
+  // the live one sits disabled here. Stopped, nothing renews them. Checked
+  // after the prompt, which can take as long as the operator likes.
+  if (disableSource && config.proxy?.port && await isServerUp(config)) {
+    console.error(`A TeamClaude server is running on port ${config.proxy.port}. Stop it first (quit the TUI, or 'teamclaude service uninstall'),`);
+    console.error('then export with --disable-source: a running server can renew a login after it is written to the file.');
+    process.exit(1);
+  }
+  // --disable-source pairs the exported rows by entry id on a fresh read.
+  await persistMintedAccountIds(config);
+  /** @type {Awaited<ReturnType<typeof collectExportAccounts>>} */
+  let snapshot = { accounts: [], ids: [], fileBacked: [], skipped: [] };
+  await withConfigLock(getConfigPath(), async () => {
+    snapshot = await collectExportAccounts((await loadConfig() || config).accounts);
+  });
+  const { accounts, ids, fileBacked, skipped } = snapshot;
+  for (const s of skipped) console.error(`Skipped "${s.name}": ${s.reason}`);
+  if (accounts.length === 0) {
+    console.error('No accounts with a stored login to export.');
+    process.exit(1);
+  }
+
+  const bundle = await createBundle(accounts, passphrase);
+  try {
+    await writePrivateFile(file, JSON.stringify(bundle, null, 2) + '\n', { force });
+  } catch (/** @type {any} */ err) {
+    console.error(err?.code === 'EEXIST' ? `${file} already exists (--force to overwrite it).` : `Cannot write ${file}: ${err?.message || err}`);
+    process.exit(1);
+  }
+
+  console.log(`Exported ${accounts.length} account${accounts.length === 1 ? '' : 's'} (${transferBreakdown(accounts)}) to ${file}`);
+  if (plain) console.error('Warning: the file is NOT encrypted. Anyone who reads it can use these accounts. Delete it once imported.');
+  else console.log('Encrypted with your passphrase. Import it on the other machine with:');
+  if (!plain) console.log(`  teamclaude accounts import ${file}`);
+  if (fileBacked.length) {
+    console.error(`Note: ${fileBacked.join(', ')} ${fileBacked.length === 1 ? 'reads its login' : 'read their logins'} from a Claude Code or Codex CLI file here; that tool still holds the same login.`);
+  }
+
+  if (disableSource) {
+    const wanted = new Set(ids);
+    let disabled = 0;
+    /** @type {string[]} */
+    let changed = [];
+    const updated = await atomicConfigUpdate((/** @type {{ accounts: Array<Record<string, any>> }} */ disk) => {
+      // Disable only what the file still holds the live login for.
+      changed = changedSinceExport(accounts, ids, disk.accounts);
+      if (changed.length) return;
+      for (const a of disk.accounts) {
+        if (wanted.has(a.id) && !a.disabled) { a.disabled = true; disabled++; }
+      }
+    });
+    if (changed.length) {
+      await unlink(file).catch(() => {});
+      console.error(`${changed.join(', ')} renewed while the export was written, so the file held a dead login. It was deleted and nothing was disabled. Run the export again.`);
+      process.exit(1);
+    }
+    console.log(`Disabled ${disabled} account${disabled === 1 ? '' : 's'} on this machine (teamclaude enable <name> undoes it).`);
+    await notifyRunningServer(updated);
+  } else {
+    console.error('Both machines now hold the same logins, and whichever renews one first signs the other out of it.');
+    console.error('Once the other machine is set up, stop TeamClaude here, or re-run with --disable-source.');
+  }
+}
+
+async function accountsImportCommand() {
+  const file = transferFileArg();
+  if (!file) {
+    console.error(TRANSFER_USAGE);
+    process.exit(1);
+  }
+  const force = args.includes('--force');
+
+  let bundle;
+  try {
+    bundle = JSON.parse(await readFile(file, 'utf-8'));
+  } catch (/** @type {any} */ err) {
+    console.error(`Cannot read ${file}: ${err?.message || err}`);
+    process.exit(1);
+  }
+  let incoming;
+  try {
+    checkBundle(bundle);
+    const passphrase = isEncryptedBundle(bundle) ? await transferPassphrase({ confirm: false }) : null;
+    incoming = await openBundle(bundle, passphrase);
+  } catch (err) {
+    if (!(err instanceof TransferError)) throw err;
+    console.error(err.message);
+    process.exit(1);
+  }
+
+  // Creates the file on a fresh machine. The merge itself runs on a fresh read
+  // under the config lock, so a running server's token writes are not lost.
+  await loadOrCreateConfig();
+  /** @type {ReturnType<typeof mergeImportedAccounts>} */
+  let result = { added: [], updated: [], skipped: [] };
+  const config = await atomicConfigUpdate((/** @type {{ accounts: Array<Record<string, any>> }} */ disk) => {
+    result = mergeImportedAccounts(disk, incoming, { force });
+  });
+
+  for (const name of result.added) console.log(`Added account "${name}"`);
+  for (const name of result.updated) console.log(`Updated account "${name}"`);
+  for (const s of result.skipped) console.log(`Skipped "${s.name}": ${s.reason}`);
+  console.log(`Imported from ${file}: ${result.added.length} added, ${result.updated.length} updated, ${result.skipped.length} skipped.`);
+  console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
 }
 
 // ── api ─────────────────────────────────────────────────────
@@ -2843,6 +3067,12 @@ Commands:
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser
   accounts            List configured accounts
+  accounts export <file> [--plain] [--force] [--disable-source]
+                      Write every account's login to an encrypted file, to set
+                      up another of your machines without signing in again
+  accounts import <file> [--force]
+                      Add the accounts from such a file; a login this machine
+                      already has is replaced only by a newer one
   switch [NAME]       Make the running server prefer one account (as 's' in the
                       TUI does); with no NAME, list accounts and mark the current
   remove <name>       Remove an account (by name or email; --org to disambiguate)
@@ -2918,6 +3148,9 @@ Environment:
                       reaches claude or the tools it spawns. An unknown account
                       is refused rather than silently rotated.
   TEAMCLAUDE_CONFIG   Path to the config file (default below)
+  TEAMCLAUDE_EXPORT_PASSPHRASE
+                      Passphrase for 'accounts export/import' instead of the
+                      terminal prompt (for scripts)
   TEAMCLAUDE_DISABLE_AUTOUPDATE=1
                       Skip the background self-update check
   Every TEAMCLAUDE_* variable is also read as TEAMROUTER_*, which wins when
@@ -3279,15 +3512,28 @@ async function notifyRunningServer(config) {
 // Quick liveness probe: is something listening on the local proxy port?
 // A successful TCP connect is enough (the proxy is local). Times out fast so a
 // down proxy doesn't add noticeable latency to `claude` launches via the alias.
-function isProxyUp(port, timeout = 600) {
+function isProxyUp(port, timeout = 600, host = '127.0.0.1') {
   return new Promise(resolve => {
-    const socket = net.connect({ host: '127.0.0.1', port });
+    const socket = net.connect({ host, port });
     const done = up => { socket.destroy(); resolve(up); };
     socket.setTimeout(timeout);
     socket.once('connect', () => done(true));
     socket.once('timeout', () => done(false));
     socket.once('error', () => resolve(false));
   });
+}
+
+/**
+ * Whether this config's server is listening where it binds: TEAMCLAUDE_HOST or
+ * proxy.host when set (see serverCommand), else loopback. A wildcard bind is
+ * not an address to dial, so both loopbacks are tried for it.
+ * @param {Record<string, any>} config
+ */
+async function isServerUp(config) {
+  const bound = envVar('HOST') || config.proxy?.host || '127.0.0.1';
+  const hosts = (bound === '0.0.0.0' || bound === '::') ? ['127.0.0.1', '::1'] : [String(bound).replace(/^\[|\]$/g, '')];
+  const up = await Promise.all(hosts.map(h => isProxyUp(config.proxy.port, 600, h)));
+  return up.includes(true);
 }
 
 function handleServerListenError(err, port) {
