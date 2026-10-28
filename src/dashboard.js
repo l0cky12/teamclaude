@@ -1780,6 +1780,10 @@ const PAGE = `<!doctype html>
   var INSTANCE = 'teamclaude-dashboard-instance';
   var peer = localStorage.getItem(INSTANCE) || '';
   var peerUrl = '';
+  // Whether this machine has let the page's key reach the linked instance yet.
+  // Nothing is relayed before it has: the relay's 403 for a client key would
+  // read as a bad key and throw a valid one away.
+  var peerChecked = false;
   function at(url) {
     return peer ? '/teamclaude/peers/' + encodeURIComponent(peer) + url.slice('/teamclaude'.length) : url;
   }
@@ -2847,7 +2851,8 @@ ${SHARED_HELPERS}
   }
 
   function pollLogs() {
-    if (logsInFlight) return;
+    // The status poll asks for the logs again once the check is through.
+    if (logsInFlight || (peer && !peerChecked)) return;
     logsInFlight = true;
     var held = logState.events;
     var after = held.length ? held[held.length - 1].id : 0;
@@ -3432,7 +3437,8 @@ ${SHARED_HELPERS}
           document.getElementById('keybox').style.display = 'none';
           document.getElementById('app').style.display = '';
           renderInstances(j.peers);
-          return !!peer;
+          peerChecked = !!peer;
+          return peerChecked;
         });
       })
       .catch(function (e) {
@@ -3446,6 +3452,7 @@ ${SHARED_HELPERS}
 
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
+    peerChecked = false;
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
     document.getElementById('key').focus();

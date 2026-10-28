@@ -2260,3 +2260,18 @@ test('a linked instance at a loopback address still signs in the remote way', as
   assert.equal(page.findLast(e => e.textContent === 'Open sign-in page').href, 'https://claude.ai/x?r=code-page');
   assert.ok(page.findLast(e => e.placeholder === 'Paste the code here'));
 });
+
+test('a page opened on Logs with a linked instance picked relays nothing before this machine allows it', async () => {
+  // The page reads its tab from the address; this one opens on Logs.
+  globalThis.location = { hash: '#logs', hostname: '', origin: '', reload() {} };
+  try {
+    const page = bootPage({ storedKey: 'tc-client', storedInstance: 'server' });
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/peers']);
+    await page.answer(403, { ok: false, error: 'a client key cannot reach linked instances' });
+    assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client', 'the valid key is kept');
+    assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+    assert.equal(page.requests.length, 0);
+  } finally {
+    delete globalThis.location;
+  }
+});
