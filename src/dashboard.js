@@ -1398,6 +1398,10 @@ const PAGE = `<!doctype html>
   .navbtn.sel { color: var(--text); background: var(--accent-bg); box-shadow: inset 2px 0 0 var(--accent); }
   .count { font-size: 11px; line-height: 18px; min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--panel2); color: var(--dim); text-align: center; font-variant-numeric: tabular-nums; }
   .count.bad { background: var(--bad); color: #fff; }
+  #instances { display: flex; flex-direction: column; gap: 4px; padding: 0 10px 6px; }
+  #instances label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); }
+  #instances select { width: 100%; font-size: 13px; }
+  #instanceNote { font-size: 12px; margin: 8px 0; color: var(--dim); }
   .sidefoot { margin-top: auto; padding: 14px 10px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--dim); }
   .sidefoot button { text-align: left; }
   .content { padding: 22px 28px 40px; min-width: 0; }
@@ -1610,6 +1614,10 @@ const PAGE = `<!doctype html>
 <div id="app" class="shell" style="display:none">
   <aside class="side">
     <div class="brand">${logoMarkup()}TeamRouter</div>
+    <div id="instances" style="display:none">
+      <label for="instance">Instance</label>
+      <select id="instance"></select>
+    </div>
     <nav id="nav"></nav>
     <div class="sidefoot">
       <button id="theme" class="more" type="button" title="Switch between following the system, light and dark"></button>
@@ -1625,6 +1633,7 @@ const PAGE = `<!doctype html>
     <div id="err"></div>
     <div id="problems" class="plist"></div>
     <div id="note"></div>
+    <div id="instanceNote" style="display:none"><span id="instanceText"></span> <button id="instanceBack" class="more" type="button">Back to this machine</button></div>
     <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="more" type="button">Change key</button></div>
 
     <section id="page-quota">
@@ -1764,6 +1773,25 @@ const PAGE = `<!doctype html>
     { key: 'settings', label: 'Settings', section: 'Control' },
   ];
   var currentPage = 'quota';
+  // The linked instance this page shows (peers.js), or '' for the machine it
+  // was opened on. Every request goes through at(), so each page, button and
+  // sign-in acts on the instance shown. Switching reloads the page: nothing
+  // one instance's page holds (its logs, its notes) carries over to another.
+  var INSTANCE = 'teamclaude-dashboard-instance';
+  var peer = localStorage.getItem(INSTANCE) || '';
+  var peerUrl = '';
+  // Whether this machine has let the page's key reach the linked instance yet.
+  // Nothing is relayed before it has: the relay's 403 for a client key would
+  // read as a bad key and throw a valid one away.
+  var peerChecked = false;
+  function at(url) {
+    return peer ? '/teamclaude/peers/' + encodeURIComponent(peer) + url.slice('/teamclaude'.length) : url;
+  }
+  function pickInstance(name) {
+    if (name) localStorage.setItem(INSTANCE, name); else localStorage.removeItem(INSTANCE);
+    peer = name;
+    if (typeof location !== 'undefined') location.reload();
+  }
   var navButtons = {};
   var navCounts = {};
   // Which provider tab the quota page is showing; kept across polls.
@@ -2373,7 +2401,7 @@ ${SHARED_HELPERS}
   function doClientKey(step, name, btn) {
     btn.disabled = true;
     var r = clientKeyRequest(step, name, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -2449,7 +2477,7 @@ ${SHARED_HELPERS}
     head.appendChild(el('b', '', 'Key for ' + name));
     head.appendChild(el('span', 'hint', existing ? 'Anyone who can see this screen can use the key.' : 'Copy it now, or come back with Show details.'));
     box.appendChild(head);
-    var origin = typeof location !== 'undefined' ? location.origin : '';
+    var origin = peer ? peerUrl : typeof location !== 'undefined' ? location.origin : '';
     var setup = clientKeySetup(origin, key);
     snippet(box, 'Key', key, 0);
     snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
@@ -2475,7 +2503,9 @@ ${SHARED_HELPERS}
         .catch(function (e) { return { kind: 'error', text: 'The test could not reach the proxy: ' + e.message }; })
         .then(function (out) { check.className = 'st ' + out.kind; check.textContent = out.text; test.disabled = false; });
     });
-    actions.appendChild(test);
+    // The test asks with the new key itself, which only the instance that
+    // issued it accepts; a linked one is reached with this machine's key.
+    if (!peer) actions.appendChild(test);
     actions.appendChild(button('btn', 'Done', hideIssuedKey));
     actions.appendChild(check);
     box.appendChild(actions);
@@ -2821,12 +2851,13 @@ ${SHARED_HELPERS}
   }
 
   function pollLogs() {
-    if (logsInFlight) return;
+    // The status poll asks for the logs again once the check is through.
+    if (logsInFlight || (peer && !peerChecked)) return;
     logsInFlight = true;
     var held = logState.events;
     var after = held.length ? held[held.length - 1].id : 0;
     var again = false;
-    fetch('/teamclaude/logs?after=' + after, { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+    fetch(at('/teamclaude/logs?after=' + after), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         if (!res.ok) throw new Error('status ' + res.status);
@@ -2949,7 +2980,7 @@ ${SHARED_HELPERS}
   function doSwitch(name, noteKey, btn) {
     btn.disabled = true;
     var r = switchRequest(name, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -2969,7 +3000,7 @@ ${SHARED_HELPERS}
   function doControlAccount(name, noteKey, spec, btn) {
     btn.disabled = true;
     var r = accountControlRequest(name, spec, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -2999,7 +3030,7 @@ ${SHARED_HELPERS}
   function doRemove(account, noteKey, btn) {
     btn.disabled = true;
     var r = removeRequest(account, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -3026,12 +3057,16 @@ ${SHARED_HELPERS}
   var SIGN_IN_LABEL = { claude: 'Claude', codex: 'Codex' };
 
   function pageHost() {
+    // A linked instance is another machine whatever its address says: one
+    // reached over an SSH tunnel at 127.0.0.1 still runs its sign-in callback
+    // listener over there, out of this browser's reach.
+    if (peer) return '';
     return typeof location !== 'undefined' ? location.hostname : '';
   }
 
   function signInFetch(step, body) {
     var r = signInRequest(step, body, localStorage.getItem(KEY));
-    return fetch(r.url, r.init).then(function (res) {
+    return fetch(at(r.url), r.init).then(function (res) {
       if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
       return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
     });
@@ -3252,7 +3287,7 @@ ${SHARED_HELPERS}
     btn.disabled = true;
     btn.textContent = 'Refreshing…';
     var r = refreshQuotaRequest(account, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -3279,7 +3314,7 @@ ${SHARED_HELPERS}
     if (!raw) { note('error', 'switch threshold: enter a percentage from 1 to 100'); return; }
     btn.disabled = true;
     var r = thresholdRequest(Number(raw), localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -3318,7 +3353,7 @@ ${SHARED_HELPERS}
     probeWanted = null;
     probeSaving = true;
     var r = probeIntervalRequest(seconds, localStorage.getItem(KEY));
-    fetch(r.url, r.init)
+    fetch(at(r.url), r.init)
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -3341,7 +3376,7 @@ ${SHARED_HELPERS}
 
   function doControl(path, label, btn) {
     btn.disabled = true;
-    fetch(path, { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+    fetch(at(path), { method: 'POST', headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
         return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
@@ -3356,8 +3391,68 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  // The instance picker: this machine and the linked ones it lists, each with
+  // what it last answered. Hidden while there is nothing to pick.
+  function renderInstances(list) {
+    var peers = Array.isArray(list) ? list : [];
+    var box = document.getElementById('instances');
+    box.style.display = peers.length || peer ? '' : 'none';
+    var shown = null;
+    peers.forEach(function (p) { if (p.name === peer) shown = p; });
+    // Gone from the config (or renamed): back to the machine that is certainly here.
+    if (peer && Array.isArray(list) && !shown) { pickInstance(''); return; }
+    peerUrl = shown ? shown.url : '';
+    var sel = document.getElementById('instance');
+    if (document.activeElement !== sel) {
+      sel.textContent = '';
+      var here = el('option', '', 'This machine');
+      here.value = '';
+      sel.appendChild(here);
+      peers.forEach(function (p) {
+        var o = el('option', '', p.name + (p.state === 'online' ? '' : ' (' + p.state + ')'));
+        o.value = p.name;
+        sel.appendChild(o);
+      });
+      sel.value = peer;
+    }
+    var noteBox = document.getElementById('instanceNote');
+    noteBox.style.display = peer ? '' : 'none';
+    if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through this machine.';
+  }
+
+  // Showing a linked instance, this machine is asked first: that read is what
+  // proves the key the page holds, and it lists the instances to pick from, so
+  // the picker (and the way back) is there even while the one shown is down.
+  // Resolves whether the instance shown should be asked next.
+  function pollInstances() {
+    return fetch('/teamclaude/peers', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return false; }
+        // A valid key that may not reach linked instances (a client key), or
+        // the loopback exemption refusing a key-less page: either way this
+        // machine's own page is the one to show, and it handles the rest.
+        if (res.status === 403) { pickInstance(''); return false; }
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json().then(function (j) {
+          document.getElementById('keybox').style.display = 'none';
+          document.getElementById('app').style.display = '';
+          renderInstances(j.peers);
+          peerChecked = !!peer;
+          return peerChecked;
+        });
+      })
+      .catch(function (e) {
+        var err = document.getElementById('err');
+        err.style.display = 'block';
+        err.textContent = 'Cannot reach the proxy: ' + e.message;
+        if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
+        return false;
+      });
+  }
+
   function showKeybox() {
     if (timer) { clearInterval(timer); timer = null; }
+    peerChecked = false;
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
     document.getElementById('key').focus();
@@ -3365,17 +3460,26 @@ ${SHARED_HELPERS}
 
   function poll() {
     if (holdPoll) return;
-    fetch('/teamclaude/status', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+    if (peer) { pollInstances().then(function (ok) { if (ok) pollStatus(); }); return; }
+    pollStatus();
+  }
+
+  function pollStatus() {
+    fetch(at('/teamclaude/status'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
         // that does not name this machine, e.g. behind a local reverse proxy
         // that adds no forwarding headers). A valid key clears that gate too.
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
-        if (!res.ok) throw new Error('status ' + res.status);
+        if (!res.ok) {
+          return res.json().catch(function () { return {}; }).then(function (j) { throw new Error(j.error || 'status ' + res.status); });
+        }
         return res.json();
       })
       .then(function (s) {
         if (!s) return;
+        // A linked instance's status lists ITS peers; the picker lists ours.
+        if (!peer) renderInstances(s.peers);
         document.getElementById('keybox').style.display = 'none';
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
@@ -3385,7 +3489,7 @@ ${SHARED_HELPERS}
       .catch(function (e) {
         var err = document.getElementById('err');
         err.style.display = 'block';
-        err.textContent = 'Cannot reach the proxy: ' + e.message;
+        err.textContent = peer ? e.message : 'Cannot reach the proxy: ' + e.message;
         // The banner lives inside #app, which stays hidden until a first
         // status lands; without this a first poll that fails is a blank page.
         if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
@@ -3486,6 +3590,8 @@ ${SHARED_HELPERS}
   // another one: the operator needs a way back to the key box.
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }
   document.getElementById('changeKey').addEventListener('click', forgetKey);
+  document.getElementById('instance').addEventListener('change', function () { pickInstance(this.value); });
+  document.getElementById('instanceBack').addEventListener('click', function () { pickInstance(''); });
   document.getElementById('forgetKey').addEventListener('click', forgetKey);
   document.getElementById('thrVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('thrSet').click();

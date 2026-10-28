@@ -1095,7 +1095,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, storedTheme = null } = {}) {
+function bootPage({ storedKey = null, storedTheme = null, storedInstance = null } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
   // kept, so a test can drive a control the page created for itself — the
@@ -1123,6 +1123,7 @@ function bootPage({ storedKey = null, storedTheme = null } = {}) {
   const store = new Map([
     ...(storedKey ? [['teamclaude-dashboard-key', storedKey]] : []),
     ...(storedTheme ? [['teamclaude-dashboard-theme', storedTheme]] : []),
+    ...(storedInstance ? [['teamclaude-dashboard-instance', storedInstance]] : []),
   ]);
   const localStorage = {
     getItem: k => (store.has(k) ? store.get(k) : null),
@@ -1448,7 +1449,7 @@ test('dashboard page is self-contained: no external resources', () => {
   assert.doesNotMatch(html, /href\s*=\s*["']https?:/i);
   assert.doesNotMatch(html, /@import/i);
   // The data fetch targets the gated status endpoint, same origin.
-  assert.match(html, /fetch\('\/teamclaude\/status'/);
+  assert.match(html, /fetch\(at\('\/teamclaude\/status'\)/);
 });
 
 test('GET /teamclaude/dashboard serves HTML without a key; other methods are a local 404', async () => {
@@ -2185,4 +2186,92 @@ test('logEventClient names the client key and the program that sent a request', 
   assert.equal(logEventClient({ client: 'laptop', agent: 'claude-cli/2.1.3' }), 'laptop · claude-cli/2.1.3');
   assert.equal(logEventClient({ agent: 'codex_cli_rs/0.46.0' }), 'codex_cli_rs/0.46.0');
   assert.equal(logEventClient({ kind: 'signin' }), '');
+});
+
+test('a page showing a linked instance asks it through the relay, and this machine for the picker', async () => {
+  const page = bootPage({ storedInstance: 'my server' });
+  // This machine first: it proves the key and lists what there is to pick.
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { peers: [{ name: 'my server', url: 'http://100.64.0.2:3456', state: 'online' }] });
+  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/status');
+  await page.answer(200, { accounts: [] });
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, '');
+  assert.match(page.byId('instanceText').textContent, /my server \(http:\/\/100\.64\.0\.2:3456\)/);
+
+  // Controls go to the instance shown too.
+  page.byId('reload').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/peers/my%20server/reload');
+});
+
+test('a page on this machine hides the picker until a peer is configured', async () => {
+  const page = bootPage();
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(200, { accounts: [], peers: [] });
+  assert.equal(page.byId('instances').style.display, 'none');
+  page.poll();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'offline' }] });
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, 'none');
+  assert.equal(page.requests.length, 0, 'the picker came with the status read');
+});
+
+test('a linked instance that is down never hides the way back, even across a key prompt', async () => {
+  const page = bootPage({ storedInstance: 'server' });
+  await page.answer(401, {});
+  assert.equal(page.byId('keybox').style.display, 'block');
+  page.byId('key').value = 'tc-local';
+  page.byId('go').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { peers: [{ name: 'server', url: 'http://100.64.0.2:3456', state: 'offline' }] });
+  await page.answer(502, { ok: false, unreachable: true, error: 'server is unreachable (connect ECONNREFUSED)' });
+  assert.equal(page.byId('keybox').style.display, 'none');
+  assert.equal(page.byId('app').style.display, '');
+  assert.equal(page.byId('instances').style.display, '');
+  assert.equal(page.byId('instanceNote').style.display, '');
+  assert.match(page.byId('err').textContent, /server is unreachable/);
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-local', 'the local key was never at fault');
+});
+
+test('a client key with a linked instance still picked goes back to this machine and keeps its key', async () => {
+  const page = bootPage({ storedKey: 'tc-client', storedInstance: 'server' });
+  await page.answer(403, { ok: false, error: 'a client key cannot reach linked instances' });
+  assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  page.poll();
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+});
+
+test('a picked name that is gone from the config is never asked for', async () => {
+  const page = bootPage({ storedInstance: '..' });
+  await page.answer(200, { peers: [{ name: 'server', url: 'http://h:1', state: 'online' }] });
+  assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+  assert.equal(page.requests.length, 0, 'nothing went out under the stale name');
+});
+
+test('a linked instance at a loopback address still signs in the remote way', async () => {
+  const page = bootPage({ storedInstance: 'tunnel' });
+  await page.answer(200, { peers: [{ name: 'tunnel', url: 'http://127.0.0.1:9999', state: 'online' }] });
+  await page.answer(200, { accounts: [] });
+  page.click('Sign in to Claude');
+  assert.equal(page.requests[0].url, '/teamclaude/peers/tunnel/login/start');
+  await page.answer(200, { ok: true, id: 'abc', provider: 'claude', url: 'https://claude.ai/x?r=code-page', browserUrl: 'http://localhost:9/x', listening: true });
+  // The callback listener is on the linked machine, so the code page it is.
+  assert.equal(page.findLast(e => e.textContent === 'Open sign-in page').href, 'https://claude.ai/x?r=code-page');
+  assert.ok(page.findLast(e => e.placeholder === 'Paste the code here'));
+});
+
+test('a page opened on Logs with a linked instance picked relays nothing before this machine allows it', async () => {
+  // The page reads its tab from the address; this one opens on Logs.
+  globalThis.location = { hash: '#logs', hostname: '', origin: '', reload() {} };
+  try {
+    const page = bootPage({ storedKey: 'tc-client', storedInstance: 'server' });
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/peers']);
+    await page.answer(403, { ok: false, error: 'a client key cannot reach linked instances' });
+    assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client', 'the valid key is kept');
+    assert.equal(page.store.has('teamclaude-dashboard-instance'), false);
+    assert.equal(page.requests.length, 0);
+  } finally {
+    delete globalThis.location;
+  }
 });

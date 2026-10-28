@@ -378,6 +378,22 @@ http://localhost:3456/teamclaude/dashboard
 
 The page is a static asset and loads without a key; the data does not — its script fetches `/teamclaude/status` first, and asks for the proxy key only if the server refuses the request without one. Loopback browsers are key-exempt as everywhere else, so on the proxy's own machine there is no prompt. A key that is entered is kept in the browser's localStorage, and a 401 after a key rotation brings the prompt back. On deployments that put the proxy behind TLS this works remotely too: `https://your-proxy.example.com/teamclaude/dashboard`.
 
+### Linked instances
+
+If you run TeamClaude on more than one machine, say your desktop and a server, link them so the dashboard on either one shows both. Each machine keeps its own accounts and config; linking only lets one dashboard reach the others.
+
+On each machine, list the other ones under [`peers`](configuration.md) with an address this machine can reach and that proxy's own `proxy.apiKey`. That proxy must listen on that address, so set its `proxy.host` (a Tailscale or LAN IP, for example) and its `proxy.apiKey`:
+
+```json
+"peers": [
+  { "name": "server", "url": "http://100.64.0.2:3456", "apiKey": "<the server's proxy.apiKey>" }
+]
+```
+
+Then reload (`teamclaude reload` or **Reload config**). An **Instance** picker appears at the top of the sidebar, with **This machine** and each linked instance. Pick one and every page shows that machine: quota, accounts, logs, routing and settings. Every button acts on it too, sign-in included. A line above the page says which instance you are looking at, with **Back to this machine**. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
+
+The browser still talks only to the machine it opened the page on. That proxy forwards each request to the linked one as `/teamclaude/peers/<name>/<route>`, using the key from `peers`, so the browser never holds the other machine's key. Only the control routes are forwarded, never model traffic. Only the operator can use the forwarding: the shared `proxy.apiKey`, or a key-exempt loopback browser. A `proxy.clientKeys` key gets a 403. If a linked machine is down, its pages show why and the rest keep working. If the machine you opened the page on is down, open the dashboard on another one instead.
+
 ## MCP endpoint
 
 The running server can expose its control plane to Claude Code (or any other MCP client) as tools, so an agent can check the fleet's quota, switch accounts, or change a rotation setting from inside a session. It is off until the config says otherwise:
