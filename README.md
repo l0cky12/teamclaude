@@ -74,9 +74,9 @@ More on accounts, including API keys and one email in several organisations: [do
 
 ### Keeps your sessions running
 
-- **Switches accounts before a limit.** When an account reaches 98% of its 5-hour or weekly limit (you can change the number), new requests go to the next account. If a request does hit a limit, it is retried once on another account, so Claude Code never sees the error while any account still has room.
+- **Switches accounts before a limit.** When an account reaches 98% of its 5-hour or weekly limit (you can change the number), new requests go to the next account. If a request does hit a spent limit, it is sent again on another account, so Claude Code never sees the error while any account still has room.
 - **Tracks each model's limit on its own.** An account that is out of Fable quota still serves Opus and Sonnet.
-- **Knows a spent limit from a short burst limit.** On a per-minute rate limit it slows down on the same account instead of switching, so the prompt cache stays warm.
+- **Knows a spent limit from a short burst limit.** A per-minute rate limit doesn't make it switch accounts for good. The request tries one other idle account at most, then waits, so a burst isn't passed down the whole pool and prompt caches stay warm.
 - **Can wait instead of failing.** With `holdSeconds` set, a request that arrives when every account is spent is held open until an account resets (up to that many seconds) instead of failing. An unattended run then finishes on its own. Off by default.
 - **Can fall back to paid extra usage.** With `allowExtraUsage` on, Anthropic's paid extra usage is used only after every account's free quota is gone, and stops as soon as a window resets. Off by default, because it costs money.
 - **Refreshes sign-ins by itself**, before they expire, and saves the new tokens.
@@ -91,7 +91,7 @@ Set `distributeSessions` (or run `teamclaude distribute <mode>`) to pick how con
 | `on` | Each new conversation goes to the least busy account and stays there, so its prompt cache is reused. |
 | `adaptive` | Fills the account with the least weekly quota left first, so less quota is wasted when windows reset. Takes plan size (Pro, Max 5x, Max 20x) into account. |
 | `affinity` | Uses an account whose 5-hour window is about to reset first, and never moves a conversation while its account can still serve it. |
-| `drain` | Uses the account whose weekly limit resets soonest until it runs out, then the next one. |
+| `drain` | Uses the account whose weekly limit resets soonest until it runs out, then the next one. It moves early if an account that resets even sooner becomes available again. |
 
 You can also set a priority order, send certain models to certain accounts (`teamclaude route`), or pin one session to one account with `TC_ACCT`. Details: [docs/routing.md](docs/routing.md).
 
@@ -99,7 +99,7 @@ You can also set a priority order, send certain models to certain accounts (`tea
 
 Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`. To use it from another machine, set `proxy.host` to `0.0.0.0` (or a Tailscale or LAN address), open the same page at that address, and enter the proxy key.
 
-- **Quota:** how much is left on every account, as 5-hour, weekly and Fable bars with reset times. Tabs for Claude, Codex and each backend, plus pooled summary cards. Accounts that are out of quota are hidden until you ask to see them. Each account has a **Refresh quota** button that reads its quota without spending any.
+- **Quota:** how much is left on every account, as 5-hour, weekly and Fable bars with reset times. Tabs for Claude, Codex and each backend, plus pooled summary cards. Accounts that are out of quota are hidden until you ask to see them. Enabled accounts whose quota can be read get a **Refresh quota** button, which checks it without spending any.
 - **Accounts:** **Sign in to Claude** and **Sign in to Codex** buttons add accounts from the browser, including from a phone or another computer. You can also sign an account in again, remove it, switch to it, disable it, or move it up or down the priority order.
 - **Logs:** every request, sign-in, sign-out, account switch and settings change, with filters by kind, provider and account. Each request shows which client sent it. Turn on `proxy.logPrompts` to also see the prompt that started it.
 - **Clients:** create a separate key for each machine or agent. The dashboard shows the exact settings to paste into Claude Code or `~/.codex/config.toml`, and how much each key has used over the last 5 hours, 24 hours, or all time.
@@ -112,7 +112,7 @@ Light and dark themes follow your system. Full tour: [docs/usage.md](docs/usage.
 
 - **Codex (ChatGPT) accounts** are pooled next to Claude accounts on the same port, with their own quota and rotation.
 - **Third-party backends** (DeepSeek, z.ai/GLM, NanoGPT, or any Anthropic-compatible API) can act as a low-priority fallback for when your Claude accounts run out.
-- **Free resets get used.** Codex rate-limit reset credits and banked Claude usage-limit resets can be spent automatically when no account has room left (`autoRedeemResets`, off by default).
+- **Free resets get used.** With `autoRedeemResets` on (off by default), banked Claude usage-limit resets and Codex rate-limit reset credits can be spent automatically when no account has room left. A Codex credit that expires within three days is also spent on an account whose weekly limit is used up, rather than being lost.
 
 ### Moves with you between machines
 
@@ -131,7 +131,9 @@ Turn on the MCP endpoint (`"proxy": { "mcp": "read" }`) and Claude Code can chec
 
 ### Spends nothing behind your back
 
-Anything that makes background calls or uses quota is off until you turn it on: quota probing, keep-warm requests, extra usage, spending resets, holding requests, MCP and session titles.
+The optional features that make extra calls or use quota are off until you turn them on: quota probing, keep-warm requests, extra usage, spending resets, holding requests, MCP and session titles.
+
+Two things do run on their own. Sign-ins are refreshed before they expire. An npm install also checks for a new version at most once a day and installs it; turn that off with `"autoUpdate": false` or `TEAMCLAUDE_DISABLE_AUTOUPDATE=1`.
 
 ## Everyday commands
 
@@ -162,7 +164,7 @@ Every setting and environment variable: [docs/configuration.md](docs/configurati
 1. Claude Code or Codex sends its request to the local proxy instead of the provider.
 2. The proxy picks an account that has room, adds that account's sign-in, and forwards the request.
 3. The provider's reply says how much quota the account has left. The proxy records it, so it knows when to move on, even after a restart.
-4. If the reply is a limit error, the request is sent once more on another account. If every account is spent, the proxy either waits (`holdSeconds`) or returns the error.
+4. If the reply says the account's limit is spent, the request is sent again on another account. A short burst limit gets one try on another account at most. If every account is spent, the proxy either waits (`holdSeconds`) or returns the error.
 
 Step by step: [docs/routing.md](docs/routing.md#request-lifecycle).
 
