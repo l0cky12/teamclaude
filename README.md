@@ -13,7 +13,11 @@ You point [Claude Code](https://claude.com/product/claude-code) or the [Codex CL
 
 You control it from a terminal UI, the command line, or a web dashboard that works from any machine on your network.
 
-![TeamRouter terminal UI](screenshots/teamclaude.png)
+![The TeamRouter web dashboard, Quota page: pooled quota cards for Claude and Codex, and each account's 7-day Fable, 5-hour and 7-day limits](screenshots/dashboard-quota.png)
+
+*Every screenshot in this README uses made-up demo accounts.*
+
+New in this fork: a redesigned web dashboard, sign-in from the browser, client keys, linked instances, account export, and two new routing modes. See [What's new in this fork](#whats-new-in-this-fork).
 
 ## Who it is for
 
@@ -106,7 +110,28 @@ Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`
 - **Sessions, Routing and Settings:** what each conversation spent, which account each model goes to, the switch threshold, and the background quota check (off, or every 5 to 120 seconds).
 - **Linked instances:** run TeamRouter on more than one machine (a desktop and a server, say) and link them from **Settings**. One dashboard can then show and control all of them. Off until you link something.
 
-Light and dark themes follow your system. Full tour: [docs/usage.md](docs/usage.md#status-dashboard-browser).
+Light and dark themes follow your system, and the layout fits a phone. Full tour: [docs/usage.md](docs/usage.md#status-dashboard-browser).
+
+<table>
+  <tr>
+    <td width="50%"><img src="screenshots/dashboard-accounts.png" alt="Accounts page with Sign in to Claude and Sign in to Codex buttons, and Switch to, Disable, Prioritize and Remove on each account"><br><b>Accounts:</b> sign in to Claude or Codex from the browser, and switch, disable, reorder or remove any account.</td>
+    <td width="50%"><img src="screenshots/dashboard-logs.png" alt="Logs page listing requests with the client key, client program and prompt, plus sign-ins and settings changes"><br><b>Logs:</b> each request with the client that sent it and its prompt, plus sign-ins, switches and settings changes.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/dashboard-clients.png" alt="Clients page showing a client key with copyable settings for Claude Code and the Codex CLI"><br><b>Clients:</b> a key per machine or agent, with the settings to paste into Claude Code or the Codex CLI.</td>
+    <td width="50%"><img src="screenshots/dashboard-linked-instances.png" alt="Settings page with the switch threshold, quota refresh picker, and a linked instance shown as online"><br><b>Settings:</b> the switch threshold, how often quota refreshes, and your linked machines.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="screenshots/dashboard-routing.png" alt="Routing page showing drain mode, the drain order for Claude and Codex, and which account each model family goes to"><br><b>Routing:</b> the distribution mode, the drain order, and which account each model goes to.</td>
+    <td width="50%" align="center"><img src="screenshots/dashboard-phone.png" alt="The Quota page on a phone-sized screen in dark mode" width="220"><br><b>On a phone:</b> the same dashboard on a narrow screen.</td>
+  </tr>
+</table>
+
+### A terminal UI too
+
+`teamclaude server` shows each account's 5-hour, weekly and Fable bars with reset countdowns, Claude and Codex side by side, and a live activity log. Keys let you switch accounts, disable one, sign in, refresh quota and change settings without stopping the proxy.
+
+![The terminal UI: Claude and Codex accounts side by side with quota bars, and the activity log below](screenshots/tui.png)
 
 ### Works with more than Claude
 
@@ -134,6 +159,39 @@ Turn on the MCP endpoint (`"proxy": { "mcp": "read" }`) and Claude Code can chec
 The optional features that make extra calls or use quota are off until you turn them on: quota probing, keep-warm requests, extra usage, spending resets, holding requests, MCP and session titles.
 
 Two things do run on their own. Sign-ins are refreshed before they expire. An npm install also checks for a new version at most once a day and installs it; turn that off with `"autoUpdate": false` or `TEAMCLAUDE_DISABLE_AUTOUPDATE=1`.
+
+## What's new in this fork
+
+This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the following to upstream TeamClaude. Each item links to its pull request.
+
+**Web dashboard**
+
+- A redesigned dashboard: a sidebar of pages, provider tabs (Claude, Codex, each backend), one row per account with its quota bars, and a Logs page ([#4](https://github.com/l0cky12/teamclaude/pull/4)).
+- The red TeamRouter logo in the sidebar and browser tab ([#10](https://github.com/l0cky12/teamclaude/pull/10)).
+- **Refresh quota** on each account, and the Fable bar shown first ([#3](https://github.com/l0cky12/teamclaude/pull/3)).
+- 5-hour limit cards for Claude and Codex next to the weekly ones ([#12](https://github.com/l0cky12/teamclaude/pull/12)).
+- Accounts with no quota left are hidden until you press **Show all** ([#13](https://github.com/l0cky12/teamclaude/pull/13)).
+- **Sign in to Claude** and **Sign in to Codex** from the Accounts page, from any device, and **Remove** for an account ([#5](https://github.com/l0cky12/teamclaude/pull/5), [#9](https://github.com/l0cky12/teamclaude/pull/9)).
+- The sign-in email shown under an account you renamed ([#8](https://github.com/l0cky12/teamclaude/pull/8)).
+- Client keys: create and revoke them on the Clients page, and see a key's connection settings again later ([#15](https://github.com/l0cky12/teamclaude/pull/15), [#17](https://github.com/l0cky12/teamclaude/pull/17)).
+- Pick how often quota refreshes in the background, from 5 to 120 seconds, on the Settings page ([#16](https://github.com/l0cky12/teamclaude/pull/16)).
+- The Sessions table shown by default ([#14](https://github.com/l0cky12/teamclaude/pull/14)).
+- The Logs page shows which client sent each request and, if you turn on `proxy.logPrompts`, its prompt ([#18](https://github.com/l0cky12/teamclaude/pull/18)).
+- Linked instances: link TeamRouter on your other machines and control them all from one dashboard, set up from the Settings page ([#20](https://github.com/l0cky12/teamclaude/pull/20), [#21](https://github.com/l0cky12/teamclaude/pull/21)).
+
+**Routing**
+
+- `affinity` mode: use an account whose 5-hour window is about to reset first, and keep each conversation on its account while it can still serve it ([#2](https://github.com/l0cky12/teamclaude/pull/2)).
+- `drain` mode: use the account whose weekly limit resets soonest until it runs out ([#6](https://github.com/l0cky12/teamclaude/pull/6)).
+
+**Accounts**
+
+- `teamclaude accounts export` and `accounts import`: move your sign-ins to another of your machines in a passphrase-encrypted file ([#19](https://github.com/l0cky12/teamclaude/pull/19)).
+
+**Project**
+
+- CI tests the npm package and the container, publishing waits for CI, and security scans run on every change ([#11](https://github.com/l0cky12/teamclaude/pull/11)).
+- An `AGENTS.md` guide for AI coding agents, with a Codex review step and screenshot rules for front-end changes ([#1](https://github.com/l0cky12/teamclaude/pull/1), [#7](https://github.com/l0cky12/teamclaude/pull/7)).
 
 ## Everyday commands
 
