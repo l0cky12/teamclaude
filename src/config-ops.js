@@ -556,3 +556,87 @@ export function revokeClientKey(config, rawName) {
   config.proxy.clientKeys = kept;
   return { name, removed: list.length - kept.length };
 }
+
+// A linked instance's name is a segment of the relay path
+// (/teamclaude/peers/<name>/…), so it keeps to characters that need no
+// escaping there, and starting with a letter or digit rules out `.` and `..`.
+const PEER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/**
+ * A linked instance's address as typed, made into the form `peers` stores: an
+ * http(s) origin with an optional path, no trailing slash. A bare host:port is
+ * taken as http, which is how a Tailscale or LAN address is usually written.
+ *
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function peerAddress(raw) {
+  let text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) throw new ConfigOpError('enter the address of the other machine, e.g. http://100.64.0.2:3456');
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) text = 'http://' + text;
+  let u;
+  try { u = new URL(text); } catch { throw new ConfigOpError(`"${safeShown(raw)}" is not an address`); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new ConfigOpError('the address must start with http:// or https://');
+  // The key has its own field; one in the address would be stored and shown in the clear.
+  if (u.username || u.password) throw new ConfigOpError('put the key in the key field, not in the address');
+  // peers.js appends the control path to the address, which a query or fragment would swallow.
+  if (u.search || u.hash) throw new ConfigOpError('the address cannot have a ? or # part');
+  return (u.origin + u.pathname).replace(/\/+$/, '');
+}
+
+/**
+ * Add a linked instance (`peers`) under a new name.
+ *
+ * A name already in the list is refused rather than replaced: the dashboard
+ * keeps the instance it shows by name, and a silent swap would point it at a
+ * different machine.
+ *
+ * @param {Config} config
+ * @param {{ name?: unknown, url?: unknown, apiKey?: unknown }} spec
+ * @returns {{ name: string, url: string }}
+ */
+export function addPeer(config, spec) {
+  const name = typeof spec?.name === 'string' ? spec.name.trim() : '';
+  if (!name) throw new ConfigOpError('name the linked instance');
+  if (!PEER_NAME.test(name)) {
+    throw new ConfigOpError('A linked instance name is up to 64 letters, digits and . _ -, starting with a letter or digit.');
+  }
+  const url = peerAddress(spec?.url);
+  const apiKey = typeof spec?.apiKey === 'string' ? spec.apiKey.trim() : '';
+  if (!apiKey) throw new ConfigOpError('enter the other machine\'s proxy key (its proxy.apiKey)');
+  if (apiKey.length > 512 || /[\s\u0000-\u001f\u007f]/.test(apiKey)) throw new ConfigOpError('that proxy key has spaces or control characters in it');
+  const list = Array.isArray(config.peers) ? config.peers : [];
+  if (list.some((/** @type {any} */ p) => peerEntryName(p) === name)) {
+    throw new ConfigOpError(`an instance named "${name}" is already linked; remove it first to change it`);
+  }
+  config.peers = [...list, { name, url, apiKey }];
+  return { name, url };
+}
+
+/**
+ * Remove a linked instance by name. Every entry under that name goes, the
+ * ones the relay skips as malformed included, so none is left to come back.
+ *
+ * @param {Config} config
+ * @param {unknown} rawName
+ * @returns {{ name: string, removed: number }}
+ */
+export function removePeer(config, rawName) {
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name) throw new ConfigOpError('name the linked instance');
+  const list = Array.isArray(config.peers) ? config.peers : [];
+  const kept = list.filter((/** @type {any} */ p) => peerEntryName(p) !== name);
+  if (kept.length === list.length) throw new ConfigOpError(`no linked instance is named "${name}"`);
+  config.peers = kept;
+  return { name, removed: list.length - kept.length };
+}
+
+/** @param {any} entry  one element of config.peers, as found in the file */
+function peerEntryName(entry) {
+  return typeof entry?.name === 'string' ? entry.name.trim() : '';
+}
+
+/** @param {unknown} raw  echoed in an error message: one short line */
+function safeShown(raw) {
+  return String(raw).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 80);
+}

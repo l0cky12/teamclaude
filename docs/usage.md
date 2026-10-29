@@ -382,7 +382,18 @@ The page is a static asset and loads without a key; the data does not — its sc
 
 If you run TeamClaude on more than one machine, say your desktop and a server, link them so the dashboard on either one shows both. Each machine keeps its own accounts and config; linking only lets one dashboard reach the others.
 
-On each machine, list the other ones under [`peers`](configuration.md) with an address this machine can reach and that proxy's own `proxy.apiKey`. That proxy must listen on that address, so set its `proxy.host` (a Tailscale or LAN IP, for example) and its `proxy.apiKey`:
+Each machine needs to listen beyond itself, on a Tailscale or LAN address (set `proxy.host`, or `TEAMCLAUDE_HOST`, to `0.0.0.0` or that address), and needs a `proxy.apiKey`.
+
+**From the dashboard.** You can do the whole thing in the browser:
+
+1. On the machine you want to link, open the dashboard's **Settings** page. Under **Linked instances**, press **Show key**. It shows that machine's proxy key and a best guess at its address. Copy both.
+2. On the other machine, open **Settings**, **Linked instances**, **Link another machine**. Paste the address and the key, then press **Test**. The test says whether something answered at that address and whether it accepted the key. It also tells you if you pasted one of that machine's client keys: linking needs its proxy key. If it did, it also fills in the name the other machine gives itself.
+3. Leave **Link back too** ticked to link both ways in one step. This machine then asks the other one to list it as well, under the address and name in the two fields below the box (prefilled with this machine's best guess). To do that it sends the other machine this machine's own proxy key, the same way you just gave this machine the other one's. The box is unticked and locked when this machine has no proxy key, since the other machine could not get in. When it listens on itself only, the card warns you: linking back then works only through something that forwards to it, such as a reverse proxy or Tailscale Serve, so enter that address.
+4. Press **Link**. The link is saved to the config file and takes effect at once, without a restart.
+
+To unlink a machine, press **Remove** next to it. That removes it from this machine only. If the other machine lists this one too, remove that link from the other machine's dashboard (pick it in the Instance picker, then go to **Settings**).
+
+**By hand.** On each machine, list the other ones under [`peers`](configuration.md) with an address this machine can reach and that proxy's own `proxy.apiKey`:
 
 ```json
 "peers": [
@@ -390,7 +401,9 @@ On each machine, list the other ones under [`peers`](configuration.md) with an a
 ]
 ```
 
-Then reload (`teamclaude reload` or **Reload config**). An **Instance** picker appears at the top of the sidebar, with **This machine** and each linked instance. Pick one and every page shows that machine: quota, accounts, logs, routing and settings. Every button acts on it too, sign-in included. A line above the page says which instance you are looking at, with **Back to this machine**. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
+Then reload with **Reload config** on the Settings page, or `curl -X POST http://localhost:3456/teamclaude/reload` on that machine.
+
+An **Instance** picker appears at the top of the sidebar, with **This machine** and each linked instance. Pick one and every page shows that machine: quota, accounts, logs, routing and settings. Every button acts on it too, sign-in included. A line above the page says which instance you are looking at, with **Back to this machine**. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
 
 The browser still talks only to the machine it opened the page on. That proxy forwards each request to the linked one as `/teamclaude/peers/<name>/<route>`, using the key from `peers`, so the browser never holds the other machine's key. Only the control routes are forwarded, never model traffic. Only the operator can use the forwarding: the shared `proxy.apiKey`, or a key-exempt loopback browser. A `proxy.clientKeys` key gets a 403. If a linked machine is down, its pages show why and the rest keep working. If the machine you opened the page on is down, open the dashboard on another one instead.
 
