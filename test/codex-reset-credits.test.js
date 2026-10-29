@@ -740,6 +740,130 @@ test('a redemption that returns one account to service stops the sibling spendin
   assert.equal(calls.consume.length, 1);
 });
 
+// ── redeeming by hand (the dashboard's "Reset usage") ──────────────────────
+
+test('a reset asked for by hand needs neither the fleet switch nor a spent week', async () => {
+  const now = Date.now();
+  const chosen = [];
+  // Off fleet, healthy weekly, a healthy sibling: every reason the automatic
+  // path would say no.
+  const { am, redeemer, calls } = harness({
+    accounts: [codex('a'), codex('b')],
+    config: {},
+    quota: account => { account.quota.unified7d = 0.4; },
+    credits: [credit({ id: 'later', expiresAt: now + 20 * DAY }), credit({ id: 'sooner', expiresAt: now + 5 * DAY })],
+  });
+  redeemer.consumeFn = async (_account, attempt) => { calls.consume++; chosen.push(attempt.creditId); return { code: 'reset', windowsReset: 2, credit: null }; };
+  const result = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(result.redeemed, true);
+  assert.equal(result.windowsReset, 2);
+  assert.deepEqual(chosen, ['sooner'], 'the credit that would be lost first is the one spent');
+  assert.equal(calls.usage, 1, 'the quota is re-read so the page shows the cleared limits');
+});
+
+test('a reset by hand reads fresh credit rows rather than a cached list', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [codex('a'), codex('b')] });
+  await redeemer.maybeRedeemForPool([am.accounts[0]]);
+  assert.equal(calls.details, 1);
+  await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(calls.details, 2);
+});
+
+test('a reset by hand on an Anthropic account reaches no Codex endpoint', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [oauth('claude')], quota: () => {} });
+  const result = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.reason, 'not a Codex account');
+  assert.equal(calls.details + calls.consume + calls.usage, 0);
+});
+
+test('a reset by hand with no credit to spend spends nothing and re-reads the count', async () => {
+  const { am, redeemer, calls } = harness({ credits: [credit({ status: 'redeemed' }), credit({ supportedByPlan: false })] });
+  const result = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.code, 'no_credit');
+  assert.equal(calls.consume, 0);
+  assert.equal(calls.usage, 1);
+});
+
+test('a reset by hand that upstream declines says why and re-reads the count', async () => {
+  const { am, redeemer, calls } = harness({ code: 'nothing_to_reset' });
+  const result = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.code, 'nothing_to_reset');
+  assert.equal(result.uncertain, undefined);
+  assert.equal(calls.usage, 1);
+});
+
+test('a reset by hand whose verdict never arrived is reported as uncertain', async () => {
+  const { am, redeemer } = harness({ code: () => ({ error: 'socket hang up' }) });
+  const result = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(result.redeemed, false);
+  assert.equal(result.uncertain, true);
+});
+
+test('a reset by hand is refused while another attempt is in flight', async () => {
+  const { am, redeemer, calls } = harness({ accounts: [codex('a'), codex('b')] });
+  /** @type {(v: any) => void} */
+  let release = () => {};
+  redeemer.consumeFn = async () => { calls.consume++; await new Promise(r => { release = r; }); return { code: 'reset', windowsReset: 1, credit: null }; };
+  const first = redeemer.redeemNow(am.accounts[0]);
+  // Wait for the first to reach its consume, then click the other account.
+  while (calls.consume === 0) await new Promise(r => setImmediate(r));
+  const second = await redeemer.redeemNow(am.accounts[1]);
+  assert.equal(second.redeemed, false);
+  assert.match(second.reason, /in progress/);
+  release(null);
+  assert.equal((await first).redeemed, true);
+  assert.equal(calls.consume, 1);
+});
+
+// The two directions of manual/automatic overlap. Neither runs beside the
+// other, and an automatic refusal is never left waiting on a manual attempt's
+// longer budget: it is turned away at once.
+test('a refusal during a reset by hand is turned away at once, not joined to it', async () => {
+  const { am, redeemer, calls } = poolHarness();
+  /** @type {(v: any) => void} */
+  let release = () => {};
+  redeemer.consumeFn = async account => { calls.consume.push(account.name); await new Promise(r => { release = r; }); return { code: 'reset', windowsReset: 1, credit: null }; };
+  const manual = redeemer.redeemNow(am.accounts[0]);
+  while (calls.consume.length === 0) await new Promise(r => setImmediate(r));
+  let settled = false;
+  const auto = redeemer.maybeRedeemForPool(am.accounts).then(r => { settled = true; return r; });
+  await new Promise(r => setImmediate(r));
+  assert.equal(settled, true, 'answered while the manual attempt is still waiting on upstream');
+  const result = await auto;
+  assert.equal(result.redeemed, false);
+  assert.match(result.reason, /by hand is in progress/);
+  release(null);
+  assert.equal((await manual).redeemed, true);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
+test('a reset by hand during a pool-dry refusal is refused, not run beside it', async () => {
+  const { am, redeemer, calls } = poolHarness({ accounts: [codex('a')] });
+  /** @type {(v: any) => void} */
+  let release = () => {};
+  redeemer.consumeFn = async account => { calls.consume.push(account.name); await new Promise(r => { release = r; }); return { code: 'reset', windowsReset: 1, credit: null }; };
+  const auto = redeemer.maybeRedeemForPool(am.accounts);
+  while (calls.consume.length === 0) await new Promise(r => setImmediate(r));
+  const manual = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(manual.redeemed, false);
+  assert.match(manual.reason, /in progress/);
+  release(null);
+  assert.equal((await auto).redeemed, true);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
+test('a reset by hand holds the automatic path off the rest of the pool', async () => {
+  const { am, redeemer, calls } = poolHarness({ caughtUp: false });
+  assert.equal((await redeemer.redeemNow(am.accounts[0])).redeemed, true);
+  const after = await redeemer.maybeRedeemForPool(am.accounts);
+  assert.equal(after.redeemed, false);
+  assert.match(after.reason, /cooling down/);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
 // ── the pool-dry refusal, through the proxy ─────────────────────────────────
 
 /**

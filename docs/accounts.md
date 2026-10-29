@@ -504,8 +504,38 @@ is more than 7 days old.
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on
-the `status` line when it is zero — and spending one is a manual action in the
-Codex CLI unless you arm the switch below.
+the `status` line when it is zero — and spending one is a manual action unless
+you arm the switch below.
+
+#### Spending one from the dashboard
+
+On the [dashboard](usage.md#status-dashboard-browser), every Codex account with a reading
+says how many resets it has left: under its controls on the **Quota** page, in
+the **Resets left** column on the **Accounts** page, and summed across accounts
+on the Quota page's Codex card. An account holding one gets a **Reset usage**
+button on both pages. The first click arms it; a second click within 8 seconds
+spends one credit on that account, the one that expires soonest. It
+sends `POST /teamclaude/reset-credits/redeem` with an `{"account": ...}` body
+(plus `provider` and `org` where a name is shared), the same way **Refresh
+quota** names its account.
+
+This is your own decision, so none of the conditions below apply: it works with
+`autoRedeemResets` off and whether or not the weekly window is spent. Upstream
+still refuses a reset that would clear nothing (`nothing_to_reset`) without
+using the credit, and the row says so. What still applies is what keeps the
+spend safe: one attempt at a time across the fleet, automatic or manual; a fresh
+read of the credit list before spending; and the same hold on automatic
+redemptions afterwards that an automatic one arms. After a reset the account's
+quota is read again, so its bars and count update on the next refresh.
+
+The answer is a `200` when a credit was spent, a `409` with the reason when
+none was, and a `502` marked `uncertain` when the request went out but no answer
+came back. In that case the credit may have been spent: **Refresh quota** shows
+what happened. The page says the same when the answer itself is lost on the way
+to the browser, or when a [linked instance](usage.md#linked-instances)
+the reset was sent to drops the connection before answering. While a reset you asked for is running, an automatic one is
+turned away at once rather than made to wait for it. A page holding a `proxy.clientKeys` key has no button, and the
+route refuses that key with a `403`.
 
 Spending one is **opt-in**, and the switch is fleet-wide: set
 [`autoRedeemResets`](configuration.md) to `true`, or toggle it from the TUI

@@ -433,6 +433,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
+  // Spends a credit the operator cannot get back.
+  ['/teamclaude/reset-credits/redeem', 'a client key cannot spend reset credits'],
   // A client key that could mint keys could hand out access the operator never
   // granted, and one that could revoke could lock the other clients out.
   ['/teamclaude/client-keys/create', 'a client key cannot manage client keys'],
@@ -1075,6 +1077,68 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           console.error('[TeamClaude] Quota probe failed:', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'quota probe failed; see the proxy log' }));
+        }
+        return;
+      }
+
+      // Spend one of a Codex account's free rate-limit reset credits now — the
+      // dashboard's "Reset usage" button. Body: {"account": "<name|uuid>"},
+      // with optional "provider" and "org" as /probe takes them. The automatic
+      // path (autoRedeemResets) decides for itself when a credit is worth
+      // spending; this one is the operator deciding, so the redeemer skips that
+      // policy and keeps only what makes the spend safe (see redeemNow).
+      if (req.method === 'POST' && req.url === '/teamclaude/reset-credits/redeem') {
+        if (!hooks.redeemCodexReset) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset credits not supported' }));
+          return;
+        }
+        let body;
+        try {
+          body = JSON.parse(await readControlBody(req) || '{}') ?? {};
+        } catch (err) {
+          const tooLarge = /** @type {Error} */ (err).message === 'body too large';
+          res.writeHead(tooLarge ? 413 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: tooLarge ? 'request body too large' : 'invalid request body' }));
+          return;
+        }
+        const names = () => (accountManager.accounts || []).map((/** @type {any} */ a) => a.name);
+        const target = body.account;
+        if (typeof target !== 'string' || !target.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'missing "account"', accounts: names() }));
+          return;
+        }
+        const found = resolveAccountTarget(accountManager, { account: target, provider: body.provider, org: body.org });
+        if (found == null) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `no such account "${target}"`, accounts: names() }));
+          return;
+        }
+        if ('ambiguous' in found) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `more than one account is named "${target}"; add "provider" or "org"` }));
+          return;
+        }
+        const account = accountManager.accounts[found.index];
+        try {
+          const result = await hooks.redeemCodexReset(account);
+          // Three answers: spent (200); not spent, with upstream's reason or
+          // ours (409); and sent but never answered (502), which the page must
+          // not read as either, since the credit may be gone.
+          const status = result.redeemed ? 200 : result.uncertain ? 502 : 409;
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: !!result.redeemed,
+            account: account.name,
+            ...(result.code ? { code: result.code } : {}),
+            ...(result.redeemed ? { windowsReset: result.windowsReset || 0 } : { error: result.reason }),
+            ...(result.uncertain ? { uncertain: true } : {}),
+          }));
+        } catch (err) {
+          console.error('[TeamClaude] Reset credit redemption failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'reset failed; see the proxy log' }));
         }
         return;
       }

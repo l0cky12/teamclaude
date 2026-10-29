@@ -937,6 +937,9 @@ async function serverCommand() {
   const claudeRedeemer = new ClaudeResetRedeemer(accountManager, { config });
   hooks.redeemClaudeResetForPool = (/** @type {Record<string, any>[]} */ accounts) => claudeRedeemer.maybeRedeemForPool(accounts);
   hooks.redeemCodexResetForPool = (/** @type {Record<string, any>[]} */ accounts) => redeemer.maybeRedeemForPool(accounts);
+  // The dashboard's "Reset usage" button: the operator's own call, so it is
+  // not gated on autoRedeemResets.
+  hooks.redeemCodexReset = (/** @type {Record<string, any>} */ account) => redeemer.redeemNow(account);
   hooks.getStatusExtra = () => ({
     // Read live from the shared config (not a startup snapshot) so the TUI's
     // blocklist editor shows up in `status` immediately, the same way the

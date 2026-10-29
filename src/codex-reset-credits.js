@@ -86,6 +86,15 @@ const BUDGET_LAPSED = Symbol('redeem budget lapsed');
  */
 export const REDEEM_BUDGET_MS = 10_000;
 
+/**
+ * How long a redemption asked for by hand may take, end to end. No Codex client
+ * is waiting on this one, only the dashboard's POST, so it gets more room than
+ * REDEEM_BUDGET_MS — but stays under the 30s a linked instance's relay waits,
+ * so a dashboard acting on another machine reads the answer rather than a
+ * relay timeout over a redemption that may have gone through.
+ */
+export const MANUAL_REDEEM_BUDGET_MS = 20_000;
+
 // Utilization at which the weekly window counts as genuinely spent. Exactly 1,
 // not the rotation threshold: rotating away from an account at 98% costs
 // nothing, while a credit is scarce and unrecoverable, so the bar for spending
@@ -363,7 +372,10 @@ export function shouldRedeemReset({ account, autoRedeemResets = false, pool = []
  * What every path through `maybeRedeemForPool` answers with. `redeemed` is the
  * only field a caller must read: the rest describe the decision for a log line.
  *
- * @typedef {{redeemed: boolean, reason: string, code?: string|null, windowsReset?: number}} RedeemResult
+ * `uncertain` is set only when a consume was sent and its verdict never read:
+ * the credit may or may not have been spent.
+ *
+ * @typedef {{redeemed: boolean, reason: string, code?: string|null, windowsReset?: number, uncertain?: boolean}} RedeemResult
  */
 
 /**
@@ -416,7 +428,7 @@ export function shouldRedeemReset({ account, autoRedeemResets = false, pool = []
 export class ResetCreditRedeemer {
   /**
    * @param {any} accountManager
-   * @param {{config?: Record<string, any>|null, detailsFn?: Function, consumeFn?: Function, usageFn?: Function, now?: () => number, log?: Function, timeoutMs?: number, detailTtlMs?: number}} [opts]
+   * @param {{config?: Record<string, any>|null, detailsFn?: Function, consumeFn?: Function, usageFn?: Function, now?: () => number, log?: Function, timeoutMs?: number, manualTimeoutMs?: number, detailTtlMs?: number}} [opts]
    */
   constructor(accountManager, {
     // The SHARED config object, not a snapshot of one field: `autoRedeemResets`
@@ -431,6 +443,7 @@ export class ResetCreditRedeemer {
     log = console.log,
     // The TOTAL budget for one attempt, not a per-call timeout.
     timeoutMs = REDEEM_BUDGET_MS,
+    manualTimeoutMs = MANUAL_REDEEM_BUDGET_MS,
     detailTtlMs = DETAIL_TTL_MS,
   } = {}) {
     this.am = accountManager;
@@ -441,6 +454,7 @@ export class ResetCreditRedeemer {
     this.now = now;
     this.log = log;
     this.timeoutMs = timeoutMs;
+    this.manualTimeoutMs = manualTimeoutMs;
     this.detailTtlMs = detailTtlMs;
     // Keyed by the account OBJECT, not its index or name: indices are renumbered
     // when an account is removed and names are not unique, while this state
@@ -455,6 +469,13 @@ export class ResetCreditRedeemer {
     // out, and only one of them should spend anything about it.
     /** @type {Promise<RedeemResult>|null} */
     this.inFlight = null;
+    // A reset asked for by hand (redeemNow), kept apart from the one above so
+    // that a refusal never JOINS it: a manual attempt runs to its own longer
+    // budget, and a waiting client joined to it would be held past
+    // REDEEM_BUDGET_MS. The two still never run together — each refuses
+    // while the other is in flight.
+    /** @type {Promise<RedeemResult>|null} */
+    this.manualInFlight = null;
     // The hold a per-account cooldown cannot express. Two outcomes are facts
     // about the FLEET rather than about the account they happened on:
     //
@@ -500,6 +521,8 @@ export class ResetCreditRedeemer {
    */
   async maybeRedeemForPool(accounts) {
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
+    // Refused at once rather than joined: see manualInFlight.
+    if (this.manualInFlight) return { redeemed: false, reason: 'a reset asked for by hand is in progress' };
     // A pool-dry refusal is a FLEET state, so concurrent refusals are one
     // decision about the fleet rather than one per request. A per-account guard
     // alone would not do: two refusals could walk the same candidate list and
@@ -758,7 +781,7 @@ export class ResetCreditRedeemer {
       state.cooldownUntil = now + RETRY_COOLDOWN_MS;
       this.fleetCooldownUntil = Math.max(this.fleetCooldownUntil, now + RETRY_COOLDOWN_MS);
       this.log(`[TeamClaude] Codex rate-limit reset failed on "${name}" — ${safeLine(result.error, 120)}; it may still have been spent, so the pool holds off`);
-      return { redeemed: false, reason: `redeem failed (${result.error})` };
+      return { redeemed: false, reason: `redeem failed (${result.error})`, uncertain: true };
     }
 
     state.redeemRequestId = null;
@@ -785,7 +808,81 @@ export class ResetCreditRedeemer {
 
     state.cooldownUntil = now + RETRY_COOLDOWN_MS;
     this.log(`[TeamClaude] Codex rate-limit reset declined on "${name}" — upstream said "${result?.code || 'nothing'}", no credit spent`);
-    return { redeemed: false, reason: `upstream declined (${result?.code || 'no code'})` };
+    return { redeemed: false, reason: `upstream declined (${result?.code || 'no code'})`, code: result?.code ?? null };
+  }
+
+  /**
+   * Spend one of this account's credits because the operator asked to.
+   *
+   * The way in from the dashboard's "Reset usage" button. Everything the
+   * automatic path weighs before spending — the fleet switch, the weekly window
+   * being spent, the rest of the pool being dry, the cooldowns — is a guess at
+   * what the operator would want, and here the operator has said. So none of
+   * it applies, and what is left is what keeps the spend itself safe:
+   *
+   *  - one attempt at a time across the fleet, automatic or not, so a click
+   *    during a pool-dry refusal cannot spend a second credit beside it (and a
+   *    refusal during a click is turned away rather than held to its budget);
+   *  - fresh credit rows rather than the cache, which can be hours old and name
+   *    a credit already spent;
+   *  - the same consume as the automatic path (_consume), so the idempotency
+   *    key, the holds it arms and the quota re-read behave identically.
+   *
+   * Upstream still refuses a reset that would clear nothing (`nothing_to_reset`)
+   * without spending the credit, so a click on an account with headroom costs
+   * nothing.
+   *
+   * @param {Record<string, any>|null|undefined} account
+   * @returns {Promise<RedeemResult>}
+   */
+  async redeemNow(account) {
+    if (!account) return { redeemed: false, reason: 'no account' };
+    if (providerOf(account) !== 'codex') return { redeemed: false, reason: 'not a Codex account' };
+    // Refused rather than joined: the attempt in flight may be on another
+    // account, and its answer is not an answer to this click.
+    if (this.inFlight || this.manualInFlight) return { redeemed: false, reason: 'another reset attempt is in progress; try again in a moment' };
+    const attempt = this._manual(account).finally(() => { this.manualInFlight = null; });
+    this.manualInFlight = attempt;
+    return attempt;
+  }
+
+  /**
+   * @param {Record<string, any>} account
+   * @returns {Promise<RedeemResult>}
+   */
+  async _manual(account) {
+    const now = this.now();
+    const deadline = now + this.manualTimeoutMs;
+    const state = this._stateFor(account);
+    state.credits = null;
+    const read = await this._credits(account, state, now, deadline);
+    if (read.error) return { redeemed: false, reason: `could not read reset credits (${read.error})` };
+    const credit = redeemableCredit(read.credits);
+    if (!credit) {
+      // The count the dashboard drew said otherwise, or it would not have
+      // offered the button: re-read it so the page stops offering one.
+      await this._reread(account, deadline);
+      return { redeemed: false, reason: 'holds no reset credit this plan can redeem', code: 'no_credit' };
+    }
+    const result = await this._consume(account, state, { redeem: true, reason: 'asked for from the dashboard', creditId: credit.id }, now, deadline);
+    // A declined consume spent nothing, but the count it was offered on may
+    // still be out of date; a successful one has already been re-read.
+    if (!result.redeemed && result.code) await this._reread(account, deadline);
+    return result;
+  }
+
+  /**
+   * Re-read an account's quota, credit count included, within what is left of
+   * the budget. Best effort: a failed read leaves the last reading in place.
+   *
+   * @param {Record<string, any>} account
+   * @param {number} deadline
+   */
+  async _reread(account, deadline) {
+    const timeoutMs = this._timeLeft(deadline);
+    if (timeoutMs <= 0) return;
+    const usage = await this.usageFn(account, { timeoutMs }).catch(() => null);
+    if (usage && !usage.error) this.am.applyCodexUsageData(account.index, usage);
   }
 
   /**

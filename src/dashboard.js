@@ -134,6 +134,87 @@ export function refreshQuotaOutcome(res) {
   return { kind: 'ok', text: 'quota refreshed' };
 }
 
+// How many free rate-limit resets a Codex account has left, as the page shows
+// it: null when there is nothing to go on (not a Codex account, no usage
+// reading yet, or one past RESET_CREDIT_MAX_AGE_MS, the badge's own cut-off),
+// else the count. Zero is a reading too, and the page says so.
+/** @param {any} account @param {number|null} [now] */
+export function codexResetsLeft(account, now) {
+  var a = account || {};
+  if (a.provider !== 'codex') return null;
+  var reading = (a.quota || {}).resetCredits;
+  if (!reading || !Number.isFinite(reading.available)) return null;
+  var at = now == null ? Date.now() : now;
+  if (Number.isFinite(reading.seenAt) && at - reading.seenAt > RESET_CREDIT_MAX_AGE_MS) return null;
+  if (Number.isFinite(reading.expiresAt) && reading.expiresAt <= at) return 0;
+  return Math.max(0, reading.available);
+}
+
+// The resets a set of Codex accounts holds between them, for the quota page's
+// Codex card: null when none of them has a reading.
+/** @param {any[]} accounts @param {number|null} [now] */
+export function codexResetsSummary(accounts, now) {
+  var left = 0;
+  var read = 0;
+  (accounts || []).forEach(function (a) {
+    var n = codexResetsLeft(a, now);
+    if (n == null) return;
+    read++;
+    left += n;
+  });
+  return read ? { left: left, accounts: read } : null;
+}
+
+// Whether a row gets a "Reset usage" button: a Codex account rotation can use,
+// holding a credit, and a key the server would let spend it.
+/** @param {any} account @param {any} caller @param {number|null} [now] */
+export function canRedeemReset(account, caller, now) {
+  if (!account || account.disabled) return false;
+  return (codexResetsLeft(account, now) || 0) > 0 && callerCan(caller, '/teamclaude/reset-credits/redeem');
+}
+
+// The POST the button sends. Same body as refreshQuotaRequest, for the same
+// reason: a name alone can belong to two cards.
+/** @param {any} account @param {string|null} key */
+export function redeemResetRequest(account, key) {
+  var r = refreshQuotaRequest(account, key);
+  r.url = '/teamclaude/reset-credits/redeem';
+  return r;
+}
+
+// What a click on "Reset usage" does, decided when the click lands rather than
+// when the button was drawn: a button armed and then left (the poll that would
+// redraw it can be late, or failing) must not spend a reset on a click long
+// after the window it offered has closed. Out of that window the click arms it
+// again; a second click too soon after the first is a double-click.
+/** @param {number|null|undefined} armedAt @param {number} now @param {number} confirmMs @param {number} doubleClickMs */
+export function resetClickStep(armedAt, now, confirmMs, doubleClickMs) {
+  if (armedAt == null || now - armedAt >= confirmMs) return 'arm';
+  if (now - armedAt < doubleClickMs) return 'wait';
+  return 'redeem';
+}
+
+// What the row says after a reset. A declined reset spent nothing and says
+// why; one with no verdict to read — the server said it never heard back, or
+// the answer itself was lost on the way to the page — may have spent a credit,
+// and says that rather than reporting a failure that invites a second one.
+/** @param {any} res  the server's answer, or null when none could be read */
+export function redeemResetOutcome(res) {
+  if (!res) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
+  var r = res;
+  if (r.ok) {
+    var n = r.windowsReset || 0;
+    return { kind: 'ok', text: 'usage reset' + (n ? ': ' + n + ' limit window' + (n === 1 ? '' : 's') + ' cleared' : '') };
+  }
+  // `unreachable` is the linked-instance relay (peers.js) losing the peer
+  // mid-request: it cannot say whether the peer acted before the connection
+  // went, so it is no more a "no" than an unread verdict here.
+  if (r.uncertain || r.unreachable) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
+  if (r.code === 'nothing_to_reset') return { kind: 'warn', text: 'nothing to reset yet: no limit on this account is spent, so no reset was used' };
+  if (r.code === 'no_credit') return { kind: 'warn', text: 'no resets left on this account' };
+  return { kind: 'error', text: 'reset failed' + (r.error ? ': ' + r.error : '') };
+}
+
 // The rows a third-party backend's own reading draws on its card (#530). The
 // probe stores it as `quota.backend` (backend-quota.js): per-window fractions
 // when the provider reports distinct windows, else one fraction, else text
@@ -327,7 +408,7 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
     var expires = Number.isFinite(reading.expiresAt)
       ? ' \u00b7 expires ' + new Date(reading.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
       : '';
-    badges.push({ cls: 'meta', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
+    badges.push({ cls: 'meta resets', text: credits + ' reset credit' + (credits === 1 ? '' : 's') + expires });
   }
   // Arguments 5/6 are optional (the pre-#409 unit test above omits them): with
   // no account switchThreshold at all — the common case — thresholdBadgeText
@@ -1406,12 +1487,16 @@ export function usageFor(entry, view) {
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
+/** What a reset with no readable verdict says. A page constant too: see SHARED_CONSTS. */
+export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have gone through. Refresh quota to check before trying again.';
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -1432,6 +1517,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
+  `var REDEEM_UNCERTAIN_TEXT = ${JSON.stringify(REDEEM_UNCERTAIN_TEXT)};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
@@ -1540,6 +1626,8 @@ const PAGE = `<!doctype html>
   .meter .rs { font-size: 11px; color: var(--dim); min-height: 16px; }
   .meter.none { color: var(--dim); font-size: 12px; opacity: .55; }
   .ctl { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+  .ctl .resets { font-size: 12px; color: var(--codex); text-align: center; align-self: center; }
+  .ctl .resets.none { color: var(--dim); }
   .btn { font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel2); color: var(--text); cursor: pointer; white-space: nowrap; }
   .btn:hover { border-color: var(--accent); color: var(--accent); }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -2059,8 +2147,12 @@ ${SHARED_HELPERS}
     // The first three are provider, type and priority: the section heading
     // already names the provider, and the Accounts page carries the other two.
     // "active" is the state every healthy row would wear, so it is left off.
+    // A Codex row says its resets under its controls instead, beside the
+    // button that spends them.
+    var resetsLeft = codexResetsLeft(a);
     accountBadges(a, s.currentAccount, s.currentAccounts || null, null, s.switchThreshold, s.switchThresholds).slice(3).forEach(function (b) {
-      if (b.cls !== 'active') badges.appendChild(el('span', 'badge ' + b.cls, b.text));
+      if (b.cls === 'active' || (resetsLeft != null && b.cls === 'meta resets')) return;
+      badges.appendChild(el('span', 'badge ' + b.cls, b.text));
     });
     modelBadges(a.usage, badges);
     who.appendChild(badges);
@@ -2084,6 +2176,8 @@ ${SHARED_HELPERS}
       var sw = button('btn', 'Switch to', function () { doSwitch(a.name, key, sw); });
       ctl.appendChild(sw);
     }
+    if (canRedeemReset(a, s.caller)) ctl.appendChild(resetButton(a, key));
+    if (resetsLeft != null) ctl.appendChild(el('div', 'resets' + (resetsLeft ? '' : ' none'), resetsLeftText(resetsLeft)));
     row.appendChild(ctl);
 
     var x = el('div', 'rowx');
@@ -2184,6 +2278,10 @@ ${SHARED_HELPERS}
         if (open) rest.forEach(function (p) { card.appendChild(poolBlock(p, true)); });
       }
     }
+    // The free resets the Codex accounts hold between them: what could be
+    // spent to clear a spent limit rather than wait it out.
+    var resets = !session && group === 'codex' ? codexResetsSummary(members) : null;
+    if (resets) card.appendChild(el('div', 'r', 'Resets left: ' + resets.left + ' across ' + resets.accounts + (resets.accounts === 1 ? ' account' : ' accounts')));
     // Drain mode's queue, when the server reports one: the account being spent
     // first and when it resets, so "why this account" reads off the card.
     var provider = group === 'codex' ? 'codex' : 'anthropic';
@@ -2318,15 +2416,19 @@ ${SHARED_HELPERS}
       var table = el('table');
       card.appendChild(table);
       var hr = el('tr');
-      ['Account', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request', ''].forEach(function (h, i) {
-        hr.appendChild(el('th', i >= 3 && i <= 7 ? 'num' : '', h));
+      // Codex accounts carry a free-reset count the others do not.
+      var heads = ['Account', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request'];
+      if (g === 'codex') heads.push('Resets left');
+      heads.push('');
+      heads.forEach(function (h, i) {
+        hr.appendChild(el('th', i >= 3 && i < heads.length - 1 ? 'num' : '', h));
       });
       table.appendChild(hr);
-      members.forEach(function (a) { table.appendChild(accountTableRow(a, s, canSignIn, canRemove)); });
+      members.forEach(function (a) { table.appendChild(accountTableRow(a, s, canSignIn, canRemove, g === 'codex')); });
     });
   }
 
-  function accountTableRow(a, s, canSignIn, canRemove) {
+  function accountTableRow(a, s, canSignIn, canRemove, withResets) {
     var key = cardNoteKey(a);
     var tr = el('tr');
     var name = el('td');
@@ -2350,6 +2452,10 @@ ${SHARED_HELPERS}
     tr.appendChild(el('td', 'num', fmtNum(u.totalRequests)));
     tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
     tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
+    if (withResets) {
+      var left = codexResetsLeft(a);
+      tr.appendChild(el('td', 'num', left == null ? '—' : String(left)));
+    }
     var act = el('td', 'num');
     // Signed out upstream: the one thing that brings it back is a sign-in,
     // so it comes first. The tokens go to whichever account the browser
@@ -2362,6 +2468,7 @@ ${SHARED_HELPERS}
       var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
       act.appendChild(ctlSwitch);
     }
+    if (canRedeemReset(a, s.caller)) act.appendChild(resetButton(a, key));
     if (callerCan(s.caller, '/teamclaude/disable')) {
       var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
       act.appendChild(ctlDisable);
@@ -3364,6 +3471,63 @@ ${SHARED_HELPERS}
   var removeArmed = Object.create(null);
   var REMOVE_CONFIRM_MS = 8000;
   var REMOVE_DOUBLE_CLICK_MS = 400;
+
+  // "Reset usage" armed by a first click, by card, as Remove is: the second
+  // click spends a reset, and there is no getting it back. Cards with a reset
+  // in flight stay disabled across the polls that rebuild them.
+  var resetArmed = Object.create(null);
+  var resetBusy = Object.create(null);
+
+  function resetsLeftText(n) {
+    return n ? n + (n === 1 ? ' reset left' : ' resets left') : 'no resets left';
+  }
+
+  function resetButton(account, key) {
+    if (resetBusy[key]) {
+      var busy = button('btn codex', 'Resetting…', function () {});
+      busy.disabled = true;
+      return busy;
+    }
+    var armedAt = resetArmed[key];
+    var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+    var b = button(armed ? 'btn codex danger' : 'btn codex', armed ? 'Confirm reset' : 'Reset usage', function () {
+      // Read afresh: what the button showed when it was drawn may be stale.
+      var now = Date.now();
+      var step = resetClickStep(resetArmed[key], now, REMOVE_CONFIRM_MS, REMOVE_DOUBLE_CLICK_MS);
+      if (step === 'wait') return;
+      if (step === 'arm') { resetArmed[key] = now; if (lastStatus) render(lastStatus); return; }
+      delete resetArmed[key];
+      doRedeemReset(account, key);
+    });
+    b.title = armed
+      ? 'Click again to spend one free reset on ' + account.name
+      : 'Clear the spent usage limits on this account with one of its free resets';
+    return b;
+  }
+
+  // Spend one reset now. The request waits for the redemption and the quota
+  // re-read after it, so the poll that follows shows the cleared bars.
+  function doRedeemReset(account, noteKey) {
+    resetBusy[noteKey] = true;
+    if (lastStatus) render(lastStatus);
+    var r = redeemResetRequest(account, localStorage.getItem(KEY));
+    // Every way of NOT reading the server's verdict — the request rejected,
+    // the body unreadable — is reported as uncertain: the server may have
+    // spent the credit before the answer was lost, and "failed" would invite
+    // spending another. Only a refused key (401) is known to have spent nothing.
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return undefined; }
+        return res.json().catch(function () { return null; });
+      }, function () { return null; })
+      .then(function (json) {
+        delete resetBusy[noteKey];
+        if (json === undefined) { if (lastStatus) render(lastStatus); return; }
+        var out = redeemResetOutcome(json);
+        cardNote(noteKey, out.kind, out.text, false);
+        poll();
+      });
+  }
 
   // The account leaves TeamClaude: the running fleet and the config file,
   // credentials included. Nothing is revoked upstream, so the login keeps
