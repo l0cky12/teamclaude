@@ -14,6 +14,7 @@ import {
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
+  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -307,6 +308,61 @@ test('refreshQuotaRequest names the card\'s account with its provider and org', 
   assert.deepEqual(refreshQuotaOutcome({ ok: false, error: 'the account is disabled' }),
     { kind: 'error', text: 'quota refresh failed: the account is disabled' });
   assert.equal(refreshQuotaOutcome(null).kind, 'error');
+});
+
+// ── Codex reset credits: the count each page shows, and the button ──────────
+
+const NOW = Date.now();
+/** @param {any} reading @param {Record<string, any>} [extra] */
+const codexWith = (reading, extra = {}) => ({ name: 'c', provider: 'codex', quota: reading === undefined ? {} : { resetCredits: reading }, ...extra });
+
+test('codexResetsLeft reads a fresh count, says zero, and stays silent without a reading', () => {
+  assert.equal(codexResetsLeft(codexWith({ available: 2, seenAt: NOW - 60_000 }), NOW), 2);
+  assert.equal(codexResetsLeft(codexWith({ available: 0, seenAt: NOW }), NOW), 0, 'zero is a reading, and the page says so');
+  assert.equal(codexResetsLeft(codexWith(undefined), NOW), null, 'no usage reading yet');
+  assert.equal(codexResetsLeft(codexWith({ available: 2, seenAt: NOW - 8 * 24 * 3600_000 }), NOW), null, 'too old to trust');
+  assert.equal(codexResetsLeft(codexWith({ available: 1, seenAt: NOW, expiresAt: NOW - 1 }), NOW), 0, 'past its expiry');
+  assert.equal(codexResetsLeft({ name: 'x', provider: 'anthropic', quota: { resetCredits: { available: 1, seenAt: NOW } } }, NOW), null,
+    'a Claude banked reset is not a Codex one');
+});
+
+test('codexResetsSummary adds up the accounts that have a reading', () => {
+  const accounts = [codexWith({ available: 2, seenAt: NOW }), codexWith({ available: 1, seenAt: NOW }), codexWith(undefined), codexWith({ available: 0, seenAt: NOW })];
+  assert.deepEqual(codexResetsSummary(accounts, NOW), { left: 3, accounts: 3 });
+  assert.equal(codexResetsSummary([codexWith(undefined)], NOW), null);
+  assert.equal(codexResetsSummary([], NOW), null);
+});
+
+test('the reset button needs a credit, an enabled account and a key allowed to spend it', () => {
+  const operator = { kind: 'operator', client: null, refused: [] };
+  const client = { kind: 'client', client: 'laptop', refused: ['/teamclaude/reset-credits/redeem'] };
+  const holding = codexWith({ available: 1, seenAt: NOW });
+  assert.equal(canRedeemReset(holding, operator, NOW), true);
+  assert.equal(canRedeemReset(holding, client, NOW), false);
+  assert.equal(canRedeemReset({ ...holding, disabled: true }, operator, NOW), false);
+  assert.equal(canRedeemReset(codexWith({ available: 0, seenAt: NOW }), operator, NOW), false);
+  assert.equal(canRedeemReset(codexWith(undefined), operator, NOW), false);
+});
+
+test('redeemResetRequest posts the card\'s account to the redeem route', () => {
+  const r = redeemResetRequest({ name: 'me@example.com', provider: 'codex', orgName: 'Acme' }, 'k');
+  assert.equal(r.url, '/teamclaude/reset-credits/redeem');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'k');
+  assert.deepEqual(JSON.parse(r.init.body), { account: 'me@example.com', provider: 'codex', org: 'Acme' });
+});
+
+test('redeemResetOutcome tells a spent reset, a declined one and an unanswered one apart', () => {
+  assert.deepEqual(redeemResetOutcome({ ok: true, windowsReset: 2 }), { kind: 'ok', text: 'usage reset: 2 limit windows cleared' });
+  assert.deepEqual(redeemResetOutcome({ ok: true, windowsReset: 1 }), { kind: 'ok', text: 'usage reset: 1 limit window cleared' });
+  assert.deepEqual(redeemResetOutcome({ ok: true }), { kind: 'ok', text: 'usage reset' });
+  assert.equal(redeemResetOutcome({ ok: false, code: 'nothing_to_reset' }).kind, 'warn');
+  assert.match(redeemResetOutcome({ ok: false, code: 'nothing_to_reset' }).text, /no reset was used/);
+  assert.equal(redeemResetOutcome({ ok: false, code: 'no_credit' }).text, 'no resets left on this account');
+  assert.match(redeemResetOutcome({ ok: false, uncertain: true, error: 'x' }).text, /may still have gone through/);
+  assert.deepEqual(redeemResetOutcome({ ok: false, error: 'a client key cannot spend reset credits' }),
+    { kind: 'error', text: 'reset failed: a client key cannot spend reset credits' });
+  assert.equal(redeemResetOutcome(null).kind, 'error');
 });
 
 test('account token total includes the cache fields', () => {
