@@ -303,14 +303,22 @@ export function selfLinkInfo(config, bindHost, port) {
  * makes, then whether that instance can be linked back from here (a version
  * with /teamclaude/peer-links) and the name it suggests for itself.
  *
+ * The quota read the picker makes is open to a client key too, so it cannot
+ * tell one from the proxy key. The second read can: a current version
+ * refuses a client key there, which makes the key `refused` with `clientKey`
+ * set, since that key would be turned away from every change made through
+ * the link. Only a 404 says the version is older.
+ *
  * @param {Peer} peer
- * @returns {Promise<{ state: PeerState, linkable: boolean, name?: string }>}
+ * @returns {Promise<{ state: PeerState, linkable: boolean, name?: string, clientKey?: boolean }>}
  */
 export async function testPeerLink(peer) {
   const state = await checkPeer(peer);
   if (state !== 'online') return { state, linkable: false };
   try {
     const { status, body } = await peerRequest(peer, 'peer-links', { timeoutMs: CHECK_TIMEOUT_MS });
+    if (status === 403) return { state: 'refused', linkable: false, clientKey: true };
+    if (status === 401) return { state: 'refused', linkable: false };
     if (status !== 200) return { state, linkable: false };
     const self = JSON.parse(body.toString('utf8'))?.self;
     const name = typeof self?.name === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(self.name) ? self.name : undefined;

@@ -18,7 +18,7 @@ import {
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1083,7 +1083,7 @@ test('the page ships the same helper implementations it is tested against', () =
     meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker]) {
+    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -2307,6 +2307,7 @@ test('peerTestOutcome tells a wrong key, a wrong address and an old version apar
   assert.equal(peerTestOutcome({ ok: true, state: 'online', linkable: true }).text, 'It answers to that key.');
   assert.equal(peerTestOutcome({ ok: true, state: 'online', linkable: false }).kind, 'warn');
   assert.match(peerTestOutcome({ ok: true, state: 'refused', linkable: false }).text, /refused that key/);
+  assert.match(peerTestOutcome({ ok: true, state: 'refused', linkable: false, clientKey: true }).text, /one of its client keys.*needs its proxy key/);
   assert.match(peerTestOutcome({ ok: true, url: 'http://h:1', state: 'offline', linkable: false }).text, /Nothing answered at http:\/\/h:1/);
   assert.equal(peerTestOutcome({ ok: false, error: 'bad' }).text, 'could not test the link: bad');
 });
@@ -2320,11 +2321,16 @@ test('linkSelfOptions puts the address the page was opened at first, unless that
   assert.deepEqual(linkSelfOptions(null, 'not a url'), []);
 });
 
-test('linkBackBlocker explains a machine nobody can reach or get into', () => {
-  assert.equal(linkBackBlocker({ offBox: true, hasKey: true }), null);
-  assert.equal(linkBackBlocker(null), null);
-  assert.match(linkBackBlocker({ offBox: false, hasKey: true }), /listens on its own machine only/);
-  assert.match(linkBackBlocker({ offBox: true, hasKey: false }), /no proxy key/);
+test('linkBackNotice blocks a machine without a key, and only warns about one on loopback', () => {
+  assert.equal(linkBackNotice({ offBox: true, hasKey: true }), null);
+  assert.equal(linkBackNotice(null), null);
+  const loopback = linkBackNotice({ offBox: false, hasKey: true });
+  assert.equal(loopback.block, false, 'a reverse proxy or Tailscale Serve can still reach it');
+  assert.match(loopback.text, /listens on its own machine only.*reverse proxy or Tailscale Serve/);
+  const keyless = linkBackNotice({ offBox: true, hasKey: false });
+  assert.equal(keyless.block, true);
+  assert.match(keyless.text, /no proxy key/);
+  assert.equal(linkBackNotice({ offBox: false, hasKey: false }).block, true);
 });
 
 /** Boot the page on Settings, as opened at `origin`, and run `fn` with it. */
@@ -2377,13 +2383,13 @@ test('the card links another machine both ways from the form, testing it first',
   });
 });
 
-test('a machine that cannot be linked back to unticks and locks the link-back option', async () => {
+test('a loopback-only machine opened at localhost starts with link back unticked but still offered', async () => {
   await onSettings(async (page) => {
     await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
     await page.answer(200, { self: { ...SELF, offBox: false, addresses: [] }, peers: [] });
     const cb = page.byId('linkBack');
-    assert.equal(cb.checked, false);
-    assert.equal(cb.disabled, true);
+    assert.equal(cb.checked, false, 'no address to offer the other machine');
+    assert.equal(cb.disabled, false, 'an address typed in by hand can still be sent');
     assert.equal(page.byId('linkBackBlocked').style.display, '');
     assert.match(page.byId('linkBackBlocked').textContent, /listens on its own machine only/);
     assert.equal(page.byId('linkSelfUrl').value, '', 'a loopback page address is never offered');
@@ -2393,6 +2399,34 @@ test('a machine that cannot be linked back to unticks and locks the link-back op
     page.byId('linkForm').fire('submit', { preventDefault() {} });
     assert.equal(JSON.parse(page.requests[0].init.body).linkBack, undefined);
   }, { origin: 'http://localhost:3456' });
+});
+
+test('a loopback-only machine behind a reverse proxy links back at the address the page came through', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: { ...SELF, offBox: false, addresses: [] }, peers: [] });
+    const cb = page.byId('linkBack');
+    assert.equal(cb.disabled, false);
+    assert.notEqual(cb.checked, false, 'left ticked: there is an address to offer');
+    assert.equal(page.byId('linkSelfUrl').value, 'https://hub.tail1234.ts.net');
+    assert.match(page.byId('linkBackBlocked').textContent, /Tailscale Serve/, 'the warning still says what it depends on');
+    page.byId('linkUrl').value = 'http://100.64.0.2:3456';
+    page.byId('linkKey').value = 'k';
+    page.byId('linkName').value = 'desk';
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.deepEqual(JSON.parse(page.requests[0].init.body).linkBack, { name: 'hub', url: 'https://hub.tail1234.ts.net' });
+  }, { origin: 'https://hub.tail1234.ts.net' });
+});
+
+test('a machine without a proxy key unticks and locks the link back', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: { ...SELF, hasKey: false }, peers: [] });
+    const cb = page.byId('linkBack');
+    assert.equal(cb.checked, false);
+    assert.equal(cb.disabled, true);
+    assert.match(page.byId('linkBackBlocked').textContent, /no proxy key/);
+  });
 });
 
 test('a test that finds an older version unticks the link back', async () => {

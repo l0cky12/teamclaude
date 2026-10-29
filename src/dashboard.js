@@ -863,6 +863,7 @@ export function peerLinkOutcome(res, step) {
  */
 export function peerTestOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: PEER_LINK_FAILED.test + (res && res.error ? ': ' + res.error : '') };
+  if (res.state === 'refused' && res.clientKey) return { kind: 'error', text: 'That is one of its client keys, which cannot manage it. Linking needs its proxy key: on its dashboard, Settings, Linked instances, Show key.' };
   if (res.state === 'refused') return { kind: 'error', text: 'It refused that key. Copy the key again from its dashboard: Settings, Linked instances, Show key.' };
   if (res.state !== 'online') return { kind: 'error', text: 'Nothing answered at ' + res.url + '. Check the address, and that it listens beyond its own machine (proxy.host).' };
   if (!res.linkable) return { kind: 'warn', text: 'It answers to that key, but it runs a version that cannot link back from here. Update it, or link this machine from its own dashboard.' };
@@ -889,14 +890,19 @@ export function linkSelfOptions(self, origin) {
 }
 
 /**
- * Why the instance shown cannot be linked back to, or null when it can.
+ * What stands in the way of linking the instance shown back from the other
+ * machine, or null when nothing does. Without a proxy key nothing can get in,
+ * so that one blocks. Listening on loopback only is a warning: a reverse
+ * proxy or Tailscale Serve in front of it is still an address the other
+ * machine can use, and the page may well have been opened through one.
  *
  * @param {any} self  the `self` of GET /teamclaude/peer-links
+ * @returns {{ block: boolean, text: string } | null}
  */
-export function linkBackBlocker(self) {
+export function linkBackNotice(self) {
   if (!self) return null;
-  if (!self.offBox) return 'It listens on its own machine only, so no other machine can reach it to link back. Set proxy.host (or TEAMCLAUDE_HOST) to 0.0.0.0 or its Tailscale address.';
-  if (!self.hasKey) return 'It has no proxy key (proxy.apiKey) for the other machine to use, so it cannot be linked back.';
+  if (!self.hasKey) return { block: true, text: 'It has no proxy key (proxy.apiKey) for the other machine to use, so it cannot be linked back.' };
+  if (!self.offBox) return { block: false, text: 'It listens on its own machine only. Link back works only through something that forwards to it, such as a reverse proxy or Tailscale Serve: enter that address. Otherwise set proxy.host (or TEAMCLAUDE_HOST) to 0.0.0.0 or its Tailscale address.' };
   return null;
 }
 
@@ -1410,7 +1416,7 @@ const SHARED_HELPERS = [
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -2714,7 +2720,7 @@ ${SHARED_HELPERS}
   }
 
   // Prefills what this machine would be called and reached at from the other
-  // one, and says up front when it cannot be linked back at all.
+  // one, and says up front what stands in the way of linking it back.
   function fillLinkSelf() {
     var opts = linkSelfOptions(linkSelf, pageOrigin());
     var list = document.getElementById('linkSelfUrls');
@@ -2724,13 +2730,16 @@ ${SHARED_HELPERS}
     if (!url.value && opts.length) url.value = opts[0];
     var name = document.getElementById('linkSelfName');
     if (!name.value && linkSelf && linkSelf.name) name.value = linkSelf.name;
-    var why = linkBackBlocker(linkSelf);
+    var notice = linkBackNotice(linkSelf);
     var blocked = document.getElementById('linkBackBlocked');
-    blocked.textContent = why || '';
-    blocked.style.display = why ? '' : 'none';
+    blocked.textContent = notice ? notice.text : '';
+    blocked.style.display = notice ? '' : 'none';
     var cb = document.getElementById('linkBack');
-    if (why) cb.checked = false;
-    cb.disabled = !!why;
+    var block = !!(notice && notice.block);
+    // Ticked only with an address to offer; with none it is still the
+    // operator's to tick after typing one in.
+    if (block || !opts.length) cb.checked = false;
+    cb.disabled = block;
     syncLinkBack();
   }
 

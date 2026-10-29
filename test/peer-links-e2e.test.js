@@ -29,8 +29,10 @@ const post = (port, key, path, body) => fetch(`http://127.0.0.1:${port}${path}`,
 
 test('one add with a link back links two real proxies both ways', async () => {
   const hub = await proxy('hub');
-  const desk = await proxy('desk');
+  // Nested, so a second proxy that fails to start still has the first stopped.
+  let desk;
   try {
+    desk = await proxy('desk');
     const hubUrl = `http://127.0.0.1:${hub.port}`;
     const deskUrl = `http://127.0.0.1:${desk.port}`;
 
@@ -68,7 +70,6 @@ test('one add with a link back links two real proxies both ways', async () => {
     assert.equal(gone.status, 404);
     assert.equal(JSON.parse(await readFile(desk.configPath, 'utf-8')).peers.length, 1);
   } finally {
-    await hub.stop();
-    await desk.stop();
+    try { await desk?.stop(); } finally { await hub.stop(); }
   }
 });

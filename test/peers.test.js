@@ -236,6 +236,7 @@ test('testPeerLink says whether the key works, and whether that instance can lin
   const older = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [404, { error: 'unknown teamclaude control route' }]);
   const refusing = await fakePeer(() => [401, { error: 'Invalid proxy API key' }]);
   const oddName = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [200, { self: { name: '../x' } }]);
+  const clientKeyed = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [403, { ok: false, error: 'a client key cannot manage linked instances' }]);
   try {
     const at = (p) => ({ name: 'test', url: `http://127.0.0.1:${p.port}`, apiKey: 'their-key' });
     assert.deepEqual(await testPeerLink(at(current)), { state: 'online', linkable: true, name: 'desk' });
@@ -244,9 +245,10 @@ test('testPeerLink says whether the key works, and whether that instance can lin
     assert.deepEqual(await testPeerLink(at(refusing)), { state: 'refused', linkable: false });
     assert.equal(refusing.seen.length, 1, 'a refused key is not tried again');
     assert.deepEqual(await testPeerLink(at(oddName)), { state: 'online', linkable: true }, 'a name the relay path cannot carry is not suggested');
+    assert.deepEqual(await testPeerLink(at(clientKeyed)), { state: 'refused', linkable: false, clientKey: true }, 'a client key is not an older version');
     assert.deepEqual(await testPeerLink({ name: 'test', url: `http://127.0.0.1:${await closedPort()}`, apiKey: 'k' }), { state: 'offline', linkable: false });
   } finally {
-    for (const p of [current, older, refusing, oddName]) p.server.close();
+    for (const p of [current, older, refusing, oddName, clientKeyed]) p.server.close();
   }
 });
 

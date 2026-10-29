@@ -256,3 +256,25 @@ test('without a reload hook nothing is written', async () => {
     assert.equal(await readFile(path, 'utf-8'), before);
   }, { reload: null });
 });
+
+test('test tells a client key of the other proxy apart from its proxy key', async () => {
+  // The other machine as a real proxy: its quota read admits a client key,
+  // so only the second read can tell the two keys apart.
+  const otherProxy = { apiKey: 'tc-other', clientKeys: [{ name: 'laptop', key: 'tc-other-client' }] };
+  const other = createProxyServer(new AccountManager(ACCTS, 0.98), { proxy: otherProxy, upstream: 'https://api.anthropic.com' }, {});
+  const otherUrl = `http://127.0.0.1:${await listen(other)}`;
+  try {
+    await withServer(async ({ port }) => {
+      const asClient = await (await send(port, 'test', { url: otherUrl, apiKey: 'tc-other-client' })).json();
+      assert.deepEqual(asClient, { ok: true, url: otherUrl, state: 'refused', linkable: false, clientKey: true });
+      const asOperator = await (await send(port, 'test', { url: otherUrl, apiKey: 'tc-other' })).json();
+      assert.equal(asOperator.state, 'online');
+      assert.equal(asOperator.linkable, true);
+      // A wrong key cannot be tried here: both proxies are on loopback, which
+      // the other admits without a key. peers.test.js covers the refusal.
+    });
+  } finally {
+    other.closeAllConnections?.();
+    other.close();
+  }
+});
