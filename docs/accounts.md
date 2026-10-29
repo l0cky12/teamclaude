@@ -513,8 +513,8 @@ On the [dashboard](usage.md#status-dashboard-browser), every Codex account with 
 says how many resets it has left: under its controls on the **Quota** page, in
 the **Resets left** column on the **Accounts** page, and summed across accounts
 on the Quota page's Codex card. An account holding one gets a **Reset usage**
-button on both pages. The first click arms it; a second click within a few
-seconds spends one credit on that account, the one that expires soonest. It
+button on both pages. The first click arms it; a second click within 8 seconds
+spends one credit on that account, the one that expires soonest. It
 sends `POST /teamclaude/reset-credits/redeem` with an `{"account": ...}` body
 (plus `provider` and `org` where a name is shared), the same way **Refresh
 quota** names its account.
@@ -531,7 +531,9 @@ quota is read again, so its bars and count update on the next refresh.
 The answer is a `200` when a credit was spent, a `409` with the reason when
 none was, and a `502` marked `uncertain` when the request went out but no answer
 came back. In that case the credit may have been spent: **Refresh quota** shows
-what happened. A page holding a `proxy.clientKeys` key has no button, and the
+what happened. The page says the same when the answer itself is lost on the way
+to the browser. While a reset you asked for is running, an automatic one is
+turned away at once rather than made to wait for it. A page holding a `proxy.clientKeys` key has no button, and the
 route refuses that key with a `403`.
 
 Spending one is **opt-in**, and the switch is fleet-wide: set

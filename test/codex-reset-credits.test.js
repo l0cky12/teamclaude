@@ -818,6 +818,43 @@ test('a reset by hand is refused while another attempt is in flight', async () =
   assert.equal(calls.consume, 1);
 });
 
+// The two directions of manual/automatic overlap. Neither runs beside the
+// other, and an automatic refusal is never left waiting on a manual attempt's
+// longer budget: it is turned away at once.
+test('a refusal during a reset by hand is turned away at once, not joined to it', async () => {
+  const { am, redeemer, calls } = poolHarness();
+  /** @type {(v: any) => void} */
+  let release = () => {};
+  redeemer.consumeFn = async account => { calls.consume.push(account.name); await new Promise(r => { release = r; }); return { code: 'reset', windowsReset: 1, credit: null }; };
+  const manual = redeemer.redeemNow(am.accounts[0]);
+  while (calls.consume.length === 0) await new Promise(r => setImmediate(r));
+  let settled = false;
+  const auto = redeemer.maybeRedeemForPool(am.accounts).then(r => { settled = true; return r; });
+  await new Promise(r => setImmediate(r));
+  assert.equal(settled, true, 'answered while the manual attempt is still waiting on upstream');
+  const result = await auto;
+  assert.equal(result.redeemed, false);
+  assert.match(result.reason, /by hand is in progress/);
+  release(null);
+  assert.equal((await manual).redeemed, true);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
+test('a reset by hand during a pool-dry refusal is refused, not run beside it', async () => {
+  const { am, redeemer, calls } = poolHarness({ accounts: [codex('a')] });
+  /** @type {(v: any) => void} */
+  let release = () => {};
+  redeemer.consumeFn = async account => { calls.consume.push(account.name); await new Promise(r => { release = r; }); return { code: 'reset', windowsReset: 1, credit: null }; };
+  const auto = redeemer.maybeRedeemForPool(am.accounts);
+  while (calls.consume.length === 0) await new Promise(r => setImmediate(r));
+  const manual = await redeemer.redeemNow(am.accounts[0]);
+  assert.equal(manual.redeemed, false);
+  assert.match(manual.reason, /in progress/);
+  release(null);
+  assert.equal((await auto).redeemed, true);
+  assert.deepEqual(calls.consume, ['a']);
+});
+
 test('a reset by hand holds the automatic path off the rest of the pool', async () => {
   const { am, redeemer, calls } = poolHarness({ caughtUp: false });
   assert.equal((await redeemer.redeemNow(am.accounts[0])).redeemed, true);

@@ -469,6 +469,13 @@ export class ResetCreditRedeemer {
     // out, and only one of them should spend anything about it.
     /** @type {Promise<RedeemResult>|null} */
     this.inFlight = null;
+    // A reset asked for by hand (redeemNow), kept apart from the one above so
+    // that a refusal never JOINS it: a manual attempt runs to its own longer
+    // budget, and a waiting client joined to it would be held past
+    // REDEEM_BUDGET_MS. The two still never run together — each refuses
+    // while the other is in flight.
+    /** @type {Promise<RedeemResult>|null} */
+    this.manualInFlight = null;
     // The hold a per-account cooldown cannot express. Two outcomes are facts
     // about the FLEET rather than about the account they happened on:
     //
@@ -514,6 +521,8 @@ export class ResetCreditRedeemer {
    */
   async maybeRedeemForPool(accounts) {
     if (!accounts?.length) return { redeemed: false, reason: 'no candidate accounts' };
+    // Refused at once rather than joined: see manualInFlight.
+    if (this.manualInFlight) return { redeemed: false, reason: 'a reset asked for by hand is in progress' };
     // A pool-dry refusal is a FLEET state, so concurrent refusals are one
     // decision about the fleet rather than one per request. A per-account guard
     // alone would not do: two refusals could walk the same candidate list and
@@ -812,7 +821,8 @@ export class ResetCreditRedeemer {
    * it applies, and what is left is what keeps the spend itself safe:
    *
    *  - one attempt at a time across the fleet, automatic or not, so a click
-   *    during a pool-dry refusal cannot spend a second credit beside it;
+   *    during a pool-dry refusal cannot spend a second credit beside it (and a
+   *    refusal during a click is turned away rather than held to its budget);
    *  - fresh credit rows rather than the cache, which can be hours old and name
    *    a credit already spent;
    *  - the same consume as the automatic path (_consume), so the idempotency
@@ -830,9 +840,9 @@ export class ResetCreditRedeemer {
     if (providerOf(account) !== 'codex') return { redeemed: false, reason: 'not a Codex account' };
     // Refused rather than joined: the attempt in flight may be on another
     // account, and its answer is not an answer to this click.
-    if (this.inFlight) return { redeemed: false, reason: 'another reset attempt is in progress; try again in a moment' };
-    const attempt = this._manual(account).finally(() => { this.inFlight = null; });
-    this.inFlight = attempt;
+    if (this.inFlight || this.manualInFlight) return { redeemed: false, reason: 'another reset attempt is in progress; try again in a moment' };
+    const attempt = this._manual(account).finally(() => { this.manualInFlight = null; });
+    this.manualInFlight = attempt;
     return attempt;
   }
 

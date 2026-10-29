@@ -14,7 +14,7 @@ import {
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome,
+  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep, REDEEM_UNCERTAIN_TEXT,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -362,7 +362,17 @@ test('redeemResetOutcome tells a spent reset, a declined one and an unanswered o
   assert.match(redeemResetOutcome({ ok: false, uncertain: true, error: 'x' }).text, /may still have gone through/);
   assert.deepEqual(redeemResetOutcome({ ok: false, error: 'a client key cannot spend reset credits' }),
     { kind: 'error', text: 'reset failed: a client key cannot spend reset credits' });
-  assert.equal(redeemResetOutcome(null).kind, 'error');
+  assert.deepEqual(redeemResetOutcome(null), { kind: 'error', text: REDEEM_UNCERTAIN_TEXT },
+    'no verdict read is not a failure: the credit may be gone');
+});
+
+test('resetClickStep decides on the clock at the click, not when the button was drawn', () => {
+  const T = 1_000_000;
+  assert.equal(resetClickStep(undefined, T, 8000, 400), 'arm');
+  assert.equal(resetClickStep(T, T + 100, 8000, 400), 'wait', 'a double-click is not a decision');
+  assert.equal(resetClickStep(T, T + 2000, 8000, 400), 'redeem');
+  assert.equal(resetClickStep(T, T + 8000, 8000, 400), 'arm', 'the window has closed: arm again');
+  assert.equal(resetClickStep(T, T + 60_000, 8000, 400), 'arm');
 });
 
 test('account token total includes the cache fields', () => {
@@ -1189,7 +1199,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null 
     removeItem: k => store.delete(k),
   };
   const requests = [];
-  const fetch = (url, init) => new Promise(resolve => requests.push({ url, init, resolve }));
+  const fetch = (url, init) => new Promise((resolve, reject) => requests.push({ url, init, resolve, reject }));
   // documentElement is real enough to record the theme attribute, so a test can
   // assert what the page actually sets rather than that it merely did not throw.
   const rootAttrs = new Map();
@@ -1391,6 +1401,74 @@ test('a card\'s refresh button probes that one account, then polls for the new b
   req.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'a', status: 'ok' }) });
   await new Promise(r => setImmediate(r));
   assert.equal(page.requests[0].url, '/teamclaude/status', 'the poll after it shows the new bars');
+});
+
+// ── the "Reset usage" button, driven through the page ───────────────────────
+
+const RESET_STATUS = () => ({ accounts: [{ name: 'cx', provider: 'codex', quota: { resetCredits: { available: 2, seenAt: Date.now() } } }] });
+
+/** Run `fn` with Date.now pinned to `at`, the page's only clock. */
+function atClock(/** @type {number} */ at, /** @type {() => void} */ fn) {
+  const real = Date.now;
+  Date.now = () => at;
+  try { fn(); } finally { Date.now = real; }
+}
+
+test('a confirmed reset posts the card\'s account, then polls for the cleared bars', async () => {
+  const page = bootPage();
+  await page.answer(200, RESET_STATUS());
+  assert.equal(page.labelled('2 resets left'), 1);
+  const t = Date.now();
+  atClock(t, () => page.click('Reset usage'));
+  assert.equal(page.requests.length, 0, 'the first click only arms it');
+  atClock(t + 2000, () => page.click('Confirm reset'));
+  const req = page.requests.shift();
+  assert.equal(req.url, '/teamclaude/reset-credits/redeem');
+  assert.deepEqual(JSON.parse(req.init.body), { account: 'cx', provider: 'codex' });
+  req.resolve({ status: 200, ok: true, json: async () => ({ ok: true, account: 'cx', windowsReset: 2 }) });
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+});
+
+test('a confirmation left past its window arms again instead of spending, even with no render between', async () => {
+  const page = bootPage();
+  await page.answer(200, RESET_STATUS());
+  const t = Date.now();
+  atClock(t, () => page.click('Reset usage'));
+  // No poll answered in between: the Confirm button drawn at t is still the
+  // one on the page a minute later.
+  atClock(t + 60_000, () => page.click('Confirm reset'));
+  assert.equal(page.requests.length, 0, 'nothing is spent on a stale confirmation');
+  // Re-armed: the render after the click draws Confirm (on both the Quota row
+  // and the Accounts table, which render together) and no plain Reset usage.
+  assert.equal(page.labelled('Reset usage'), 0, 'it is armed afresh instead');
+  assert.ok(page.labelled('Confirm reset') > 0);
+});
+
+test('a reset whose request is lost says it may have gone through, not that it failed', async () => {
+  const page = bootPage();
+  await page.answer(200, RESET_STATUS());
+  const t = Date.now();
+  atClock(t, () => page.click('Reset usage'));
+  atClock(t + 2000, () => page.click('Confirm reset'));
+  page.requests.shift().reject(new TypeError('Failed to fetch'));
+  await new Promise(r => setImmediate(r));
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(200, RESET_STATUS());
+  assert.ok(page.built.some(e => typeof e.textContent === 'string' && e.textContent.endsWith(REDEEM_UNCERTAIN_TEXT)));
+  assert.ok(!page.built.some(e => typeof e.textContent === 'string' && /reset failed/.test(e.textContent)));
+});
+
+test('a reset whose answer cannot be read is reported as uncertain too', async () => {
+  const page = bootPage();
+  await page.answer(200, RESET_STATUS());
+  const t = Date.now();
+  atClock(t, () => page.click('Reset usage'));
+  atClock(t + 2000, () => page.click('Confirm reset'));
+  page.requests.shift().resolve({ status: 502, ok: false, json: async () => { throw new SyntaxError('Unexpected token <'); } });
+  await new Promise(r => setImmediate(r));
+  await page.answer(200, RESET_STATUS());
+  assert.ok(page.built.some(e => typeof e.textContent === 'string' && e.textContent.endsWith(REDEEM_UNCERTAIN_TEXT)));
 });
 
 test('the Logs page fetches the event log only while it is open, and from where it left off', async () => {

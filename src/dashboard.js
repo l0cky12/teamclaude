@@ -182,17 +182,31 @@ export function redeemResetRequest(account, key) {
   return r;
 }
 
+// What a click on "Reset usage" does, decided when the click lands rather than
+// when the button was drawn: a button armed and then left (the poll that would
+// redraw it can be late, or failing) must not spend a reset on a click long
+// after the window it offered has closed. Out of that window the click arms it
+// again; a second click too soon after the first is a double-click.
+/** @param {number|null|undefined} armedAt @param {number} now @param {number} confirmMs @param {number} doubleClickMs */
+export function resetClickStep(armedAt, now, confirmMs, doubleClickMs) {
+  if (armedAt == null || now - armedAt >= confirmMs) return 'arm';
+  if (now - armedAt < doubleClickMs) return 'wait';
+  return 'redeem';
+}
+
 // What the row says after a reset. A declined reset spent nothing and says
-// why; one that was sent and never answered may have spent a credit, and says
-// that rather than guessing.
-/** @param {any} res */
+// why; one with no verdict to read — the server said it never heard back, or
+// the answer itself was lost on the way to the page — may have spent a credit,
+// and says that rather than reporting a failure that invites a second one.
+/** @param {any} res  the server's answer, or null when none could be read */
 export function redeemResetOutcome(res) {
-  var r = res || {};
+  if (!res) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
+  var r = res;
   if (r.ok) {
     var n = r.windowsReset || 0;
     return { kind: 'ok', text: 'usage reset' + (n ? ': ' + n + ' limit window' + (n === 1 ? '' : 's') + ' cleared' : '') };
   }
-  if (r.uncertain) return { kind: 'error', text: 'no answer to the reset; it may still have gone through. Refresh quota to check.' };
+  if (r.uncertain) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
   if (r.code === 'nothing_to_reset') return { kind: 'warn', text: 'nothing to reset yet: no limit on this account is spent, so no reset was used' };
   if (r.code === 'no_credit') return { kind: 'warn', text: 'no resets left on this account' };
   return { kind: 'error', text: 'reset failed' + (r.error ? ': ' + r.error : '') };
@@ -1470,13 +1484,16 @@ export function usageFor(entry, view) {
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
+/** What a reset with no readable verdict says. A page constant too: see SHARED_CONSTS. */
+export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have gone through. Refresh quota to check before trying again.';
+
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome,
+  codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -1497,6 +1514,7 @@ const SHARED_CONSTS = [
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
+  `var REDEEM_UNCERTAIN_TEXT = ${JSON.stringify(REDEEM_UNCERTAIN_TEXT)};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
@@ -3470,8 +3488,11 @@ ${SHARED_HELPERS}
     var armedAt = resetArmed[key];
     var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
     var b = button(armed ? 'btn codex danger' : 'btn codex', armed ? 'Confirm reset' : 'Reset usage', function () {
-      if (!armed) { resetArmed[key] = Date.now(); if (lastStatus) render(lastStatus); return; }
-      if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
+      // Read afresh: what the button showed when it was drawn may be stale.
+      var now = Date.now();
+      var step = resetClickStep(resetArmed[key], now, REMOVE_CONFIRM_MS, REMOVE_DOUBLE_CLICK_MS);
+      if (step === 'wait') return;
+      if (step === 'arm') { resetArmed[key] = now; if (lastStatus) render(lastStatus); return; }
       delete resetArmed[key];
       doRedeemReset(account, key);
     });
@@ -3487,19 +3508,22 @@ ${SHARED_HELPERS}
     resetBusy[noteKey] = true;
     if (lastStatus) render(lastStatus);
     var r = redeemResetRequest(account, localStorage.getItem(KEY));
+    // Every way of NOT reading the server's verdict — the request rejected,
+    // the body unreadable — is reported as uncertain: the server may have
+    // spent the credit before the answer was lost, and "failed" would invite
+    // spending another. Only a refused key (401) is known to have spent nothing.
     fetch(at(r.url), r.init)
       .then(function (res) {
-        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
-        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
-      })
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return undefined; }
+        return res.json().catch(function () { return null; });
+      }, function () { return null; })
       .then(function (json) {
         delete resetBusy[noteKey];
-        if (!json) return;
+        if (json === undefined) { if (lastStatus) render(lastStatus); return; }
         var out = redeemResetOutcome(json);
         cardNote(noteKey, out.kind, out.text, false);
         poll();
-      })
-      .catch(function (e) { delete resetBusy[noteKey]; cardNote(noteKey, 'error', 'reset failed: ' + e.message, true); });
+      });
   }
 
   // The account leaves TeamClaude: the running fleet and the config file,
