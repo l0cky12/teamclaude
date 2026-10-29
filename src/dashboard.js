@@ -1604,10 +1604,14 @@ const PAGE = `<!doctype html>
   .ckeys td .btn + .btn { margin-top: 4px; }
   /* The Linked instances card reuses the client-key look, with its form as labelled rows. */
   .links { margin-top: 16px; }
-  .links form { flex-direction: column; align-items: stretch; gap: 6px; margin-top: 12px; }
+  .links form, #linkBackFields { display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 6px; }
+  .links form { margin-top: 12px; }
   .links .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .links .row > label { flex: 0 0 200px; font-size: 12px; color: var(--dim); }
   .links .row > .btn { flex: none; }
+  /* An address has no spaces to break at; on a phone it would push Remove off the card. */
+  .links td.addr { word-break: break-all; }
+  .links td .btn + .btn { margin-top: 4px; }
   .links .check { display: flex; gap: 8px; align-items: center; font-size: 12px; margin-top: 4px; }
   .links .check input { flex: none; margin: 0; }
   .links .sub2 { font-size: 12px; font-weight: 600; margin-top: 4px; }
@@ -2666,7 +2670,7 @@ ${SHARED_HELPERS}
     s.peers.forEach(function (p) {
       var tr = el('tr');
       tr.appendChild(el('td', '', p.name));
-      tr.appendChild(el('td', '', p.url));
+      tr.appendChild(el('td', 'addr', p.url));
       var td = el('td');
       td.appendChild(el('span', 'st ' + (p.state === 'online' ? 'ok' : p.state === 'checking' ? '' : 'error'), p.state));
       tr.appendChild(td);
@@ -2826,7 +2830,7 @@ ${SHARED_HELPERS}
         if (!j.ok) {
           box.appendChild(el('div', 'st error', PEER_LINK_FAILED.key + (j.error ? ': ' + j.error : '')));
         } else {
-          box.appendChild(el('span', 'hint', 'Anyone who can see this screen can use the key. Enter both on the other machine, under Link another machine.'));
+          box.appendChild(el('div', 'lbl', 'Anyone who can see this screen can use the key. Enter both on the other machine, under Link another machine.'));
           var opts = linkSelfOptions(linkSelf, pageOrigin());
           if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
