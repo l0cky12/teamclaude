@@ -818,6 +818,88 @@ export function clientKeyCheckOutcome(httpStatus, body, name) {
   return { kind: 'error', text: 'The proxy did not recognise the key as ' + name + (httpStatus === 200 ? '.' : ' (status ' + httpStatus + ').') };
 }
 
+// The start of a failed linked-instance step's message. A page constant too: see SHARED_CONSTS.
+const PEER_LINK_FAILED = { test: 'could not test the link', add: 'could not link the instance', remove: 'could not remove the link', key: 'could not read the key' };
+
+/**
+ * POST one step of the Linked instances card: `test` {url, apiKey}, `add`
+ * {name, url, apiKey, linkBack?}, `remove` {name} or `key` {}.
+ *
+ * @param {'test'|'add'|'remove'|'key'} step
+ * @param {Record<string, any>} body
+ * @param {string|null} key  the proxy key the page holds
+ */
+export function peerLinkRequest(step, body, key) {
+  return {
+    url: '/teamclaude/peer-links/' + step,
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    },
+  };
+}
+
+/**
+ * What to tell the operator after an add or a remove. An add that linked one
+ * way only says so: the other machine's dashboard will not show this one yet.
+ *
+ * @param {any} res
+ * @param {'add'|'remove'} step
+ */
+export function peerLinkOutcome(res, step) {
+  if (!res || !res.ok) return { kind: 'error', text: PEER_LINK_FAILED[step] + (res && res.error ? ': ' + res.error : '') };
+  if (step === 'remove') return { kind: 'ok', text: 'Removed ' + res.name + '. If it lists this machine too, remove that link from its own dashboard.' };
+  var back = res.linkBack;
+  if (back && back.ok) return { kind: 'ok', text: 'Linked ' + res.name + ' both ways: each dashboard now shows the other in the Instance picker.' };
+  if (back) return { kind: 'warn', text: 'Linked ' + res.name + ', but it did not link back: ' + back.error + '.' };
+  return { kind: 'ok', text: 'Linked ' + res.name + '. Pick it in the Instance picker to see it.' };
+}
+
+/**
+ * What a test of an address and key found (peers.js testPeerLink).
+ *
+ * @param {any} res
+ */
+export function peerTestOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: PEER_LINK_FAILED.test + (res && res.error ? ': ' + res.error : '') };
+  if (res.state === 'refused') return { kind: 'error', text: 'It refused that key. Copy the key again from its dashboard: Settings, Linked instances, Show key.' };
+  if (res.state !== 'online') return { kind: 'error', text: 'Nothing answered at ' + res.url + '. Check the address, and that it listens beyond its own machine (proxy.host).' };
+  if (!res.linkable) return { kind: 'warn', text: 'It answers to that key, but it runs a version that cannot link back from here. Update it, or link this machine from its own dashboard.' };
+  return { kind: 'ok', text: 'It answers to that key' + (res.name ? ' and calls itself ' + res.name : '') + '.' };
+}
+
+/**
+ * The addresses to offer for "this machine, as the other one reaches it",
+ * best first: the address this page was opened at, when that is not this
+ * machine's loopback and the page shows this machine, then what the server
+ * found on its own interfaces.
+ *
+ * @param {any} self  the `self` of GET /teamclaude/peer-links
+ * @param {string} origin  location.origin, or '' when the page shows a linked instance
+ */
+export function linkSelfOptions(self, origin) {
+  /** @type {string[]} */
+  var out = [];
+  var host = '';
+  try { host = origin ? new URL(origin).hostname : ''; } catch { host = ''; }
+  if (host && !isLoopbackHost(host)) out.push(origin);
+  (self && Array.isArray(self.addresses) ? self.addresses : []).forEach(function (/** @type {string} */ a) { if (out.indexOf(a) < 0) out.push(a); });
+  return out;
+}
+
+/**
+ * Why the instance shown cannot be linked back to, or null when it can.
+ *
+ * @param {any} self  the `self` of GET /teamclaude/peer-links
+ */
+export function linkBackBlocker(self) {
+  if (!self) return null;
+  if (!self.offBox) return 'It listens on its own machine only, so no other machine can reach it to link back. Set proxy.host (or TEAMCLAUDE_HOST) to 0.0.0.0 or its Tailscale address.';
+  if (!self.hasKey) return 'It has no proxy key (proxy.apiKey) for the other machine to use, so it cannot be linked back.';
+  return null;
+}
+
 /**
  * Whether the caller may use the control behind `path`. A status without the
  * `caller` field keeps every control: the server still refuses what it must.
@@ -1328,6 +1410,7 @@ const SHARED_HELPERS = [
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1346,6 +1429,7 @@ const SHARED_CONSTS = [
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
+  `var PEER_LINK_FAILED = ${JSON.stringify(PEER_LINK_FAILED)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1518,6 +1602,16 @@ const PAGE = `<!doctype html>
   .ckeys table { margin-top: 8px; }
   /* Show details and Revoke stack on a phone; keep them apart there too. */
   .ckeys td .btn + .btn { margin-top: 4px; }
+  /* The Linked instances card reuses the client-key look, with its form as labelled rows. */
+  .links { margin-top: 16px; }
+  .links form { flex-direction: column; align-items: stretch; gap: 6px; margin-top: 12px; }
+  .links .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .links .row > label { flex: 0 0 200px; font-size: 12px; color: var(--dim); }
+  .links .row > .btn { flex: none; }
+  .links .check { display: flex; gap: 8px; align-items: center; font-size: 12px; margin-top: 4px; }
+  .links .check input { flex: none; margin: 0; }
+  .links .sub2 { font-size: 12px; font-weight: 600; margin-top: 4px; }
+  .links .own { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
   .badge.sessions.known { color: var(--dim); }
@@ -1736,6 +1830,27 @@ const PAGE = `<!doctype html>
           <div><b>Proxy key</b><span class="tag">Forget the key this browser stored and enter another.</span></div>
           <button id="forgetKey" class="btn" type="button">Change key</button>
         </div>
+      </div>
+      <div id="links" class="card ckeys links" style="display:none">
+        <div class="ckh"><b>Linked instances</b><span class="hint">TeamClaude on your other machines. Each one linked here is in the Instance picker at the top of the sidebar, where every page shows that machine.</span></div>
+        <table id="linkList"></table>
+        <p class="hint" id="linkEmpty" style="display:none">No machine is linked yet.</p>
+        <p class="st warn" id="linkUnsupported" style="display:none">This instance runs a version that cannot be linked from the dashboard. Update it to manage its links here.</p>
+        <form id="linkForm" autocomplete="off">
+          <div class="sub2">Link another machine</div>
+          <div class="row"><label for="linkUrl">Its address</label><input id="linkUrl" placeholder="http://100.64.0.2:3456" spellcheck="false"></div>
+          <div class="row"><label for="linkKey">Its proxy key</label><input id="linkKey" type="password" placeholder="From its dashboard: Settings, Linked instances, Show key" spellcheck="false"><button id="linkTest" class="btn" type="button">Test</button></div>
+          <div class="row"><label for="linkName">Name it</label><input id="linkName" maxlength="64" placeholder="e.g. desktop" spellcheck="false"></div>
+          <label class="check"><input id="linkBack" type="checkbox" checked><span id="linkBackText">Link back too: list this machine on it, so its dashboard shows this one</span></label>
+          <div id="linkBackFields">
+            <div class="row"><label for="linkSelfUrl" id="linkSelfUrlLabel">This machine, as it reaches it</label><input id="linkSelfUrl" list="linkSelfUrls" placeholder="http://100.64.0.1:3456" spellcheck="false"><datalist id="linkSelfUrls"></datalist></div>
+            <div class="row"><label for="linkSelfName" id="linkSelfNameLabel">Name for this machine there</label><input id="linkSelfName" maxlength="64" spellcheck="false"></div>
+          </div>
+          <div id="linkBackBlocked" class="st warn" style="display:none"></div>
+          <div class="row"><button id="linkAdd" class="btn primary" type="submit">Link</button><span id="linkStatus" class="st"></span></div>
+        </form>
+        <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
+        <div id="ownKeyBox" class="issued" style="display:none"></div>
       </div>
     </section>
   </div>
@@ -2512,6 +2627,218 @@ ${SHARED_HELPERS}
     box.style.display = '';
   }
 
+  // Linked instances (Settings). The list comes with every status; what the
+  // instance shown can offer another machine (a name for itself, its
+  // addresses, whether it can be linked back) is asked once per page load,
+  // since it does not change while the proxy runs. Like everything else on
+  // the page it is the shown instance's: picking a linked one manages ITS links.
+  // Remove is armed by a first click, like Revoke.
+  var linkSelf = null;
+  var linkSelfState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'unsupported'
+  var linkRemoveArmed = Object.create(null);
+
+  // The address this page was opened at, which is this machine as the browser
+  // reaches it; nothing when the page shows a linked instance.
+  function pageOrigin() {
+    return !peer && typeof location !== 'undefined' ? location.origin : '';
+  }
+
+  function val(id) { return document.getElementById(id).value.trim(); }
+
+  function renderLinks(s) {
+    var card = document.getElementById('links');
+    var can = Array.isArray(s.peers) && callerCan(s.caller, '/teamclaude/peer-links/add');
+    card.style.display = can ? '' : 'none';
+    if (!can) return;
+    // Asked only once the card is on screen: every other page has no use for it.
+    if (linkSelfState === 'unasked' && currentPage === 'settings') loadLinkSelf();
+    var unsupported = linkSelfState === 'unsupported';
+    document.getElementById('linkUnsupported').style.display = unsupported ? '' : 'none';
+    document.getElementById('linkForm').style.display = unsupported ? 'none' : '';
+    document.getElementById('ownKey').style.display = unsupported ? 'none' : '';
+    document.getElementById('linkEmpty').style.display = s.peers.length ? 'none' : '';
+    var table = document.getElementById('linkList');
+    table.textContent = '';
+    if (!s.peers.length) return;
+    var hr = el('tr');
+    ['Name', 'Address', 'State', ''].forEach(function (h, i) { hr.appendChild(el('th', i === 3 ? 'num' : '', h)); });
+    table.appendChild(hr);
+    s.peers.forEach(function (p) {
+      var tr = el('tr');
+      tr.appendChild(el('td', '', p.name));
+      tr.appendChild(el('td', '', p.url));
+      var td = el('td');
+      td.appendChild(el('span', 'st ' + (p.state === 'online' ? 'ok' : p.state === 'checking' ? '' : 'error'), p.state));
+      tr.appendChild(td);
+      var actions = el('td', 'num');
+      // The picker lists this machine's links, so only those can be opened from here.
+      if (!peer) actions.appendChild(button('btn', 'Open', function () { pickInstance(p.name); }));
+      if (!unsupported) {
+        var armedAt = linkRemoveArmed[p.name];
+        var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+        var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {
+          if (!armed) { linkRemoveArmed[p.name] = Date.now(); if (lastStatus) render(lastStatus); return; }
+          if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
+          delete linkRemoveArmed[p.name];
+          doRemoveLink(p.name, b);
+        });
+        b.title = armed ? 'Click again: it leaves the Instance picker' : 'Stop showing this machine here';
+        actions.appendChild(b);
+      }
+      tr.appendChild(actions);
+      table.appendChild(tr);
+    });
+  }
+
+  function loadLinkSelf() {
+    linkSelfState = 'asking';
+    fetch(at('/teamclaude/peer-links'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        // An instance from before this card: no such route.
+        if (res.status === 404) return { unsupported: true };
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (j) {
+        linkSelfState = j.unsupported ? 'unsupported' : 'done';
+        linkSelf = j.self || null;
+        fillLinkSelf();
+        if (lastStatus) renderLinks(lastStatus);
+      })
+      // Asked again on a later render, not now: a loop on a proxy that keeps failing helps no one.
+      .catch(function () { linkSelfState = 'unasked'; });
+  }
+
+  // Prefills what this machine would be called and reached at from the other
+  // one, and says up front when it cannot be linked back at all.
+  function fillLinkSelf() {
+    var opts = linkSelfOptions(linkSelf, pageOrigin());
+    var list = document.getElementById('linkSelfUrls');
+    list.textContent = '';
+    opts.forEach(function (o) { var op = el('option'); op.value = o; list.appendChild(op); });
+    var url = document.getElementById('linkSelfUrl');
+    if (!url.value && opts.length) url.value = opts[0];
+    var name = document.getElementById('linkSelfName');
+    if (!name.value && linkSelf && linkSelf.name) name.value = linkSelf.name;
+    var why = linkBackBlocker(linkSelf);
+    var blocked = document.getElementById('linkBackBlocked');
+    blocked.textContent = why || '';
+    blocked.style.display = why ? '' : 'none';
+    var cb = document.getElementById('linkBack');
+    if (why) cb.checked = false;
+    cb.disabled = !!why;
+    syncLinkBack();
+  }
+
+  function syncLinkBack() {
+    document.getElementById('linkBackFields').style.display = document.getElementById('linkBack').checked ? '' : 'none';
+  }
+
+  // The card says "this machine" for the machine it manages, which is the
+  // linked one when the page shows one.
+  function labelLinkCard() {
+    if (!peer) return;
+    document.getElementById('linkBackText').textContent = 'Link back too: list ' + peer + ' on it, so its dashboard shows ' + peer;
+    document.getElementById('linkSelfUrlLabel').textContent = peer + ', as it reaches it';
+    document.getElementById('linkSelfNameLabel').textContent = 'Name for ' + peer + ' there';
+    document.getElementById('ownKeyLabel').textContent = peer + "'s proxy key and address, for linking it from another machine's dashboard.";
+  }
+
+  function linkStatus(kind, text) {
+    var st = document.getElementById('linkStatus');
+    st.className = 'st ' + kind;
+    st.textContent = text;
+  }
+
+  function postPeerLink(step, body) {
+    var r = peerLinkRequest(step, body, localStorage.getItem(KEY));
+    return fetch(at(r.url), r.init).then(function (res) {
+      if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+      return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+    });
+  }
+
+  function doTestLink(btn) {
+    var url = val('linkUrl');
+    var apiKey = val('linkKey');
+    if (!url || !apiKey) { linkStatus('error', 'Enter its address and its proxy key first.'); return; }
+    btn.disabled = true;
+    linkStatus('', 'Testing…');
+    postPeerLink('test', { url: url, apiKey: apiKey })
+      .then(function (j) {
+        if (!j) return;
+        var out = peerTestOutcome(j);
+        linkStatus(out.kind, out.text);
+        var name = document.getElementById('linkName');
+        if (j.ok && j.name && !name.value.trim()) name.value = j.name;
+        // It cannot take this machine's link, so the form should not offer to send one.
+        if (j.ok && j.state === 'online' && !j.linkable) { document.getElementById('linkBack').checked = false; syncLinkBack(); }
+      })
+      .catch(function (e) { linkStatus('error', PEER_LINK_FAILED.test + ': ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doAddLink() {
+    var body = { name: val('linkName'), url: val('linkUrl'), apiKey: val('linkKey') };
+    if (!body.url || !body.apiKey || !body.name) { linkStatus('error', 'Fill in its address, its proxy key and a name for it.'); return; }
+    var cb = document.getElementById('linkBack');
+    if (cb.checked && !cb.disabled) body.linkBack = { name: val('linkSelfName'), url: val('linkSelfUrl') };
+    var btn = document.getElementById('linkAdd');
+    btn.disabled = true;
+    linkStatus('', body.linkBack ? 'Linking both ways…' : 'Linking…');
+    postPeerLink('add', body)
+      .then(function (j) {
+        if (!j) return;
+        var out = peerLinkOutcome(j, 'add');
+        linkStatus(out.kind, out.text);
+        if (j.ok) {
+          ['linkUrl', 'linkKey', 'linkName'].forEach(function (id) { document.getElementById(id).value = ''; });
+          poll();
+        }
+      })
+      .catch(function (e) { linkStatus('error', PEER_LINK_FAILED.add + ': ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  function doRemoveLink(name, btn) {
+    btn.disabled = true;
+    postPeerLink('remove', { name: name })
+      .then(function (j) {
+        if (!j) return;
+        var out = peerLinkOutcome(j, 'remove');
+        linkStatus(out.kind, out.text);
+        poll();
+      })
+      .catch(function (e) { linkStatus('error', PEER_LINK_FAILED.remove + ': ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  // The key and a best-guess address, which is what the other machine's form asks for.
+  var ownKeyOpen = false;
+  function toggleOwnKey(btn) {
+    var box = document.getElementById('ownKeyBox');
+    if (ownKeyOpen) { ownKeyOpen = false; box.textContent = ''; box.style.display = 'none'; btn.textContent = 'Show key'; return; }
+    btn.disabled = true;
+    postPeerLink('key', {})
+      .then(function (j) {
+        if (!j) return;
+        box.textContent = '';
+        if (!j.ok) {
+          box.appendChild(el('div', 'st error', PEER_LINK_FAILED.key + (j.error ? ': ' + j.error : '')));
+        } else {
+          box.appendChild(el('span', 'hint', 'Anyone who can see this screen can use the key. Enter both on the other machine, under Link another machine.'));
+          var opts = linkSelfOptions(linkSelf, pageOrigin());
+          if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
+          snippet(box, 'Proxy key', j.key, 0);
+        }
+        box.style.display = '';
+        ownKeyOpen = true;
+        btn.textContent = 'Hide key';
+      })
+      .catch(function (e) { box.textContent = ''; box.appendChild(el('div', 'st error', PEER_LINK_FAILED.key + ': ' + e.message)); box.style.display = ''; ownKeyOpen = true; btn.textContent = 'Hide key'; })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // The window buttons, built once: the windows are fixed by the server that
   // served this page. Visibility is decided per render, since the control only
   // means something when there is a usage table under it.
@@ -2941,6 +3268,7 @@ ${SHARED_HELPERS}
     renderProblems(s);
     renderRouting(s);
     renderClientKeys(s);
+    renderLinks(s);
     renderClients(s.clients);
     renderDimensions(s.usageDimensions);
     // The control means nothing with no usage table under it. The payload
@@ -3535,6 +3863,7 @@ ${SHARED_HELPERS}
     }
     if (lastStatus) renderProblems(lastStatus);
     if (page.key === 'logs') { renderLogs(); pollLogs(); }
+    if (page.key === 'settings' && lastStatus) renderLinks(lastStatus);
   }
 
   document.getElementById('go').addEventListener('click', function () {
@@ -3603,6 +3932,11 @@ ${SHARED_HELPERS}
     if (!name) { ckStatus('error', 'Name the key first: the machine or agent that will use it.'); return; }
     doClientKey('create', name, document.getElementById('ckCreate'));
   });
+  document.getElementById('linkForm').addEventListener('submit', function (e) { e.preventDefault(); doAddLink(); });
+  document.getElementById('linkTest').addEventListener('click', function () { doTestLink(this); });
+  document.getElementById('linkBack').addEventListener('change', syncLinkBack);
+  document.getElementById('ownKeyShow').addEventListener('click', function () { toggleOwnKey(this); });
+  labelLinkCard();
   buildLogFilters();
   buildNav();
 

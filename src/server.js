@@ -27,12 +27,12 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, clientKeyNames, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
-import { createPeerDirectory, parsePeerUrl, relayToPeer } from './peers.js';
+import { askPeerToLinkBack, createPeerDirectory, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -446,6 +446,12 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/login/code', 'a client key cannot sign accounts in'],
   ['/teamclaude/login/status', 'a client key cannot sign accounts in'],
   ['/teamclaude/login/cancel', 'a client key cannot sign accounts in'],
+  // Linking reaches other machines with their proxy keys, and `key` hands out
+  // this one's: both are the operator's alone.
+  ['/teamclaude/peer-links/test', 'a client key cannot manage linked instances'],
+  ['/teamclaude/peer-links/add', 'a client key cannot manage linked instances'],
+  ['/teamclaude/peer-links/remove', 'a client key cannot manage linked instances'],
+  ['/teamclaude/peer-links/key', 'a client key cannot manage linked instances'],
 ]);
 
 /**
@@ -649,6 +655,120 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         if (peerRoute) { await relayToPeer(req, res, config, peerRoute); return; }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ peers: peerDirectory.list(config) }));
+        return;
+      }
+
+      // Managing the links themselves, for the dashboard's Linked instances
+      // card: what this machine can offer another (the GET), trying an address
+      // and key before saving them (test), adding and removing an entry of
+      // `peers`, and handing out this machine's own proxy key so another one
+      // can be linked to it. Operator only, like the relay: the client-key
+      // refusal above covers the POSTs, and the GET is refused here. Not under
+      // /teamclaude/peers/, where every name is a relay target.
+      if (req.method === 'GET' && req.url === '/teamclaude/peer-links') {
+        if (req.tcClient) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'a client key cannot manage linked instances' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ self: selfLinkInfo(config, boundHost(), req.socket.localPort || 0), peers: peerDirectory.list(config) }));
+        return;
+      }
+
+      // This machine's proxy.apiKey, to paste into another machine's dashboard.
+      // No more than the operator holds already: the key is in the config file,
+      // and a caller off this machine got here by presenting it.
+      if (req.method === 'POST' && req.url === '/teamclaude/peer-links/key') {
+        const key = config.proxy?.apiKey;
+        if (!key) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'this proxy has no proxy.apiKey, so no other machine can be linked to it' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, key }));
+        return;
+      }
+
+      // `{"url","apiKey"}`: whether that instance answers to that key, and
+      // whether it can be linked back. Nothing is written.
+      if (req.method === 'POST' && req.url === '/teamclaude/peer-links/test') {
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        let url;
+        try {
+          url = peerAddress(body.url);
+          if (typeof body.apiKey !== 'string' || !body.apiKey.trim()) throw new ConfigOpError('enter the other machine\'s proxy key (its proxy.apiKey)');
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: /** @type {Error} */ (err).message }));
+          return;
+        }
+        const out = await testPeerLink({ name: 'test', url, apiKey: body.apiKey.trim() });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, url, ...out }));
+        return;
+      }
+
+      // `add` {"name","url","apiKey","linkBack"?: {"name","url"}} and `remove`
+      // {"name"}. Written under the config lock and reloaded, as the client
+      // keys are, since the relay reads `peers` off the running config.
+      // `linkBack` then asks the new instance to list this machine as well,
+      // under that name and address and with this machine's own proxy key, so
+      // one form links both ways.
+      if (req.method === 'POST' && (req.url === '/teamclaude/peer-links/add' || req.url === '/teamclaude/peer-links/remove')) {
+        const isAdd = req.url === '/teamclaude/peer-links/add';
+        if (!hooks.reload) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'linked instance changes not supported' }));
+          return;
+        }
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        const refuse = (/** @type {string} */ error) => {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error }));
+        };
+        // The link back is checked before anything is written, so a form that
+        // cannot be carried out in full leaves the file as it was.
+        /** @type {{ name: string, url: string } | null} */ let back = null;
+        if (isAdd && body.linkBack) {
+          if (!config.proxy?.apiKey) return refuse('this machine has no proxy.apiKey for the other one to use, so it cannot be linked back');
+          try {
+            back = addPeer({}, { ...body.linkBack, apiKey: config.proxy.apiKey });
+          } catch (err) {
+            if (!(err instanceof ConfigOpError)) throw err;
+            return refuse('this machine, as the other one should list it: ' + err.message);
+          }
+        }
+        /** @type {any} */ let result;
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+            result = isAdd ? addPeer(c, body) : removePeer(c, body.name);
+          });
+        } catch (err) {
+          if (err instanceof ConfigOpError) return refuse(err.message);
+          console.error('[TeamClaude] Linked instance change failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'linked instance change failed; see the proxy log' }));
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a linked instance change failed:', /** @type {Error} */ (err).message);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' }));
+          return;
+        }
+        // The name and address only: the key never reaches the log.
+        console.log(`[TeamClaude] ${isAdd ? `Linked instance "${safeLine(result.name, 80)}" at ${safeLine(result.url, 200)}` : `Removed linked instance "${safeLine(result.name, 80)}"`} (control endpoint)`);
+        const linkBack = back
+          ? await askPeerToLinkBack({ name: result.name, url: result.url, apiKey: String(body.apiKey).trim() }, { ...back, apiKey: config.proxy.apiKey })
+          : null;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ...result, ...(linkBack ? { linkBack } : {}) }));
         return;
       }
 

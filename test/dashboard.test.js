@@ -18,6 +18,7 @@ import {
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1081,7 +1082,8 @@ test('the page ships the same helper implementations it is tested against', () =
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
     meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
-    clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome]) {
+    clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
+    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackBlocker]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // cardNoteFor reads it from page scope; without it the first render throws.
@@ -2274,4 +2276,208 @@ test('a page opened on Logs with a linked instance picked relays nothing before 
   } finally {
     delete globalThis.location;
   }
+});
+
+// The Linked instances card on Settings.
+
+test('peerLinkRequest posts each step to its own route with the page key', () => {
+  const r = peerLinkRequest('add', { name: 'desk', url: 'http://h:1', apiKey: 'k' }, 'tc-op');
+  assert.equal(r.url, '/teamclaude/peer-links/add');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-op');
+  assert.deepEqual(JSON.parse(r.init.body), { name: 'desk', url: 'http://h:1', apiKey: 'k' });
+  assert.equal(peerLinkRequest('key', null, null).init.body, '{}');
+  assert.equal(peerLinkRequest('key', null, null).init.headers['x-api-key'], '');
+});
+
+test('peerLinkOutcome says when a link went one way only', () => {
+  assert.deepEqual(peerLinkOutcome({ ok: true, name: 'desk', linkBack: { ok: true } }, 'add'),
+    { kind: 'ok', text: 'Linked desk both ways: each dashboard now shows the other in the Instance picker.' });
+  assert.deepEqual(peerLinkOutcome({ ok: true, name: 'desk', linkBack: { ok: false, error: 'desk refused the key' } }, 'add'),
+    { kind: 'warn', text: 'Linked desk, but it did not link back: desk refused the key.' });
+  assert.equal(peerLinkOutcome({ ok: true, name: 'desk' }, 'add').kind, 'ok');
+  assert.match(peerLinkOutcome({ ok: true, name: 'desk' }, 'remove').text, /^Removed desk\. If it lists this machine too/);
+  assert.deepEqual(peerLinkOutcome({ ok: false, error: 'an instance named "desk" is already linked' }, 'add'),
+    { kind: 'error', text: 'could not link the instance: an instance named "desk" is already linked' });
+  assert.equal(peerLinkOutcome(null, 'remove').text, 'could not remove the link');
+});
+
+test('peerTestOutcome tells a wrong key, a wrong address and an old version apart', () => {
+  assert.deepEqual(peerTestOutcome({ ok: true, state: 'online', linkable: true, name: 'desk' }), { kind: 'ok', text: 'It answers to that key and calls itself desk.' });
+  assert.equal(peerTestOutcome({ ok: true, state: 'online', linkable: true }).text, 'It answers to that key.');
+  assert.equal(peerTestOutcome({ ok: true, state: 'online', linkable: false }).kind, 'warn');
+  assert.match(peerTestOutcome({ ok: true, state: 'refused', linkable: false }).text, /refused that key/);
+  assert.match(peerTestOutcome({ ok: true, url: 'http://h:1', state: 'offline', linkable: false }).text, /Nothing answered at http:\/\/h:1/);
+  assert.equal(peerTestOutcome({ ok: false, error: 'bad' }).text, 'could not test the link: bad');
+});
+
+test('linkSelfOptions puts the address the page was opened at first, unless that is loopback', () => {
+  const self = { addresses: ['http://100.64.0.1:3456', 'http://10.0.0.5:3456'] };
+  assert.deepEqual(linkSelfOptions(self, 'http://100.64.0.1:3456'), ['http://100.64.0.1:3456', 'http://10.0.0.5:3456']);
+  assert.deepEqual(linkSelfOptions(self, 'http://hub.tail.ts.net:3456'), ['http://hub.tail.ts.net:3456', 'http://100.64.0.1:3456', 'http://10.0.0.5:3456']);
+  assert.deepEqual(linkSelfOptions(self, 'http://localhost:3456'), self.addresses);
+  assert.deepEqual(linkSelfOptions(self, ''), self.addresses);
+  assert.deepEqual(linkSelfOptions(null, 'not a url'), []);
+});
+
+test('linkBackBlocker explains a machine nobody can reach or get into', () => {
+  assert.equal(linkBackBlocker({ offBox: true, hasKey: true }), null);
+  assert.equal(linkBackBlocker(null), null);
+  assert.match(linkBackBlocker({ offBox: false, hasKey: true }), /listens on its own machine only/);
+  assert.match(linkBackBlocker({ offBox: true, hasKey: false }), /no proxy key/);
+});
+
+/** Boot the page on Settings, as opened at `origin`, and run `fn` with it. */
+async function onSettings(fn, { origin = 'http://100.64.0.1:3456', ...boot } = {}) {
+  const hostname = new URL(origin).hostname;
+  globalThis.location = { hash: '#settings', hostname, origin, reload() {} };
+  try {
+    await fn(bootPage(boot));
+  } finally {
+    delete globalThis.location;
+  }
+}
+
+const OPERATOR = { kind: 'operator', client: null, refused: [] };
+const SELF = { name: 'hub', addresses: ['http://100.64.0.1:3456', 'http://10.0.0.5:3456'], offBox: true, hasKey: true };
+
+test('the card links another machine both ways from the form, testing it first', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    assert.equal(page.byId('links').style.display, '');
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links', 'what this machine can offer is asked once Settings shows');
+    await page.answer(200, { self: SELF, peers: [] });
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.1:3456', 'prefilled with the address the page was opened at');
+    assert.equal(page.byId('linkSelfName').value, 'hub');
+    assert.equal(page.byId('linkBackBlocked').style.display, 'none');
+    assert.equal(page.byId('linkEmpty').style.display, '');
+
+    page.byId('linkUrl').value = '100.64.0.2:3456';
+    page.byId('linkKey').value = 'tc-desk';
+    page.byId('linkTest').fire('click');
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links/test');
+    assert.deepEqual(JSON.parse(page.requests[0].init.body), { url: '100.64.0.2:3456', apiKey: 'tc-desk' });
+    await page.answer(200, { ok: true, url: 'http://100.64.0.2:3456', state: 'online', linkable: true, name: 'desk' });
+    assert.equal(page.byId('linkName').value, 'desk', 'the name it calls itself fills an empty field');
+    assert.equal(page.byId('linkStatus').textContent, 'It answers to that key and calls itself desk.');
+
+    page.byId('linkBack').checked = true;
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links/add');
+    assert.deepEqual(JSON.parse(page.requests[0].init.body), {
+      name: 'desk', url: '100.64.0.2:3456', apiKey: 'tc-desk', linkBack: { name: 'hub', url: 'http://100.64.0.1:3456' },
+    });
+    await page.answer(200, { ok: true, name: 'desk', url: 'http://100.64.0.2:3456', linkBack: { ok: true } });
+    assert.match(page.byId('linkStatus').textContent, /^Linked desk both ways/);
+    assert.equal(page.byId('linkKey').value, '', 'the key does not stay in the form');
+    assert.equal(page.requests[0].url, '/teamclaude/status', 'the list and the picker refresh at once');
+    await page.answer(200, { accounts: [], peers: [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'checking' }], caller: OPERATOR });
+    assert.equal(page.byId('instances').style.display, '', 'the picker appears');
+    assert.ok(page.findLast(e => e.textContent === 'http://100.64.0.2:3456'), 'the list shows the new link');
+  });
+});
+
+test('a machine that cannot be linked back to unticks and locks the link-back option', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: { ...SELF, offBox: false, addresses: [] }, peers: [] });
+    const cb = page.byId('linkBack');
+    assert.equal(cb.checked, false);
+    assert.equal(cb.disabled, true);
+    assert.equal(page.byId('linkBackBlocked').style.display, '');
+    assert.match(page.byId('linkBackBlocked').textContent, /listens on its own machine only/);
+    assert.equal(page.byId('linkSelfUrl').value, '', 'a loopback page address is never offered');
+    page.byId('linkUrl').value = 'http://100.64.0.2:3456';
+    page.byId('linkKey').value = 'k';
+    page.byId('linkName').value = 'desk';
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.equal(JSON.parse(page.requests[0].init.body).linkBack, undefined);
+  }, { origin: 'http://localhost:3456' });
+});
+
+test('a test that finds an older version unticks the link back', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: SELF, peers: [] });
+    page.byId('linkBack').checked = true;
+    page.byId('linkUrl').value = 'http://100.64.0.2:3456';
+    page.byId('linkKey').value = 'k';
+    page.byId('linkTest').fire('click');
+    await page.answer(200, { ok: true, url: 'http://100.64.0.2:3456', state: 'online', linkable: false });
+    assert.equal(page.byId('linkBack').checked, false);
+    assert.equal(page.byId('linkBackFields').style.display, 'none');
+    assert.equal(page.byId('linkStatus').className, 'st warn');
+  });
+});
+
+test('the form asks for what is missing instead of sending it', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: SELF, peers: [] });
+    page.byId('linkTest').fire('click');
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.equal(page.requests.length, 0);
+    assert.match(page.byId('linkStatus').textContent, /Fill in its address, its proxy key and a name/);
+  });
+});
+
+test('Show key reads this machine\'s key and offers it with an address to copy', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: SELF, peers: [] });
+    page.byId('ownKeyShow').fire('click');
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links/key');
+    await page.answer(200, { ok: true, key: 'tc-hub' });
+    assert.equal(page.byId('ownKeyBox').style.display, '');
+    assert.ok(page.findLast(e => e.value === 'tc-hub'), 'the key');
+    assert.ok(page.findLast(e => e.value === 'http://100.64.0.1:3456'), 'and where to reach this machine');
+    assert.equal(page.byId('ownKeyShow').textContent, 'Hide key');
+    page.byId('ownKeyShow').fire('click');
+    assert.equal(page.byId('ownKeyBox').style.display, 'none');
+    assert.equal(page.requests.length, 0, 'hiding asks nothing');
+  });
+});
+
+test('Remove is armed by a first click and sent by the second', async () => {
+  await onSettings(async (page) => {
+    const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
+    await page.answer(200, { accounts: [], peers, caller: OPERATOR });
+    await page.answer(200, { self: SELF, peers });
+    page.click('Remove');
+    assert.equal(page.requests.length, 0);
+    const realNow = Date.now;
+    Date.now = () => realNow() + 1000;
+    try { page.click('Confirm remove'); } finally { Date.now = realNow; }
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links/remove');
+    assert.deepEqual(JSON.parse(page.requests[0].init.body), { name: 'desk' });
+    await page.answer(200, { ok: true, name: 'desk', removed: 1 });
+    assert.match(page.byId('linkStatus').textContent, /^Removed desk/);
+  });
+});
+
+test('the card is hidden from a client key, and asks nothing', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], caller: { kind: 'client', client: 'laptop', refused: ['/teamclaude/peer-links/add'] } });
+    assert.equal(page.byId('links').style.display, 'none');
+    assert.equal(page.requests.length, 0);
+  }, { storedKey: 'tc-client' });
+});
+
+test('an instance from before the card says so instead of offering a form that cannot work', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { peers: [{ name: 'server', url: 'http://100.64.0.2:3456', state: 'online' }] });
+    await page.answer(200, { accounts: [], peers: [{ name: 'hub', url: 'http://100.64.0.1:3456', state: 'online' }], caller: OPERATOR });
+    // Managed through the relay, like every other control on a linked instance's page.
+    assert.equal(page.requests[0].url, '/teamclaude/peers/server/peer-links');
+    await page.answer(404, { error: 'unknown teamclaude control route (check the path and the method)' });
+    assert.equal(page.byId('linkUnsupported').style.display, '');
+    assert.equal(page.byId('linkForm').style.display, 'none');
+    assert.equal(page.byId('ownKey').style.display, 'none');
+    page.poll();
+    await page.answer(200, { peers: [{ name: 'server', url: 'http://100.64.0.2:3456', state: 'online' }] });
+    await page.answer(200, { accounts: [], peers: [{ name: 'hub', url: 'http://100.64.0.1:3456', state: 'online' }], caller: OPERATOR });
+    assert.equal(page.requests.length, 0, 'not asked again');
+    assert.equal(page.labelled('Remove'), 0);
+    assert.equal(page.labelled('Open'), 0, 'its links are not in this machine\'s picker');
+  }, { storedInstance: 'server' });
 });

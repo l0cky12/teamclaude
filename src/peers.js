@@ -11,6 +11,7 @@
 
 import http from 'node:http';
 import https from 'node:https';
+import os from 'node:os';
 
 // A control route can take a while: a probe or a sign-in step calls upstream.
 const RELAY_TIMEOUT_MS = 30_000;
@@ -231,4 +232,115 @@ export async function checkPeer(peer) {
   } catch {
     return 'offline';
   }
+}
+
+// Interfaces whose addresses another machine never uses to reach this one:
+// container and VM bridges, which every Docker host has.
+const BRIDGE_IFACE = /^(docker|br-|veth|virbr|cni|flannel|podman)/;
+
+/**
+ * Whether a bind address keeps the proxy on this machine only.
+ * @param {string | null | undefined} bindHost
+ */
+export function bindsLoopbackOnly(bindHost) {
+  const h = String(bindHost || '127.0.0.1').replace(/^\[|\]$/g, '').toLowerCase();
+  return h === 'localhost' || h === '::1' || h.startsWith('127.');
+}
+
+/**
+ * Addresses another machine of yours might reach this proxy at, best guess
+ * first, for the dashboard's "link back" field: Tailscale, then the LAN, then
+ * anything else. A proxy that binds one address has only that one; one bound
+ * to loopback has none, since nothing off this machine can reach it.
+ *
+ * @param {string | null | undefined} bindHost
+ * @param {number} port
+ * @param {NodeJS.Dict<import('node:os').NetworkInterfaceInfo[]>} [interfaces]
+ * @returns {string[]}
+ */
+export function selfAddresses(bindHost, port, interfaces = os.networkInterfaces()) {
+  if (bindsLoopbackOnly(bindHost)) return [];
+  const bound = String(bindHost).replace(/^\[|\]$/g, '');
+  const at = (/** @type {string} */ ip) => `http://${ip.includes(':') ? `[${ip}]` : ip}:${port}`;
+  if (bound !== '0.0.0.0' && bound !== '::' && bound !== '') return [at(bound)];
+  /** @type {{ ip: string, rank: number }[]} */
+  const found = [];
+  for (const [name, list] of Object.entries(interfaces)) {
+    if (BRIDGE_IFACE.test(name)) continue;
+    for (const a of list || []) {
+      if (a.internal || a.family !== 'IPv4' || found.some(f => f.ip === a.address)) continue;
+      const [x, y] = a.address.split('.').map(Number);
+      // 100.64.0.0/10 is Tailscale's range; the private ranges are a LAN.
+      const rank = x === 100 && y >= 64 && y < 128 ? 0
+        : x === 10 || (x === 172 && y >= 16 && y < 32) || (x === 192 && y === 168) ? 1 : 2;
+      found.push({ ip: a.address, rank });
+    }
+  }
+  return found.sort((a, b) => a.rank - b.rank).map(f => at(f.ip));
+}
+
+/**
+ * What the dashboard needs to offer this machine to another: a name to list
+ * it under there, the addresses it may be reached at, and whether it can be
+ * linked at all (it listens off this machine and has a proxy key to hand out).
+ *
+ * @param {Record<string, any>} config
+ * @param {string | null | undefined} bindHost
+ * @param {number} port  the port the asking request came in on
+ */
+export function selfLinkInfo(config, bindHost, port) {
+  const name = os.hostname().split('.')[0].replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 64);
+  return {
+    name: name || 'teamclaude',
+    addresses: selfAddresses(bindHost, port),
+    offBox: !bindsLoopbackOnly(bindHost),
+    hasKey: !!config.proxy?.apiKey,
+  };
+}
+
+/**
+ * Try an address and key before they are saved: the same check the picker
+ * makes, then whether that instance can be linked back from here (a version
+ * with /teamclaude/peer-links) and the name it suggests for itself.
+ *
+ * @param {Peer} peer
+ * @returns {Promise<{ state: PeerState, linkable: boolean, name?: string }>}
+ */
+export async function testPeerLink(peer) {
+  const state = await checkPeer(peer);
+  if (state !== 'online') return { state, linkable: false };
+  try {
+    const { status, body } = await peerRequest(peer, 'peer-links', { timeoutMs: CHECK_TIMEOUT_MS });
+    if (status !== 200) return { state, linkable: false };
+    const self = JSON.parse(body.toString('utf8'))?.self;
+    const name = typeof self?.name === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(self.name) ? self.name : undefined;
+    return { state, linkable: true, ...(name ? { name } : {}) };
+  } catch {
+    return { state, linkable: false };
+  }
+}
+
+/**
+ * Ask a peer to list this machine in its own `peers`, so its dashboard shows
+ * this one too. `entry` carries this machine's own proxy key: the peer needs
+ * it to reach us, exactly as we hold the peer's.
+ *
+ * @param {Peer} peer
+ * @param {{ name: string, url: string, apiKey: string }} entry
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function askPeerToLinkBack(peer, entry) {
+  let out;
+  try {
+    out = await peerRequest(peer, 'peer-links/add', { method: 'POST', body: Buffer.from(JSON.stringify(entry)) });
+  } catch (err) {
+    return { ok: false, error: `${peer.name} is unreachable (${/** @type {Error} */ (err).message})` };
+  }
+  if (out.status === 200) return { ok: true };
+  if (out.status === 401 || out.status === 403) return { ok: false, error: `${peer.name} refused the key` };
+  if (out.status === 404) return { ok: false, error: `${peer.name} runs a version that cannot be linked from another dashboard; update it, or link this machine from its own dashboard` };
+  let why = '';
+  try { why = String(JSON.parse(out.body.toString('utf8')).error || ''); } catch { /* not JSON */ }
+  why = why.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200);
+  return { ok: false, error: `${peer.name} did not add this machine (${why || 'status ' + out.status})` };
 }

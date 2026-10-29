@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { configuredPeers, createPeerDirectory, parsePeerUrl } from '../src/peers.js';
+import { askPeerToLinkBack, bindsLoopbackOnly, configuredPeers, createPeerDirectory, parsePeerUrl, selfAddresses, testPeerLink } from '../src/peers.js';
 import { closedPort } from '../test-helpers/spawn-server.js';
 
 // Linked instances: a proxy relays /teamclaude/peers/<name>/<route> to another
@@ -208,4 +208,67 @@ test('a peer\'s reply reaches the browser as inert JSON, whatever it claims to b
       assert.equal(await res.text(), '<script>alert(localStorage.length)</script>');
     });
   } finally { peer.server.close(); }
+});
+
+test('selfAddresses offers Tailscale, then the LAN, and never a container bridge or loopback', () => {
+  const ifaces = {
+    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+    docker0: [{ address: '172.17.0.1', family: 'IPv4', internal: false }],
+    'br-095a': [{ address: '172.26.0.1', family: 'IPv4', internal: false }],
+    eth0: [{ address: '203.0.113.7', family: 'IPv4', internal: false }, { address: 'fe80::1', family: 'IPv6', internal: false }],
+    enp0s31f6: [{ address: '10.2.1.121', family: 'IPv4', internal: false }],
+    tailscale0: [{ address: '100.119.13.105', family: 'IPv4', internal: false }],
+  };
+  assert.deepEqual(selfAddresses('0.0.0.0', 3456, ifaces), ['http://100.119.13.105:3456', 'http://10.2.1.121:3456', 'http://203.0.113.7:3456']);
+  assert.deepEqual(selfAddresses('::', 3456, ifaces)[0], 'http://100.119.13.105:3456');
+  // Bound to one address, that is the only one anything can reach.
+  assert.deepEqual(selfAddresses('100.119.13.105', 3456, ifaces), ['http://100.119.13.105:3456']);
+  assert.deepEqual(selfAddresses('fd7a::5', 3456, ifaces), ['http://[fd7a::5]:3456']);
+  for (const bound of ['127.0.0.1', 'localhost', '::1', '[::1]', null, undefined]) {
+    assert.deepEqual(selfAddresses(bound, 3456, ifaces), [], String(bound));
+    assert.equal(bindsLoopbackOnly(bound), true, String(bound));
+  }
+  assert.equal(bindsLoopbackOnly('0.0.0.0'), false);
+});
+
+test('testPeerLink says whether the key works, and whether that instance can link back', async () => {
+  const current = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [200, { self: { name: 'desk', addresses: [] } }]);
+  const older = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [404, { error: 'unknown teamclaude control route' }]);
+  const refusing = await fakePeer(() => [401, { error: 'Invalid proxy API key' }]);
+  const oddName = await fakePeer((req) => req.url === '/teamclaude/quota' ? [200, {}] : [200, { self: { name: '../x' } }]);
+  try {
+    const at = (p) => ({ name: 'test', url: `http://127.0.0.1:${p.port}`, apiKey: 'their-key' });
+    assert.deepEqual(await testPeerLink(at(current)), { state: 'online', linkable: true, name: 'desk' });
+    assert.deepEqual(current.seen.map(r => [r.url, r.key]), [['/teamclaude/quota', 'their-key'], ['/teamclaude/peer-links', 'their-key']]);
+    assert.deepEqual(await testPeerLink(at(older)), { state: 'online', linkable: false });
+    assert.deepEqual(await testPeerLink(at(refusing)), { state: 'refused', linkable: false });
+    assert.equal(refusing.seen.length, 1, 'a refused key is not tried again');
+    assert.deepEqual(await testPeerLink(at(oddName)), { state: 'online', linkable: true }, 'a name the relay path cannot carry is not suggested');
+    assert.deepEqual(await testPeerLink({ name: 'test', url: `http://127.0.0.1:${await closedPort()}`, apiKey: 'k' }), { state: 'offline', linkable: false });
+  } finally {
+    for (const p of [current, older, refusing, oddName]) p.server.close();
+  }
+});
+
+test('askPeerToLinkBack posts this machine to the peer with the peer\'s key, and explains a refusal', async () => {
+  const answers = [[200, { ok: true }], [400, { ok: false, error: 'an instance named "hub" is already linked; remove it first to change it' }], [404, {}], [401, {}], [500, 'not json']];
+  const peer = await fakePeer(() => answers.shift());
+  try {
+    const target = { name: 'desk', url: `http://127.0.0.1:${peer.port}`, apiKey: 'desk-key' };
+    const entry = { name: 'hub', url: 'http://100.64.0.1:3456', apiKey: 'hub-key' };
+    assert.deepEqual(await askPeerToLinkBack(target, entry), { ok: true });
+    assert.equal(peer.seen[0].method, 'POST');
+    assert.equal(peer.seen[0].url, '/teamclaude/peer-links/add');
+    assert.equal(peer.seen[0].key, 'desk-key');
+    assert.deepEqual(JSON.parse(peer.seen[0].body), entry);
+    assert.match((await askPeerToLinkBack(target, entry)).error, /desk did not add this machine \(an instance named "hub" is already linked/);
+    assert.match((await askPeerToLinkBack(target, entry)).error, /runs a version that cannot be linked/);
+    assert.match((await askPeerToLinkBack(target, entry)).error, /refused the key/);
+    assert.match((await askPeerToLinkBack(target, entry)).error, /status 500/);
+  } finally {
+    peer.server.close();
+  }
+  const down = await askPeerToLinkBack({ name: 'desk', url: `http://127.0.0.1:${await closedPort()}`, apiKey: 'k' }, { name: 'hub', url: 'http://h:1', apiKey: 'k' });
+  assert.equal(down.ok, false);
+  assert.match(down.error, /desk is unreachable/);
 });
