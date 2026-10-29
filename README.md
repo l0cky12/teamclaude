@@ -168,7 +168,7 @@ This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the
 
 - A redesigned dashboard: a sidebar of pages, provider tabs (Claude, Codex, each backend), one row per account with its quota bars, and a Logs page ([#4](https://github.com/l0cky12/teamclaude/pull/4)).
 - The red TeamRouter logo in the sidebar and browser tab ([#10](https://github.com/l0cky12/teamclaude/pull/10)).
-- **Refresh quota** on each account, and the Fable bar shown first ([#3](https://github.com/l0cky12/teamclaude/pull/3)).
+- **Refresh quota** on enabled accounts whose quota can be read, and the Fable bar shown first ([#3](https://github.com/l0cky12/teamclaude/pull/3)).
 - 5-hour limit cards for Claude and Codex next to the weekly ones ([#12](https://github.com/l0cky12/teamclaude/pull/12)).
 - Accounts with no quota left are hidden until you press **Show all** ([#13](https://github.com/l0cky12/teamclaude/pull/13)).
 - **Sign in to Claude** and **Sign in to Codex** from the Accounts page, from any device, and **Remove** for an account ([#5](https://github.com/l0cky12/teamclaude/pull/5), [#9](https://github.com/l0cky12/teamclaude/pull/9)).
@@ -182,7 +182,7 @@ This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the
 **Routing**
 
 - `affinity` mode: use an account whose 5-hour window is about to reset first, and keep each conversation on its account while it can still serve it ([#2](https://github.com/l0cky12/teamclaude/pull/2)).
-- `drain` mode: use the account whose weekly limit resets soonest until it runs out ([#6](https://github.com/l0cky12/teamclaude/pull/6)).
+- `drain` mode: use the account whose weekly limit resets soonest until it runs out, moving early if one that resets even sooner becomes available ([#6](https://github.com/l0cky12/teamclaude/pull/6)).
 
 **Accounts**
 
