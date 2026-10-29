@@ -206,7 +206,10 @@ export function redeemResetOutcome(res) {
     var n = r.windowsReset || 0;
     return { kind: 'ok', text: 'usage reset' + (n ? ': ' + n + ' limit window' + (n === 1 ? '' : 's') + ' cleared' : '') };
   }
-  if (r.uncertain) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
+  // `unreachable` is the linked-instance relay (peers.js) losing the peer
+  // mid-request: it cannot say whether the peer acted before the connection
+  // went, so it is no more a "no" than an unread verdict here.
+  if (r.uncertain || r.unreachable) return { kind: 'error', text: REDEEM_UNCERTAIN_TEXT };
   if (r.code === 'nothing_to_reset') return { kind: 'warn', text: 'nothing to reset yet: no limit on this account is spent, so no reset was used' };
   if (r.code === 'no_credit') return { kind: 'warn', text: 'no resets left on this account' };
   return { kind: 'error', text: 'reset failed' + (r.error ? ': ' + r.error : '') };

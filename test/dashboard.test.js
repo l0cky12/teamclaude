@@ -362,6 +362,10 @@ test('redeemResetOutcome tells a spent reset, a declined one and an unanswered o
   assert.match(redeemResetOutcome({ ok: false, uncertain: true, error: 'x' }).text, /may still have gone through/);
   assert.deepEqual(redeemResetOutcome({ ok: false, error: 'a client key cannot spend reset credits' }),
     { kind: 'error', text: 'reset failed: a client key cannot spend reset credits' });
+  // The relay's answer when a linked instance dropped the connection: the
+  // peer may have spent the credit before it went.
+  assert.deepEqual(redeemResetOutcome({ ok: false, unreachable: true, error: 'laptop is unreachable (socket hang up)' }),
+    { kind: 'error', text: REDEEM_UNCERTAIN_TEXT });
   assert.deepEqual(redeemResetOutcome(null), { kind: 'error', text: REDEEM_UNCERTAIN_TEXT },
     'no verdict read is not a failure: the credit may be gone');
 });
@@ -1454,6 +1458,20 @@ test('a reset whose request is lost says it may have gone through, not that it f
   page.requests.shift().reject(new TypeError('Failed to fetch'));
   await new Promise(r => setImmediate(r));
   assert.equal(page.requests[0].url, '/teamclaude/status');
+  await page.answer(200, RESET_STATUS());
+  assert.ok(page.built.some(e => typeof e.textContent === 'string' && e.textContent.endsWith(REDEEM_UNCERTAIN_TEXT)));
+  assert.ok(!page.built.some(e => typeof e.textContent === 'string' && /reset failed/.test(e.textContent)));
+});
+
+test('a reset relayed to a linked instance that dropped the connection is reported as uncertain', async () => {
+  const page = bootPage();
+  await page.answer(200, RESET_STATUS());
+  const t = Date.now();
+  atClock(t, () => page.click('Reset usage'));
+  atClock(t + 2000, () => page.click('Confirm reset'));
+  // The shape peers.js relayToPeer answers with when the peer is lost mid-request.
+  page.requests.shift().resolve({ status: 502, ok: false, json: async () => ({ ok: false, unreachable: true, error: 'laptop is unreachable (socket hang up)' }) });
+  await new Promise(r => setImmediate(r));
   await page.answer(200, RESET_STATUS());
   assert.ok(page.built.some(e => typeof e.textContent === 'string' && e.textContent.endsWith(REDEEM_UNCERTAIN_TEXT)));
   assert.ok(!page.built.some(e => typeof e.textContent === 'string' && /reset failed/.test(e.textContent)));

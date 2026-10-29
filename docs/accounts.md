@@ -532,7 +532,8 @@ The answer is a `200` when a credit was spent, a `409` with the reason when
 none was, and a `502` marked `uncertain` when the request went out but no answer
 came back. In that case the credit may have been spent: **Refresh quota** shows
 what happened. The page says the same when the answer itself is lost on the way
-to the browser. While a reset you asked for is running, an automatic one is
+to the browser, or when a [linked instance](usage.md#linked-instances)
+the reset was sent to drops the connection before answering. While a reset you asked for is running, an automatic one is
 turned away at once rather than made to wait for it. A page holding a `proxy.clientKeys` key has no button, and the
 route refuses that key with a `403`.
 
