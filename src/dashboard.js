@@ -2017,6 +2017,10 @@ const PAGE = `<!doctype html>
     .sidefoot { flex-direction: row; flex-wrap: wrap; align-items: center; margin-top: 8px; padding-top: 8px; }
     .content { padding: 16px; }
     .arow { grid-template-columns: 1fr; }
+    /* The Account sync column has to fit beside the others on a phone. */
+    .links td.sync .btn { display: block; margin: 4px 0 0; }
+    .links td .btn.rm { min-width: 0; }
+    #linkList th, #linkList td { padding-left: 5px; padding-right: 5px; }
   }
 </style>
 <script>
@@ -3393,7 +3397,7 @@ ${SHARED_HELPERS}
       line.appendChild(link);
       one.appendChild(line);
       steps.appendChild(one);
-      steps.appendChild(el('li', '', 'Come back here. ' + where + ' finishes the sign-in by itself once you approve.'));
+      steps.appendChild(el('li', '', 'Come back here: the sign-in on ' + where + ' finishes by itself once you approve.'));
       box.appendChild(steps);
     }
     var st = syncSignIn.status || { kind: '', text: '' };
