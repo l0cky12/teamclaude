@@ -356,6 +356,17 @@ export async function askPeerToLinkBack(peer, entry) {
 // A mesh join visits every instance either side lists; past this many it
 // stops, so a misbehaving peer's list cannot make one link run for minutes.
 const MESH_MAX_INSTANCES = 32;
+// The whole join, so a link made through the relay still gets its answer:
+// at most this long, and over by RELAY_TIMEOUT_MS less a margin, counted from
+// when the add began (the link back before it can be slow too). What is not
+// done by then is reported as not done.
+const MESH_BUDGET_MS = 15_000;
+const MESH_REPLY_MARGIN_MS = 5_000;
+// One read or add during a join. A remote test runs two checks of its own,
+// each up to CHECK_TIMEOUT_MS, so it gets longer.
+const MESH_STEP_TIMEOUT_MS = 5_000;
+const MESH_TEST_TIMEOUT_MS = 2 * CHECK_TIMEOUT_MS + 2_000;
+const TIMED_OUT = Symbol('timed out');
 
 /**
  * The linked instances a peer lists, keys included, from its
@@ -363,11 +374,12 @@ const MESH_MAX_INSTANCES = 32;
  * refused, or a version without the route.
  *
  * @param {Peer} peer
+ * @param {{ timeoutMs?: number }} [opts]
  * @returns {Promise<Peer[] | null>}
  */
-export async function readPeerList(peer) {
+export async function readPeerList(peer, { timeoutMs = MESH_STEP_TIMEOUT_MS } = {}) {
   try {
-    const { status, body } = await peerRequest(peer, 'peer-links/peers', { method: 'POST', body: Buffer.from('{}') });
+    const { status, body } = await peerRequest(peer, 'peer-links/peers', { method: 'POST', body: Buffer.from('{}'), timeoutMs });
     if (status !== 200) return null;
     return configuredPeers({ peers: JSON.parse(body.toString('utf8'))?.peers });
   } catch {
@@ -376,14 +388,16 @@ export async function readPeerList(peer) {
 }
 
 /**
- * A name for `want` that `list` does not use for another instance yet: the
- * name itself, else the name with -2, -3 and so on.
+ * A name for `want` that the add routes accept (config-ops.js PEER_NAME) and
+ * that `list` does not use for another instance yet: the name itself, else
+ * with -2, -3 and so on. configuredPeers lets through names an add refuses,
+ * such as one with a space.
  *
  * @param {Peer[]} list
  * @param {string} want
  */
 function freeName(list, want) {
-  const base = want.slice(0, 60);
+  const base = want.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 60) || 'instance';
   if (!list.some(p => p.name === base)) return base;
   for (let n = 2; ; n++) if (!list.some(p => p.name === `${base}-${n}`)) return `${base}-${n}`;
 }
@@ -395,90 +409,166 @@ function freeName(list, want) {
 
 /**
  * Join two groups of linked instances into one, after this machine and
- * `joined` have just been linked both ways: every instance this machine
- * lists, and this machine itself, gets linked both ways with `joined` and
- * every instance `joined` lists. Linking desk to hub, when hub already lists
- * a server, so also links desk and the server.
+ * `joined` have just been linked both ways: this machine, `joined`, and
+ * every instance either of them lists are linked both ways with each other.
+ * Linking desk to hub, when hub already lists a server, so also links desk
+ * and the server; and a link missing inside either group is made as well,
+ * since a group is meant to be everyone linked with everyone.
  *
  * Instances are told apart by their proxy key, since a name and an address
- * are only what one machine calls another. A pair is linked one direction
- * at a time, each by the machine that will hold the entry: it tests the
- * address and key first (its own peer-links/test), so an address that only
- * the listing machine can reach is reported instead of saved. The adds sent
- * to other machines carry no linkBack, so they never start a join of their own.
+ * are only what one machine calls another. Two installs may share a key,
+ * though: a key listed at two different addresses could be one machine or
+ * two, so every instance with that key is left out and reported.
  *
- * Nothing here is undone when a step fails: each link that was made works on
- * its own, and the ones that were not are listed with why.
+ * A pair is linked one direction at a time, each by the machine that will
+ * hold the entry: it tests the address and key first (its own
+ * peer-links/test), so an address that only the listing machine can reach is
+ * reported instead of saved. The adds sent to other machines carry no
+ * linkBack, so they never start a join of their own. Each machine's adds run
+ * in turn, different machines' at once, and the whole join stops at
+ * MESH_BUDGET_MS.
+ *
+ * Nothing is undone when a step fails: each link made works on its own, and
+ * the ones that were not are listed with why.
  *
  * @param {object} opts
  * @param {Peer} opts.self  this machine, as `joined` lists it, with its own proxy key
  * @param {Peer[]} opts.ownPeers  what this machine lists, `joined` included
  * @param {Peer} opts.joined  the instance just linked
- * @param {(entries: Peer[]) => Promise<void>} opts.addLocal  save entries to this machine's `peers`
+ * @param {(entries: Peer[]) => Promise<(string | null)[]>} opts.addLocal  save entries to this
+ *   machine's `peers`; per entry, null when saved or why not
  * @param {typeof readPeerList} [opts.readList]
- * @param {typeof testPeerLink} [opts.test]
+ * @param {(peer: Peer) => Promise<{ state: PeerState }>} [opts.test]
  * @param {typeof peerRequest} [opts.request]
+ * @param {number} [opts.startedAt]  when the add that led here began (Date.now()); now by default
+ * @param {Promise<unknown>} [opts.expiry]  settles when the join is out of time; the
+ *   budget above by default
  * @returns {Promise<{ linked: MeshLink[], skipped: MeshSkip[] }>}
  */
-export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList = readPeerList, test = testPeerLink, request = peerRequest }) {
-  /** @type {MeshLink[]} */ const linked = [];
-  /** @type {MeshSkip[]} */ const skipped = [];
-
-  const joinedList = await readList(joined);
-  if (!joinedList) {
-    skipped.push({ from: joined.name, to: '*', error: `could not read the instances ${joined.name} lists; it may run an older version` });
-    return { linked, skipped };
+export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList = readPeerList, test = testPeerLink, request = peerRequest, startedAt = Date.now(), expiry }) {
+  const budgetMs = Math.min(MESH_BUDGET_MS, RELAY_TIMEOUT_MS - MESH_REPLY_MARGIN_MS - (Date.now() - startedAt));
+  if (!expiry && budgetMs <= 0) {
+    return { linked: [], skipped: [{ from: self.name, to: '*', error: `linking ${joined.name} took all the time this request has, so no other instance was linked; link those from their own dashboards` }] };
+  }
+  /** @type {ReturnType<typeof setTimeout> | undefined} */ let timer;
+  let timedOut = false;
+  /** @type {Promise<typeof TIMED_OUT>} */
+  const expired = (expiry || new Promise((resolve) => { timer = setTimeout(resolve, budgetMs); timer.unref?.(); }))
+    .then(() => { timedOut = true; return TIMED_OUT; });
+  /** @type {<T>(p: Promise<T>) => Promise<T | typeof TIMED_OUT>} */
+  const bounded = (p) => Promise.race([p, expired]);
+  try {
+    return await join();
+  } finally {
+    clearTimeout(timer);
   }
 
-  // Each side, one entry per key: this machine and what it lists, then the
-  // joined one and what it lists. An instance both list belongs to this side.
-  /** @type {Map<string, Peer>} */ const sideA = new Map([[self.apiKey, self]]);
-  for (const p of ownPeers) if (p.apiKey !== joined.apiKey && !sideA.has(p.apiKey)) sideA.set(p.apiKey, p);
-  /** @type {Map<string, Peer>} */ const sideB = new Map([[joined.apiKey, joined]]);
-  for (const p of joinedList) if (!sideA.has(p.apiKey) && !sideB.has(p.apiKey)) sideB.set(p.apiKey, p);
-  if (sideA.size + sideB.size > MESH_MAX_INSTANCES) {
-    skipped.push({ from: self.name, to: '*', error: `more than ${MESH_MAX_INSTANCES} instances between the two; link the rest by hand` });
-    return { linked, skipped };
-  }
+  async function join() {
+    /** @type {MeshSkip[]} */ const skipped = [];
+    const done = (/** @type {MeshLink[]} */ linked = []) => ({ linked, skipped });
 
-  // What each instance lists now. One that cannot be read cannot be asked to
-  // add anything either, so every pair with it is skipped.
-  /** @type {Map<string, Peer[] | null>} */ const lists = new Map([[self.apiKey, ownPeers], [joined.apiKey, joinedList]]);
-  for (const p of [...sideA.values(), ...sideB.values()]) {
-    if (!lists.has(p.apiKey)) lists.set(p.apiKey, await readList(p));
-  }
-
-  /** @type {Peer[]} */ const localAdds = [];
-  /**
-   * Have `from` list `to`, unless it does already.
-   * @param {Peer} from
-   * @param {Peer} to
-   */
-  const link = async (from, to) => {
-    const list = lists.get(from.apiKey);
-    if (!list) { skipped.push({ from: from.name, to: to.name, error: `could not reach ${from.name}` }); return; }
-    if (list.some(p => p.apiKey === to.apiKey)) return;
-    const entry = { name: freeName(list, to.name), url: to.url, apiKey: to.apiKey };
-    if (from === self) {
-      const { state } = await test(to).catch(() => ({ state: 'offline' }));
-      if (state !== 'online') { skipped.push({ from: from.name, to: to.name, error: `${to.name} is ${state} from ${from.name}` }); return; }
-      localAdds.push(entry);
-    } else {
-      const err = await remoteAdd(request, from, entry);
-      if (err) { skipped.push({ from: from.name, to: to.name, error: err }); return; }
+    const joinedList = await bounded(readList(joined, { timeoutMs: MESH_STEP_TIMEOUT_MS }));
+    if (!joinedList || joinedList === TIMED_OUT) {
+      skipped.push({ from: joined.name, to: '*', error: `could not read the instances ${joined.name} lists; it may run an older version` });
+      return done();
     }
-    list.push(entry);
-    linked.push({ from: from.name, to: entry.name });
-  };
 
-  for (const a of sideA.values()) {
-    for (const b of sideB.values()) {
-      await link(a, b);
-      await link(b, a);
+    // Every instance either side names, one per key, under the name this
+    // machine gives it where it lists it. A key seen at two addresses is
+    // ambiguous and left out.
+    /** @type {Map<string, Peer>} */ const nodes = new Map();
+    /** @type {Map<string, Set<string>>} */ const seenAt = new Map();
+    /** @type {Map<string, Set<string>>} */ const seenAs = new Map();
+    for (const p of [self, ...ownPeers, joined, ...joinedList]) {
+      if (!nodes.has(p.apiKey)) { nodes.set(p.apiKey, p); seenAt.set(p.apiKey, new Set()); seenAs.set(p.apiKey, new Set()); }
+      seenAt.get(p.apiKey)?.add(p.url);
+      seenAs.get(p.apiKey)?.add(p.name);
     }
+    /** @type {Set<string>} */ const ambiguous = new Set();
+    for (const [key, urls] of seenAt) {
+      if (urls.size < 2) continue;
+      ambiguous.add(key);
+      const names = [...(seenAs.get(key) || [])].join(' / ');
+      skipped.push({ from: names, to: '*', error: `${names} is listed at ${[...urls].join(' and ')} with one proxy key, so it cannot be told whether that is one instance or several; give each its own proxy.apiKey, or link these by hand` });
+    }
+    if (ambiguous.has(self.apiKey) || ambiguous.has(joined.apiKey)) return done();
+    for (const key of ambiguous) nodes.delete(key);
+
+    if (nodes.size > MESH_MAX_INSTANCES) {
+      skipped.push({ from: self.name, to: '*', error: `more than ${MESH_MAX_INSTANCES} instances between the two; link the rest by hand` });
+      return done();
+    }
+
+    // What each instance lists now, read all at once. One that cannot be read
+    // cannot be asked to add anything either; it is reported once, and the
+    // others still try to list it.
+    /** @type {Map<string, Peer[] | null>} */ const lists = new Map([[self.apiKey, [...ownPeers]], [joined.apiKey, [...joinedList]]]);
+    const toRead = [...nodes.keys()].filter(k => !lists.has(k));
+    const read = await Promise.all(toRead.map(k => bounded(readList(/** @type {Peer} */ (nodes.get(k)), { timeoutMs: MESH_STEP_TIMEOUT_MS }))));
+    toRead.forEach((k, i) => {
+      const r = read[i];
+      lists.set(k, r === TIMED_OUT ? null : r);
+      if (!r || r === TIMED_OUT) {
+        const p = /** @type {Peer} */ (nodes.get(k));
+        skipped.push({ from: p.name, to: '*', error: `could not reach ${p.name} to read what it lists, so it was not asked to list the others; link it from its own dashboard` });
+      }
+    });
+
+    // Each missing direction once, in a fixed order, so the report reads the
+    // same whatever finishes first.
+    /** @type {{ from: Peer, to: Peer }[]} */ const pairs = [];
+    for (const [u, from] of nodes) {
+      const list = lists.get(u);
+      if (!list) continue;
+      for (const [v, to] of nodes) if (u !== v && !list.some(p => p.apiKey === v)) pairs.push({ from, to });
+    }
+
+    /** @type {(MeshLink | MeshSkip | null)[]} */ const results = pairs.map(() => null);
+    /** @type {{ index: number, entry: Peer }[]} */ const localAdds = [];
+    const byFrom = new Map();
+    pairs.forEach((pair, index) => {
+      if (!byFrom.has(pair.from.apiKey)) byFrom.set(pair.from.apiKey, []);
+      byFrom.get(pair.from.apiKey).push(index);
+    });
+    await Promise.all([...byFrom.values()].map(async (/** @type {number[]} */ indexes) => {
+      for (const index of indexes) {
+        const { from, to } = pairs[index];
+        const skip = (/** @type {string} */ error) => { results[index] = { from: from.name, to: to.name, error }; };
+        const list = /** @type {Peer[]} */ (lists.get(from.apiKey));
+        if (timedOut) { skip('ran out of time before getting to it'); continue; }
+        const entry = { name: freeName(list, to.name), url: to.url, apiKey: to.apiKey };
+        if (from === self) {
+          const out = await bounded(test(to).catch(() => ({ state: /** @type {PeerState} */ ('offline') })));
+          if (out === TIMED_OUT) { skip(`ran out of time testing ${to.name}`); continue; }
+          if (out.state !== 'online') { skip(`${to.name} is ${out.state} from ${from.name}`); continue; }
+          localAdds.push({ index, entry });
+        } else {
+          const err = await bounded(remoteAdd(request, from, entry));
+          if (err === TIMED_OUT) { skip(`ran out of time waiting for ${from.name}; it may have linked ${to.name} anyway`); continue; }
+          if (err) { skip(err); continue; }
+          results[index] = { from: from.name, to: entry.name };
+        }
+        list.push(entry);
+      }
+    }));
+
+    // Saved last and in one go: one write under the config lock, one reload.
+    // A link counts only once it is saved.
+    if (localAdds.length) {
+      const saved = await addLocal(localAdds.map(a => a.entry)).catch(() => localAdds.map(() => 'could not save it; see the proxy log'));
+      localAdds.forEach(({ index, entry }, i) => {
+        const why = saved[i];
+        results[index] = why ? { from: self.name, to: pairs[index].to.name, error: why } : { from: self.name, to: entry.name };
+      });
+    }
+
+    /** @type {MeshLink[]} */ const linked = [];
+    for (const r of results) {
+      if (r && 'error' in r) skipped.push(r);
+      else if (r) linked.push(r);
+    }
+    return done(linked);
   }
-  if (localAdds.length) await addLocal(localAdds);
-  return { linked, skipped };
 }
 
 /**
@@ -496,11 +586,11 @@ async function remoteAdd(request, from, entry) {
     try { return String(JSON.parse(body.toString('utf8')).error || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200); } catch { return ''; }
   };
   try {
-    const tested = await request(from, 'peer-links/test', { method: 'POST', body: Buffer.from(JSON.stringify({ url: entry.url, apiKey: entry.apiKey })) });
+    const tested = await request(from, 'peer-links/test', { method: 'POST', body: Buffer.from(JSON.stringify({ url: entry.url, apiKey: entry.apiKey })), timeoutMs: MESH_TEST_TIMEOUT_MS });
     if (tested.status !== 200) return `${from.name} could not test the link (${why(tested.body) || 'status ' + tested.status})`;
     const state = JSON.parse(tested.body.toString('utf8'))?.state;
     if (state !== 'online') return `${entry.name} is ${typeof state === 'string' ? state.slice(0, 20) : 'unknown'} from ${from.name}`;
-    const added = await request(from, 'peer-links/add', { method: 'POST', body: Buffer.from(JSON.stringify(entry)) });
+    const added = await request(from, 'peer-links/add', { method: 'POST', body: Buffer.from(JSON.stringify(entry)), timeoutMs: MESH_STEP_TIMEOUT_MS });
     if (added.status !== 200) return `${from.name} did not add ${entry.name} (${why(added.body) || 'status ' + added.status})`;
     return null;
   } catch (err) {

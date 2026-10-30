@@ -49,7 +49,8 @@ async function fakePeer(reply) {
 /**
  * A server whose config file is a throwaway, with the running `peers` kept in
  * step with the file by the reload hook, as index.js does. Pass `reload: null`
- * for a server without one.
+ * for a server without one, or a function of `{ config, path, reloads }` to
+ * replace it.
  */
 async function withServer(fn, { proxy = { apiKey: 'tc-local' }, peers, reload } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'teamclaude-peer-links-'));
@@ -61,7 +62,7 @@ async function withServer(fn, { proxy = { apiKey: 'tc-local' }, peers, reload } 
   const config = { proxy: JSON.parse(JSON.stringify(proxy)), upstream: 'https://api.anthropic.com', peers };
   const reloads = { count: 0 };
   const hooks = reload === null ? {} : {
-    reload: reload || (async () => { reloads.count++; config.peers = await readPeers(path); return {}; }),
+    reload: reload ? () => reload({ config, path, reloads }) : (async () => { reloads.count++; config.peers = await readPeers(path); return {}; }),
   };
   const server = createProxyServer(new AccountManager(ACCTS, 0.98), config, hooks, null, null, null, { bindHost: '0.0.0.0' });
   const port = await listen(server);
@@ -222,9 +223,11 @@ test('the GET says what this machine can offer, and lists the links without thei
 });
 
 test('add with linkBack then reads what the new instance lists, and links this machine to it', async () => {
-  // A fake desk that lists a server, and a fake server that answers tests.
+  // A fake desk that lists a server, and a fake server that lists desk and
+  // answers tests. Only this machine and the server are left to link.
+  let deskUrl = '';
   const server = await fakePeer((req) => {
-    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [] }];
+    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [{ name: 'desk', url: deskUrl, apiKey: 'desk-key' }] }];
     if (req.url === '/teamclaude/peer-links/test') return [200, { ok: true, state: 'online', linkable: true }];
     return [200, { ok: true }];
   });
@@ -233,6 +236,7 @@ test('add with linkBack then reads what the new instance lists, and links this m
     if (req.url === '/teamclaude/peer-links') return [200, { self: { name: 'server' } }];
     return [200, { ok: true }];
   });
+  deskUrl = desk.url;
   try {
     await withServer(async ({ port, path, config }) => {
       const res = await send(port, 'add', { name: 'desk', url: desk.url, apiKey: 'desk-key', linkBack: { name: 'hub', url: 'http://100.64.0.1:3456' } });
@@ -250,6 +254,75 @@ test('add with linkBack then reads what the new instance lists, and links this m
         ['/teamclaude/peer-links/add', 'server-key'],
       ]);
       assert.deepEqual(JSON.parse(asked[2].body), { name: 'hub', url: 'http://100.64.0.1:3456', apiKey: 'tc-local' });
+    });
+  } finally {
+    desk.server.close();
+    server.server.close();
+  }
+});
+
+test('a link the join could not save here is reported as not linked, and the others still are', async () => {
+  // The file already names another instance "server", which the running
+  // config has not picked up (a hand edit not yet reloaded): the join picks
+  // that name, and the save refuses it.
+  let deskUrl = '';
+  const server = await fakePeer((req) => {
+    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [{ name: 'desk', url: deskUrl, apiKey: 'desk-key' }] }];
+    if (req.url === '/teamclaude/peer-links/test') return [200, { ok: true, state: 'online', linkable: true }];
+    return [200, { ok: true }];
+  });
+  const desk = await fakePeer((req) => {
+    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [{ name: 'hub', url: 'http://100.64.0.1:3456', apiKey: 'tc-local' }, { name: 'server', url: server.url, apiKey: 'server-key' }] }];
+    return [200, { ok: true }];
+  });
+  deskUrl = desk.url;
+  const other = { name: 'server', url: 'http://127.0.0.1:1', apiKey: 'other-key' };
+  try {
+    await withServer(async ({ port, path }) => {
+      const res = await send(port, 'add', { name: 'desk', url: desk.url, apiKey: 'desk-key', linkBack: { name: 'hub', url: 'http://100.64.0.1:3456' } });
+      const body = await res.json();
+      assert.deepEqual(body.mesh.linked, [{ from: 'server', to: 'hub' }]);
+      assert.deepEqual(body.mesh.skipped, [{ from: 'hub', to: 'server', error: 'an instance named "server" is already linked; remove it first to change it' }]);
+      assert.deepEqual((await readPeers(path)).map(p => p.apiKey), ['other-key', 'desk-key']);
+    }, {
+      peers: [other],
+      reload: async ({ config, path: file, reloads }) => {
+        reloads.count++;
+        config.peers = (await readPeers(file)).filter(p => p.apiKey !== 'other-key');
+        return {};
+      },
+    });
+  } finally {
+    desk.server.close();
+    server.server.close();
+  }
+});
+
+test('a reload that fails after the join saved its links says so', async () => {
+  let deskUrl = '';
+  const server = await fakePeer((req) => {
+    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [{ name: 'desk', url: deskUrl, apiKey: 'desk-key' }] }];
+    if (req.url === '/teamclaude/peer-links/test') return [200, { ok: true, state: 'online', linkable: true }];
+    return [200, { ok: true }];
+  });
+  const desk = await fakePeer((req) => {
+    if (req.url === '/teamclaude/peer-links/peers') return [200, { ok: true, peers: [{ name: 'hub', url: 'http://100.64.0.1:3456', apiKey: 'tc-local' }, { name: 'server', url: server.url, apiKey: 'server-key' }] }];
+    return [200, { ok: true }];
+  });
+  deskUrl = desk.url;
+  try {
+    await withServer(async ({ port, path }) => {
+      const res = await send(port, 'add', { name: 'desk', url: desk.url, apiKey: 'desk-key', linkBack: { name: 'hub', url: 'http://100.64.0.1:3456' } });
+      const body = await res.json();
+      assert.deepEqual(body.mesh.skipped, [{ from: 'hub', to: 'server', error: 'saved to the config file, but the reload failed; see the proxy log' }]);
+      assert.deepEqual((await readPeers(path)).map(p => p.name), ['desk', 'server']);
+    }, {
+      // The add's own reload works; the join's, the second, fails.
+      reload: async ({ config, path: file, reloads }) => {
+        if (++reloads.count > 1) throw new Error('boom');
+        config.peers = await readPeers(file);
+        return {};
+      },
     });
   } finally {
     desk.server.close();

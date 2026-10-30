@@ -55,17 +55,26 @@ function peerOf(m) {
   return { name: m.name, url: m.url, apiKey: m.apiKey };
 }
 
-/** Run a join from `self`, which has just linked `joined` both ways. */
-async function join(w, self, joined) {
+/**
+ * Run a join from `self`, which has just linked `joined` both ways. `refuse`
+ * maps an entry name to the error this machine's save gives it.
+ */
+async function join(w, self, joined, { refuse = {}, expiry } = {}) {
   const added = [];
   const out = await joinPeerMesh({
     self: w.peer(self),
     ownPeers: w.machines[self].list.map(p => ({ ...p })),
     joined: w.peer(joined),
-    addLocal: async (entries) => { added.push(...entries); w.machines[self].list.push(...entries); },
+    addLocal: async (entries) => entries.map((e) => {
+      if (refuse[e.name]) return refuse[e.name];
+      added.push(e);
+      w.machines[self].list.push(e);
+      return null;
+    }),
     readList: w.readList,
     test: w.test,
     request: w.request,
+    expiry,
   });
   return { ...out, added };
 }
@@ -115,10 +124,11 @@ test('an instance that cannot be reached is reported, and the rest are still lin
   const w = world({ hub: ['server', 'nas', 'desk'], server: ['hub', 'nas'], nas: ['hub', 'server'], desk: ['hub'] }, { down: ['nas'] });
   const out = await join(w, 'desk', 'hub');
   assert.deepEqual(out.linked, [{ from: 'desk', to: 'server' }, { from: 'server', to: 'desk' }]);
-  assert.deepEqual(out.skipped, [
-    { from: 'desk', to: 'nas', error: 'nas is offline from desk' },
-    { from: 'nas', to: 'desk', error: 'could not reach nas' },
-  ]);
+  // nas is reported once for what it could not be asked, and once for desk's
+  // own test of it.
+  assert.deepEqual(out.skipped.map(s => [s.from, s.to]), [['nas', '*'], ['desk', 'nas']]);
+  assert.match(out.skipped[0].error, /could not reach nas to read what it lists/);
+  assert.equal(out.skipped[1].error, 'nas is offline from desk');
   assert.deepEqual(w.lists('desk'), ['hub', 'server']);
 });
 
@@ -151,6 +161,74 @@ test('nothing to do when the two groups are linked already', async () => {
   assert.ok(!w.calls.some(([step]) => step === 'peer-links/add'));
 });
 
+test('machines both sides list get their missing links to either side too', async () => {
+  // desk and hub both list the server, but the server lists only hub.
+  const w = world({ desk: ['hub', 'server'], hub: ['desk', 'server'], server: ['hub'] });
+  const out = await join(w, 'desk', 'hub');
+  assert.deepEqual(out.linked, [{ from: 'server', to: 'desk' }]);
+  assert.deepEqual(out.skipped, []);
+  assert.deepEqual(w.lists('server'), ['hub', 'desk']);
+});
+
+test('two instances that share a proxy key are reported, not merged into one', async () => {
+  const w = world({ hub: ['server', 'nas', 'desk'], server: ['hub'], nas: ['hub'], desk: ['hub'] });
+  w.machines.nas.apiKey = 'server-key';
+  w.machines.hub.list[1].apiKey = 'server-key';
+  const out = await join(w, 'desk', 'hub');
+  assert.deepEqual(out.linked, []);
+  assert.equal(out.skipped.length, 1);
+  assert.equal(out.skipped[0].from, 'server / nas');
+  assert.match(out.skipped[0].error, /listed at http:\/\/server\.test:3456 and http:\/\/nas\.test:3456 with one proxy key/);
+  assert.deepEqual(w.lists('desk'), ['hub']);
+});
+
+test('one that shares this machine\'s key stops the join, since this machine cannot be told apart', async () => {
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  w.machines.server.apiKey = 'desk-key';
+  w.machines.hub.list[0].apiKey = 'desk-key';
+  const out = await join(w, 'desk', 'hub');
+  assert.deepEqual(out.linked, []);
+  assert.match(out.skipped[0].error, /cannot be told whether that is one instance or several/);
+  assert.ok(!w.calls.some(([step]) => step === 'peer-links/add'));
+});
+
+test('a link this machine could not save is reported, not counted as linked', async () => {
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  const out = await join(w, 'desk', 'hub', { refuse: { server: 'an instance named "server" is already linked; remove it first to change it' } });
+  assert.deepEqual(out.linked, [{ from: 'server', to: 'desk' }]);
+  assert.deepEqual(out.skipped, [{ from: 'desk', to: 'server', error: 'an instance named "server" is already linked; remove it first to change it' }]);
+});
+
+test('a name the add routes would refuse is made into one they accept', async () => {
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] }, { aliases: { hub: { server: 'my server' } } });
+  const out = await join(w, 'desk', 'hub');
+  assert.deepEqual(out.added.map(e => e.name), ['my-server']);
+  assert.deepEqual(out.skipped, []);
+});
+
+test('out of time, the join answers with what it did and what it did not get to', async () => {
+  // The server never answers its add; desk's own test of the server answers at once.
+  const w = world({ hub: ['server', 'nas', 'desk'], server: ['hub', 'nas'], nas: ['hub', 'server'], desk: ['hub'] });
+  let expire;
+  const expiry = new Promise((resolve) => { expire = resolve; });
+  const request = w.request;
+  w.request = (from, rest, opts) => {
+    if (from.name === 'server' && rest === 'peer-links/add') { expire(); return new Promise(() => {}); }
+    return request(from, rest, opts);
+  };
+  const out = await join(w, 'desk', 'hub', { expiry });
+  const skipped = Object.fromEntries(out.skipped.map(s => [`${s.from}>${s.to}`, s.error]));
+  assert.match(skipped['server>desk'], /ran out of time waiting for server; it may have linked desk anyway/);
+  // Every missing direction is in the answer once, as linked or as out of
+  // time; which of the others finished before the server stalled depends on
+  // nothing the test controls, so it only checks they add up.
+  const linked = out.linked.map(l => `${l.from}>${l.to}`);
+  assert.deepEqual([...linked, ...Object.keys(skipped)].sort(), ['desk>nas', 'desk>server', 'nas>desk', 'server>desk']);
+  for (const [pair, error] of Object.entries(skipped)) assert.match(error, /ran out of time/, pair);
+  // What desk tested in time is saved.
+  assert.deepEqual(out.added.map(e => e.name), linked.filter(l => l.startsWith('desk>')).map(l => l.slice(5)));
+});
+
 test('a joined instance listing too many instances is refused before any is visited', async () => {
   const many = Array.from({ length: 40 }, (_, i) => `m${i}`);
   const w = world({ hub: [...many, 'desk'], desk: ['hub'], ...Object.fromEntries(many.map(n => [n, []])) });
@@ -158,4 +236,22 @@ test('a joined instance listing too many instances is refused before any is visi
   assert.deepEqual(out.linked, []);
   assert.match(out.skipped[0].error, /more than 32 instances/);
   assert.deepEqual(w.calls, [['read', 'hub']]);
+});
+
+test('an add that already used up the time links nothing more, and says so', async () => {
+  // The link back alone took past what a relayed reply allows.
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  const out = await joinPeerMesh({
+    self: w.peer('desk'),
+    ownPeers: w.machines.desk.list.map(p => ({ ...p })),
+    joined: w.peer('hub'),
+    addLocal: async (entries) => entries.map(() => null),
+    readList: w.readList,
+    test: w.test,
+    request: w.request,
+    startedAt: Date.now() - 60_000,
+  });
+  assert.deepEqual(out.linked, []);
+  assert.match(out.skipped[0].error, /linking hub took all the time this request has/);
+  assert.deepEqual(w.calls, [], 'nothing was asked');
 });

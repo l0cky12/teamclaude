@@ -494,17 +494,36 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
 
   /**
    * Save the entries a mesh join found for this machine, then reload so the
-   * relay reaches them at once. An entry whose name was taken in the meantime
-   * is left out rather than failing the rest.
+   * relay reaches them at once. Per entry, null when it was saved, or why
+   * not: an entry the add refuses (a name taken in the meantime, say) is left
+   * out without failing the rest.
    * @param {{ name: string, url: string, apiKey: string }[]} entries
+   * @returns {Promise<(string | null)[]>}
    */
   async function savePeersFromMesh(entries) {
-    await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
-      for (const e of entries) {
-        try { addPeer(c, e); } catch (err) { if (!(err instanceof ConfigOpError)) throw err; }
+    /** @type {(string | null)[]} */ let out = [];
+    try {
+      await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+        out = entries.map((e) => {
+          try { addPeer(c, e); return null; } catch (err) {
+            if (!(err instanceof ConfigOpError)) throw err;
+            return err.message;
+          }
+        });
+      });
+    } catch (err) {
+      console.error('[TeamClaude] Saving the linked instances a join found failed:', /** @type {Error} */ (err).message);
+      return entries.map(() => 'could not save it to the config file; see the proxy log');
+    }
+    if (out.some(o => o === null)) {
+      try {
+        await hooks.reload?.();
+      } catch (err) {
+        console.error('[TeamClaude] Reload after linking the instances a join found failed:', /** @type {Error} */ (err).message);
+        return out.map(o => o ?? 'saved to the config file, but the reload failed; see the proxy log');
       }
-    });
-    await hooks.reload?.();
+    }
+    return out;
   }
 
   // The log directory is made up front and synchronously, so a path that
@@ -750,6 +769,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // (joinPeerMesh), unless the body says `"mesh": false`.
       if (req.method === 'POST' && (req.url === '/teamclaude/peer-links/add' || req.url === '/teamclaude/peer-links/remove')) {
         const isAdd = req.url === '/teamclaude/peer-links/add';
+        const startedAt = Date.now();
         if (!hooks.reload) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'linked instance changes not supported' }));
@@ -803,6 +823,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             ownPeers: configuredPeers(config),
             joined,
             addLocal: (entries) => savePeersFromMesh(entries),
+            startedAt,
           }).catch((err) => {
             console.error('[TeamClaude] Linking the other linked instances failed:', /** @type {Error} */ (err).message);
             return { linked: [], skipped: [{ from: back.name || 'this machine', to: '*', error: 'failed; see the proxy log' }] };
