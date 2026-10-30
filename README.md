@@ -179,6 +179,7 @@ This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the
 - The Sessions table shown by default ([#14](https://github.com/l0cky12/teamclaude/pull/14)).
 - The Logs page shows which client sent each request and, if you turn on `proxy.logPrompts`, its prompt ([#18](https://github.com/l0cky12/teamclaude/pull/18)).
 - Linked instances: link TeamRouter on your other machines and control them all from one dashboard, set up from the Settings page ([#20](https://github.com/l0cky12/teamclaude/pull/20), [#21](https://github.com/l0cky12/teamclaude/pull/21)).
+- An Insights page with graphs of your usage over the last day, week, month, 90 days or all time: tokens by provider, account or token type, the token mix, and the busiest accounts and models ([#29](https://github.com/l0cky12/teamclaude/pull/29)).
 
 **Routing**
 
