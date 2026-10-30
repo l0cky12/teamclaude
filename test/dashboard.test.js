@@ -20,6 +20,7 @@ import {
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
+  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncOutcome,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1153,7 +1154,8 @@ test('the page ships the same helper implementations it is tested against', () =
     meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing]) {
+    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
+    accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // parseInstanceLink reads it from page scope.
@@ -1169,7 +1171,11 @@ test('the page ships the same helper implementations it is tested against', () =
 // Run the page's whole inline script against a stub DOM, a stub localStorage and
 // a fetch the test answers by hand. Elements absorb any method call, so render()
 // runs without a real DOM; only the style and text the startup path sets are read.
-function bootPage({ storedKey = null, storedTheme = null, storedInstance = null } = {}) {
+// `autoAnswer(url)` may answer a request at once instead of queueing it (a
+// response, or null to queue), for a test about one card that should not
+// have to answer another's reads. `manualTimers` hands the page's setTimeout
+// to the test (`page.runTimers()`), for a poll it would otherwise wait out.
+function bootPage({ storedKey = null, storedTheme = null, storedInstance = null, autoAnswer = null, manualTimers = false } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
   // kept, so a test can drive a control the page created for itself — the
@@ -1205,7 +1211,15 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null 
     removeItem: k => store.delete(k),
   };
   const requests = [];
-  const fetch = (url, init) => new Promise((resolve, reject) => requests.push({ url, init, resolve, reject }));
+  const fetch = (url, init) => {
+    const auto = autoAnswer && autoAnswer(url, init);
+    if (auto) return Promise.resolve({ ok: auto.status >= 200 && auto.status < 300, status: auto.status, json: async () => auto.body });
+    return new Promise((resolve, reject) => requests.push({ url, init, resolve, reject }));
+  };
+  const timers = [];
+  const timerFns = manualTimers
+    ? [(fn) => { timers.push(fn); return timers.length; }, (id) => { if (id) timers[id - 1] = null; }]
+    : [setTimeout, clearTimeout];
   // documentElement is real enough to record the theme attribute, so a test can
   // assert what the page actually sets rather than that it merely did not throw.
   const rootAttrs = new Map();
@@ -1218,12 +1232,20 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null 
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   let poll;
-  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', script)(
-    document, localStorage, fetch, fn => { poll = fn; return 1; }, () => {});
+  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', script)(
+    document, localStorage, fetch, fn => { poll = fn; return 1; }, () => {}, ...timerFns);
   const answer = async (status, body = {}) => {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
   };
+  // Answer the queued request to this URL, wherever it is in the queue.
+  const answerTo = async (url, status, body = {}) => {
+    const i = requests.findIndex(r => r.url === url);
+    assert.ok(i >= 0, `no request to ${url} (queued: ${requests.map(r => r.url).join(', ')})`);
+    requests.splice(i, 1)[0].resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
+    await new Promise(r => setImmediate(r));
+  };
+  const runTimers = () => { const due = timers.splice(0).filter(Boolean); due.forEach(fn => fn()); };
   // Click the control carrying this label, whoever built it. A render replaces
   // a table by building new elements rather than mutating the old ones, so the
   // mark is what keeps `labelled` counting what is on the page now instead of
@@ -1239,7 +1261,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null 
   // The latest element built that matches, for a control with no label to
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
-  return { byId, store, requests, answer, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
+  return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
 }
 
 test('the quota refresh picker keeps keyboard focus and coalesces steps made while saving', async () => {
@@ -2535,12 +2557,16 @@ test('linkBackNotice blocks a machine without a key, and only warns about one on
   assert.equal(linkBackNotice({ offBox: false, hasKey: false }).block, true);
 });
 
+// The Account sync card's reads, answered as by a server without it: the
+// Linked instances tests are about that card's own requests.
+const NO_ACCOUNT_SYNC = (url) => (url.includes('/account-sync') ? { status: 501, body: { ok: false } } : null);
+
 /** Boot the page on Settings, as opened at `origin`, and run `fn` with it. */
-async function onSettings(fn, { origin = 'http://100.64.0.1:3456', ...boot } = {}) {
+async function onSettings(fn, { origin = 'http://100.64.0.1:3456', autoAnswer = NO_ACCOUNT_SYNC, ...boot } = {}) {
   const hostname = new URL(origin).hostname;
   globalThis.location = { hash: '#settings', hostname, origin, reload() {} };
   try {
-    await fn(bootPage(boot));
+    await fn(bootPage({ autoAnswer, ...boot }));
   } finally {
     delete globalThis.location;
   }
@@ -2795,4 +2821,176 @@ test('selfInstanceLabel falls back to This machine', () => {
   assert.equal(selfInstanceLabel({ name: 'hermes' }), 'hermes');
   assert.equal(selfInstanceLabel(undefined), 'This machine');
   assert.equal(selfInstanceLabel({ name: '' }), 'This machine');
+});
+
+// ── Account sync (callback.net) ─────────────────────────────
+
+test('accountSyncRequest: the GET carries the key, a step POSTs its body', () => {
+  assert.deepEqual(accountSyncRequest('view', null, 'k'), { url: '/teamclaude/account-sync', init: { headers: { 'x-api-key': 'k' } } });
+  const r = accountSyncRequest('status', { id: 'abc' }, null);
+  assert.equal(r.url, '/teamclaude/account-sync/status');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], '');
+  assert.equal(r.init.headers['content-type'], 'application/json');
+  assert.deepEqual(JSON.parse(r.init.body), { id: 'abc' });
+});
+
+test('accountSyncUser names the user by name and email, or whichever there is', () => {
+  assert.equal(accountSyncUser({ user: { name: 'Me', email: 'me@example.com' } }), 'Me (me@example.com)');
+  assert.equal(accountSyncUser({ user: { name: 'me@example.com', email: 'me@example.com' } }), 'me@example.com');
+  assert.equal(accountSyncUser({ user: { name: null, email: 'me@example.com' } }), 'me@example.com');
+  assert.equal(accountSyncUser({ user: null }), null);
+});
+
+test('accountSyncLine says off, on, failing, or waiting on a sign-in', () => {
+  assert.deepEqual(accountSyncLine({ ok: true, signedIn: false }, 'this machine'), { kind: '', text: 'Off: this machine keeps its own sign-ins.' });
+  const user = { email: 'me@example.com', name: null };
+  assert.deepEqual(accountSyncLine({ ok: true, signedIn: true, user, sync: { lastSyncAt: null } }, 'x'),
+    { kind: 'ok', text: 'On, as me@example.com. The first sync is under way.' });
+  assert.deepEqual(accountSyncLine({ ok: true, signedIn: true, user, sync: { lastSyncAt: 1, rows: 1 } }, 'x'),
+    { kind: 'ok', text: 'On, as me@example.com. 1 account in the store.' });
+  assert.deepEqual(accountSyncLine({ ok: true, signedIn: true, user, sync: { lastSyncAt: 1, rows: 3, signInNeeded: 2 } }, 'x'),
+    { kind: 'warn', text: 'On, as me@example.com. 3 accounts in the store. 2 need a sign-in on one of your machines.' });
+  assert.equal(accountSyncLine({ ok: true, signedIn: true, user, sync: { lastSyncAt: 1, lastError: 'fetch failed' } }, 'x').kind, 'error');
+  assert.match(accountSyncLine({ ok: true, signedIn: true, user: null, userError: 'the session has expired', sync: {} }, 'x').text, /did not say who/);
+  assert.deepEqual(accountSyncLine({ ok: false, error: 'status 500' }, 'x'), { kind: 'error', text: 'could not read account sync: status 500' });
+});
+
+test('peerSyncCell offers Set up only where sync is off, and flags another callback.net account', () => {
+  const own = { ok: true, signedIn: true, user: { email: 'me@example.com', name: null } };
+  assert.deepEqual(peerSyncCell(null, 0, own), { kind: '', text: '…', setUp: false });
+  assert.deepEqual(peerSyncCell({ ok: false }, 404, own), { kind: 'warn', text: 'needs an update', setUp: false });
+  assert.deepEqual(peerSyncCell({ ok: false }, 502, own), { kind: 'error', text: 'unknown', setUp: false });
+  assert.deepEqual(peerSyncCell({ ok: true, signedIn: false }, 200, own), { kind: '', text: 'off', setUp: true });
+  assert.deepEqual(peerSyncCell({ ok: true, signedIn: true, user: { email: 'me@example.com', name: null } }, 200, own),
+    { kind: 'ok', text: 'on, as me@example.com', setUp: false });
+  const other = peerSyncCell({ ok: true, signedIn: true, user: { email: 'someone@example.com', name: null } }, 200, own);
+  assert.equal(other.kind, 'warn');
+  assert.match(other.text, /another callback\.net account, so it shares nothing/);
+  assert.match(peerSyncCell({ ok: true, signedIn: true, user: null }, 200, { ok: true, signedIn: false }).text, /this machine is off/);
+});
+
+test('accountSyncApprovalHref opens https, or http to this machine, and nothing else', () => {
+  assert.equal(accountSyncApprovalHref('https://oid.jp/ABC'), 'https://oid.jp/ABC');
+  assert.equal(accountSyncApprovalHref('http://127.0.0.1:8080/_rest/OAuth2:auth?x=1'), 'http://127.0.0.1:8080/_rest/OAuth2:auth?x=1');
+  for (const bad of ['javascript:alert(1)', 'http://example.com/a', 'https://a b', 'data:text/html,x', '', null, 42]) {
+    assert.equal(accountSyncApprovalHref(bad), null, String(bad));
+  }
+});
+
+test('accountSyncSignInOutcome maps each state, and a failed read keeps polling', () => {
+  assert.equal(accountSyncSignInOutcome({ ok: true, state: 'waiting' }).done, false);
+  assert.deepEqual(accountSyncSignInOutcome({ ok: true, state: 'succeeded' }), { done: true, kind: 'ok', text: 'Signed in. Account sync is on, and the first sync is running.' });
+  assert.deepEqual(accountSyncSignInOutcome({ ok: true, state: 'failed', error: 'denied' }), { done: true, kind: 'error', text: 'The sign-in failed: denied' });
+  assert.equal(accountSyncSignInOutcome({ ok: true, state: 'cancelled' }).done, true);
+  assert.equal(accountSyncSignInOutcome({ ok: true, state: 'unknown' }).kind, 'warn');
+  const lost = accountSyncSignInOutcome({ ok: false, error: 'server is unreachable' });
+  assert.equal(lost.done, false);
+  assert.match(lost.text, /Still trying/);
+});
+
+test('accountSyncOutcome reports what a pass changed, and how a sign-out went', () => {
+  assert.deepEqual(accountSyncOutcome({ ok: true, result: { signedIn: true } }, 'sync'), { kind: 'ok', text: 'Synced: everything already matched.' });
+  assert.deepEqual(accountSyncOutcome({ ok: true, result: { signedIn: true, added: 2, adopted: 1, pushed: 1, created: 1, evicted: 1 } }, 'sync'),
+    { kind: 'ok', text: 'Synced: added 2 accounts from your other machines, took 1 newer sign-in, shared 2 sign-ins, removed 1 account removed on another machine.' });
+  assert.equal(accountSyncOutcome({ ok: true, result: { signedIn: false } }, 'sync').kind, 'warn');
+  assert.deepEqual(accountSyncOutcome({ ok: false, error: 'callback.net: HTTP 503' }, 'sync'), { kind: 'error', text: 'could not sync: callback.net: HTTP 503' });
+  assert.match(accountSyncOutcome({ ok: true, wasSignedIn: true, revoked: true }, 'sign-out').text, /^Signed out\. Account sync is off/);
+  assert.match(accountSyncOutcome({ ok: true, wasSignedIn: true, revoked: false }, 'sign-out').text, /could not be told/);
+});
+
+test('the Settings page carries the Account sync card', () => {
+  const html = renderDashboardHtml();
+  assert.ok(html.includes('id="acctSync"'));
+  assert.ok(html.includes('var ACCOUNT_SYNC_FAILED = '), 'the failure prefixes ride along');
+  assert.ok(html.includes("callerCan(s.caller, '/teamclaude/account-sync/start')"), 'hidden from a caller refused the sign-in');
+});
+
+// The Account sync card on the page itself: what it reads, what each button
+// sends, and that a link it was handed is opened only if it is one.
+
+const SIGNED_OUT = { ok: true, signedIn: false, user: null, userError: null, sync: {}, signIn: null };
+const SIGNED_IN = { ok: true, signedIn: true, user: { email: 'me@example.com', name: null }, userError: null, sync: { lastSyncAt: 1, rows: 2 }, signIn: null };
+const shown = (page, re) => page.built.some(e => typeof e.textContent === 'string' && re.test(e.textContent));
+
+test('Account sync: Turn on shows the approval link and finishes by itself', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    assert.equal(page.byId('acctSync').style.display, '');
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers: [] });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_OUT);
+    assert.ok(shown(page, /^Off: this machine keeps its own sign-ins\.$/));
+    page.click('Turn on account sync');
+    const start = page.requests.find(r => r.url === '/teamclaude/account-sync/start');
+    assert.equal(start.init.method, 'POST');
+    await page.answerTo('/teamclaude/account-sync/start', 200, { ok: true, id: 's1', url: 'https://oid.jp/ABC', lifetimeSeconds: 900 });
+    const open = page.findLast(e => e.textContent === 'Open callback.net');
+    assert.equal(open.href, 'https://oid.jp/ABC');
+    assert.equal(open.rel, 'noopener noreferrer');
+    assert.ok(shown(page, /^Waiting for the approval at callback\.net/));
+
+    page.runTimers();
+    const st = page.requests.find(r => r.url === '/teamclaude/account-sync/status');
+    assert.deepEqual(JSON.parse(st.init.body), { id: 's1' });
+    await page.answerTo('/teamclaude/account-sync/status', 200, { ok: true, state: 'succeeded', error: null });
+    assert.ok(shown(page, /^Signed in\. Account sync is on/));
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/account-sync' && !r.init.method), 'the card is read again');
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: a link that is not one to open is refused and the sign-in cancelled', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers: [] });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_OUT);
+    page.click('Turn on account sync');
+    await page.answerTo('/teamclaude/account-sync/start', 200, { ok: true, id: 's1', url: 'javascript:alert(1)' });
+    assert.equal(page.findLast(e => e.textContent === 'Open callback.net'), undefined);
+    assert.ok(shown(page, /^could not start the sign-in: the link it answered with is not one this page opens$/));
+    const cancel = page.requests.find(r => r.url === '/teamclaude/account-sync/cancel');
+    assert.deepEqual(JSON.parse(cancel.init.body), { id: 's1' });
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: a linked instance that is off is set up from this page, through the relay', async () => {
+  const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers, caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_IN);
+    await page.answerTo('/teamclaude/peers/desk/account-sync', 200, SIGNED_OUT);
+    assert.ok(shown(page, /^off$/), 'the row says sync is off there');
+    page.click('Set up');
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/peers/desk/account-sync/start' && r.init.method === 'POST'));
+    await page.answerTo('/teamclaude/peers/desk/account-sync/start', 200, { ok: true, id: 'p1', url: 'https://oid.jp/DESK' });
+    assert.ok(shown(page, /^Turn on account sync for desk$/));
+    assert.equal(page.findLast(e => e.textContent === 'Open callback.net').href, 'https://oid.jp/DESK');
+    page.runTimers();
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/peers/desk/account-sync/status'), 'its status is asked of it too');
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: Sign out is armed by a first click and sent by the second', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers: [] });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_IN);
+    assert.ok(shown(page, /^On, as me@example\.com\. 2 accounts in the store\.$/));
+    page.click('Sign out');
+    assert.equal(page.requests.length, 0);
+    const realNow = Date.now;
+    Date.now = () => realNow() + 1000;
+    try { page.click('Confirm sign out'); } finally { Date.now = realNow; }
+    assert.equal(page.requests[0].url, '/teamclaude/account-sync/sign-out');
+    await page.answerTo('/teamclaude/account-sync/sign-out', 200, { ok: true, wasSignedIn: true, revoked: true });
+    assert.ok(shown(page, /^Signed out\. Account sync is off/));
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: hidden from a client key, and asks nothing', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], caller: { kind: 'client', client: 'laptop', refused: ['/teamclaude/peer-links/add', '/teamclaude/account-sync/start'] } });
+    assert.equal(page.byId('acctSync').style.display, 'none');
+    assert.equal(page.requests.length, 0);
+  }, { storedKey: 'tc-client', autoAnswer: null });
 });

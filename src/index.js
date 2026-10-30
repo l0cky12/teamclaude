@@ -60,6 +60,7 @@ import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
 import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
+import { WebAccountSync } from './web-account-sync.js';
 import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
@@ -912,6 +913,10 @@ async function serverCommand() {
     signIn: (provider, { signal, onPrompt }) => loggedSignIn({ provider, account: null, via: 'dashboard' },
       () => signInProvider(provider, { signal, onPrompt, via: 'dashboard' })),
   });
+
+  // The dashboard's Account sync card (/teamclaude/account-sync): the
+  // callback.net sign-in `teamclaude callback login` runs, from a browser.
+  hooks.accountSync = new WebAccountSync({ sync: credentialSync });
 
   // The dashboard's Remove (POST /teamclaude/remove).
   hooks.removeAccount = createAccountRemover({

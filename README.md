@@ -142,7 +142,7 @@ Light and dark themes follow your system, and the layout fits a phone. Full tour
 ### Moves with you between machines
 
 - **Export and import accounts.** `teamclaude accounts export <file>` writes every sign-in to a passphrase-encrypted file. `teamclaude accounts import <file>` sets up a new machine without signing in again.
-- **Keep the same accounts live on several machines** with callback.net sync, which stops two machines from signing each other out.
+- **Keep the same accounts live on several machines** with callback.net sync, which stops two machines from signing each other out. Turn it on from the dashboard's Settings page, for each linked machine too.
 
 ### Fits into your network
 
