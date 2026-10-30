@@ -841,7 +841,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           if (step === 'sign-out') return reply(200, { ok: true, ...await sync.signOut() });
           if (typeof body.id !== 'string' || !body.id) return reply(400, { ok: false, error: 'missing "id"' });
           if (step === 'status') return reply(200, { ok: true, ...sync.status(body.id) });
-          return reply(200, { ok: true, cancelled: sync.cancel(body.id) });
+          // The state after it, so the page can tell a sign-in that was
+          // already approved (and went through) from one that stopped.
+          const cancelled = sync.cancel(body.id);
+          return reply(200, { ok: true, cancelled, state: sync.status(body.id).state });
         } catch (err) {
           if (err instanceof AccountSyncError) return reply(400, { ok: false, error: err.message });
           // callback-auth.js strips what callback.net says before it gets

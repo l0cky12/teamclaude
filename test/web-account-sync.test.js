@@ -17,7 +17,7 @@ async function settle() {
  * A WebAccountSync over stand-ins. `approve()` lets the pending sign-in
  * finish with a token; `fail(err)` makes it fail.
  */
-function harness({ token = null, whoami, beforeUrl } = {}) {
+function harness({ token = null, whoami, beforeUrl, saveGate = null } = {}) {
   const state = { token, saved: [], syncs: [], logouts: 0, whoamiCalls: 0, logs: [], loginOpts: null };
   let approve = () => {};
   let fail = () => {};
@@ -36,7 +36,8 @@ function harness({ token = null, whoami, beforeUrl } = {}) {
     },
     login,
     load: async () => state.token,
-    save: async (t) => { state.saved.push(t); state.token = t; },
+    // `saveGate`, when given, holds the write until the test releases it.
+    save: async (t) => { if (saveGate) await saveGate; state.saved.push(t); state.token = t; },
     whoami: whoami || (async () => { state.whoamiCalls++; return { id: 'u1', email: 'me@example.com', name: 'Me' }; }),
     logout: async () => { state.logouts++; const was = !!state.token; state.token = null; return { wasSignedIn: was, revoked: was }; },
     log: (l) => state.logs.push(l),
@@ -156,4 +157,56 @@ test('syncNow needs a session; signOut ends it and runs a pass that forgets the 
   assert.equal(state.logouts, 1);
   assert.deepEqual(state.syncs, ['dashboard', 'sign-out']);
   assert.ok(state.logs.some(l => /Signed out of callback\.net from the dashboard/.test(l)));
+});
+
+/** A promise the test resolves, for a token write that has to land late. */
+function gate() {
+  let open = () => {};
+  const promise = new Promise((resolve) => { open = resolve; });
+  return { promise, open };
+}
+
+test('an approved sign-in is finishing: Cancel no longer stops it, and a new start waits', async () => {
+  const g = gate();
+  const { sync, state, approve } = harness({ saveGate: g.promise });
+  const { id } = await sync.start();
+  approve();
+  await settle();
+  assert.equal(sync.status(id).state, 'finishing', 'the token is being written');
+  assert.deepEqual((await sync.view()).signIn, { id, state: 'finishing' });
+  assert.equal(sync.cancel(id), false, 'too late to cancel');
+  await assert.rejects(sync.start(), (err) => err instanceof AccountSyncError && /still finishing/.test(err.message));
+  g.open();
+  await settle();
+  assert.equal(sync.status(id).state, 'succeeded');
+  assert.equal(state.saved.length, 1);
+});
+
+test('a sign-out during a late token write waits for it, so the write cannot turn sync back on', async () => {
+  const g = gate();
+  const { sync, state, approve } = harness({ saveGate: g.promise });
+  await sync.start();
+  approve();
+  await settle();
+  let signedOut = false;
+  const out = sync.signOut().then((r) => { signedOut = true; return r; });
+  await settle();
+  assert.equal(signedOut, false, 'the sign-out waits for the write');
+  g.open();
+  assert.deepEqual(await out, { wasSignedIn: true, revoked: true });
+  assert.equal(state.saved.length, 1, 'the write happened');
+  assert.equal(state.token, null, 'and the sign-out came after it');
+  assert.deepEqual(state.syncs, ['dashboard sign-in', 'sign-out'], 'the sign-out pass is its own, not the sign-in\'s');
+});
+
+test('a cancel just before the write keeps the token out, whenever the approval lands', async () => {
+  const g = gate();
+  const { sync, state, approve } = harness({ saveGate: g.promise });
+  const { id } = await sync.start();
+  approve();
+  assert.equal(sync.cancel(id), true, 'cancelled before the approval was taken up');
+  g.open();
+  await settle();
+  assert.equal(sync.status(id).state, 'cancelled');
+  assert.deepEqual(state.saved, []);
 });

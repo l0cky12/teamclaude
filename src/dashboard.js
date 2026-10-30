@@ -1176,10 +1176,26 @@ export function accountSyncApprovalHref(url) {
 export function accountSyncSignInOutcome(res) {
   if (!res || !res.ok) return { done: false, kind: 'warn', text: ACCOUNT_SYNC_FAILED.status + (res && res.error ? ': ' + res.error : '') + '. Still trying.' };
   if (res.state === 'waiting') return { done: false, kind: '', text: 'Waiting for the approval at callback.net. This finishes by itself.' };
+  if (res.state === 'finishing') return { done: false, kind: '', text: 'Approved. Finishing the sign-in…' };
   if (res.state === 'succeeded') return { done: true, kind: 'ok', text: 'Signed in. Account sync is on, and the first sync is running.' };
   if (res.state === 'failed') return { done: true, kind: 'error', text: 'The sign-in failed' + (res.error ? ': ' + res.error : '.') };
   if (res.state === 'cancelled') return { done: true, kind: '', text: 'Cancelled.' };
   return { done: true, kind: 'warn', text: 'The server no longer knows this sign-in (it may have restarted). Start it again.' };
+}
+
+/**
+ * What to tell the operator after a Cancel, or null when there is nothing to
+ * say: the sign-in stopped, or had already ended without signing in. One
+ * already approved went through, and only Sign out undoes it.
+ *
+ * @param {any} res  POST /teamclaude/account-sync/cancel
+ * @param {string} where  'this machine', or the linked instance's name
+ */
+export function accountSyncCancelOutcome(res, where) {
+  if (!res || !res.ok) return { kind: 'error', text: ACCOUNT_SYNC_FAILED.cancel + ' on ' + where + (res && res.error ? ': ' + res.error : '') + '. If its link is approved, it still signs in.' };
+  if (res.cancelled) return null;
+  if (res.state === 'finishing' || res.state === 'succeeded') return { kind: 'warn', text: 'The sign-in on ' + where + ' had already been approved, so it went through. Sign out there to undo it.' };
+  return null;
 }
 
 /**
@@ -1723,7 +1739,7 @@ const SHARED_HELPERS = [
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncOutcome,
+  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -3041,8 +3057,7 @@ ${SHARED_HELPERS}
         var cell = p.state !== 'online' ? { kind: '', text: '—', setUp: false } : peerSyncCell(ps ? ps.view : null, ps ? ps.status : 0, syncView);
         var std = el('td', 'sync');
         std.appendChild(el('span', 'st ' + cell.kind, cell.text));
-        var signingIn = syncSignIn && !syncSignIn.done && syncSignIn.target === p.name;
-        if (cell.setUp && canSync && !signingIn) {
+        if (cell.setUp && canSync && !syncSigningIn()) {
           var setUp = button('btn', 'Set up', function () { startSyncSignIn(p.name); });
           setUp.title = 'Sign ' + p.name + ' in to callback.net from here';
           std.appendChild(setUp);
@@ -3270,6 +3285,10 @@ ${SHARED_HELPERS}
 
   function syncWhere(target) { return target || peer || 'this machine'; }
 
+  // One sign-in at a time, on whichever instance: a second would leave the
+  // first one's link live with nothing on the page to cancel it.
+  function syncSigningIn() { return !!(syncSignIn && !syncSignIn.done); }
+
   // '' is the instance the page shows; a name is one of this machine's links.
   function syncAt(target, url) {
     return target ? '/teamclaude/peers/' + encodeURIComponent(target) + url.slice('/teamclaude'.length) : at(url);
@@ -3345,7 +3364,7 @@ ${SHARED_HELPERS}
     body.appendChild(row);
     var acts = el('div', 'row acts');
     if (syncView.ok && !syncView.signedIn) {
-      if (!(syncSignIn && !syncSignIn.done && !syncSignIn.target)) acts.appendChild(button('btn primary', 'Turn on account sync', function () { startSyncSignIn(''); }));
+      if (!syncSigningIn()) acts.appendChild(button('btn primary', 'Turn on account sync', function () { startSyncSignIn(''); }));
     } else if (syncView.ok) {
       var now = button('btn', syncBusy === 'sync' ? 'Syncing…' : 'Sync now', function () { doSync('sync'); });
       now.disabled = !!syncBusy;
@@ -3425,9 +3444,11 @@ ${SHARED_HELPERS}
   }
 
   function startSyncSignIn(target) {
+    if (syncSigningIn()) return;
     stopSyncSignInPoll();
     var seq = ++syncSignInSeq;
-    syncSignIn = { target: target, id: null, url: null, done: false, seq: seq, status: { kind: '', text: 'Asking callback.net for a sign-in link…' } };
+    var me = { target: target, id: null, url: null, done: false, abandoned: false, seq: seq, status: { kind: '', text: 'Asking callback.net for a sign-in link…' } };
+    syncSignIn = me;
     syncNote = null;
     renderSyncSignIn();
     if (lastStatus) { renderSync(lastStatus); renderLinks(lastStatus); }
@@ -3435,11 +3456,15 @@ ${SHARED_HELPERS}
     if (card.scrollIntoView) card.scrollIntoView({ block: 'nearest' });
     syncFetch('start', {}, target)
       .then(function (j) {
-        if (!j || !syncSignIn || syncSignIn.seq !== seq) return;
+        if (!j) return;
+        // Closed before its link arrived: the server is waiting all the same,
+        // so it is cancelled now that there is an id to name.
+        if (me.abandoned) { if (j.ok && j.id) cancelSyncSignIn(target, j.id); return; }
+        if (syncSignIn !== me) return;
         var href = j.ok ? accountSyncApprovalHref(j.url) : null;
         if (!href) {
           // Not a link this page opens: the server is left waiting for nothing.
-          if (j.ok && j.id) syncFetch('cancel', { id: j.id }, target).catch(function () {});
+          if (j.ok && j.id) cancelSyncSignIn(target, j.id);
           settleSyncSignIn({ kind: 'error', text: ACCOUNT_SYNC_FAILED.start + (j.ok ? ': the link it answered with is not one this page opens' : j.error ? ': ' + j.error : '') });
           return;
         }
@@ -3450,7 +3475,7 @@ ${SHARED_HELPERS}
         pollSyncSignIn(seq);
       })
       .catch(function (e) {
-        if (!syncSignIn || syncSignIn.seq !== seq) return;
+        if (syncSignIn !== me) return;
         settleSyncSignIn({ kind: 'error', text: ACCOUNT_SYNC_FAILED.start + ': ' + e.message });
       });
   }
@@ -3477,8 +3502,28 @@ ${SHARED_HELPERS}
     stopSyncSignInPoll();
     syncSignIn = null;
     renderSyncSignIn();
-    if (cur && !cur.done && cur.id) syncFetch('cancel', { id: cur.id }, cur.target).catch(function () {});
+    // Still open on the server. One whose link has not arrived yet is
+    // cancelled when it does (startSyncSignIn).
+    if (cur && !cur.done) {
+      if (cur.id) cancelSyncSignIn(cur.target, cur.id);
+      else cur.abandoned = true;
+    }
     if (lastStatus) { renderSync(lastStatus); renderLinks(lastStatus); }
+  }
+
+  // A cancel that did not take is said on the card: its link may still sign
+  // the instance in, or already has.
+  function cancelSyncSignIn(target, id) {
+    var where = syncWhere(target);
+    syncFetch('cancel', { id: id }, target)
+      .then(function (j) { return j || { ok: false }; }, function (e) { return { ok: false, error: e.message }; })
+      .then(function (j) {
+        var out = accountSyncCancelOutcome(j, where);
+        if (!out) return;
+        syncNote = out;
+        syncReadAt = 0;
+        if (lastStatus) { renderSync(lastStatus); renderLinks(lastStatus); }
+      });
   }
 
   // Sync now and Sign out, on the instance shown.

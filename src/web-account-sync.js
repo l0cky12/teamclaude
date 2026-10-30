@@ -27,7 +27,7 @@ const WHOAMI_TIMEOUT_MS = 5000;
 
 /**
  * @typedef {{ email: string|null, name: string|null }} SyncUser
- * @typedef {'waiting' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'} SyncSignInState
+ * @typedef {'waiting' | 'finishing' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'} SyncSignInState
  */
 
 /**
@@ -36,6 +36,8 @@ const WHOAMI_TIMEOUT_MS = 5000;
  * @property {AbortController} controller
  * @property {Exclude<SyncSignInState, 'unknown'>} state
  * @property {string | null} error
+ * @property {Promise<void>} [settled]  resolves once the sign-in has ended, its token saved or not
+ * @property {Promise<unknown>} [firstPass]  the pass a successful sign-in starts
  */
 
 /** A refusal the page may show as it is. */
@@ -150,7 +152,7 @@ export class WebAccountSync {
       user,
       userError,
       sync: this._sync.summary(),
-      signIn: cur && cur.state === 'waiting' ? { id: cur.id, state: cur.state } : null,
+      signIn: cur && (cur.state === 'waiting' || cur.state === 'finishing') ? { id: cur.id, state: cur.state } : null,
     };
   }
 
@@ -158,9 +160,16 @@ export class WebAccountSync {
    * Start a sign-in, cancelling one still waiting. Resolves once callback.net
    * has handed out the approval link; the approval itself is waited for in
    * the background, and `status` says how it went.
+   *
+   * Once approved, the sign-in is FINISHING: its token is being saved, and
+   * from then on Cancel no longer stops it and a sign-out waits for it, so a
+   * save that lands late can never turn sync back on behind either of them.
    * @returns {Promise<{ id: string, url: string, lifetimeSeconds: number }>}
    */
   async start() {
+    if (this._current?.state === 'finishing') {
+      throw new AccountSyncError('the last sign-in was approved and is still finishing; try again in a moment');
+    }
     if (await this._load().catch(() => null)) {
       throw new AccountSyncError('already signed in to callback.net; sign out first to use another callback.net account');
     }
@@ -182,6 +191,8 @@ export class WebAccountSync {
     }).then(async (token) => {
       // Approved after a cancel: the page has moved on, so the grant is not kept.
       if (controller.signal.aborted) throw abortError();
+      // Synchronously with the check above: no cancel can come between them.
+      entry.state = 'finishing';
       await this._save(token);
       this._who = null;
       return token;
@@ -192,7 +203,7 @@ export class WebAccountSync {
         this._log('[TeamClaude] Signed in to callback.net from the dashboard; account sync is on');
         // The first pass brings the store's accounts here and this install's
         // freshly renewed ones there. Not awaited: the page polls the card.
-        this._sync.sync('dashboard sign-in').catch(() => {});
+        entry.firstPass = this._sync.sync('dashboard sign-in').catch(() => {});
       },
       (err) => {
         entry.state = err?.name === 'AbortError' || controller.signal.aborted ? 'cancelled' : 'failed';
@@ -200,6 +211,8 @@ export class WebAccountSync {
         if (entry.state === 'failed') this._log(`[TeamClaude] callback.net sign-in from the dashboard failed: ${entry.error}`);
       },
     );
+    // After the two handlers above, so a state read once this resolves is final.
+    entry.settled = outcome.then(() => {}, () => {});
 
     // A failure before the link exists (callback.net unreachable, say) is this
     // request's to report. Both sides settle into a value, so the side that
@@ -224,7 +237,9 @@ export class WebAccountSync {
   }
 
   /**
-   * Stop waiting for the approval `id` names. Nothing to cancel is not an error.
+   * Stop waiting for the approval `id` names. Nothing to cancel is not an
+   * error. A sign-in already approved (finishing) is past cancelling: its
+   * token is being saved, and Sign out is what undoes it.
    * @param {string} id
    * @returns {boolean}  whether a waiting sign-in was cancelled
    */
@@ -251,7 +266,16 @@ export class WebAccountSync {
    * @returns {Promise<{ wasSignedIn: boolean, revoked: boolean }>}
    */
   async signOut() {
-    this.cancel(this._current?.id ?? '');
+    const cur = this._current;
+    if (cur) {
+      this.cancel(cur.id);
+      // An approved sign-in still saving its token would otherwise write it
+      // back after the session is gone; and its first pass, still running,
+      // would be the one the pass below joins and so count a store that is
+      // no longer this install's.
+      await cur.settled;
+      await cur.firstPass;
+    }
     const out = await this._logout();
     this._who = null;
     // A pass with no session forgets what the store held, so the card stops

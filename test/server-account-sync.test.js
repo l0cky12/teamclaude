@@ -125,10 +125,11 @@ test('a linked instance is signed in through the relay', async () => {
       const start = await post(port, '/teamclaude/peers/server/account-sync/start', {}, h);
       assert.deepEqual(await start.json(), { ok: true, id: 'abc', url: 'https://oid.jp/XYZ', lifetimeSeconds: 900 });
       await post(port, '/teamclaude/peers/server/account-sync/status', { id: 'abc' }, h);
-      await post(port, '/teamclaude/peers/server/account-sync/cancel', { id: 'abc' }, h);
+      const cancel = await post(port, '/teamclaude/peers/server/account-sync/cancel', { id: 'abc' }, h);
+      assert.deepEqual(await cancel.json(), { ok: true, cancelled: true, state: 'waiting' }, 'the state after the cancel rides along');
       const out = await post(port, '/teamclaude/peers/server/account-sync/sign-out', {}, h);
       assert.deepEqual(await out.json(), { ok: true, wasSignedIn: true, revoked: true });
-      assert.deepEqual(calls, ['start', 'status:abc', 'cancel:abc']);
+      assert.deepEqual(calls, ['start', 'status:abc', 'cancel:abc', 'status:abc']);
     }, { peers });
   }, { proxy: { apiKey: 'tc-remote' }, hooks: { accountSync: remote } });
 });
@@ -179,7 +180,7 @@ test('end to end: start, approve at callback.net, the token is saved and a pass 
       let st;
       for (let i = 0; i < 50; i++) {
         st = await (await post(port, '/teamclaude/account-sync/status', { id: start.id }, h)).json();
-        if (st.state !== 'waiting') break;
+        if (st.state !== 'waiting' && st.state !== 'finishing') break;
         await new Promise(resolve => setImmediate(resolve));
       }
       assert.equal(st.state, 'succeeded');

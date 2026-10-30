@@ -20,7 +20,7 @@ import {
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncOutcome,
+  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1155,7 +1155,7 @@ test('the page ships the same helper implementations it is tested against', () =
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
     peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-    accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncOutcome]) {
+    accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // parseInstanceLink reads it from page scope.
@@ -2993,4 +2993,67 @@ test('Account sync: hidden from a client key, and asks nothing', async () => {
     assert.equal(page.byId('acctSync').style.display, 'none');
     assert.equal(page.requests.length, 0);
   }, { storedKey: 'tc-client', autoAnswer: null });
+});
+
+test('accountSyncCancelOutcome is quiet when the sign-in stopped, and says when it could not be stopped', () => {
+  assert.equal(accountSyncCancelOutcome({ ok: true, cancelled: true, state: 'cancelled' }, 'desk'), null);
+  assert.equal(accountSyncCancelOutcome({ ok: true, cancelled: false, state: 'failed' }, 'desk'), null, 'it had ended by itself');
+  assert.equal(accountSyncCancelOutcome({ ok: true, cancelled: false, state: 'unknown' }, 'desk'), null);
+  const through = accountSyncCancelOutcome({ ok: true, cancelled: false, state: 'finishing' }, 'desk');
+  assert.equal(through.kind, 'warn');
+  assert.match(through.text, /on desk had already been approved, so it went through\. Sign out there/);
+  assert.equal(accountSyncCancelOutcome({ ok: true, cancelled: false, state: 'succeeded' }, 'desk').kind, 'warn');
+  const lost = accountSyncCancelOutcome({ ok: false, error: 'desk is unreachable' }, 'desk');
+  assert.equal(lost.kind, 'error');
+  assert.match(lost.text, /^could not cancel the sign-in on desk: desk is unreachable\. If its link is approved, it still signs in\.$/);
+  assert.equal(accountSyncSignInOutcome({ ok: true, state: 'finishing' }).done, false, 'an approved sign-in is still polled');
+});
+
+test('Account sync: Cancel before the link arrives cancels it once the server names it', async () => {
+  const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers, caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_IN);
+    await page.answerTo('/teamclaude/peers/desk/account-sync', 200, SIGNED_OUT);
+    page.click('Set up');
+    page.click('Cancel');
+    assert.ok(!page.requests.some(r => r.url.endsWith('/cancel')), 'no id to cancel yet');
+    await page.answerTo('/teamclaude/peers/desk/account-sync/start', 200, { ok: true, id: 'late', url: 'https://oid.jp/DESK' });
+    const cancel = page.requests.find(r => r.url === '/teamclaude/peers/desk/account-sync/cancel');
+    assert.ok(cancel, 'the late sign-in is cancelled');
+    assert.deepEqual(JSON.parse(cancel.init.body), { id: 'late' });
+    assert.equal(page.findLast(e => e.textContent === 'Open callback.net'), undefined, 'its link is never shown');
+    await page.answerTo('/teamclaude/peers/desk/account-sync/cancel', 200, { ok: true, cancelled: true, state: 'cancelled' });
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: while one sign-in is open, no other can be started', async () => {
+  const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers, caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_OUT);
+    await page.answerTo('/teamclaude/peers/desk/account-sync', 200, SIGNED_OUT);
+    page.click('Turn on account sync');
+    await page.answerTo('/teamclaude/account-sync/start', 200, { ok: true, id: 's1', url: 'https://oid.jp/ABC' });
+    assert.equal(page.labelled('Set up'), 0, 'the linked instance offers no second sign-in');
+    assert.equal(page.labelled('Turn on account sync'), 0);
+    page.poll();
+    await page.answerTo('/teamclaude/status', 200, { accounts: [], peers, caller: OPERATOR });
+    assert.equal(page.labelled('Set up'), 0, 'nor after a poll');
+  }, { autoAnswer: null, manualTimers: true });
+});
+
+test('Account sync: a cancel that does not take is reported', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers: [] });
+    await page.answerTo('/teamclaude/account-sync', 200, SIGNED_OUT);
+    page.click('Turn on account sync');
+    await page.answerTo('/teamclaude/account-sync/start', 200, { ok: true, id: 's1', url: 'https://oid.jp/ABC' });
+    page.click('Cancel');
+    await page.answerTo('/teamclaude/account-sync/cancel', 200, { ok: true, cancelled: false, state: 'finishing' });
+    assert.ok(shown(page, /^The sign-in on this machine had already been approved, so it went through\./));
+  }, { autoAnswer: null, manualTimers: true });
 });
