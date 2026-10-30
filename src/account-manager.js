@@ -5443,9 +5443,10 @@ export class AccountManager {
    * over, since a usage read says neither.
    *
    * A count that went up is a credit granted since the last read, and is logged.
-   * One that went down lost its soonest-expiring credits, which is the one a
-   * redemption spends and the one that lapses first, so the dates on hand still
-   * describe what is left.
+   * Any change to the count leaves the dates on hand out of step until the rows
+   * are read again: which credit went is not something a count can say (a
+   * redemption skips a credit the plan cannot spend, so it is not always the
+   * soonest to expire).
    *
    * @param {Record<string, any>} account
    * @param {Record<string, any>|undefined} prev
@@ -5461,20 +5462,11 @@ export class AccountManager {
     if (Array.isArray(prev?.expiries) && Number.isFinite(prev?.expiriesAt)) {
       reading.expiries = prev?.expiries;
       reading.expiriesAt = prev?.expiriesAt;
-      // The dates follow the count only from a reading they fully described. A
-      // count that went up, or dates already out of step with it, stay out of
-      // step (null) until the rows are read again: otherwise a grant followed
-      // by a redemption lands back on the old count and the new credit would
-      // wear the spent one's date.
-      const complete = Number.isFinite(before) && prev?.expiriesFor === before;
-      if (!complete || next.available > /** @type {number} */ (before)) {
-        reading.expiriesFor = null;
-      } else if (next.available < /** @type {number} */ (before)) {
-        reading.expiries = prev?.expiries.slice(/** @type {number} */ (before) - next.available);
-        reading.expiriesFor = next.available;
-      } else {
-        reading.expiriesFor = prev?.expiriesFor;
-      }
+      // Null once the count moves, and it stays null until the rows are read
+      // again: otherwise a grant followed by a redemption lands back on the old
+      // count, and the credit left would wear the spent one's date.
+      const unchanged = Number.isFinite(before) && prev?.expiriesFor === before && next.available === before;
+      reading.expiriesFor = unchanged ? prev?.expiriesFor : null;
     }
     if (Number.isFinite(before) && next.available > before) {
       reading.grantedAt = now;

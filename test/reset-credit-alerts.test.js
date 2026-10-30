@@ -63,23 +63,46 @@ test('a usage read whose count went up records when, and logs the grant once', (
   assert.equal(am.accounts[0].quota.resetCredits.grantedAt, grantedAt, 'and keeps the grant time');
 });
 
-test('a usage read carries the expiry dates over, and drops the soonest when the count falls', () => {
+test('a usage read carries the dates over while the count holds, and drops their trust when it falls', () => {
   const now = Date.now();
   const am = new AccountManager([codex('a')], 0.98);
+  /** @param {any} q */
+  const shown = q => codexResetExpiry({ name: 'a', provider: 'codex', quota: q });
   am.applyCodexUsageData(0, usage(2));
-  am.applyResetCreditDetails(0, [row(now + 20 * DAY), row(now + 10 * DAY)]);
-  assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + 10 * DAY, now + 20 * DAY]);
+  // A credit this plan cannot spend expires first; a redemption skips it and
+  // spends the supported one, so the count alone cannot say which one went.
+  am.applyResetCreditDetails(0, [{ ...row(now + DAY), supportedByPlan: false }, row(now + 2 * DAY)]);
+  assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + DAY, now + 2 * DAY]);
 
   am.applyCodexUsageData(0, usage(2));
-  assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + 10 * DAY, now + 20 * DAY]);
+  assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + DAY, now + 2 * DAY]);
   assert.equal(creditDetailsDue(am.accounts[0].quota.resetCredits), false);
+  assert.equal(shown(am.accounts[0].quota), now + DAY);
 
-  // A redemption spends the soonest, and the soonest is the one that lapses first.
   am.applyCodexUsageData(0, usage(1));
   const q = am.accounts[0].quota.resetCredits;
-  assert.deepEqual(q.expiries, [now + 20 * DAY]);
-  assert.equal(q.expiriesFor, 1);
-  assert.equal(creditDetailsDue(q), false);
+  assert.equal(q.expiriesFor, null);
+  assert.equal(creditDetailsDue(q), true, 'the rows are read again');
+  assert.equal(shown(am.accounts[0].quota), null, 'no date is guessed meanwhile');
+
+  am.applyResetCreditDetails(0, [{ ...row(now + DAY), supportedByPlan: false }]);
+  assert.equal(shown(am.accounts[0].quota), now + DAY);
+});
+
+test('rows that disagree with the count are not shown, and the next count change reads them again', () => {
+  const now = Date.now();
+  const am = new AccountManager([codex('a')], 0.98);
+  /** @param {any} q */
+  const shown = q => codexResetExpiry({ name: 'a', provider: 'codex', quota: q });
+  am.applyCodexUsageData(0, usage(2));
+  // Rows read after one of the two was spent, before a usage read caught up.
+  am.applyResetCreditDetails(0, [row(now + 5 * DAY)]);
+  assert.equal(shown(am.accounts[0].quota), null, 'one row against a count of two');
+
+  am.applyCodexUsageData(0, usage(1));
+  assert.equal(creditDetailsDue(am.accounts[0].quota.resetCredits), true);
+  am.applyResetCreditDetails(0, [row(now + 5 * DAY)]);
+  assert.equal(shown(am.accounts[0].quota), now + 5 * DAY);
 });
 
 test('dates left out of step by a grant stay untrusted when the count falls back', () => {
@@ -185,7 +208,8 @@ function card(credits, name = 'a') {
 
 test('codexResetExpiry names the soonest future expiry, only for dates read against this count', () => {
   const now = Date.now();
-  assert.equal(codexResetExpiry(card({ available: 2, expiries: [now - DAY, now + 5 * DAY, null], expiriesFor: 2 }), now), now + 5 * DAY);
+  assert.equal(codexResetExpiry(card({ available: 3, expiries: [now - DAY, now + 5 * DAY, null], expiriesFor: 3 }), now), now + 5 * DAY);
+  assert.equal(codexResetExpiry(card({ available: 2, expiries: [now + 5 * DAY], expiriesFor: 2 }), now), null, 'fewer rows than the count');
   assert.equal(codexResetExpiry(card({ available: 2, expiries: [now + 5 * DAY], expiriesFor: 1 }), now), null, 'a credit granted since');
   assert.equal(codexResetExpiry(card({ available: 1 }), now), null, 'no dates read');
   assert.equal(codexResetExpiry(card({ available: 0, expiries: [], expiriesFor: 0 }), now), null);

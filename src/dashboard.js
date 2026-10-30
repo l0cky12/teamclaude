@@ -218,14 +218,14 @@ export function redeemResetOutcome(res) {
 
 // When the soonest of a Codex account's reset credits expires, or null when the
 // page cannot say: no credit, no dates read yet (the quota refresh reads them),
-// or dates read against another count, such as a credit granted since then
-// whose date is not known yet.
+// the count changed since they were read (a credit granted, spent or expired),
+// or the rows read did not match the count.
 /** @param {any} account @param {number|null} [now] */
 export function codexResetExpiry(account, now) {
   var at = now == null ? Date.now() : now;
   if (!codexResetsLeft(account, at)) return null;
   var r = (account.quota || {}).resetCredits || {};
-  if (!Array.isArray(r.expiries) || r.expiriesFor !== r.available) return null;
+  if (!Array.isArray(r.expiries) || r.expiriesFor !== r.available || r.expiries.length !== r.available) return null;
   /** @type {number|null} */
   var soonest = null;
   r.expiries.forEach(function (/** @type {any} */ t) {

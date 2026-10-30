@@ -538,8 +538,8 @@ about to run out:
   another credit's expiry shows again.
 - Next to *resets left*, on the Quota page and in the Accounts page's **Resets
   left** column, the date the soonest credit expires (*1 reset left · expires
-  Nov 12*). A credit granted since the last credit read has no date yet, so the
-  page leaves the date off until the next refresh reads it.
+  Nov 12*). Once the count changes (a credit granted, spent or expired), the
+  page leaves the date off until the next refresh reads the credit list again.
 
 OpenAI says when a credit expires, but not when the next one will be granted,
 so the dashboard can tell you a credit is new only after it has arrived.
