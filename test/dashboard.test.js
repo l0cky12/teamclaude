@@ -2984,6 +2984,57 @@ test('an address set by a reload or another browser reaches the link without a p
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 
+test('a status asked before a save cannot put the old address back', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    await page.answer(200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    page.poll();
+    page.byId('addrVal').value = '100.64.0.9:3456';
+    page.byId('addrSet').fire('click');
+    await page.answerTo('/teamclaude/instance-address', 200, { ok: true, address: 'http://100.64.0.9:3456' });
+    // The poll asked before the save answers after it, with the old address.
+    await page.answerTo('/teamclaude/status', 200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    assert.equal(page.byId('addrVal').value, 'http://100.64.0.9:3456');
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456');
+    page.byId('ownKeyShow').fire('click');
+    await page.answerTo('/teamclaude/peer-links/key', 200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
+test('a /peer-links read asked before a save is asked again rather than used', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links');
+    page.byId('addrVal').value = '100.64.0.9:3456';
+    page.byId('addrSet').fire('click');
+    await page.answerTo('/teamclaude/instance-address', 200, { ok: true, address: 'http://100.64.0.9:3456' });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    assert.notEqual(page.byId('linkSelfUrl').value, 'http://172.30.0.2:3456', 'the old read is not used');
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/peer-links'), 'it is asked again');
+    await page.answerTo('/teamclaude/peer-links', 200, { self: { ...SELF, address: 'http://100.64.0.9:3456', addresses: ['http://100.64.0.9:3456', 'http://172.30.0.2:3456'] }, peers: [] });
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456');
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
+test('an address cleared elsewhere that was also the only guess is read back from the server', async () => {
+  await onSettings(async (page) => {
+    const set = { name: 'hub', host: 'hub', custom: false, address: 'http://172.30.0.2:3456' };
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: set });
+    await page.answer(200, { self: { ...SELF, address: 'http://172.30.0.2:3456', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    page.poll();
+    await page.answerTo('/teamclaude/status', 200, { accounts: [], peers: [], caller: OPERATOR, instance: { ...set, address: '' } });
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/peer-links'), 'the guesses are asked for again');
+    await page.answerTo('/teamclaude/peer-links', 200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    page.byId('ownKeyShow').fire('click');
+    await page.answerTo('/teamclaude/peer-links/key', 200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.ok(link, 'Show key still offers a link');
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://172.30.0.2:3456', apiKey: 'tc-hub' });
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
 test('a proxy too old to say its address has no Instance address row', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], instance: { name: 'hub', host: 'hub', custom: false } });

@@ -3486,6 +3486,11 @@ ${SHARED_HELPERS}
   var linkSelf = null;
   var linkSelfState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'unsupported'
   var linkSelfPrefill = '';
+  // Saves of the Instance address so far. A status or /peer-links read that
+  // was asked before the latest one may answer after it, with the address it
+  // replaced, so such a read is not let near the address.
+  var addrSaves = 0;
+  var statusAddrStale = false;
   var linkRemoveArmed = Object.create(null);
 
   // The address this page was opened at, which is this machine as the browser
@@ -3559,6 +3564,7 @@ ${SHARED_HELPERS}
 
   function loadLinkSelf() {
     linkSelfState = 'asking';
+    var saves = addrSaves;
     fetch(at('/teamclaude/peer-links'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // An instance from before this card: no such route.
@@ -3567,6 +3573,8 @@ ${SHARED_HELPERS}
         return res.json();
       })
       .then(function (j) {
+        // Asked before a save: it may offer the address that save replaced.
+        if (saves !== addrSaves) { linkSelfState = 'unasked'; if (lastStatus) renderLinks(lastStatus); return; }
         linkSelfState = j.unsupported ? 'unsupported' : 'done';
         linkSelf = j.self || null;
         fillLinkSelf();
@@ -3578,11 +3586,14 @@ ${SHARED_HELPERS}
 
   // Brings what this instance offers in line with the address set for it,
   // and closes a shown link that still carries the old one.
+  // Then asks for it again: the address set may also have been the one guess
+  // the server found, which the swap dropped along with it.
   function useInstanceAddress(address) {
     if (!linkSelf || linkSelf.address === address) return;
     linkSelf = linkSelfWithAddress(linkSelf, address);
     fillLinkSelf();
     if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
+    linkSelfState = 'unasked';
   }
 
   // Prefills what this machine would be called and reached at from the other
@@ -4967,9 +4978,11 @@ ${SHARED_HELPERS}
     var hasAddr = !!inst && typeof inst.address === 'string';
     document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
     var addrInput = document.getElementById('addrVal');
-    if (hasAddr && document.activeElement !== addrInput) addrInput.value = inst.address;
-    // Set from a reload or another browser: the link must not keep the old one.
-    if (hasAddr) useInstanceAddress(inst.address);
+    if (hasAddr && !statusAddrStale) {
+      if (document.activeElement !== addrInput) addrInput.value = inst.address;
+      // Set from a reload or another browser: the link must not keep the old one.
+      useInstanceAddress(inst.address);
+    }
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -5495,8 +5508,8 @@ ${SHARED_HELPERS}
           // At once, so a Show key that answers before the reads below
           // already builds its link from the new address. Then ask again, for
           // guesses the old address may have hidden.
+          addrSaves++;
           useInstanceAddress(json.address);
-          linkSelfState = 'unasked';
         }
         poll();
       })
@@ -5639,6 +5652,7 @@ ${SHARED_HELPERS}
   }
 
   function pollStatus() {
+    var saves = addrSaves;
     fetch(at('/teamclaude/status'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -5652,6 +5666,7 @@ ${SHARED_HELPERS}
       })
       .then(function (s) {
         if (!s) return;
+        statusAddrStale = saves !== addrSaves;
         // A linked instance's status lists ITS peers; the picker lists ours.
         if (!peer) renderInstances(s.peers, s.instance);
         document.getElementById('keybox').style.display = 'none';
