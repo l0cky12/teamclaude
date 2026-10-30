@@ -516,6 +516,34 @@ describes — redeemed in the Codex CLI, or expired. The `status` line therefore
 says how old the reading is (`as of 3h ago`), and every surface drops it once it
 is more than 7 days old.
 
+When an account holds a credit, the same probe also reads its credit list
+(`GET /wham/rate-limit-reset-credits`) to learn when each credit expires. It does
+this only when the count is new to it or the dates are more than 6 hours old, so
+a probe costs at most one extra read that often, and an account with no credits
+costs none. A read that fails is not tried again for 30 minutes. Like the count, the dates are only read where you already run the
+probe or press **Refresh quota**.
+
+#### Being told about a credit
+
+The dashboard tells you when a Codex account gets a credit, and when one is
+about to run out:
+
+- On the **Logs** page, under **Resets**: *Got a free reset credit: 2 left*
+  when a usage read finds more credits than the last one did, and *A free reset
+  credit expires in 2 days (…): use it before then* once per credit, when a
+  credit read finds one expiring within three days.
+- On the **Quota** page, a banner above the summary cards for the same two
+  events: a credit granted in the last 7 days, and a credit that expires within
+  three days. **Dismiss** hides that one event in this browser; a later grant or
+  another credit's expiry shows again.
+- Next to *resets left*, on the Quota page and in the Accounts page's **Resets
+  left** column, the date the soonest credit expires (*1 reset left · expires
+  Nov 12*). Once the count changes (a credit granted, spent or expired), the
+  page leaves the date off until the next refresh reads the credit list again.
+
+OpenAI says when a credit expires, but not when the next one will be granted,
+so the dashboard can tell you a credit is new only after it has arrived.
+
 The count is what the account **holds**. Whether a particular credit can be
 spent is a separate question — the payload's `applicable_available_count` is
 upstream's own view of how many would reset a window right now, and is named on

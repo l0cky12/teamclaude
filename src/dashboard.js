@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
+import { CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { logoDataUrl, logoMarkup } from './logo.js';
 
 export function renderDashboardHtml() {
@@ -213,6 +214,70 @@ export function redeemResetOutcome(res) {
   if (r.code === 'nothing_to_reset') return { kind: 'warn', text: 'nothing to reset yet: no limit on this account is spent, so no reset was used' };
   if (r.code === 'no_credit') return { kind: 'warn', text: 'no resets left on this account' };
   return { kind: 'error', text: 'reset failed' + (r.error ? ': ' + r.error : '') };
+}
+
+// When the soonest of a Codex account's reset credits expires, or null when the
+// page cannot say: no credit, no dates read yet (the quota refresh reads them),
+// the count changed since they were read (a credit granted, spent or expired),
+// or the rows read did not match the count.
+/** @param {any} account @param {number|null} [now] */
+export function codexResetExpiry(account, now) {
+  var at = now == null ? Date.now() : now;
+  if (!codexResetsLeft(account, at)) return null;
+  var r = (account.quota || {}).resetCredits || {};
+  if (!Array.isArray(r.expiries) || r.expiriesFor !== r.available || r.expiries.length !== r.available) return null;
+  /** @type {number|null} */
+  var soonest = null;
+  r.expiries.forEach(function (/** @type {any} */ t) {
+    if (typeof t === 'number' && isFinite(t) && t > at && (soonest == null || t < soonest)) soonest = t;
+  });
+  return soonest;
+}
+
+/** @param {number} ts */
+function shortDate(ts) {
+  return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+// "2 resets left", with the soonest expiry when the page knows it.
+/** @param {number} n @param {number|null} [expiry] */
+export function resetsLeftText(n, expiry) {
+  var text = n ? n + (n === 1 ? ' reset left' : ' resets left') : 'no resets left';
+  return n && expiry != null ? text + ' \u00b7 expires ' + shortDate(expiry) : text;
+}
+
+// The Quota page's reset-credit banner: a Codex account that got a credit in
+// the last RESET_ALERT_NEW_MS, and one whose soonest credit expires within
+// CREDIT_EXPIRY_WINDOW_MS (the same window autoRedeemResets treats as "use it
+// or lose it"). Each has a key naming the event, so dismissing one hides that
+// event and not the next one like it.
+/** @param {any[]} accounts @param {string[]|null} [dismissed] @param {number|null} [now] */
+export function resetCreditAlerts(accounts, dismissed, now) {
+  var at = now == null ? Date.now() : now;
+  var hidden = dismissed || [];
+  /** @type {{kind: string, key: string, text: string}[]} */
+  var out = [];
+  var day = 24 * 60 * 60 * 1000;
+  (accounts || []).forEach(function (a) {
+    var left = codexResetsLeft(a, at);
+    if (!left) return;
+    var r = a.quota.resetCredits;
+    var expiry = codexResetExpiry(a, at);
+    if (expiry != null && expiry - at <= CREDIT_EXPIRY_WINDOW_MS) {
+      var days = Math.ceil((expiry - at) / day);
+      out.push({
+        kind: 'warn', key: 'expiring:' + a.name + ':' + expiry,
+        text: a.name + ': a free reset credit expires ' + (days <= 1 ? 'within a day' : 'in ' + days + ' days') + ' (' + shortDate(expiry) + '). Use it before then.',
+      });
+    }
+    if (typeof r.grantedAt === 'number' && isFinite(r.grantedAt) && r.grantedAt <= at && at - r.grantedAt < RESET_ALERT_NEW_MS) {
+      out.push({
+        kind: 'ok', key: 'granted:' + a.name + ':' + r.grantedAt,
+        text: a.name + ' got a new free reset credit on ' + shortDate(r.grantedAt) + ': ' + resetsLeftText(left, expiry) + '.',
+      });
+    }
+  });
+  return out.filter(function (x) { return hidden.indexOf(x.key) < 0; });
 }
 
 // The rows a third-party backend's own reading draws on its card (#530). The
@@ -631,6 +696,30 @@ export function instanceNameRequest(name, key) {
 export function instanceNameOutcome(res) {
   if (!res || !res.ok) return { kind: 'error', text: 'instance name change failed' + (res && res.error ? ': ' + res.error : '') };
   return { kind: 'ok', text: res.custom ? 'this instance is now called ' + res.name : 'instance name cleared; it goes by its host name, ' + res.name };
+}
+
+/**
+ * @param {string} address  '' goes back to the guess
+ * @param {string|null|undefined} key
+ */
+export function instanceAddressRequest(address, key) {
+  return {
+    url: '/teamclaude/instance-address',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ address: address }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function instanceAddressOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'instance address change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.address ? 'other machines are now given ' + res.address : 'instance address cleared; the link uses a guess again' };
 }
 
 // What the Instance picker calls the machine the page was opened on: its
@@ -1064,9 +1153,10 @@ export function linkAddMissing(body) {
 
 /**
  * The addresses to offer for "this machine, as the other one reaches it",
- * best first: the address this page was opened at, when that is not this
- * machine's loopback and the page shows this machine, then what the server
- * found on its own interfaces.
+ * best first: the address set on the Settings page (`instanceAddress`), then
+ * the address this page was opened at, when that is not this machine's
+ * loopback and the page shows this machine, then what the server found on its
+ * own interfaces.
  *
  * @param {any} self  the `self` of GET /teamclaude/peer-links
  * @param {string} origin  location.origin, or '' when the page shows a linked instance
@@ -1076,9 +1166,26 @@ export function linkSelfOptions(self, origin) {
   var out = [];
   var host = '';
   try { host = origin ? new URL(origin).hostname : ''; } catch { host = ''; }
-  if (host && !isLoopbackHost(host)) out.push(origin);
+  if (self && typeof self.address === 'string' && self.address) out.push(self.address);
+  if (host && !isLoopbackHost(host) && out.indexOf(origin) < 0) out.push(origin);
   (self && Array.isArray(self.addresses) ? self.addresses : []).forEach(function (/** @type {string} */ a) { if (out.indexOf(a) < 0) out.push(a); });
   return out;
+}
+
+/**
+ * The `self` of GET /teamclaude/peer-links as it is once `instanceAddress` is
+ * `address`, so the page can offer a new address the moment it is saved or a
+ * status reports it, without waiting for a fresh read. The old address set
+ * leaves the list; the guesses stay.
+ *
+ * @param {any} self  the `self` of GET /teamclaude/peer-links
+ * @param {string} address  '' when none is set
+ */
+export function linkSelfWithAddress(self, address) {
+  if (!self) return self;
+  var old = typeof self.address === 'string' ? self.address : '';
+  var rest = (Array.isArray(self.addresses) ? self.addresses : []).filter(function (/** @type {string} */ a) { return a !== old && a !== address; });
+  return Object.assign({}, self, { address: address, addresses: address ? [address].concat(rest) : rest });
 }
 
 /**
@@ -1649,6 +1756,7 @@ export function providerTabs(accounts) {
 export var LOG_KINDS = [
   { key: 'all', label: 'All' }, { key: 'usage', label: 'Usage' }, { key: 'signin', label: 'Sign-in' },
   { key: 'auth', label: 'Auth' }, { key: 'rotation', label: 'Rotation' }, { key: 'control', label: 'Changes' },
+  { key: 'credits', label: 'Resets' },
 ];
 
 // Fold one GET /teamclaude/logs reply into what the page holds: the log's
@@ -1712,13 +1820,14 @@ export function logEventClient(event) {
 }
 
 // How loudly a log row is drawn: red for what lost an account or a request,
-// amber for what will clear on its own, green for a sign-in that worked.
+// amber for what will clear on its own or is about to be lost (a reset credit
+// expiring), green for a sign-in that worked or a reset credit granted.
 /** @param {any} event */
 export function logEventTone(event) {
   var e = event || {};
   if (['signin_failed', 'signed_out', 'credential_rejected', 'exhausted'].indexOf(e.type) >= 0) return 'bad';
-  if (['rate_limited', 'signin_timeout', 'hold'].indexOf(e.type) >= 0) return 'warn';
-  if (e.type === 'signin_succeeded') return 'ok';
+  if (['rate_limited', 'signin_timeout', 'hold', 'credit_expiring'].indexOf(e.type) >= 0) return 'warn';
+  if (e.type === 'signin_succeeded' || e.type === 'credit_granted') return 'ok';
   if (typeof e.status === 'number') return e.status >= 500 ? 'bad' : e.status >= 400 ? 'warn' : '';
   return '';
 }
@@ -2082,6 +2191,9 @@ export function fleetMissingText(data) {
   return 'Not counted: ' + missed.map(function (/** @type {any} */ m) { return m.name + ' (' + (why[m.state] || m.state) + ')'; }).join(', ') + '.';
 }
 
+/** How long the Quota page's banner says a Codex account got a new reset credit. */
+export const RESET_ALERT_NEW_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
@@ -2091,10 +2203,11 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
+  codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -2113,6 +2226,8 @@ const SHARED_CONSTS = [
   `var STARVED_MIN = ${STARVED_MIN};`,
   `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
+  `var CREDIT_EXPIRY_WINDOW_MS = ${CREDIT_EXPIRY_WINDOW_MS};`,
+  `var RESET_ALERT_NEW_MS = ${RESET_ALERT_NEW_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
@@ -2365,9 +2480,10 @@ const PAGE = `<!doctype html>
   .actions button:disabled { opacity: .5; cursor: default; }
   .actions button.sel, .chip.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
   .actions .lbl { color: var(--dim); font-size: 12px; }
-  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; max-width: 100%; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .thr input.name { width: 170px; text-align: left; }
+  .thr input.addr { width: 220px; min-width: 0; flex: 0 1 auto; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -2391,6 +2507,9 @@ const PAGE = `<!doctype html>
   .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
   .plist .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
   .plist .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
+  .plist .ok { background: rgba(63,185,80,.12); border: 1px solid var(--ok); color: var(--ok); }
+  #resetAlerts div { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+  #resetAlerts button { flex: none; }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #problems { display: none; margin: 0 0 16px; }
   #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
@@ -2499,6 +2618,7 @@ const PAGE = `<!doctype html>
 
     <section id="page-quota">
       <div id="tabs" class="tabs"></div>
+      <div id="resetAlerts" class="plist"></div>
       <div id="summaryCards" class="cards"></div>
       <div id="quotaVisibility" class="filters"></div>
       <div id="accounts"></div>
@@ -2563,7 +2683,7 @@ const PAGE = `<!doctype html>
         <span class="hint" id="logCount"></span>
       </div>
       <div class="card" style="padding:4px 6px"><table id="logs"></table></div>
-      <p class="hint">Requests, sign-ins, sign-outs, rotation and changes, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
+      <p class="hint">Requests, sign-ins, sign-outs, rotation, changes and Codex reset credits, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
     </section>
 
     <section id="page-problems" style="display:none">
@@ -2586,6 +2706,14 @@ const PAGE = `<!doctype html>
             <label for="nameVal">Name</label>
             <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
             <button id="nameSet" class="btn" type="button">Save</button>
+          </span>
+        </div>
+        <div class="setting" id="addrRow" style="display:none">
+          <div><b>Instance address</b><span class="tag">The address the link gives other machines. Set it in a Docker container. Empty uses a guess.</span></div>
+          <span class="thr">
+            <label for="addrVal">Address</label>
+            <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
+            <button id="addrSet" class="btn" type="button">Save</button>
           </span>
         </div>
         <div class="setting">
@@ -2873,7 +3001,7 @@ ${SHARED_HELPERS}
       ctl.appendChild(sw);
     }
     if (canRedeemReset(a, s.caller)) ctl.appendChild(resetButton(a, key));
-    if (resetsLeft != null) ctl.appendChild(el('div', 'resets' + (resetsLeft ? '' : ' none'), resetsLeftText(resetsLeft)));
+    if (resetsLeft != null) ctl.appendChild(el('div', 'resets' + (resetsLeft ? '' : ' none'), resetsLeftText(resetsLeft, codexResetExpiry(a))));
     row.appendChild(ctl);
 
     var x = el('div', 'rowx');
@@ -2991,6 +3119,30 @@ ${SHARED_HELPERS}
     return card;
   }
 
+  // Dismissed reset-credit alerts, by event key (resetCreditAlerts). Kept in
+  // the browser, so a dismissal holds across reloads; the newest are kept.
+  var RESET_ALERTS_KEY = 'teamclaude-dashboard-reset-alerts';
+  function dismissedResetAlerts() {
+    try {
+      var list = JSON.parse(localStorage.getItem(RESET_ALERTS_KEY) || '[]');
+      return Array.isArray(list) ? list.filter(function (k) { return typeof k === 'string'; }) : [];
+    } catch (e) { return []; }
+  }
+
+  function renderResetAlerts(accounts) {
+    var box = document.getElementById('resetAlerts');
+    box.textContent = '';
+    resetCreditAlerts(accounts, dismissedResetAlerts()).forEach(function (x) {
+      var row = el('div', x.kind);
+      row.appendChild(el('span', '', x.text));
+      row.appendChild(button('more', 'Dismiss', function () {
+        localStorage.setItem(RESET_ALERTS_KEY, JSON.stringify(dismissedResetAlerts().concat([x.key]).slice(-50)));
+        renderResetAlerts(accounts);
+      }));
+      box.appendChild(row);
+    });
+  }
+
   function renderQuota(s) {
     var accounts = s.accounts || [];
     var tabs = providerTabs(accounts);
@@ -3022,6 +3174,7 @@ ${SHARED_HELPERS}
       toggle.setAttribute('aria-pressed', String(showAllAccounts));
       visibility.appendChild(toggle);
     }
+    renderResetAlerts(accounts);
     var cards = document.getElementById('summaryCards');
     cards.textContent = '';
     var acc = document.getElementById('accounts');
@@ -3150,7 +3303,8 @@ ${SHARED_HELPERS}
     tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
     if (withResets) {
       var left = codexResetsLeft(a);
-      tr.appendChild(el('td', 'num', left == null ? '—' : String(left)));
+      var expiry = codexResetExpiry(a);
+      tr.appendChild(el('td', 'num', left == null ? '—' : String(left) + (expiry == null ? '' : ' \u00b7 expires ' + shortDate(expiry))));
     }
     var act = el('td', 'num');
     // Signed out upstream: the one thing that brings it back is a sign-in,
@@ -3442,6 +3596,12 @@ ${SHARED_HELPERS}
   // Remove is armed by a first click, like Revoke.
   var linkSelf = null;
   var linkSelfState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'unsupported'
+  var linkSelfPrefill = '';
+  // Saves of the Instance address so far. A status or /peer-links read that
+  // was asked before the latest one may answer after it, with the address it
+  // replaced, so such a read is not let near the address.
+  var addrSaves = 0;
+  var statusAddrStale = false;
   var linkRemoveArmed = Object.create(null);
 
   // The address this page was opened at, which is this machine as the browser
@@ -3515,6 +3675,7 @@ ${SHARED_HELPERS}
 
   function loadLinkSelf() {
     linkSelfState = 'asking';
+    var saves = addrSaves;
     fetch(at('/teamclaude/peer-links'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // An instance from before this card: no such route.
@@ -3523,6 +3684,8 @@ ${SHARED_HELPERS}
         return res.json();
       })
       .then(function (j) {
+        // Asked before a save: it may offer the address that save replaced.
+        if (saves !== addrSaves) { linkSelfState = 'unasked'; if (lastStatus) renderLinks(lastStatus); return; }
         linkSelfState = j.unsupported ? 'unsupported' : 'done';
         linkSelf = j.self || null;
         fillLinkSelf();
@@ -3530,6 +3693,18 @@ ${SHARED_HELPERS}
       })
       // Asked again on a later render, not now: a loop on a proxy that keeps failing helps no one.
       .catch(function () { linkSelfState = 'unasked'; });
+  }
+
+  // Brings what this instance offers in line with the address set for it,
+  // and closes a shown link that still carries the old one.
+  // Then asks for it again: the address set may also have been the one guess
+  // the server found, which the swap dropped along with it.
+  function useInstanceAddress(address) {
+    if (!linkSelf || linkSelf.address === address) return;
+    linkSelf = linkSelfWithAddress(linkSelf, address);
+    fillLinkSelf();
+    if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
+    linkSelfState = 'unasked';
   }
 
   // Prefills what this machine would be called and reached at from the other
@@ -3540,7 +3715,8 @@ ${SHARED_HELPERS}
     list.textContent = '';
     opts.forEach(function (o) { var op = el('option'); op.value = o; list.appendChild(op); });
     var url = document.getElementById('linkSelfUrl');
-    if (!url.value && opts.length) url.value = opts[0];
+    // A prefill nobody has typed over follows a new Instance address.
+    if ((!url.value || url.value === linkSelfPrefill) && opts.length) url.value = linkSelfPrefill = opts[0];
     var name = document.getElementById('linkSelfName');
     if (!name.value && linkSelf && linkSelf.name) name.value = linkSelf.name;
     var notice = linkBackNotice(linkSelf);
@@ -3678,7 +3854,8 @@ ${SHARED_HELPERS}
           var opts = linkSelfOptions(linkSelf, pageOrigin());
           var link = opts.length ? instanceLink(opts[0], j.key) : '';
           if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
-          if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
+          var addrSet = !!(linkSelf && linkSelf.address && linkSelf.address === opts[0]);
+          if (opts.length) snippet(box, addrSet ? 'Address (set under Instance address above)' : 'Address (a best guess: use one the other machine can reach, or set Instance address above)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
         box.style.display = '';
@@ -4909,6 +5086,15 @@ ${SHARED_HELPERS}
       nameInput.value = inst.custom ? inst.name : '';
       nameInput.placeholder = inst.host || '';
     }
+    // A proxy too old to say its address has no row for it either.
+    var hasAddr = !!inst && typeof inst.address === 'string';
+    document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
+    var addrInput = document.getElementById('addrVal');
+    if (hasAddr && !statusAddrStale) {
+      if (document.activeElement !== addrInput) addrInput.value = inst.address;
+      // Set from a reload or another browser: the link must not keep the old one.
+      useInstanceAddress(inst.address);
+    }
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -5037,10 +5223,6 @@ ${SHARED_HELPERS}
   // in flight stay disabled across the polls that rebuild them.
   var resetArmed = Object.create(null);
   var resetBusy = Object.create(null);
-
-  function resetsLeftText(n) {
-    return n ? n + (n === 1 ? ' reset left' : ' resets left') : 'no resets left';
-  }
 
   function resetButton(account, key) {
     if (resetBusy[key]) {
@@ -5418,6 +5600,36 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doInstanceAddress(btn) {
+    var input = document.getElementById('addrVal');
+    btn.disabled = true;
+    var r = instanceAddressRequest(input.value.trim(), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = instanceAddressOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) {
+          input.value = json.address;
+          // At once, so a Show key that answers before the reads below
+          // already builds its link from the new address. Then ask again, for
+          // guesses the old address may have hidden.
+          addrSaves++;
+          // The status the page holds was read before the save, so a
+          // re-render from it must not bring the old address back either.
+          statusAddrStale = true;
+          useInstanceAddress(json.address);
+        }
+        poll();
+      })
+      .catch(function (e) { note('error', 'instance address change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // Saved on pick: a select has no half-entered state to protect, so a Set
   // button would only be a second click. The select is neither disabled nor
   // blurred while it saves: either would drop keyboard focus, and arrowing
@@ -5553,6 +5765,7 @@ ${SHARED_HELPERS}
   }
 
   function pollStatus() {
+    var saves = addrSaves;
     fetch(at('/teamclaude/status'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -5566,6 +5779,7 @@ ${SHARED_HELPERS}
       })
       .then(function (s) {
         if (!s) return;
+        statusAddrStale = saves !== addrSaves;
         // A linked instance's status lists ITS peers; the picker lists ours.
         if (!peer) renderInstances(s.peers, s.instance);
         document.getElementById('keybox').style.display = 'none';
@@ -5683,6 +5897,10 @@ ${SHARED_HELPERS}
   document.getElementById('nameSet').addEventListener('click', function () { doInstanceName(this); });
   document.getElementById('nameVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); doInstanceName(document.getElementById('nameSet')); }
+  });
+  document.getElementById('addrSet').addEventListener('click', function () { doInstanceAddress(this); });
+  document.getElementById('addrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doInstanceAddress(document.getElementById('addrSet')); }
   });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for

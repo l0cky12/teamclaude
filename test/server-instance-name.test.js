@@ -9,7 +9,9 @@ import { hostInstanceName } from '../src/peers.js';
 
 // /teamclaude/instance-name is the dashboard's Instance name row on Settings:
 // it writes `instanceName` under the config lock and reloads, and the status
-// and the picker's /teamclaude/peers read then call this machine by it. Every
+// and the picker's /teamclaude/peers read then call this machine by it.
+// /teamclaude/instance-address is the Instance address row beside it, and
+// works the same way for `instanceAddress`, which the link back offers. Every
 // test points TEAMCLAUDE_CONFIG (and TEAMROUTER_CONFIG, which wins over it) at
 // a throwaway file, so the real config is never touched.
 
@@ -36,8 +38,10 @@ async function withServer(fn, { instanceName, reload } = {}) {
     reload: async () => {
       reloads.count++;
       const disk = JSON.parse(await readFile(path, 'utf-8'));
-      if (disk.instanceName === undefined) delete config.instanceName;
-      else config.instanceName = disk.instanceName;
+      for (const key of ['instanceName', 'instanceAddress']) {
+        if (disk[key] === undefined) delete config[key];
+        else config[key] = disk[key];
+      }
       return {};
     },
   };
@@ -71,10 +75,10 @@ test('a name is saved, reloaded, and is what the status and the picker call this
   await withServer(async ({ port, path, reloads }) => {
     const res = await setName(port, { name: ' hermes ' });
     assert.equal(res.status, 200);
-    assert.deepEqual(await res.json(), { ok: true, name: 'hermes', host: hostInstanceName(), custom: true });
+    assert.deepEqual(await res.json(), { ok: true, name: 'hermes', host: hostInstanceName(), custom: true, address: '' });
     assert.equal(JSON.parse(await readFile(path, 'utf-8')).instanceName, 'hermes');
     assert.equal(reloads.count, 1);
-    assert.deepEqual((await getJson(port, '/teamclaude/status')).instance, { name: 'hermes', host: hostInstanceName(), custom: true });
+    assert.deepEqual((await getJson(port, '/teamclaude/status')).instance, { name: 'hermes', host: hostInstanceName(), custom: true, address: '' });
     assert.deepEqual((await getJson(port, '/teamclaude/peers')).self, { name: 'hermes' });
     assert.equal((await getJson(port, '/teamclaude/peer-links')).self.name, 'hermes', 'and what a link back offers');
   });
@@ -83,7 +87,7 @@ test('a name is saved, reloaded, and is what the status and the picker call this
 test('an empty name drops the key and the host name is used again', async () => {
   await withServer(async ({ port, path }) => {
     const res = await setName(port, { name: '' });
-    assert.deepEqual(await res.json(), { ok: true, name: hostInstanceName(), host: hostInstanceName(), custom: false });
+    assert.deepEqual(await res.json(), { ok: true, name: hostInstanceName(), host: hostInstanceName(), custom: false, address: '' });
     assert.equal('instanceName' in JSON.parse(await readFile(path, 'utf-8')), false);
     assert.equal((await getJson(port, '/teamclaude/status')).instance.custom, false);
   }, { instanceName: 'hermes' });
@@ -122,4 +126,46 @@ test('without a reload hook nothing is written', async () => {
     assert.equal(res.status, 501);
     assert.equal(await readFile(path, 'utf-8'), before);
   }, { reload: null });
+});
+
+function setAddress(port, body, headers = {}) {
+  return fetch(`http://127.0.0.1:${port}/teamclaude/instance-address`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+}
+
+test('an address is saved, reloaded, and offered first for linking this machine', async () => {
+  await withServer(async ({ port, path, reloads }) => {
+    const res = await setAddress(port, { address: ' 100.64.0.9:3456/ ' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true, address: 'http://100.64.0.9:3456' });
+    assert.equal(JSON.parse(await readFile(path, 'utf-8')).instanceAddress, 'http://100.64.0.9:3456');
+    assert.equal(reloads.count, 1);
+    assert.equal((await getJson(port, '/teamclaude/status')).instance.address, 'http://100.64.0.9:3456');
+    const self = (await getJson(port, '/teamclaude/peer-links')).self;
+    assert.equal(self.address, 'http://100.64.0.9:3456');
+    assert.equal(self.addresses[0], 'http://100.64.0.9:3456');
+
+    const cleared = await setAddress(port, { address: '' });
+    assert.deepEqual(await cleared.json(), { ok: true, address: '' });
+    assert.equal('instanceAddress' in JSON.parse(await readFile(path, 'utf-8')), false);
+    assert.equal((await getJson(port, '/teamclaude/peer-links')).self.address, '');
+  });
+});
+
+test('a refused address leaves the file as it was, and a client key cannot set one', async () => {
+  await withServer(async ({ port, path, reloads }) => {
+    const before = await readFile(path, 'utf-8');
+    for (const body of [{ address: 'ftp://host:21' }, { address: 'http://u:p@host:1' }, {}, { address: 5 }, 'not json']) {
+      const res = await setAddress(port, body);
+      assert.equal(res.status, 400, JSON.stringify(body));
+    }
+    const res = await setAddress(port, { address: 'http://100.64.0.9:3456' }, { 'x-api-key': 'tc-client' });
+    assert.equal(res.status, 403);
+    assert.match((await res.json()).error, /client key cannot change settings/);
+    assert.equal(await readFile(path, 'utf-8'), before);
+    assert.equal(reloads.count, 0);
+  });
 });

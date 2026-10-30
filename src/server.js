@@ -28,7 +28,7 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { AccountSyncError } from './web-account-sync.js';
 import { RemovalRefused } from './account-removal.js';
@@ -36,7 +36,7 @@ import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
 import { insightsRange } from './usage-history.js';
 import { fleetInsights, insightsScope } from './fleet-insights.js';
-import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
+import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceAddress, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -435,6 +435,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/probe-interval', 'a client key cannot change settings'],
   ['/teamclaude/instance-name', 'a client key cannot change settings'],
+  ['/teamclaude/instance-address', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -491,15 +492,16 @@ export function callerView(client) {
 
 /**
  * What this instance is called, for /teamclaude/status: the name in use, the
- * host name it falls back to, and whether `instanceName` is what set it.
+ * host name it falls back to, whether `instanceName` is what set it, and the
+ * address set for it (`instanceAddress`, '' when none is).
  *
  * @param {Record<string, any>} config
- * @returns {{ name: string, host: string, custom: boolean }}
+ * @returns {{ name: string, host: string, custom: boolean, address: string }}
  */
 export function instanceView(config) {
   const name = instanceName(config);
   const host = hostInstanceName();
-  return { name, host, custom: typeof config.instanceName === 'string' && config.instanceName.trim() === name };
+  return { name, host, custom: typeof config.instanceName === 'string' && config.instanceName.trim() === name, address: instanceAddress(config) };
 }
 
 /**
@@ -1587,6 +1589,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const view = instanceView(config);
         console.log(`[TeamClaude] Instance name ${view.custom ? `set to "${safeLine(view.name, 80)}"` : 'cleared; using the host name'} (dashboard)`);
         reply(200, { ok: true, ...view });
+        return;
+      }
+
+      // Instance address endpoint: the dashboard's Instance address row on
+      // Settings. Body: {"address": "<url>"}, or "" to go back to the guess.
+      // Written and reloaded like the instance name; the link the page hands
+      // out reads it from /teamclaude/peer-links.
+      if (req.method === 'POST' && req.url === '/teamclaude/instance-address') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (!hooks.reload) { reply(501, { ok: false, error: 'instance address change not supported' }); return; }
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setInstanceAddress(c, body.address); });
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Instance address change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'instance address change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after an instance address change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        const address = instanceAddress(config);
+        console.log(`[TeamClaude] Instance address ${address ? `set to ${safeLine(address, 200)}` : 'cleared; using the guess'} (dashboard)`);
+        reply(200, { ok: true, address });
         return;
       }
 

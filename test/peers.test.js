@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { askPeerToLinkBack, bindsLoopbackOnly, configuredPeers, createPeerDirectory, hostInstanceName, instanceName, parsePeerUrl, selfAddresses, selfLinkInfo, testPeerLink } from '../src/peers.js';
+import { askPeerToLinkBack, bindsLoopbackOnly, configuredPeers, createPeerDirectory, hostInstanceName, instanceAddress, instanceName, parsePeerUrl, selfAddresses, selfLinkInfo, testPeerLink } from '../src/peers.js';
 import { closedPort } from '../test-helpers/spawn-server.js';
 
 // Linked instances: a proxy relays /teamclaude/peers/<name>/<route> to another
@@ -290,4 +290,20 @@ test('instanceName is instanceName from the config, else the host name, and is w
   assert.equal(instanceName({ instanceName: 'my laptop' }), hostInstanceName());
   assert.equal(instanceName({ instanceName: 7 }), hostInstanceName());
   assert.equal(selfLinkInfo({ instanceName: 'hermes', proxy: {} }, '127.0.0.1', 3456).name, 'hermes');
+});
+
+test('selfLinkInfo offers the instanceAddress set before any guess, even on loopback', () => {
+  const ifaces = { eth0: [{ address: '172.30.0.2', family: 'IPv4', internal: false }] };
+  // What a Docker container sees: only its own bridge address.
+  assert.deepEqual(selfAddresses('0.0.0.0', 3456, ifaces), ['http://172.30.0.2:3456']);
+  assert.equal(instanceAddress({ instanceAddress: ' http://100.64.0.9:3456 ' }), 'http://100.64.0.9:3456');
+  assert.equal(instanceAddress({ instanceAddress: 5 }), '');
+  assert.equal(instanceAddress({}), '');
+  const set = selfLinkInfo({ instanceAddress: 'http://100.64.0.9:3456', proxy: {} }, '100.64.0.9', 3456);
+  assert.equal(set.address, 'http://100.64.0.9:3456');
+  assert.deepEqual(set.addresses, ['http://100.64.0.9:3456'], 'the bound address it matches is not listed twice');
+  const loop = selfLinkInfo({ instanceAddress: 'https://hub.tail.ts.net', proxy: {} }, '127.0.0.1', 3456);
+  assert.deepEqual(loop.addresses, ['https://hub.tail.ts.net'], 'a reverse proxy in front of a loopback proxy');
+  assert.equal(loop.offBox, false);
+  assert.equal(selfLinkInfo({ proxy: {} }, '127.0.0.1', 3456).address, '');
 });

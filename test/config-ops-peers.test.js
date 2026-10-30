@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConfigOpError, addPeer, peerAddress, removePeer, setInstanceName } from '../src/config-ops.js';
+import { ConfigOpError, addPeer, peerAddress, removePeer, setInstanceAddress, setInstanceName } from '../src/config-ops.js';
 import { configuredPeers } from '../src/peers.js';
 
 // The rules behind the dashboard's Linked instances card: what an entry of
@@ -86,5 +86,24 @@ test('setInstanceName refuses a name a link could not store, and anything but te
   }
   for (const bad of [undefined, null, 5, {}]) {
     assert.throws(() => setInstanceName({}, bad), /must be text/);
+  }
+});
+
+test('setInstanceAddress stores an address as a link stores one, and an empty one drops the key', () => {
+  const config = {};
+  assert.equal(setInstanceAddress(config, ' 100.64.0.9:3456/ '), 'http://100.64.0.9:3456');
+  assert.equal(config.instanceAddress, 'http://100.64.0.9:3456');
+  assert.equal(setInstanceAddress(config, '  '), '');
+  assert.equal('instanceAddress' in config, false, 'cleared, so the guess is used again');
+});
+
+test('setInstanceAddress refuses what a link could not use, and anything but text', () => {
+  for (const bad of ['ftp://host:21', 'http://user:pw@host:1', 'http://host:1/?x=1', 'http://exa mple:1']) {
+    const config = { instanceAddress: 'http://kept:1' };
+    assert.throws(() => setInstanceAddress(config, bad), ConfigOpError, bad);
+    assert.equal(config.instanceAddress, 'http://kept:1');
+  }
+  for (const bad of [undefined, null, 5, {}]) {
+    assert.throws(() => setInstanceAddress({}, bad), /must be text/);
   }
 });

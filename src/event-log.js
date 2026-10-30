@@ -35,10 +35,11 @@ export const EVENT_LOG_PAGE = 500;
  * `signin` an interactive sign-in (started, succeeded, failed, timed out,
  * cancelled), `auth` an account losing its credentials, `rotation` the router
  * moving off an account or holding, `control` an operator change made from
- * the dashboard or the CLI.
- * @typedef {'usage'|'signin'|'auth'|'rotation'|'control'} EventKind
+ * the dashboard or the CLI, `credits` a Codex reset credit granted or about
+ * to expire.
+ * @typedef {'usage'|'signin'|'auth'|'rotation'|'control'|'credits'} EventKind
  */
-export const EVENT_KINDS = /** @type {const} */ (['usage', 'signin', 'auth', 'rotation', 'control']);
+export const EVENT_KINDS = /** @type {const} */ (['usage', 'signin', 'auth', 'rotation', 'control', 'credits']);
 
 /**
  * @typedef {Object} LogEvent
