@@ -1587,6 +1587,282 @@ export function usageFor(entry, view) {
   };
 }
 
+// ---- Insights page ---------------------------------------------------------
+//
+// The page draws GET /teamclaude/insights (usage-history.js). What follows is
+// its arithmetic: number formats, axis tops, the series each "split by" choice
+// stacks, the donut geometry and the headline tiles. The drawing itself is in
+// the page script, which only turns these numbers into SVG.
+
+// Token counts as the page prints them: 4.48B, 340M, 12.3k. Three significant
+// figures at most, since the axis and the tiles are read at a glance and the
+// table view carries the exact number.
+/** @param {unknown} n */
+export function fmtTokens(n) {
+  var v = Number(n) || 0;
+  var a = Math.abs(v);
+  if (a >= 1e12) return (v / 1e12).toFixed(2) + 'T';
+  if (a >= 1e9) return (v / 1e9).toFixed(a >= 1e11 ? 0 : a >= 1e10 ? 1 : 2) + 'B';
+  if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e8 ? 0 : a >= 1e7 ? 1 : 2) + 'M';
+  if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e5 ? 0 : 1) + 'k';
+  return String(Math.round(v));
+}
+
+// The top of a value axis: the first 1, 2, 2.5 or 5 times a power of ten at or
+// above `v`, so the four gridlines under it land on round numbers.
+/** @param {number} v */
+export function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  var p = Math.pow(10, Math.floor(Math.log10(v)));
+  var f = v / p;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p;
+}
+
+// The gap between gridlines on an axis that counts things (requests): a whole
+// number, so none of the four lines lands on 62.5 of something that comes in
+// ones. The first 1, 2, 3, 4, 5, 6 or 8 times a power of ten at or above `v`.
+/** @param {number} v */
+export function niceStep(v) {
+  if (!(v > 1)) return 1;
+  var p = Math.pow(10, Math.floor(Math.log10(v)));
+  var f = v / p;
+  var steps = [1, 2, 3, 4, 5, 6, 8, 10];
+  for (var i = 0; i < steps.length; i++) if (f <= steps[i]) return steps[i] * p;
+  return 10 * p;
+}
+
+// The range as a phrase: "last 30 days", "all time".
+/** @param {string} range */
+export function insightsRangeText(range) {
+  if (range === '24h') return 'last 24 hours';
+  if (range === 'all') return 'all time';
+  var n = parseInt(range, 10);
+  return n > 0 ? 'last ' + n + ' days' : String(range);
+}
+
+// "▲ 12% vs the previous 30 days" under a tile, or null when there is nothing
+// to compare with: no earlier period on record, or one that spent nothing (a
+// percentage of zero is not a number anyone can read). The arrow and the words
+// carry the direction; neither is coloured, since more usage is not good or
+// bad in itself.
+/**
+ * @param {number} cur
+ * @param {number|null|undefined} prev
+ * @param {string} range
+ */
+export function insightsDelta(cur, prev, range) {
+  if (prev == null || !(prev > 0)) return null;
+  var pct = Math.round((cur / prev - 1) * 100);
+  var span = range === '24h' ? '24 hours' : parseInt(range, 10) + ' days';
+  return (pct > 0 ? '▲ ' : pct < 0 ? '▼ ' : '') + Math.abs(pct) + '% vs the previous ' + span;
+}
+
+// A day bucket ("2026-10-29") or an hour bucket (epoch ms) as an axis label,
+// and in the longer form the tooltip and table use.
+/**
+ * @param {string|number} bucket
+ * @param {string} unit
+ * @param {boolean} long
+ */
+export function insightsBucketLabel(bucket, unit, long) {
+  if (unit === 'hour') {
+    var h = new Date(Number(bucket));
+    // The hour's own minutes, not ':00': buckets are epoch hours, which start
+    // at :30 or :45 local time in a zone with a fractional offset (India, Nepal).
+    var hh = String(h.getHours()).padStart(2, '0') + ':' + String(h.getMinutes()).padStart(2, '0');
+    return long ? h.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + hh : hh;
+  }
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(bucket));
+  if (!m) return String(bucket);
+  var d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return d.toLocaleDateString([], long ? { weekday: 'short', month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric' });
+}
+
+// The series the timeline stacks for one "split by" choice, bottom first, each
+// with its colour as a CSS variable so the theme decides the shade.
+//
+// Colour follows the thing, never its rank, so a range change cannot repaint
+// a series. Providers use their own colours (all third-party backends share
+// one, and are one series). A history row's `provider` is the account's group
+// (accountGroup): `anthropic`, `codex` or `backend:<host>`. Accounts take the chart palette by their place in
+// the config (`accounts` is status.accounts, which keeps config order), so an
+// account keeps its colour whatever the range; past the palette's eight, and
+// for an account no longer configured, they are summed into one grey "Other".
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {string} split  'provider' | 'account' | 'kind'
+ * @param {any[]} accounts  status.accounts
+ * @returns {{ key: string, label: string, color: string, values: number[], total: number }[]}
+ */
+export function insightsSeries(data, split, accounts) {
+  var n = (data && data.buckets ? data.buckets.length : 0);
+  var zeros = function () { /** @type {number[]} */ var a = []; for (var i = 0; i < n; i++) a.push(0); return a; };
+  var sum = function (/** @type {number[]} */ vals) { return vals.reduce(function (x, y) { return x + y; }, 0); };
+  /** @type {{ key: string, label: string, color: string, values: number[], total: number }[]} */
+  var out = [];
+  if (!data) return out;
+  if (split === 'kind') {
+    [['cacheRead', 'Cache read'], ['cacheWrite', 'Cache write'], ['input', 'Input'], ['output', 'Output']].forEach(function (k) {
+      var vals = (data.kinds && data.kinds[k[0]]) || zeros();
+      out.push({ key: k[0], label: k[1], color: 'var(--ik-' + k[0] + ')', values: vals, total: sum(vals) });
+    });
+    return out;
+  }
+  if (split === 'account') {
+    var known = (accounts || []).map(function (a) { return accountGroup(a) + '/' + a.name; });
+    /** @type {Record<number, { key: string, label: string, color: string, values: number[], total: number }>} */
+    var bySlot = {};
+    /** @type {{ key: string, label: string, color: string, values: number[], total: number }|null} */
+    var other = null;
+    (data.accounts || []).forEach(function (/** @type {any} */ a) {
+      var slot = known.indexOf(a.provider + '/' + a.account);
+      if (slot >= 0 && slot < 8) {
+        bySlot[slot] = { key: a.provider + '/' + a.account, label: a.account, color: 'var(--is' + (slot + 1) + ')', values: a.values.slice(), total: a.tokens };
+      } else {
+        if (!other) other = { key: 'other', label: 'Other', color: 'var(--dim)', values: zeros(), total: 0 };
+        for (var i = 0; i < n; i++) other.values[i] += a.values[i] || 0;
+        other.total += a.tokens;
+      }
+    });
+    Object.keys(bySlot).map(Number).sort(function (x, y) { return x - y; }).forEach(function (s) { out.push(bySlot[s]); });
+    if (other) out.push(other);
+    return out;
+  }
+  /** @type {Record<string, { key: string, label: string, color: string, values: number[], total: number, members: number }>} */
+  var tones = {};
+  (data.providers || []).forEach(function (/** @type {any} */ p) {
+    var tone = providerTone(p.provider);
+    if (!tones[tone]) {
+      tones[tone] = { key: tone, label: groupLabel(p.provider), color: 'var(--ip-' + tone + ')', values: zeros(), total: 0, members: 0 };
+    }
+    var t = tones[tone];
+    t.members++;
+    if (tone === 'backend' && t.members > 1) t.label = 'Backends';
+    for (var i = 0; i < n; i++) t.values[i] += p.values[i] || 0;
+    t.total += p.tokens;
+  });
+  ['claude', 'codex', 'backend'].forEach(function (tone) {
+    if (!tones[tone]) return;
+    var t = tones[tone];
+    out.push({ key: t.key, label: t.label, color: t.color, values: t.values, total: t.total });
+  });
+  return out;
+}
+
+// Where each series sits in the stack at each bucket: `[bottom, top]`.
+/**
+ * @param {{ values: number[] }[]} series
+ * @param {number} n
+ */
+export function stackSeries(series, n) {
+  /** @type {number[][][]} */
+  var cols = [];
+  for (var i = 0; i < n; i++) {
+    var acc = 0;
+    /** @type {number[][]} */
+    var col = [];
+    for (var s = 0; s < series.length; s++) {
+      var v = series[s].values[i] || 0;
+      col.push([acc, acc + v]);
+      acc += v;
+    }
+    cols.push(col);
+  }
+  return cols;
+}
+
+// One SVG path per slice of a donut centred at (c, c), outer radius r, inner
+// radius ir, starting at twelve o'clock and going clockwise. A zero slice gets
+// null. A slice that is (all but) the whole is a ring instead: an arc whose ends
+// meet draws nothing, and one drawn a hair short of a full turn has inner ends
+// that round to the same point, so the inner arc vanished and the hole filled.
+// The ring is the outer circle clockwise and the inner one anticlockwise, as
+// two half-turns each; the opposite windings leave the centre unfilled.
+/**
+ * @param {number[]} values
+ * @param {number} c
+ * @param {number} r
+ * @param {number} ir
+ */
+export function donutArcs(values, c, r, ir) {
+  var total = values.reduce(function (x, y) { return x + (y > 0 ? y : 0); }, 0);
+  var a0 = -Math.PI / 2;
+  var pt = function (/** @type {number} */ rad, /** @type {number} */ a) { return (c + rad * Math.cos(a)).toFixed(2) + ',' + (c + rad * Math.sin(a)).toFixed(2); };
+  var ring = function (/** @type {number} */ rad, /** @type {number} */ sweep) {
+    return 'M' + c + ',' + (c - rad) + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c + rad)
+      + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c - rad) + 'Z';
+  };
+  return values.map(function (v) {
+    if (!(v > 0) || !(total > 0)) return null;
+    var sweep = v / total * Math.PI * 2;
+    if (sweep > Math.PI * 2 - 0.01) { a0 += sweep; return ring(r, 1) + ring(ir, 0); }
+    var a1 = a0 + sweep;
+    var large = sweep > Math.PI ? 1 : 0;
+    var d = 'M' + pt(r, a0) + 'A' + r + ',' + r + ' 0 ' + large + ' 1 ' + pt(r, a1)
+      + 'L' + pt(ir, a1) + 'A' + ir + ',' + ir + ' 0 ' + large + ' 0 ' + pt(ir, a0) + 'Z';
+    a0 = a1;
+    return d;
+  });
+}
+
+// The ranked model list: dated snapshots of one model ("…-20251001") are one
+// model to a reader, so models are grouped by the name modelLabel gives them,
+// per provider, before ranking.
+/**
+ * @param {any[]|null|undefined} models  insights.models
+ * @param {number} [limit]
+ */
+export function topModels(models, limit) {
+  /** @type {Record<string, { label: string, provider: string, tokens: number, requests: number }>} */
+  var groups = {};
+  /** @type {string[]} */
+  var order = [];
+  (models || []).forEach(function (/** @type {any} */ m) {
+    var label = m.model === '(unknown)' || m.model === '(other)' ? m.model : modelLabel(m.model);
+    var key = m.provider + '/' + label;
+    if (!groups[key]) { groups[key] = { label: label, provider: m.provider, tokens: 0, requests: 0 }; order.push(key); }
+    groups[key].tokens += m.tokens;
+    groups[key].requests += m.requests;
+  });
+  return order.map(function (k) { return groups[k]; })
+    .sort(function (x, y) { return y.tokens - x.tokens; })
+    .slice(0, limit || 6);
+}
+
+// The headline tiles: tokens and requests for the range (each against the
+// period before it), the pool as configured now, and how much of the range's
+// tokens the prompt cache served.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {any[]} accounts  status.accounts
+ */
+export function insightsKpis(data, accounts) {
+  var t = (data && data.totals) || { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
+  var p = data && data.previous;
+  var range = data ? data.range : '30d';
+  var list = accounts || [];
+  /** @type {Record<string, number>} */
+  var tally = { claude: 0, codex: 0, backend: 0 };
+  list.forEach(function (a) { tally[providerTone(accountGroup(a))]++; });
+  /** @type {string[]} */
+  var parts = [];
+  if (tally.claude) parts.push(tally.claude + ' Claude');
+  if (tally.codex) parts.push(tally.codex + ' Codex');
+  if (tally.backend) parts.push(tally.backend + (tally.backend === 1 ? ' backend' : ' backends'));
+  var enabled = list.filter(function (a) { return !a.disabled; }).length;
+  return [
+    { key: 'tokens', label: 'Tokens · ' + insightsRangeText(range), value: fmtTokens(tokens),
+      sub: insightsDelta(tokens, p ? p.input + p.output + p.cacheRead + p.cacheWrite : null, range) || (data && data.since == null ? 'nothing recorded yet' : 'no earlier period on record') },
+    { key: 'requests', label: 'Requests', value: t.requests.toLocaleString(),
+      sub: insightsDelta(t.requests, p ? p.requests : null, range) || 'responses that reported usage' },
+    { key: 'accounts', label: 'Accounts', value: String(list.length),
+      sub: (list.length ? enabled + ' enabled' + (parts.length ? ' · ' + parts.join(' · ') : '') : 'none configured') },
+    { key: 'cache', label: 'Served from cache', value: tokens > 0 ? (t.cacheRead / tokens * 100).toFixed(1) + '%' : '—',
+      sub: 'of these tokens were cache reads' },
+  ];
+}
+
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
@@ -1605,6 +1881,7 @@ const SHARED_HELPERS = [
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
+  fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1647,6 +1924,14 @@ const PAGE = `<!doctype html>
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd; --accent-bg: rgba(83,177,253,.12);
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
     --claude: #e0896a; --codex: #2bb88f; --backend: #a58bf0;
+    /* Insights charts. Separate from the provider colours above, which are
+       tuned for text and dots: a filled area needs a darker, validated step of
+       the same hue, and a series palette whose neighbours stay apart for
+       colour-blind readers. */
+    --ip-claude: #d95926; --ip-codex: #199e70; --ip-backend: #9085e9;
+    --ik-cacheRead: #3987e5; --ik-cacheWrite: #c98500; --ik-input: #d55181; --ik-output: #008300;
+    --is1: #3987e5; --is2: #d95926; --is3: #199e70; --is4: #c98500; --is5: #d55181; --is6: #008300; --is7: #9085e9; --is8: #e66767;
+    --igrid: #222a35; --iaxis: #343e4b;
   }
   @media (prefers-color-scheme: light) {
     :root:not([data-theme="dark"]) {
@@ -1655,6 +1940,10 @@ const PAGE = `<!doctype html>
       --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
       --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
       --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
+      --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-backend: #6250d6;
+      --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
+      --is1: #2a78d6; --is2: #eb6834; --is3: #1baf7a; --is4: #eda100; --is5: #e87ba4; --is6: #008300; --is7: #6250d6; --is8: #e34948;
+      --igrid: #eceef1; --iaxis: #c3c8cf;
     }
   }
   :root[data-theme="light"] {
@@ -1663,6 +1952,10 @@ const PAGE = `<!doctype html>
     --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
     --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
     --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
+    --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-backend: #6250d6;
+    --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
+    --is1: #2a78d6; --is2: #eb6834; --is3: #1baf7a; --is4: #eda100; --is5: #e87ba4; --is6: #008300; --is7: #6250d6; --is8: #e34948;
+    --igrid: #eceef1; --iaxis: #c3c8cf;
   }
   * { box-sizing: border-box; margin: 0; }
   body { background: var(--bg); color: var(--text); font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -1875,6 +2168,44 @@ const PAGE = `<!doctype html>
   #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
+  .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .insbar .lbl { color: var(--dim); font-size: 12px; }
+  .inskpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 12px; margin-bottom: 12px; }
+  .inskpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; min-width: 0; }
+  .inskpi .l { color: var(--dim); font-size: 12px; }
+  .inskpi .v { font-size: 26px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3; }
+  .inskpi .d { color: var(--dim); font-size: 12px; }
+  .inskpi svg { display: block; margin-top: 6px; }
+  .insgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 12px; margin-bottom: 12px; }
+  .insgrid.wide { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+  .insgrid .card, #insBody > .card { margin-bottom: 0; min-width: 0; }
+  #insBody > .card { margin-bottom: 12px; }
+  .insh { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .insh b { font-size: 13.5px; }
+  .insh .s { display: block; color: var(--dim); font-size: 12px; }
+  svg.inschart { display: block; overflow: visible; }
+  svg.inschart text { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .inslegend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--dim); margin-top: 6px; }
+  .inslegend b { color: var(--text); font-weight: 600; margin-left: 4px; }
+  .insw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+  .insdonut { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .insdonut svg { flex: none; }
+  .insdonut .insrows { flex: 1; min-width: 160px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+  .insdonut .insrow { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
+  .insdonut .insrow span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ihb { display: grid; grid-template-columns: minmax(64px, 34%) minmax(0, 1fr) auto; gap: 10px; align-items: center; font-size: 12.5px; padding: 4px 0; }
+  .ihb .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ihb .t { height: 12px; background: var(--track); border-radius: 4px; overflow: hidden; }
+  .ihb .f { height: 100%; border-radius: 0 4px 4px 0; }
+  .ihb .v { font-variant-numeric: tabular-nums; }
+  .instip { position: fixed; z-index: 50; pointer-events: none; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.25); min-width: 150px; }
+  .instip .tt { font-weight: 600; margin-bottom: 4px; }
+  .instip .insrow { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
+  .instip .insrow span:first-child { color: var(--dim); }
+  .instv { max-height: 320px; overflow: auto; }
+  @media (max-width: 1080px) {
+    .insgrid.wide { grid-template-columns: 1fr; }
+  }
   @media (max-width: 1080px) {
     .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .who, .ctl { grid-column: 1 / -1; }
@@ -1972,6 +2303,16 @@ const PAGE = `<!doctype html>
         <div class="card" style="padding:4px 6px"><table id="clients"></table></div>
       </div>
       <div id="dimensionsWrap"></div>
+    </section>
+
+    <section id="page-insights" style="display:none">
+      <div class="insbar">
+        <span class="lbl">Range</span><div id="insRange" class="chips"></div>
+        <span class="lbl">Split by</span><div id="insSplit" class="chips"></div>
+      </div>
+      <p class="sub" id="insNote" style="display:none"></p>
+      <div id="insBody"></div>
+      <p class="hint">Tokens include cache reads and writes. Days follow this proxy's clock; a year of days and the last 48 hours are kept in its state file.</p>
     </section>
 
     <section id="page-accounts" style="display:none">
@@ -2093,6 +2434,7 @@ const PAGE = `<!doctype html>
     { key: 'quota', label: 'Quota', section: 'Overview' },
     { key: 'sessions', label: 'Sessions', section: 'Overview' },
     { key: 'clients', label: 'Clients', section: 'Overview' },
+    { key: 'insights', label: 'Insights', section: 'Overview' },
     { key: 'accounts', label: 'Accounts', section: 'Accounts' },
     { key: 'logs', label: 'Logs', section: 'Observe' },
     { key: 'problems', label: 'Problems', section: 'Observe' },
@@ -3455,6 +3797,439 @@ ${SHARED_HELPERS}
       .finally(function () { logsInFlight = false; if (again) pollLogs(); });
   }
 
+  // ---- Insights page -------------------------------------------------------
+  // Fetched only while the page is open, like the log, and then at most once a
+  // minute: the history moves by the request, but a day's chart is not read to
+  // the second, and each read sums every bucket in the range.
+  var INS_RANGES = [{ key: '24h', label: '24h' }, { key: '7d', label: '7d' }, { key: '30d', label: '30d' }, { key: '90d', label: '90d' }, { key: 'all', label: 'All' }];
+  var INS_SPLITS = [{ key: 'provider', label: 'Provider', text: 'provider' }, { key: 'account', label: 'Account', text: 'account' }, { key: 'kind', label: 'Token type', text: 'token type' }];
+  var INSIGHTS_REFRESH_MS = 60 * 1000;
+  var ins = { range: '30d', split: 'provider', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var insTip = null;
+
+  function buildInsightsControls() {
+    var range = document.getElementById('insRange');
+    var split = document.getElementById('insSplit');
+    INS_RANGES.forEach(function (o) {
+      var b = button('chip', o.label, function () {
+        if (ins.range === o.key) return;
+        // The chart on screen stays, dimmed, until the new range arrives,
+        // rather than the page jumping to empty and back.
+        ins.range = o.key;
+        ins.pending = true;
+        markInsightsChips();
+        renderInsights();
+        pollInsights(true);
+      });
+      range.appendChild(b);
+      ins.chips.push({ group: 'range', key: o.key, btn: b });
+    });
+    INS_SPLITS.forEach(function (o) {
+      var b = button('chip', o.label, function () { ins.split = o.key; markInsightsChips(); renderInsights(); });
+      split.appendChild(b);
+      ins.chips.push({ group: 'split', key: o.key, btn: b });
+    });
+    markInsightsChips();
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      var t = null;
+      window.addEventListener('resize', function () {
+        clearTimeout(t);
+        t = setTimeout(function () { if (currentPage === 'insights') renderInsights(); }, 150);
+      });
+    }
+  }
+
+  function markInsightsChips() {
+    ins.chips.forEach(function (c) {
+      var on = c.group === 'range' ? c.key === ins.range : c.key === ins.split;
+      c.btn.className = on ? 'chip sel' : 'chip';
+    });
+  }
+
+  function pollInsights(force) {
+    if (ins.inFlight || (peer && !peerChecked)) return;
+    // Throttled by when it last ASKED, not when it last succeeded: a proxy that
+    // answers 404 or 500 would otherwise be asked again on every status poll.
+    if (!force && Date.now() - ins.at < INSIGHTS_REFRESH_MS) return;
+    ins.at = Date.now();
+    ins.inFlight = true;
+    var range = ins.range;
+    fetch(at('/teamclaude/insights?range=' + encodeURIComponent(range)), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        // A linked instance on an older proxy has no history to read.
+        if (res.status === 404) { ins.missing = true; return null; }
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (d) {
+        if (d) {
+          // A reply for a range the page has since left is not drawn; the
+          // finally below asks for the one it is on now.
+          if (d.range !== ins.range) return;
+          ins.data = d;
+          ins.missing = false;
+          ins.pending = false;
+        }
+        ins.error = null;
+        renderInsights();
+      })
+      .catch(function (e) { ins.error = e.message; ins.pending = false; renderInsights(); })
+      .finally(function () { ins.inFlight = false; if (ins.range !== range) pollInsights(true); });
+  }
+
+  function svgEl(tag, attrs, parent) {
+    var n = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) if (Object.prototype.hasOwnProperty.call(attrs, k)) n.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+
+  // Colours are CSS variables, which a presentation attribute does not
+  // resolve; a style property does.
+  function paint(n, fill, stroke) {
+    if (fill) n.style.fill = fill;
+    if (stroke) n.style.stroke = stroke;
+    return n;
+  }
+
+  function showInsightsTip(e, title, rows) {
+    if (!insTip) { insTip = el('div', 'instip'); document.body.appendChild(insTip); }
+    insTip.textContent = '';
+    insTip.appendChild(el('div', 'tt', title));
+    rows.forEach(function (r) {
+      var row = el('div', 'insrow');
+      var l = el('span');
+      if (r.color) { var sw = el('i', 'insw'); sw.style.background = r.color; l.appendChild(sw); }
+      l.appendChild(el('span', '', r.label));
+      row.appendChild(l);
+      row.appendChild(el('span', '', r.value));
+      insTip.appendChild(row);
+    });
+    insTip.style.display = 'block';
+    var x = e.clientX + 14;
+    var y = e.clientY + 14;
+    if (x + insTip.offsetWidth > window.innerWidth - 8) x = e.clientX - insTip.offsetWidth - 14;
+    if (y + insTip.offsetHeight > window.innerHeight - 8) y = e.clientY - insTip.offsetHeight - 14;
+    insTip.style.left = Math.max(4, x) + 'px';
+    insTip.style.top = Math.max(4, y) + 'px';
+  }
+
+  function hideInsightsTip() { if (insTip) insTip.style.display = 'none'; }
+
+  function insightsLegend(host, series) {
+    var box = el('div', 'inslegend');
+    series.forEach(function (sr) {
+      var item = el('span');
+      var sw = el('i', 'insw');
+      sw.style.background = sr.color;
+      item.appendChild(sw);
+      item.appendChild(el('span', '', sr.label));
+      if (sr.total != null) item.appendChild(el('b', '', fmtTokens(sr.total)));
+      box.appendChild(item);
+    });
+    host.appendChild(box);
+  }
+
+  // A bar with a 4px rounded end at its value and a square end on the axis.
+  function barPath(x, y, w, h) {
+    var r = Math.min(4, w / 2, h);
+    return 'M' + x + ',' + (y + h) + 'v' + (r - h) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + (-r)
+      + 'h' + (w - 2 * r) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + r + 'v' + (h - r) + 'z';
+  }
+
+  function insightsAxis(s, W, H, m, top, fmt) {
+    var ph = H - m.t - m.b;
+    for (var g = 0; g <= 4; g++) {
+      var y = m.t + ph - ph * g / 4;
+      paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, 'stroke-width': 1 }, s), null, g ? 'var(--igrid)' : 'var(--iaxis)');
+      svgEl('text', { x: m.l - 6, y: y + 4, 'text-anchor': 'end' }, s).textContent = fmt(top * g / 4);
+    }
+  }
+
+  function drawTimeline(host, d, series) {
+    var W = Math.max(280, host.clientWidth || 640);
+    var H = 240;
+    var m = { l: 48, r: 12, t: 10, b: 24 };
+    var pw = W - m.l - m.r;
+    var ph = H - m.t - m.b;
+    var n = d.buckets.length;
+    var cols = stackSeries(series, n);
+    var max = 0;
+    cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
+    var top = niceCeil(max);
+    var X = function (i) { return m.l + (n === 1 ? pw / 2 : i * pw / (n - 1)); };
+    var Y = function (v) { return m.t + ph - v / top * ph; };
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Tokens over time' }, host);
+    insightsAxis(s, W, H, m, top, fmtTokens);
+    var want = Math.max(2, Math.min(n, Math.floor(pw / 70)));
+    var lastX = -1e9;
+    for (var t = 0; t < want; t++) {
+      var i = Math.round(t * (n - 1) / Math.max(1, want - 1));
+      var x = X(i);
+      if (x - lastX < 56) continue;
+      lastX = x;
+      var anchor = n === 1 ? 'middle' : i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle';
+      svgEl('text', { x: x, y: H - 6, 'text-anchor': anchor }, s).textContent = insightsBucketLabel(d.buckets[i], d.unit, false);
+    }
+    series.forEach(function (sr, si) {
+      if (n === 1) {
+        var lo = cols[0][si][0];
+        var hi = cols[0][si][1];
+        if (hi > lo) paint(svgEl('rect', { x: X(0) - 20, y: Y(hi), width: 40, height: Math.max(0, Y(lo) - Y(hi) - 1) }, s), sr.color);
+        return;
+      }
+      var up = '';
+      var down = '';
+      for (var i = 0; i < n; i++) {
+        up += (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(cols[i][si][1]).toFixed(1);
+        down = 'L' + X(i).toFixed(1) + ',' + Y(cols[i][si][0]).toFixed(1) + down;
+      }
+      // The panel-coloured stroke is the gap between layers, so neighbouring
+      // series never touch.
+      paint(svgEl('path', { d: up + down + 'Z', 'fill-opacity': 0.88, 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), sr.color, 'var(--panel)');
+    });
+    var cross = paint(svgEl('line', { y1: m.t, y2: m.t + ph, 'stroke-width': 1 }, s), null, 'var(--dim)');
+    cross.style.opacity = '0';
+    var hit = svgEl('rect', { x: m.l, y: m.t, width: pw, height: ph, fill: 'transparent' }, s);
+    hit.addEventListener('mousemove', function (e) {
+      var box = s.getBoundingClientRect();
+      var i = n === 1 ? 0 : Math.max(0, Math.min(n - 1, Math.round((e.clientX - box.left - m.l) / pw * (n - 1))));
+      cross.setAttribute('x1', X(i));
+      cross.setAttribute('x2', X(i));
+      cross.style.opacity = '1';
+      var rows = series.map(function (sr) { return { label: sr.label, value: fmtTokens(sr.values[i] || 0), color: sr.color }; }).reverse();
+      if (series.length > 1) rows.push({ label: 'Total', value: fmtTokens(cols[i].length ? cols[i][cols[i].length - 1][1] : 0) });
+      showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), rows);
+    });
+    hit.addEventListener('mouseleave', function () { cross.style.opacity = '0'; hideInsightsTip(); });
+  }
+
+  function drawBars(host, d, values, color, name) {
+    var W = Math.max(260, host.clientWidth || 520);
+    var H = 200;
+    var m = { l: 44, r: 8, t: 10, b: 24 };
+    var pw = W - m.l - m.r;
+    var ph = H - m.t - m.b;
+    var n = values.length;
+    var top = 4 * niceStep(Math.max.apply(null, values.concat([0])) / 4);
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': name }, host);
+    insightsAxis(s, W, H, m, top, fmtTokens);
+    var band = pw / n;
+    var gap = Math.max(1, Math.min(band * 0.25, 8));
+    var bw = Math.max(1, band - gap);
+    var every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / 52))));
+    values.forEach(function (v, i) {
+      var x = m.l + i * band + gap / 2;
+      var h = v / top * ph;
+      if (h > 0) paint(svgEl('path', { d: barPath(x, m.t + ph - h, bw, h) }, s), color);
+      if (i % every === 0) svgEl('text', { x: x + bw / 2, y: H - 6, 'text-anchor': 'middle' }, s).textContent = insightsBucketLabel(d.buckets[i], d.unit, false);
+      var hit = svgEl('rect', { x: m.l + i * band, y: m.t, width: band, height: ph, fill: 'transparent' }, s);
+      hit.addEventListener('mousemove', function (e) { showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), [{ label: name, value: v.toLocaleString(), color: color }]); });
+      hit.addEventListener('mouseleave', hideInsightsTip);
+    });
+  }
+
+  function drawDonut(host, items, centerValue, centerLabel) {
+    var total = items.reduce(function (x, it) { return x + it.value; }, 0);
+    var wrap = el('div', 'insdonut');
+    host.appendChild(wrap);
+    var s = svgEl('svg', { class: 'inschart', width: 130, height: 130, viewBox: '0 0 150 150', role: 'img', 'aria-label': centerLabel }, wrap);
+    var share = function (v) { var p = total > 0 ? v / total * 100 : 0; return (p > 0 && p < 10 ? p.toFixed(1) : Math.round(p)) + '%'; };
+    donutArcs(items.map(function (it) { return it.value; }), 75, 74, 48).forEach(function (path, i) {
+      if (!path) return;
+      var it = items[i];
+      var p = paint(svgEl('path', { d: path, 'stroke-width': 2, 'stroke-linejoin': 'round' }, s), it.color, 'var(--panel)');
+      p.addEventListener('mousemove', function (e) { showInsightsTip(e, it.label, [{ label: 'Tokens', value: fmtTokens(it.value), color: it.color }, { label: 'Share', value: share(it.value) }]); });
+      p.addEventListener('mouseleave', hideInsightsTip);
+    });
+    var v = svgEl('text', { x: 75, y: 78, 'text-anchor': 'middle' }, s);
+    v.textContent = centerValue;
+    v.style.fill = 'var(--text)';
+    v.style.fontSize = '18px';
+    v.style.fontWeight = '650';
+    svgEl('text', { x: 75, y: 95, 'text-anchor': 'middle' }, s).textContent = centerLabel;
+    var rows = el('div', 'insrows');
+    items.forEach(function (it) {
+      var row = el('div', 'insrow');
+      var l = el('span');
+      var sw = el('i', 'insw');
+      sw.style.background = it.color;
+      l.appendChild(sw);
+      l.appendChild(el('span', '', it.label));
+      row.appendChild(l);
+      var r = el('span');
+      r.appendChild(el('b', '', share(it.value)));
+      r.appendChild(el('span', 'hint', ' ' + fmtTokens(it.value)));
+      row.appendChild(r);
+      rows.appendChild(row);
+    });
+    wrap.appendChild(rows);
+  }
+
+  function drawRanked(host, items) {
+    var max = items.reduce(function (x, it) { return Math.max(x, it.value); }, 0);
+    items.forEach(function (it) {
+      var row = el('div', 'ihb');
+      var name = el('span', 'n', it.label);
+      name.title = it.label;
+      row.appendChild(name);
+      var track = el('div', 't');
+      var fill = el('div', 'f');
+      fill.style.width = (max > 0 ? Math.max(0.5, it.value / max * 100) : 0) + '%';
+      fill.style.background = it.color;
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el('span', 'v', fmtTokens(it.value)));
+      row.addEventListener('mousemove', function (e) { showInsightsTip(e, it.label, it.tip); });
+      row.addEventListener('mouseleave', hideInsightsTip);
+      host.appendChild(row);
+    });
+  }
+
+  function sparkline(parent, values, color) {
+    var W = 200;
+    var H = 28;
+    var n = values.length;
+    var max = Math.max.apply(null, values.concat([0])) || 1;
+    var s = svgEl('svg', { class: 'inschart', width: '100%', height: H, viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', 'aria-hidden': 'true' }, parent);
+    var d = '';
+    values.forEach(function (v, i) { d += (i ? 'L' : 'M') + (i * W / (n - 1)).toFixed(1) + ',' + (H - 3 - v / max * (H - 6)).toFixed(1); });
+    paint(svgEl('path', { d: d + 'L' + W + ',' + H + 'L0,' + H + 'Z', 'fill-opacity': 0.14 }, s), color);
+    paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round', 'vector-effect': 'non-scaling-stroke' }, s), null, color);
+  }
+
+  // A chart card with a Table button: every chart can be read as numbers too,
+  // which is also what a reader who cannot tell the colours apart falls back on.
+  function insightsCard(parent, key, title, sub, draw, table) {
+    var card = el('div', 'card');
+    parent.appendChild(card);
+    var head = el('div', 'insh');
+    var t = el('div');
+    t.appendChild(el('b', '', title));
+    t.appendChild(el('span', 's', sub));
+    head.appendChild(t);
+    head.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
+    card.appendChild(head);
+    var body = el('div');
+    card.appendChild(body);
+    if (!ins.tables[key]) { draw(body); return; }
+    var spec = table();
+    var wrap = el('div', 'instv');
+    var tbl = el('table');
+    var hr = el('tr');
+    spec.cols.forEach(function (c, i) { hr.appendChild(el('th', i ? 'num' : '', c)); });
+    tbl.appendChild(hr);
+    spec.rows.forEach(function (r) {
+      var tr = el('tr');
+      r.forEach(function (c, i) { tr.appendChild(el('td', i ? 'num' : '', c)); });
+      tbl.appendChild(tr);
+    });
+    wrap.appendChild(tbl);
+    body.appendChild(wrap);
+  }
+
+  // What the page was last drawn against: whether it could measure itself, and
+  // the accounts the tiles count. The status poll redraws when either changes,
+  // rather than on every poll, which would drop a tooltip being read.
+  function insightsDrawnKey() {
+    var body = document.getElementById('insBody');
+    var accounts = (lastStatus && lastStatus.accounts) || [];
+    return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) { return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : ''); }).join('\\n');
+  }
+
+  function renderInsights() {
+    hideInsightsTip();
+    ins.drawn = insightsDrawnKey();
+    var note = document.getElementById('insNote');
+    var body = document.getElementById('insBody');
+    var d = ins.data;
+    var msg = ins.missing ? 'This instance runs an older proxy that keeps no usage history. Update it to see Insights.'
+      : ins.error ? 'Could not load insights: ' + ins.error
+      : !d ? 'Loading…'
+      : d.since == null ? 'Nothing recorded yet. Insights fill in as requests go through the proxy, starting with the first one this version serves.'
+      : null;
+    note.textContent = msg || '';
+    note.style.display = msg ? '' : 'none';
+    body.textContent = '';
+    body.style.opacity = ins.pending ? '0.55' : '';
+    if (!d || ins.missing) return;
+    var accounts = (lastStatus && lastStatus.accounts) || [];
+    var when = function (b) { return insightsBucketLabel(b, d.unit, true); };
+    var num = function (v) { return Math.round(v).toLocaleString(); };
+    var rangeText = insightsRangeText(d.range);
+    var perBucket = d.unit === 'hour' ? 'per hour' : 'per day';
+    var tokensPer = d.buckets.map(function (_, i) { return d.kinds.cacheRead[i] + d.kinds.cacheWrite[i] + d.kinds.input[i] + d.kinds.output[i]; });
+
+    var tiles = el('div', 'inskpis');
+    insightsKpis(d, accounts).forEach(function (k) {
+      var c = el('div', 'inskpi');
+      c.appendChild(el('div', 'l', k.label));
+      c.appendChild(el('div', 'v', k.value));
+      c.appendChild(el('div', 'd', k.sub));
+      if (k.key === 'tokens' && tokensPer.length > 1) sparkline(c, tokensPer, 'var(--is1)');
+      if (k.key === 'requests' && d.requests.length > 1) sparkline(c, d.requests, 'var(--is7)');
+      tiles.appendChild(c);
+    });
+    body.appendChild(tiles);
+    if (d.since == null) return;
+
+    var split = INS_SPLITS.filter(function (o) { return o.key === ins.split; })[0];
+    var series = insightsSeries(d, ins.split, accounts);
+    insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text, function (host) {
+      drawTimeline(host, d, series);
+      insightsLegend(host, series);
+    }, function () {
+      return {
+        cols: ['When'].concat(series.map(function (sr) { return sr.label; }), ['Total']),
+        rows: d.buckets.map(function (b, i) { return [when(b)].concat(series.map(function (sr) { return num(sr.values[i] || 0); }), [num(tokensPer[i])]); }).reverse(),
+      };
+    });
+
+    var grid = el('div', 'insgrid');
+    body.appendChild(grid);
+    var t = d.totals;
+    var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
+    var kinds = insightsSeries(d, 'kind', accounts).map(function (k) { return { label: k.label, value: k.total, color: k.color }; });
+    insightsCard(grid, 'mix', 'Token mix', 'what the tokens were', function (host) {
+      drawDonut(host, kinds, fmtTokens(tokens), 'tokens');
+    }, function () {
+      return { cols: ['Type', 'Tokens', 'Share'], rows: kinds.map(function (k) { return [k.label, num(k.value), tokens > 0 ? (k.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
+    });
+    var provs = insightsSeries(d, 'provider', accounts).map(function (p) { return { label: p.label, value: p.total, color: p.color }; });
+    insightsCard(grid, 'providers', 'By provider', 'share of tokens', function (host) {
+      drawDonut(host, provs, String(provs.length), provs.length === 1 ? 'provider' : 'providers');
+    }, function () {
+      return { cols: ['Provider', 'Tokens', 'Share'], rows: provs.map(function (p) { return [p.label, num(p.value), tokens > 0 ? (p.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
+    });
+    insightsCard(grid, 'accounts', 'By account', 'tokens, ' + rangeText, function (host) {
+      drawRanked(host, d.accounts.map(function (a) {
+        return { label: a.account, value: a.tokens, color: 'var(--ip-' + providerTone(a.provider) + ')',
+          tip: [{ label: 'Tokens', value: fmtTokens(a.tokens) }, { label: 'Requests', value: num(a.requests) }, { label: 'Provider', value: groupLabel(a.provider) }] };
+      }));
+    }, function () {
+      return { cols: ['Account', 'Provider', 'Requests', 'Tokens'], rows: d.accounts.map(function (a) { return [a.account, groupLabel(a.provider), num(a.requests), num(a.tokens)]; }) };
+    });
+
+    var wide = el('div', 'insgrid wide');
+    body.appendChild(wide);
+    insightsCard(wide, 'requests', 'Requests', perBucket, function (host) {
+      drawBars(host, d, d.requests, 'var(--is1)', 'Requests');
+    }, function () {
+      return { cols: ['When', 'Requests'], rows: d.buckets.map(function (b, i) { return [when(b), num(d.requests[i])]; }).reverse() };
+    });
+    var models = topModels(d.models, 6);
+    insightsCard(wide, 'models', 'Top models', 'tokens, ' + rangeText, function (host) {
+      drawRanked(host, models.map(function (mo) {
+        return { label: mo.label, value: mo.tokens, color: 'var(--ip-' + providerTone(mo.provider) + ')',
+          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
+      }));
+    }, function () {
+      return { cols: ['Model', 'Provider', 'Requests', 'Tokens'], rows: topModels(d.models, 1000).map(function (mo) { return [mo.label, groupLabel(mo.provider), num(mo.requests), num(mo.tokens)]; }) };
+    });
+  }
+
   function render(s) {
     lastStatus = s;
     // The poll owns the threshold field except while it is being typed into:
@@ -4153,6 +4928,10 @@ ${SHARED_HELPERS}
         document.getElementById('err').style.display = 'none';
         render(s);
         if (currentPage === 'logs') pollLogs();
+        if (currentPage === 'insights') {
+          if (ins.data && ins.drawn !== insightsDrawnKey()) renderInsights();
+          pollInsights(false);
+        }
       })
       .catch(function (e) {
         var err = document.getElementById('err');
@@ -4203,6 +4982,8 @@ ${SHARED_HELPERS}
     }
     if (lastStatus) renderProblems(lastStatus);
     if (page.key === 'logs') { renderLogs(); pollLogs(); }
+    hideInsightsTip();
+    if (page.key === 'insights') { renderInsights(); pollInsights(false); }
     if (page.key === 'settings' && lastStatus) renderLinks(lastStatus);
   }
 
@@ -4284,6 +5065,7 @@ ${SHARED_HELPERS}
   document.getElementById('ownKeyShow').addEventListener('click', function () { toggleOwnKey(this); });
   labelLinkCard();
   buildLogFilters();
+  buildInsightsControls();
   buildNav();
 
   ['fProject', 'fClient'].forEach(function (id) {
