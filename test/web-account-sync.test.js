@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { WebAccountSync, AccountSyncError } from '../src/web-account-sync.js';
+import { saveCallbackTokenIn, callbackSessionEpoch, loadCallbackToken, logoutCallback } from '../src/callback-auth.js';
 
 // The dashboard's Account sync card holds a callback.net sign-in across
 // requests: `start` hands out the approval link, the approval is waited for in
@@ -35,7 +39,9 @@ function harness({ token = null, whoami, beforeUrl, saveGate = null } = {}) {
       sync: async (reason) => { state.syncs.push(reason); return { signedIn: !!state.token, added: 1 }; },
     },
     login,
-    load: async () => state.token,
+    // `state.load`, when set, answers the next reads instead (a read held open).
+    load: async () => (state.load ? state.load() : state.token),
+    epoch: () => 0,
     // `saveGate`, when given, holds the write until the test releases it.
     save: async (t) => { if (saveGate) await saveGate; state.saved.push(t); state.token = t; },
     whoami: whoami || (async () => { state.whoamiCalls++; return { id: 'u1', email: 'me@example.com', name: 'Me' }; }),
@@ -182,23 +188,6 @@ test('an approved sign-in is finishing: Cancel no longer stops it, and a new sta
   assert.equal(state.saved.length, 1);
 });
 
-test('a sign-out during a late token write waits for it, so the write cannot turn sync back on', async () => {
-  const g = gate();
-  const { sync, state, approve } = harness({ saveGate: g.promise });
-  await sync.start();
-  approve();
-  await settle();
-  let signedOut = false;
-  const out = sync.signOut().then((r) => { signedOut = true; return r; });
-  await settle();
-  assert.equal(signedOut, false, 'the sign-out waits for the write');
-  g.open();
-  assert.deepEqual(await out, { wasSignedIn: true, revoked: true });
-  assert.equal(state.saved.length, 1, 'the write happened');
-  assert.equal(state.token, null, 'and the sign-out came after it');
-  assert.deepEqual(state.syncs, ['dashboard sign-in', 'sign-out'], 'the sign-out pass is its own, not the sign-in\'s');
-});
-
 test('a cancel just before the write keeps the token out, whenever the approval lands', async () => {
   const g = gate();
   const { sync, state, approve } = harness({ saveGate: g.promise });
@@ -210,3 +199,95 @@ test('a cancel just before the write keeps the token out, whenever the approval 
   assert.equal(sync.status(id).state, 'cancelled');
   assert.deepEqual(state.saved, []);
 });
+
+test('a start whose read of the session overlaps an approval being saved is refused, not let in', async () => {
+  const g = gate();
+  const { sync, state, approve } = harness({ saveGate: g.promise });
+  const a = await sync.start();
+  // B reads the session file; the read is held open.
+  const read = gate();
+  state.load = () => read.promise;
+  const b = sync.start();
+  // Meanwhile A is approved and starts saving.
+  approve();
+  await settle();
+  assert.equal(sync.status(a.id).state, 'finishing');
+  read.open(null);
+  await assert.rejects(b, (err) => err instanceof AccountSyncError && /still finishing/.test(err.message));
+  assert.equal(sync.status(a.id).state, 'finishing', 'A is still the sign-in in progress');
+  g.open();
+  await settle();
+  assert.equal(sync.status(a.id).state, 'succeeded');
+});
+
+test('a start whose read missed a save that finished meanwhile is refused as signed in', async () => {
+  const { sync, state, approve } = harness();
+  await sync.start();
+  const read = gate();
+  state.load = () => read.promise;
+  const b = sync.start();
+  approve();
+  await settle();
+  // The read began before the token was written and still answers "none".
+  read.open(null);
+  await assert.rejects(b, (err) => err instanceof AccountSyncError && /already signed in/.test(err.message));
+});
+
+// With the real token store: callback-auth.js ties every write to the session
+// epoch a sign-out moves, so whatever the order, a sign-out ends signed out.
+
+async function tempConfig(t) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-web-sync-'));
+  const prev = { c: process.env.TEAMCLAUDE_CONFIG, r: process.env.TEAMROUTER_CONFIG };
+  process.env.TEAMCLAUDE_CONFIG = join(dir, 'config.json');
+  process.env.TEAMROUTER_CONFIG = join(dir, 'config.json');
+  t.after(async () => {
+    for (const [k, v] of [['TEAMCLAUDE_CONFIG', prev.c], ['TEAMROUTER_CONFIG', prev.r]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    await rm(dir, { recursive: true, force: true });
+  });
+}
+
+/** WebAccountSync over the real token store; the revoke goes to a stand-in. */
+function realStore({ revoke = 'ok', saveGate = null } = {}) {
+  let approve = () => {};
+  const revokeFetch = async () => {
+    if (revoke === 'unreachable') throw new TypeError('fetch failed');
+    // What callbackApi reads of a reply.
+    return { ok: true, status: 200, headers: { get: () => null }, text: async () => JSON.stringify({ result: 'success', data: true }) };
+  };
+  const sync = new WebAccountSync({
+    sync: { summary: () => ({}), sync: async () => ({}) },
+    login: async (opts) => {
+      const approved = new Promise((resolve) => { approve = resolve; });
+      opts.onUrl('https://oid.jp/ABC', { lifetimeSeconds: 900 });
+      await approved;
+      return { access_token: 'at-web', refresh_token: 'rt-web', client_id: 'oaap-x', obtained_at: 1 };
+    },
+    save: async (token, epoch) => { if (saveGate) await saveGate; return saveCallbackTokenIn(token, epoch); },
+    epoch: callbackSessionEpoch,
+    whoami: async () => ({ email: null, name: null }),
+    logout: () => logoutCallback({ base: 'http://127.0.0.1:9', fetchImpl: revokeFetch }),
+    log: () => {},
+  });
+  return { sync, approve: () => approve() };
+}
+
+for (const revoke of ['ok', 'unreachable']) {
+  test(`an approval saved after Sign out began cannot sign the install back in (revoke ${revoke})`, async (t) => {
+    await tempConfig(t);
+    const g = gate();
+    const { sync, approve } = realStore({ revoke, saveGate: g.promise });
+    const { id } = await sync.start();
+    approve();
+    await settle();
+    assert.equal(sync.status(id).state, 'finishing');
+    const out = sync.signOut();
+    g.open();
+    await out;
+    await settle();
+    assert.equal(await loadCallbackToken(), null, 'still signed out');
+    assert.equal(sync.status(id).state, 'cancelled', 'the sign-out ended it');
+  });
+}

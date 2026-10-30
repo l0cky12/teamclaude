@@ -10,6 +10,7 @@ import {
   approvalUrl, callbackBase, callbackClientId, CALLBACK_CLIENT_ID, loginCallback, refreshCallbackToken,
   getCallbackAuthPath, loadCallbackToken, saveCallbackToken, clearCallbackToken,
   callbackCall, callbackWhoami, logoutCallback, callbackTokenLapsed,
+  saveCallbackTokenIn, callbackSessionEpoch,
 } from '../src/callback-auth.js';
 
 // Sign-in to callback.net: a poll-token OAuth2 flow. The client asks for a poll
@@ -368,6 +369,94 @@ test('signing out revokes the grant and forgets the token, reachable server or n
   const dead = async () => { throw new TypeError('fetch failed'); };
   assert.deepEqual(await logoutCallback({ base: api.base, fetchImpl: dead }), { wasSignedIn: true, revoked: false });
   assert.equal(await loadCallbackToken(), null);
+});
+
+// ── signing out against writes still running ────────────────
+
+/**
+ * A fetch that holds the renewal (OAuth2:token) until released, and fails the
+ * revoke when asked to; the rest goes to the stand-in API as usual.
+ */
+function heldRenewal({ revokeFails = false } = {}) {
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  let entered = () => {};
+  const reached = new Promise((resolve) => { entered = resolve; });
+  const fetchImpl = async (url, init) => {
+    const path = String(url);
+    if (path.endsWith('OAuth2:token')) { entered(); await held; }
+    if (revokeFails && path.endsWith('OAuth2:revoke')) throw new TypeError('fetch failed');
+    return fetch(url, init);
+  };
+  return { fetchImpl, reached, release };
+}
+
+for (const revokeFails of [false, true]) {
+  test(`a renewal in flight when sign-out begins cannot write its token back (revoke ${revokeFails ? 'unreachable' : 'ok'})`, async (t) => {
+    await tempConfig(t);
+    const api = await mockApi(t, { access: 'at-1' });
+    // Past its stated lifetime: the next call renews first.
+    await saveCallbackToken({ access_token: 'at-1', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+    const h = heldRenewal({ revokeFails });
+    const opts = { base: api.base, now: () => 3600 * 1000, fetchImpl: h.fetchImpl };
+    const call = callbackWhoami(opts).then(() => 'ok', (err) => err);
+    await h.reached;
+    let signedOut = false;
+    const out = logoutCallback(opts).then((r) => { signedOut = true; return r; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signedOut, false, 'the sign-out waits for the renewal');
+    h.release();
+    assert.deepEqual(await out, { wasSignedIn: true, revoked: !revokeFails });
+    const result = await call;
+    assert.ok(result instanceof Error && result.loginRequired, 'the call learns the session is gone');
+    assert.equal(await loadCallbackToken(), null, 'nothing was written back');
+  });
+}
+
+test('a renewal that would start during a sign-out is refused', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t, { access: 'at-1' });
+  await saveCallbackToken({ access_token: 'at-1', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 0 });
+  // The revoke is held, so the sign-out is still running when the call comes.
+  let releaseRevoke = () => {};
+  const revokeHeld = new Promise((resolve) => { releaseRevoke = resolve; });
+  let revokeReached = () => {};
+  const atRevoke = new Promise((resolve) => { revokeReached = resolve; });
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('OAuth2:revoke')) { revokeReached(); await revokeHeld; }
+    return fetch(url, init);
+  };
+  const out = logoutCallback({ base: api.base, fetchImpl });
+  await atRevoke;
+  const call = await callbackWhoami({ base: api.base, now: () => 3600 * 1000, fetchImpl }).then(() => 'ok', (err) => err);
+  assert.ok(call instanceof Error && call.loginRequired);
+  assert.equal(api.state.seen.filter((s) => s.path === 'OAuth2:token').length, 0, 'no renewal was sent');
+  releaseRevoke();
+  await out;
+  assert.equal(await loadCallbackToken(), null);
+});
+
+test('a write under way when sign-out begins finishes first, and the sign-out deletes it', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t);
+  const write = saveCallbackTokenIn({ access_token: 'at-new', refresh_token: 'rt-new', client_id: CLIENT, obtained_at: 1 }, callbackSessionEpoch());
+  const out = await logoutCallback({ base: api.base });
+  await write;
+  assert.deepEqual(out, { wasSignedIn: true, revoked: true }, 'it saw the token the write left');
+  assert.deepEqual(api.state.revoked, ['rt-new']);
+  assert.equal(await loadCallbackToken(), null);
+});
+
+test('a write from before a sign-out is refused afterwards', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t);
+  const epoch = callbackSessionEpoch();
+  await logoutCallback({ base: api.base });
+  await assert.rejects(saveCallbackTokenIn({ access_token: 'a', refresh_token: 'r', client_id: CLIENT, obtained_at: 1 }, epoch), (err) => err.loginRequired === true);
+  assert.equal(await loadCallbackToken(), null);
+  // A writer that began after the sign-out writes as usual.
+  await saveCallbackTokenIn({ access_token: 'a', refresh_token: 'r', client_id: CLIENT, obtained_at: 1 }, callbackSessionEpoch());
+  assert.equal((await loadCallbackToken()).access_token, 'a');
 });
 
 // ── the command ──────────────────────────────────────────────

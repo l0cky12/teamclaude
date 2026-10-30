@@ -18,7 +18,7 @@
 // can never quietly move an install's tokens to someone else's store.
 
 import { randomBytes } from 'node:crypto';
-import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback } from './callback-auth.js';
+import { loginCallback, loadCallbackToken, saveCallbackTokenIn, callbackSessionEpoch, callbackWhoami, logoutCallback } from './callback-auth.js';
 import { safeLine } from './safe-text.js';
 
 // The user's name and email are read from callback.net for the card. A page
@@ -36,7 +36,6 @@ const WHOAMI_TIMEOUT_MS = 5000;
  * @property {AbortController} controller
  * @property {Exclude<SyncSignInState, 'unknown'>} state
  * @property {string | null} error
- * @property {Promise<void>} [settled]  resolves once the sign-in has ended, its token saved or not
  * @property {Promise<unknown>} [firstPass]  the pass a successful sign-in starts
  */
 
@@ -96,17 +95,22 @@ export class WebAccountSync {
    *   the running CredentialSync
    * @param {typeof loginCallback} [opts.login]
    * @param {typeof loadCallbackToken} [opts.load]
-   * @param {typeof saveCallbackToken} [opts.save]
+   * @param {typeof saveCallbackTokenIn} [opts.save]  saves the token for the session epoch it began in
+   * @param {typeof callbackSessionEpoch} [opts.epoch]
    * @param {typeof callbackWhoami} [opts.whoami]
    * @param {typeof logoutCallback} [opts.logout]
    * @param {typeof fetch} [opts.fetchImpl]
    * @param {(line: string) => void} [opts.log]
    */
-  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackToken, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l) }) {
+  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackTokenIn, epoch = callbackSessionEpoch, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l) }) {
     this._sync = sync;
     this._login = login;
     this._load = load;
     this._save = save;
+    this._epoch = epoch;
+    // Tokens this class has saved, counted: a start that read the token file
+    // while one was being written cannot trust what it read.
+    this._saves = 0;
     this._whoami = whoami;
     this._logout = logout;
     this._fetch = fetchImpl;
@@ -162,20 +166,28 @@ export class WebAccountSync {
    * the background, and `status` says how it went.
    *
    * Once approved, the sign-in is FINISHING: its token is being saved, and
-   * from then on Cancel no longer stops it and a sign-out waits for it, so a
-   * save that lands late can never turn sync back on behind either of them.
+   * from then on Cancel no longer stops it. The save belongs to the session
+   * epoch the sign-in began in (callback-auth.js saveCallbackTokenIn), so a
+   * sign-out at any point either refuses it or waits for it and then deletes
+   * it: a late save can never turn sync back on behind a sign-out.
    * @returns {Promise<{ id: string, url: string, lifetimeSeconds: number }>}
    */
   async start() {
+    const saves = this._saves;
+    const signedIn = await this._load().catch(() => null);
+    // Checked after the read, and synchronously with taking over _current
+    // below: a sign-in approved or saved while the file was being read wins,
+    // and this one is refused rather than replacing it.
+    if (signedIn || this._saves !== saves) {
+      throw new AccountSyncError('already signed in to callback.net; sign out first to use another callback.net account');
+    }
     if (this._current?.state === 'finishing') {
       throw new AccountSyncError('the last sign-in was approved and is still finishing; try again in a moment');
-    }
-    if (await this._load().catch(() => null)) {
-      throw new AccountSyncError('already signed in to callback.net; sign out first to use another callback.net account');
     }
     this.cancel(this._current?.id ?? '');
     const id = randomBytes(16).toString('hex');
     const controller = new AbortController();
+    const epoch = this._epoch();
     /** @type {SyncSignIn} */
     const entry = { id, controller, state: 'waiting', error: null };
     this._current = entry;
@@ -193,7 +205,8 @@ export class WebAccountSync {
       if (controller.signal.aborted) throw abortError();
       // Synchronously with the check above: no cancel can come between them.
       entry.state = 'finishing';
-      await this._save(token);
+      await this._save(token, epoch);
+      this._saves++;
       this._who = null;
       return token;
     });
@@ -206,13 +219,13 @@ export class WebAccountSync {
         entry.firstPass = this._sync.sync('dashboard sign-in').catch(() => {});
       },
       (err) => {
-        entry.state = err?.name === 'AbortError' || controller.signal.aborted ? 'cancelled' : 'failed';
+        // Refused by a sign-out that began meanwhile: the operator ended it.
+        const ended = err?.name === 'AbortError' || controller.signal.aborted || (err?.loginRequired && this._epoch() !== epoch);
+        entry.state = ended ? 'cancelled' : 'failed';
         entry.error = entry.state === 'failed' ? syncError(err) : null;
         if (entry.state === 'failed') this._log(`[TeamClaude] callback.net sign-in from the dashboard failed: ${entry.error}`);
       },
     );
-    // After the two handlers above, so a state read once this resolves is final.
-    entry.settled = outcome.then(() => {}, () => {});
 
     // A failure before the link exists (callback.net unreachable, say) is this
     // request's to report. Both sides settle into a value, so the side that
@@ -267,16 +280,13 @@ export class WebAccountSync {
    */
   async signOut() {
     const cur = this._current;
-    if (cur) {
-      this.cancel(cur.id);
-      // An approved sign-in still saving its token would otherwise write it
-      // back after the session is gone; and its first pass, still running,
-      // would be the one the pass below joins and so count a store that is
-      // no longer this install's.
-      await cur.settled;
-      await cur.firstPass;
-    }
+    if (cur) this.cancel(cur.id);
+    // The logout itself refuses or waits for every token write in this
+    // process, the dashboard's sign-in and callback.net's own renewals alike.
     const out = await this._logout();
+    // A sign-in's first pass still running would be the one the pass below
+    // joins, and so count a store that is no longer this install's.
+    if (cur) await cur.firstPass;
     this._who = null;
     // A pass with no session forgets what the store held, so the card stops
     // counting its rows.
