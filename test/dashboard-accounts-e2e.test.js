@@ -80,18 +80,20 @@ test('a server with no accounts starts, serves the dashboard, and answers reques
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
   const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
-  const server = await spawnServer({
-    config: () => ({
-      proxy: { apiKey: 'tc-test' },
-      upstream: `http://127.0.0.1:${upstreamPort}`,
-      upstreamProxy: false,
-      autoUpdate: false,
-      // An empty pool must not be held: no window will ever bring an account back.
-      holdSeconds: 600,
-      accounts: [],
-    }),
-  });
+  /** @type {Awaited<ReturnType<typeof spawnServer>> | null} */
+  let server = null;
   try {
+    server = await spawnServer({
+      config: () => ({
+        proxy: { apiKey: 'tc-test' },
+        upstream: `http://127.0.0.1:${upstreamPort}`,
+        upstreamProxy: false,
+        autoUpdate: false,
+        // An empty pool must not be held: no window will ever bring an account back.
+        holdSeconds: 600,
+        accounts: [],
+      }),
+    });
     const { port, configPath } = server;
     assert.deepEqual((await status(port)).accounts, []);
     assert.match(server.output(), /No accounts configured yet/);
@@ -119,7 +121,7 @@ test('a server with no accounts starts, serves the dashboard, and answers reques
     assert.equal(after.status, 200);
     assert.equal(upstreamHits, 1);
   } finally {
-    await server.stop();
+    await server?.stop();
     await new Promise(resolve => upstream.close(() => resolve(undefined)));
   }
 });

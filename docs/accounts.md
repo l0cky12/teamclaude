@@ -22,7 +22,7 @@ refused regardless of `--name` — log in again to get a fresh one.
 
 ## Starting with no accounts
 
-The server starts with no accounts, so a new install (a fresh Docker container, for example) can sign its first one in from the [dashboard](#signing-in-from-the-dashboard). Until it has one, every Claude Code and Codex request through the proxy gets a `503` saying TeamClaude has no accounts yet. It is not held for `holdSeconds`, because no quota window will bring an account back. Requests go through as soon as the first sign-in finishes. No restart is needed.
+The server starts with no accounts, so a new install (a fresh Docker container, for example) can sign its first one in from the [dashboard](#signing-in-from-the-dashboard). Until it has one, every Claude Code and Codex request the proxy handles gets a `503` saying TeamClaude has no accounts yet. In [MITM mode](proxy-modes.md#mitm-proxy-mode-default), `chatgpt.com` is only intercepted once the pool has a Codex account, so until then a Codex client on the MITM proxy is tunnelled through untouched and uses its own login, as it is in any pool without a Codex account. It is not held for `holdSeconds`, because no quota window will bring an account back. Requests go through as soon as the first sign-in finishes. No restart is needed.
 
 ## Signing in from the dashboard
 
