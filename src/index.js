@@ -354,26 +354,17 @@ async function serverCommand() {
   // --activity-log <file>
   const activityLogPath = argValue('--activity-log') || null;
 
-  // An empty pool is a configuration error — unless this install is signed in
-  // to callback.net, where the credential store may hold the accounts: a fresh
-  // machine gets them from the first sync pass, which needs a running server.
+  // An empty pool still starts: a fresh install (a new Docker container, say)
+  // signs its first account in from the dashboard, which needs a running
+  // server. Until one arrives every proxied request is answered 503 (see
+  // forwardRequest in server.js). An install signed in to callback.net may get
+  // its accounts from the first sync pass instead.
   const syncMayFill = config.accounts.length === 0 && !!(await loadCallbackToken().catch(() => null));
-  if (config.accounts.length === 0 && !syncMayFill) {
-    console.error('No accounts configured.\n');
-    console.error('Add an account first:');
-    console.error('  teamclaude import           Import from Claude Code');
-    console.error('  teamclaude login            OAuth login via browser');
-    console.error('  teamclaude login --api      Add an API key (last resort by default; --priority <n>)');
-    console.error('  teamclaude callback login   Sign in to callback.net and take the accounts of your other installs');
-    process.exit(1);
-  }
-
   const accounts = await resolveAccounts(config);
-  if (accounts.length === 0 && !syncMayFill) {
-    console.error('No valid accounts after initialization');
-    process.exit(1);
-  }
   if (syncMayFill) console.log('[TeamClaude] No accounts configured; signed in to callback.net, so the credential store will be checked for them');
+  else if (accounts.length === 0) {
+    console.log(`[TeamClaude] No accounts configured yet. Sign one in from the dashboard (http://127.0.0.1:${config.proxy.port}/teamclaude/dashboard), or with: teamclaude login`);
+  }
 
   // `accounts[].models` (#74) is superseded by the `routes` table (#86). Routes
   // do the same job with glob matching, several accounts per rule and a bucket

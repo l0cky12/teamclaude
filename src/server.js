@@ -3676,6 +3676,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     }));
     return;
   }
+  if (!account && accountManager.accounts.length === 0) {
+    // A fresh install with nothing signed in yet. Not a 429: no window will
+    // reset, and a holdSeconds wait would only stall the client until a person
+    // signs in. Not a 401/403 either, which would make the client drop its own
+    // login. Answered at once, naming where the first account comes from.
+    ctx.status = 503;
+    ctx.account = '(no accounts)';
+    if (!res.headersSent) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: 'TeamClaude has no accounts yet. Sign one in from the dashboard (/teamclaude/dashboard) or with: teamclaude login' },
+      }));
+    }
+    return;
+  }
   if (!account) {
     // Every candidate was refused by upstream (403). Waiting will not help — the
     // account needs attention, not a retry — so say so plainly rather than

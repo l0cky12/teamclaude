@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { readFile, writeFile } from 'node:fs/promises';
 import { spawnServer, closedPort } from '../test-helpers/spawn-server.js';
 
 // The real server, headless, driven the way the dashboard's Accounts page
@@ -58,12 +59,71 @@ test('Remove takes the account out of the fleet and the config file, and leaves 
     const logs = await fetch(`http://127.0.0.1:${port}/teamclaude/logs`).then(r => r.json());
     assert.ok(logs.events.some(e => e.type === 'account_removed' && e.account === 'a@example.com'), 'the removal is on the event log');
 
-    // The last one stays: a config with no accounts would not start again.
+    // The last one goes too: a server with none keeps running, so the
+    // dashboard is still there to sign one in again.
     const last = await post(port, '/teamclaude/remove', { account: 'b@example.com' });
-    assert.equal(last.status, 409);
-    assert.match((await last.json()).error, /only account/);
-    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).accounts.map(a => a.name), ['b@example.com']);
+    assert.equal(last.status, 200);
+    assert.deepEqual((await status(port)).accounts, []);
+    assert.deepEqual(JSON.parse(await readFile(configPath, 'utf8')).accounts, []);
   });
+});
+
+test('a server with no accounts starts, serves the dashboard, and answers requests 503 until one arrives', async () => {
+  // A stand-in upstream that counts what reaches it: nothing may, until an
+  // account exists.
+  let upstreamHits = 0;
+  const upstream = createServer((req, res) => {
+    upstreamHits++;
+    req.resume();
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'message', content: [] }));
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
+  const upstreamPort = /** @type {import('node:net').AddressInfo} */ (upstream.address()).port;
+  /** @type {Awaited<ReturnType<typeof spawnServer>> | null} */
+  let server = null;
+  try {
+    server = await spawnServer({
+      config: () => ({
+        proxy: { apiKey: 'tc-test' },
+        upstream: `http://127.0.0.1:${upstreamPort}`,
+        upstreamProxy: false,
+        autoUpdate: false,
+        // An empty pool must not be held: no window will ever bring an account back.
+        holdSeconds: 600,
+        accounts: [],
+      }),
+    });
+    const { port, configPath } = server;
+    assert.deepEqual((await status(port)).accounts, []);
+    assert.match(server.output(), /No accounts configured yet/);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/teamclaude/dashboard`)).status, 200);
+
+    const request = path => fetch(`http://127.0.0.1:${port}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    for (const path of ['/v1/messages', '/backend-api/codex/responses']) {
+      const res = await request(path);
+      assert.equal(res.status, 503, path);
+      assert.match((await res.json()).error.message, /no accounts yet/, path);
+    }
+    assert.equal(upstreamHits, 0);
+
+    // An account added while it runs is used without a restart.
+    const disk = JSON.parse(await readFile(configPath, 'utf8'));
+    disk.accounts = [{ name: 'a@example.com', type: 'apikey', apiKey: 'sk-demo-1' }];
+    await writeFile(configPath, JSON.stringify(disk));
+    assert.equal((await fetch(`http://127.0.0.1:${port}/teamclaude/reload`, { method: 'POST' })).status, 200);
+    assert.deepEqual((await status(port)).accounts.map(a => a.name), ['a@example.com']);
+    const after = await request('/v1/messages');
+    assert.equal(after.status, 200);
+    assert.equal(upstreamHits, 1);
+  } finally {
+    await server?.stop();
+    await new Promise(resolve => upstream.close(() => resolve(undefined)));
+  }
 });
 
 test('a dashboard sign-in is the server\'s own Claude flow, and Cancel ends it', async () => {

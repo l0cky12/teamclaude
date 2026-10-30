@@ -2331,7 +2331,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     if (!accounts.length) {
-      acc.appendChild(el('div', 'card empty', 'No accounts yet. Add one with teamclaude login.'));
+      acc.appendChild(el('div', 'card empty', 'No accounts yet. Sign one in on the Accounts page, or run teamclaude login.'));
       return;
     }
     var probeAccounts = (s.probe || {}).accounts || [];
@@ -2486,13 +2486,7 @@ ${SHARED_HELPERS}
     // nothing but this button, which keeps its width, so no other control
     // slides under the pointer between the clicks; and a second click too
     // soon after the first is a double-click, not a decision.
-    // The only account cannot go: the server would refuse to start without it.
-    if (canRemove && (s.accounts || []).length <= 1) {
-      var lone = button('btn rm', 'Remove', function () {});
-      lone.disabled = true;
-      lone.title = 'The proxy needs at least one account to start. Sign in another account first.';
-      act.appendChild(lone);
-    } else if (canRemove) {
+    if (canRemove) {
       var armedAt = removeArmed[key];
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
       var ctlRemove = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {

@@ -27,6 +27,18 @@ docker exec -it teamclaude teamclaude login --token   # add accounts from inside
 docker exec -it teamclaude teamclaude status
 ```
 
+A new deployment needs no account to start. With no config to mount, keep `/data` in a volume instead, so the config created on first start survives the container:
+
+```bash
+docker run -d --name teamclaude -p 3456:3456 \
+  -v teamclaude-data:/data \
+  ghcr.io/karpeleslab/teamclaude:latest
+
+docker exec teamclaude node -e "console.log(require('/data/teamclaude.json').proxy.apiKey)"
+```
+
+Open `http://<host>:3456/teamclaude/dashboard`, enter the proxy key the second command prints, and use **Sign in to Claude** or **Sign in to Codex** on the **Accounts** page ([Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)). Until the first account is signed in, the proxy answers the Claude Code and Codex requests it handles with a `503` that says it has no accounts yet (see [Starting with no accounts](accounts.md#starting-with-no-accounts)).
+
 The entrypoint starts as root only long enough to match the runtime user to the owner of the mounted config (or of `/data` when the file does not exist yet), then drops privileges — so a file owned by your user stays writable without a `chown`. `TEAMCLAUDE_UID` (and optional `TEAMCLAUDE_GID`) override the detected owner. stderr is folded into stdout so `docker logs` shows one stream; set `TEAMCLAUDE_SPLIT_STDERR=1` to keep them apart. Auto-update is disabled in the image; pull a new tag to upgrade. The image ships without npm or yarn: the proxy has no runtime dependencies, and leaving the base image's package managers out keeps the image small and free of their known vulnerabilities.
 
 The config is created on first start with a random `proxy.apiKey`. Anything reaching the proxy from outside the container is a non-loopback client and must present that key (see [proxy.host](configuration.md#fields)); only `teamclaude` commands run via `docker exec` are exempt.
@@ -44,7 +56,7 @@ docker compose -f docker/docker-compose.preview.yml run --rm preview login
 docker compose -f docker/docker-compose.preview.yml up -d
 ```
 
-The proxy refuses to start with no accounts, so `run … login` signs one in first, with the same paste flow as [over SSH](accounts.md#signing-accounts-in-over-ssh) (`login --codex` for a Codex account). Then open `http://<tailscale-ip>:3466/teamclaude/dashboard` and enter the preview's own proxy key:
+`run … login` signs an account in before the proxy starts, with the same paste flow as [over SSH](accounts.md#signing-accounts-in-over-ssh) (`login --codex` for a Codex account). You can skip it and sign in from the dashboard instead. Then open `http://<tailscale-ip>:3466/teamclaude/dashboard` and enter the preview's own proxy key:
 
 ```bash
 docker exec teamclaude-preview node -e "console.log(require('/data/teamclaude.json').proxy.apiKey)"
@@ -146,7 +158,7 @@ curl -X POST http://localhost:3456/teamclaude/remove \
   -H 'content-type: application/json' -d '{"account": "me@example.com", "provider": "codex"}'
 ```
 
-`POST /teamclaude/remove` takes `{"account"}` (any identifier `switch` takes) with an optional `"provider"` (`anthropic`, `codex`, …) and `"org"`, for one email that holds a Claude and a Codex login or seats in several orgs. An ambiguous name is a `400` and an unknown one a `404`. The only account is refused with `409`: a config with no accounts stops the server from starting. The account leaves the running fleet and the config file at once, credentials included, and the reply is `{"ok": true, "name", "provider", "persisted"}`. A removal waits for a reload in progress. A `500` means the account may already be out of the running server but the config file could not be saved.
+`POST /teamclaude/remove` takes `{"account"}` (any identifier `switch` takes) with an optional `"provider"` (`anthropic`, `codex`, …) and `"org"`, for one email that holds a Claude and a Codex login or seats in several orgs. An ambiguous name is a `400` and an unknown one a `404`. The account leaves the running fleet and the config file at once, credentials included, and the reply is `{"ok": true, "name", "provider", "persisted"}`. A removal waits for a reload in progress. A `500` means the account may already be out of the running server but the config file could not be saved.
 
 A sign-in is four calls, all POSTs with a JSON body. `login/start` `{"provider": "claude" | "codex"}` answers `{"id", "provider", "url", "browserUrl", "listening", "note"}`: `url` is the link to open (it works from any device), and `browserUrl`, Claude only, is the link whose redirect reaches this machine's loopback listener. `login/code` `{"id", "code"}` takes what the browser was left with: Claude's code, or the whole `http://localhost:1455/auth/callback?…` address for Codex. A paste that cannot be used is a `400` with the reason, and the sign-in keeps waiting. `login/status` `{"id"}` answers `state`: `waiting`, `finishing` (the code has arrived, by paste or the listener, and is being exchanged), `succeeded` (with `account`, `action`, `added` or `updated`, and `fileBacked`, true when the account reads its tokens from an `importFrom` file and so does not use the ones just stored), `failed` (with a one-line `error`), `cancelled`, or `unknown` for a sign-in that was replaced or that a restart forgot. `login/cancel` `{"id"}` gives up and closes the listener. The server runs one sign-in at a time, and starting one cancels the one before, unless that one is `finishing`: then `login/start` is a `400` until it ends. `login/cancel` answers `cancelled: false` once the code has arrived. A sign-in waits five minutes. All five routes are refused for a `proxy.clientKeys` key with `403`.
 
