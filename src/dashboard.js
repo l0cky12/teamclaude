@@ -951,6 +951,60 @@ export function peerTestOutcome(res) {
   return { kind: 'ok', text: 'It answers to that key' + (res.name ? ' and calls itself ' + res.name : '') + '.' };
 }
 
+// The scheme of an instance link. The old spelling is read too (issue #72).
+const INSTANCE_LINK_SCHEMES = ['teamrouter:', 'teamclaude:'];
+
+/**
+ * One line to copy from a machine's dashboard to another's, carrying the
+ * address the other machine reaches it at and its proxy key, so the form there
+ * fills in both from one paste. It carries no name: the machine it is pasted
+ * into is where the link is named. The key is in it, so the link is as secret
+ * as the key.
+ *
+ * @param {string} address  e.g. http://100.64.0.2:3456
+ * @param {string} key  the proxy key
+ * @returns {string}  '' when either is missing
+ */
+export function instanceLink(address, key) {
+  if (!address || !key) return '';
+  return 'teamrouter://link?address=' + encodeURIComponent(address) + '&key=' + encodeURIComponent(key);
+}
+
+/**
+ * Read a link made by instanceLink. Anything else, including a link whose
+ * address is not an http(s) URL, is null.
+ *
+ * @param {string} text
+ * @returns {{ url: string, apiKey: string } | null}
+ */
+export function parseInstanceLink(text) {
+  var u;
+  try { u = new URL(String(text || '').trim()); } catch { return null; }
+  if (INSTANCE_LINK_SCHEMES.indexOf(u.protocol) < 0 || u.hostname !== 'link') return null;
+  var address = (u.searchParams.get('address') || '').trim();
+  var key = (u.searchParams.get('key') || '').trim();
+  if (!address || !key) return null;
+  try {
+    var a = new URL(address);
+    if (a.protocol !== 'http:' && a.protocol !== 'https:') return null;
+  } catch { return null; }
+  return { url: address, apiKey: key };
+}
+
+/**
+ * What stops the Link button, or null when nothing does. A missing name has a
+ * message of its own: it is the field a pasted link leaves empty, and the
+ * address and key the form already holds stay where they are.
+ *
+ * @param {{ name: string, url: string, apiKey: string }} body
+ * @returns {string | null}
+ */
+export function linkAddMissing(body) {
+  if (!body.url || !body.apiKey) return 'Fill in its address and its proxy key, or paste its link.';
+  if (!body.name) return 'You need to name this machine: enter a name under Name it, then click Link again.';
+  return null;
+}
+
 /**
  * The addresses to offer for "this machine, as the other one reaches it",
  * best first: the address this page was opened at, when that is not this
@@ -1501,7 +1555,7 @@ const SHARED_HELPERS = [
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1522,6 +1576,7 @@ const SHARED_CONSTS = [
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
   `var PEER_LINK_FAILED = ${JSON.stringify(PEER_LINK_FAILED)};`,
+  `var INSTANCE_LINK_SCHEMES = ${JSON.stringify(INSTANCE_LINK_SCHEMES)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1936,6 +1991,7 @@ const PAGE = `<!doctype html>
         <p class="st warn" id="linkUnsupported" style="display:none">This instance runs a version that cannot be linked from the dashboard. Update it to manage its links here.</p>
         <form id="linkForm" autocomplete="off">
           <div class="sub2">Link another machine</div>
+          <div class="row"><label for="linkPaste">Its link</label><input id="linkPaste" type="password" placeholder="From its dashboard: Settings, Linked instances, Show key, Copy link" spellcheck="false"></div>
           <div class="row"><label for="linkUrl">Its address</label><input id="linkUrl" placeholder="http://100.64.0.2:3456" spellcheck="false"></div>
           <div class="row"><label for="linkKey">Its proxy key</label><input id="linkKey" type="password" placeholder="From its dashboard: Settings, Linked instances, Show key" spellcheck="false"><button id="linkTest" class="btn" type="button">Test</button></div>
           <div class="row"><label for="linkName">Name it</label><input id="linkName" maxlength="64" placeholder="e.g. desktop" spellcheck="false"></div>
@@ -1947,7 +2003,7 @@ const PAGE = `<!doctype html>
           <div id="linkBackBlocked" class="st warn" style="display:none"></div>
           <div class="row"><button id="linkAdd" class="btn primary" type="submit">Link</button><span id="linkStatus" class="st"></span></div>
         </form>
-        <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
+        <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's link, or its proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
         <div id="ownKeyBox" class="issued" style="display:none"></div>
       </div>
     </section>
@@ -2861,7 +2917,7 @@ ${SHARED_HELPERS}
     document.getElementById('linkBackText').textContent = 'Link back too: list ' + peer + ' on it, so its dashboard shows ' + peer;
     document.getElementById('linkSelfUrlLabel').textContent = peer + ', as it reaches it';
     document.getElementById('linkSelfNameLabel').textContent = 'Name for ' + peer + ' there';
-    document.getElementById('ownKeyLabel').textContent = peer + "'s proxy key and address, for linking it from another machine's dashboard.";
+    document.getElementById('ownKeyLabel').textContent = peer + "'s link, or its proxy key and address, for linking it from another machine's dashboard.";
   }
 
   function linkStatus(kind, text) {
@@ -2889,8 +2945,8 @@ ${SHARED_HELPERS}
         if (!j) return;
         var out = peerTestOutcome(j);
         linkStatus(out.kind, out.text);
-        var name = document.getElementById('linkName');
-        if (j.ok && j.name && !name.value.trim()) name.value = j.name;
+        // Its own name is only a suggestion: naming the link is left to the operator.
+        if (j.ok && j.name) document.getElementById('linkName').placeholder = 'e.g. ' + j.name;
         // It cannot take this machine's link, so the form should not offer to send one.
         if (j.ok && j.state === 'online' && !j.linkable) { document.getElementById('linkBack').checked = false; syncLinkBack(); }
       })
@@ -2900,7 +2956,13 @@ ${SHARED_HELPERS}
 
   function doAddLink() {
     var body = { name: val('linkName'), url: val('linkUrl'), apiKey: val('linkKey') };
-    if (!body.url || !body.apiKey || !body.name) { linkStatus('error', 'Fill in its address, its proxy key and a name for it.'); return; }
+    // The form keeps what it holds, so naming it and clicking Link again is all it takes.
+    var missing = linkAddMissing(body);
+    if (missing) {
+      linkStatus('error', missing);
+      if (body.url && body.apiKey) document.getElementById('linkName').focus();
+      return;
+    }
     var cb = document.getElementById('linkBack');
     if (cb.checked && !cb.disabled) body.linkBack = { name: val('linkSelfName'), url: val('linkSelfUrl') };
     var btn = document.getElementById('linkAdd');
@@ -2912,12 +2974,28 @@ ${SHARED_HELPERS}
         var out = peerLinkOutcome(j, 'add');
         linkStatus(out.kind, out.text);
         if (j.ok) {
-          ['linkUrl', 'linkKey', 'linkName'].forEach(function (id) { document.getElementById(id).value = ''; });
+          ['linkPaste', 'linkUrl', 'linkKey', 'linkName'].forEach(function (id) { document.getElementById(id).value = ''; });
+          document.getElementById('linkName').placeholder = 'e.g. desktop';
           poll();
         }
       })
       .catch(function (e) { linkStatus('error', PEER_LINK_FAILED.add + ': ' + e.message); })
       .finally(function () { btn.disabled = false; });
+  }
+
+  // A pasted link fills in the address and key; the name is left to the operator.
+  // Typing is quiet until the field is left: a half-typed link is not an error yet.
+  function useInstanceLink(quiet) {
+    var text = val('linkPaste');
+    if (!text) return;
+    var got = parseInstanceLink(text);
+    if (!got && quiet) return;
+    if (!got) { linkStatus('error', 'That is not a link from the Linked instances card. Copy it again from the other machine: Settings, Linked instances, Show key, Copy link.'); return; }
+    if (val('linkUrl') === got.url && val('linkKey') === got.apiKey) return;
+    document.getElementById('linkUrl').value = got.url;
+    document.getElementById('linkKey').value = got.apiKey;
+    linkStatus('ok', 'Filled in its address and key from the link. Name it, then click Link.');
+    document.getElementById('linkName').focus();
   }
 
   function doRemoveLink(name, btn) {
@@ -2946,8 +3024,10 @@ ${SHARED_HELPERS}
         if (!j.ok) {
           box.appendChild(el('div', 'st error', PEER_LINK_FAILED.key + (j.error ? ': ' + j.error : '')));
         } else {
-          box.appendChild(el('div', 'lbl', 'Anyone who can see this screen can use the key. Enter both on the other machine, under Link another machine.'));
+          box.appendChild(el('div', 'lbl', 'Anyone who can see this screen, or has the link, can use the key. On the other machine, under Link another machine, paste the link or enter the address and key.'));
           var opts = linkSelfOptions(linkSelf, pageOrigin());
+          var link = opts.length ? instanceLink(opts[0], j.key) : '';
+          if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
           if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
@@ -4111,6 +4191,8 @@ ${SHARED_HELPERS}
   });
   document.getElementById('linkForm').addEventListener('submit', function (e) { e.preventDefault(); doAddLink(); });
   document.getElementById('linkTest').addEventListener('click', function () { doTestLink(this); });
+  document.getElementById('linkPaste').addEventListener('input', function () { useInstanceLink(true); });
+  document.getElementById('linkPaste').addEventListener('change', function () { useInstanceLink(false); });
   document.getElementById('linkBack').addEventListener('change', syncLinkBack);
   document.getElementById('ownKeyShow').addEventListener('click', function () { toggleOwnKey(this); });
   labelLinkCard();
