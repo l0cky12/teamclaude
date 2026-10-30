@@ -67,6 +67,19 @@ test('buckets read as days or hours', () => {
   assert.equal(insightsBucketLabel('junk', 'day', false), 'junk');
 });
 
+test('an hour bucket says the minute it starts at, in a zone with a fractional offset', () => {
+  const saved = process.env.TZ;
+  try {
+    // UTC+5:30 the year round: an epoch hour starts at :30 local time.
+    process.env.TZ = 'Asia/Kolkata';
+    const bucket = Math.floor(Date.UTC(2026, 2, 7, 1, 10) / 3600000) * 3600000;
+    assert.equal(insightsBucketLabel(bucket, 'hour', false), '06:30');
+    assert.match(insightsBucketLabel(bucket, 'hour', true), /06:30$/);
+  } finally {
+    if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+  }
+});
+
 const data = {
   range: '7d', unit: 'day', buckets: ['a', 'b'], since: 1,
   totals: { requests: 3, input: 10, output: 20, cacheRead: 900, cacheWrite: 70 },
@@ -136,9 +149,34 @@ test('donut slices: none for a zero, and a whole circle still draws', () => {
   assert.equal(arcs[1], null);
   assert.match(arcs[0], /^M75\.00,1\.00A74,74 0 1 1 /, 'starts at twelve o\'clock, the large arc for 3/4');
   assert.match(arcs[2], /A74,74 0 0 1 /);
-  const whole = donutArcs([5], 75, 74, 48)[0];
-  assert.ok(whole && !whole.includes('NaN'));
   assert.deepEqual(donutArcs([0, 0], 75, 74, 48), [null, null]);
+});
+
+// A slice that is the whole is drawn as two concentric circles of opposite
+// winding. Under the nonzero fill rule a point is filled when the circles
+// around it wind to a nonzero sum: the band between them winds once, the
+// centre zero times. (A path a hair short of a full turn used to round its
+// inner ends onto one point, lose the inner arc, and fill the centre.)
+/** @param {string} d @param {number} x @param {number} y */
+function winding(d, x, y) {
+  let sum = 0;
+  for (const m of d.matchAll(/M([\d.]+),([\d.]+)A([\d.]+),[\d.]+ 0 1 ([01]) /g)) {
+    const [cx, top, rad, sweep] = [Number(m[1]), Number(m[2]), Number(m[3]), m[4]];
+    const cy = top + rad;
+    if (Math.hypot(x - cx, y - cy) < rad) sum += sweep === '1' ? 1 : -1;
+  }
+  return sum;
+}
+
+test('a slice that is the whole is a ring, with its centre left empty', () => {
+  for (const values of [[5], [999999, 1], [0, 7]]) {
+    const whole = donutArcs(values, 75, 74, 48).find(d => d && (d.match(/M/g) || []).length === 2);
+    assert.ok(whole, `${values}: drawn as two circles`);
+    assert.ok(!whole.includes('NaN'));
+    assert.equal(winding(whole, 75, 75), 0, 'the centre is not filled');
+    assert.equal(winding(whole, 75, 75 - 61), 1, 'the band between the circles is');
+    assert.equal(winding(whole, 75, 0.5), 0, 'outside the ring is not');
+  }
 });
 
 test('models are ranked by the name a person reads, dated snapshots together', () => {

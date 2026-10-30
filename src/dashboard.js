@@ -1618,7 +1618,9 @@ export function insightsDelta(cur, prev, range) {
 export function insightsBucketLabel(bucket, unit, long) {
   if (unit === 'hour') {
     var h = new Date(Number(bucket));
-    var hh = String(h.getHours()).padStart(2, '0') + ':00';
+    // The hour's own minutes, not ':00': buckets are epoch hours, which start
+    // at :30 or :45 local time in a zone with a fractional offset (India, Nepal).
+    var hh = String(h.getHours()).padStart(2, '0') + ':' + String(h.getMinutes()).padStart(2, '0');
     return long ? h.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' ' + hh : hh;
   }
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(bucket));
@@ -1722,8 +1724,11 @@ export function stackSeries(series, n) {
 
 // One SVG path per slice of a donut centred at (c, c), outer radius r, inner
 // radius ir, starting at twelve o'clock and going clockwise. A zero slice gets
-// null; a slice that is the whole is drawn a hair short of a full turn, since
-// an arc whose ends meet draws nothing.
+// null. A slice that is (all but) the whole is a ring instead: an arc whose ends
+// meet draws nothing, and one drawn a hair short of a full turn has inner ends
+// that round to the same point, so the inner arc vanished and the hole filled.
+// The ring is the outer circle clockwise and the inner one anticlockwise, as
+// two half-turns each; the opposite windings leave the centre unfilled.
 /**
  * @param {number[]} values
  * @param {number} c
@@ -1734,9 +1739,14 @@ export function donutArcs(values, c, r, ir) {
   var total = values.reduce(function (x, y) { return x + (y > 0 ? y : 0); }, 0);
   var a0 = -Math.PI / 2;
   var pt = function (/** @type {number} */ rad, /** @type {number} */ a) { return (c + rad * Math.cos(a)).toFixed(2) + ',' + (c + rad * Math.sin(a)).toFixed(2); };
+  var ring = function (/** @type {number} */ rad, /** @type {number} */ sweep) {
+    return 'M' + c + ',' + (c - rad) + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c + rad)
+      + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c - rad) + 'Z';
+  };
   return values.map(function (v) {
     if (!(v > 0) || !(total > 0)) return null;
-    var sweep = Math.min(v / total * Math.PI * 2, Math.PI * 2 - 0.0001);
+    var sweep = v / total * Math.PI * 2;
+    if (sweep > Math.PI * 2 - 0.01) { a0 += sweep; return ring(r, 1) + ring(ir, 0); }
     var a1 = a0 + sweep;
     var large = sweep > Math.PI ? 1 : 0;
     var d = 'M' + pt(r, a0) + 'A' + r + ',' + r + ' 0 ' + large + ' 1 ' + pt(r, a1)
@@ -3781,7 +3791,10 @@ ${SHARED_HELPERS}
 
   function pollInsights(force) {
     if (ins.inFlight || (peer && !peerChecked)) return;
-    if (!force && ins.data && !ins.pending && Date.now() - ins.at < INSIGHTS_REFRESH_MS) return;
+    // Throttled by when it last ASKED, not when it last succeeded: a proxy that
+    // answers 404 or 500 would otherwise be asked again on every status poll.
+    if (!force && Date.now() - ins.at < INSIGHTS_REFRESH_MS) return;
+    ins.at = Date.now();
     ins.inFlight = true;
     var range = ins.range;
     fetch(at('/teamclaude/insights?range=' + encodeURIComponent(range)), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
@@ -3800,7 +3813,6 @@ ${SHARED_HELPERS}
           ins.data = d;
           ins.missing = false;
           ins.pending = false;
-          ins.at = Date.now();
         }
         ins.error = null;
         renderInsights();

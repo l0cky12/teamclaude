@@ -1275,6 +1275,27 @@ test('the Insights page asks for history only while open, once per range, and sa
   assert.match(page.byId('insNote').textContent, /older proxy that keeps no usage history/);
 });
 
+// A failed read is throttled like a successful one: a proxy answering 404 or
+// 500 must not be asked again on every five-second status poll.
+for (const status of [404, 500]) {
+  test(`a ${status} from the history is not asked for again on the next status poll`, async () => {
+    const page = bootPage();
+    await page.answer(200, { accounts: [] });
+    page.click('Insights');
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=30d']);
+    await page.answer(status, {});
+    for (let i = 0; i < 3; i++) {
+      page.poll();
+      assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/status']);
+      await page.answer(200, { accounts: [] });
+      assert.deepEqual(page.requests, [], `poll ${i + 1} asks for status only`);
+    }
+    // Choosing a range is the person asking: that goes out at once.
+    page.click('7d');
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=7d']);
+  });
+}
+
 test('the quota refresh picker keeps keyboard focus and coalesces steps made while saving', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [], probe: { intervalSeconds: 30 } });
