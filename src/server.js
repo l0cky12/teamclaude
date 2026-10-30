@@ -32,6 +32,7 @@ import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
+import { insightsRange } from './usage-history.js';
 import { askPeerToLinkBack, createPeerDirectory, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -799,6 +800,22 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const page = accountManager.events?.since(logsAfter(req.url)) ?? { events: [], lastId: 0, capacity: 0 };
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify(page));
+        return;
+      }
+
+      // The usage history behind the dashboard's Insights page (usage-history.js),
+      // summed for one `?range=` (24h, 7d, 30d, 90d or all). Same gate as /status
+      // and /logs, client keys included, and the same naming: accounts by their
+      // configured name, never an email or a token.
+      if (req.method === 'GET' && /^\/teamclaude\/insights(\?|$)/.test(req.url || '')) {
+        const body = accountManager.usageHistory?.insights(insightsRange(req.url));
+        if (!body) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'insights not supported' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(body));
         return;
       }
 

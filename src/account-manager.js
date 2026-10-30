@@ -16,6 +16,7 @@ import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
 import { EventLog } from './event-log.js';
+import { UsageHistory } from './usage-history.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
 // Re-exported for callers that import these model helpers from here.
@@ -578,12 +579,16 @@ export class AccountManager {
    * @param {string} [opts.advisorEligibility]  'strict' (default) or 'prefer'
    * @param {{ host: string, port: number }|null} [opts.listener]  this server's own address, so an accounts[].routing that points back at it is refused (see accountRouting)
    * @param {import('./event-log.js').EventLog} [opts.events]  the event log to record into (a fresh one when omitted)
+   * @param {UsageHistory} [opts.usageHistory]  the day-by-day usage history to book into (a fresh one when omitted)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events, usageHistory } = {}) {
     // What the dashboard's Logs page reads (event-log.js). One per manager, so
     // each proxy in a process keeps its own; the server and the login flows
     // record into the same one.
     this.events = events ?? new EventLog();
+    // What the dashboard's Insights page reads (usage-history.js), booked in
+    // recordTokenUsage. One per manager for the same reason as the log.
+    this.usageHistory = usageHistory ?? new UsageHistory();
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -5192,6 +5197,12 @@ export class AccountManager {
         || (account.usage.byBucket[bucket] = { cacheReadTokens: 0, cacheCreationTokens: 0 });
       per.cacheReadTokens += read;
       per.cacheCreationTokens += creation;
+      // By configured name, the way the Logs page names accounts: the history
+      // is read by anyone who may read status, client keys included. A
+      // third-party backend is booked under its host, as the dashboard groups
+      // it: by provider it is Anthropic, and would read as a Claude account.
+      const host = backendHost(account);
+      this.usageHistory.record({ provider: host ? `backend:${host}` : providerOf(account), account: account.name, model, usage });
     }
     // A request with no session id (or one the tracker has forgotten) is still a
     // real spend by the account, so the two scopes are recorded independently.
