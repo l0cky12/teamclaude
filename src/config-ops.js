@@ -631,6 +631,28 @@ export function removePeer(config, rawName) {
   return { name, removed: list.length - kept.length };
 }
 
+/**
+ * Name this instance (`instanceName`): what the dashboard's Instance picker
+ * calls the machine it is opened on, and the name it offers another machine
+ * that links to it. That other machine may store it as a link name, so it
+ * keeps to the same characters. An empty name drops the key, and the host
+ * name is used again.
+ *
+ * @param {Config} config
+ * @param {unknown} raw
+ * @returns {string}  the name saved, or '' when it was cleared
+ */
+export function setInstanceName(config, raw) {
+  if (typeof raw !== 'string') throw new ConfigOpError('the instance name must be text');
+  const name = raw.trim();
+  if (!name) { delete config.instanceName; return ''; }
+  if (!PEER_NAME.test(name)) {
+    throw new ConfigOpError('An instance name is up to 64 letters, digits and . _ -, starting with a letter or digit.');
+  }
+  config.instanceName = name;
+  return name;
+}
+
 /** @param {any} entry  one element of config.peers, as found in the file */
 function peerEntryName(entry) {
   return typeof entry?.name === 'string' ? entry.name.trim() : '';

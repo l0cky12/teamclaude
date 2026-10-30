@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer } from '../src/server.js';
-import { askPeerToLinkBack, bindsLoopbackOnly, configuredPeers, createPeerDirectory, parsePeerUrl, selfAddresses, testPeerLink } from '../src/peers.js';
+import { askPeerToLinkBack, bindsLoopbackOnly, configuredPeers, createPeerDirectory, hostInstanceName, instanceName, parsePeerUrl, selfAddresses, selfLinkInfo, testPeerLink } from '../src/peers.js';
 import { closedPort } from '../test-helpers/spawn-server.js';
 
 // Linked instances: a proxy relays /teamclaude/peers/<name>/<route> to another
@@ -273,4 +273,21 @@ test('askPeerToLinkBack posts this machine to the peer with the peer\'s key, and
   const down = await askPeerToLinkBack({ name: 'desk', url: `http://127.0.0.1:${await closedPort()}`, apiKey: 'k' }, { name: 'hub', url: 'http://h:1', apiKey: 'k' });
   assert.equal(down.ok, false);
   assert.match(down.error, /desk is unreachable/);
+});
+
+test('hostInstanceName cuts the host name to what a link name may hold', () => {
+  assert.equal(hostInstanceName('hermes.tail1234.ts.net'), 'hermes');
+  assert.equal(hostInstanceName('My Laptop'), 'My-Laptop');
+  assert.equal(hostInstanceName('--box'), 'box');
+  assert.equal(hostInstanceName(''), 'teamclaude');
+  assert.equal(hostInstanceName('x'.repeat(80)).length, 64);
+});
+
+test('instanceName is instanceName from the config, else the host name, and is what a link is offered', () => {
+  assert.equal(instanceName({ instanceName: ' hermes ' }), 'hermes');
+  assert.equal(instanceName({}), hostInstanceName());
+  // A hand edit a link could not store is passed over rather than offered.
+  assert.equal(instanceName({ instanceName: 'my laptop' }), hostInstanceName());
+  assert.equal(instanceName({ instanceName: 7 }), hostInstanceName());
+  assert.equal(selfLinkInfo({ instanceName: 'hermes', proxy: {} }, '127.0.0.1', 3456).name, 'hermes');
 });

@@ -280,6 +280,29 @@ export function selfAddresses(bindHost, port, interfaces = os.networkInterfaces(
 }
 
 /**
+ * The host name, cut to the characters a link name may hold: what this
+ * instance is called until `instanceName` names it.
+ *
+ * @param {string} [host]
+ */
+export function hostInstanceName(host = os.hostname()) {
+  const name = host.split('.')[0].replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 64);
+  return name || 'teamclaude';
+}
+
+/**
+ * What this instance is called: `instanceName` from the config (the
+ * dashboard's Settings page sets it), or the host name. A hand-edited name
+ * that a link could not store is passed over rather than offered.
+ *
+ * @param {Record<string, any>} config
+ */
+export function instanceName(config) {
+  const set = typeof config?.instanceName === 'string' ? config.instanceName.trim() : '';
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(set) ? set : hostInstanceName();
+}
+
+/**
  * What the dashboard needs to offer this machine to another: a name to list
  * it under there, the addresses it may be reached at, and whether it can be
  * linked at all (it listens off this machine and has a proxy key to hand out).
@@ -289,9 +312,8 @@ export function selfAddresses(bindHost, port, interfaces = os.networkInterfaces(
  * @param {number} port  the port the asking request came in on
  */
 export function selfLinkInfo(config, bindHost, port) {
-  const name = os.hostname().split('.')[0].replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '').slice(0, 64);
   return {
-    name: name || 'teamclaude',
+    name: instanceName(config),
     addresses: selfAddresses(bindHost, port),
     offBox: !bindsLoopbackOnly(bindHost),
     hasKey: !!config.proxy?.apiKey,

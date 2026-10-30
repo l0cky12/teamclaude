@@ -601,6 +601,37 @@ export function probeIntervalOutcome(res) {
   return { kind: 'ok', text: res.quotaProbeSeconds > 0 ? 'quota refreshes every ' + res.quotaProbeSeconds + 's' : 'quota refresh turned off' };
 }
 
+/**
+ * @param {string} name  '' goes back to the host name
+ * @param {string|null|undefined} key
+ */
+export function instanceNameRequest(name, key) {
+  return {
+    url: '/teamclaude/instance-name',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function instanceNameOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'instance name change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.custom ? 'this instance is now called ' + res.name : 'instance name cleared; it goes by its host name, ' + res.name };
+}
+
+// What the Instance picker calls the machine the page was opened on: its
+// name, or "This machine" from a proxy too old to say.
+/** @param {any} self  { name } from /teamclaude/peers, or status.instance */
+export function selfInstanceLabel(self) {
+  return self && typeof self.name === 'string' && self.name ? self.name : 'This machine';
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
@@ -967,6 +998,60 @@ export function peerTestOutcome(res) {
   if (res.state !== 'online') return { kind: 'error', text: 'Nothing answered at ' + res.url + '. Check the address, and that it listens beyond its own machine (proxy.host).' };
   if (!res.linkable) return { kind: 'warn', text: 'It answers to that key, but it runs a version that cannot link back from here. Update it, or link this machine from its own dashboard.' };
   return { kind: 'ok', text: 'It answers to that key' + (res.name ? ' and calls itself ' + res.name : '') + '.' };
+}
+
+// The scheme of an instance link. The old spelling is read too (issue #72).
+const INSTANCE_LINK_SCHEMES = ['teamrouter:', 'teamclaude:'];
+
+/**
+ * One line to copy from a machine's dashboard to another's, carrying the
+ * address the other machine reaches it at and its proxy key, so the form there
+ * fills in both from one paste. It carries no name: the machine it is pasted
+ * into is where the link is named. The key is in it, so the link is as secret
+ * as the key.
+ *
+ * @param {string} address  e.g. http://100.64.0.2:3456
+ * @param {string} key  the proxy key
+ * @returns {string}  '' when either is missing
+ */
+export function instanceLink(address, key) {
+  if (!address || !key) return '';
+  return 'teamrouter://link?address=' + encodeURIComponent(address) + '&key=' + encodeURIComponent(key);
+}
+
+/**
+ * Read a link made by instanceLink. Anything else, including a link whose
+ * address is not an http(s) URL, is null.
+ *
+ * @param {string} text
+ * @returns {{ url: string, apiKey: string } | null}
+ */
+export function parseInstanceLink(text) {
+  var u;
+  try { u = new URL(String(text || '').trim()); } catch { return null; }
+  if (INSTANCE_LINK_SCHEMES.indexOf(u.protocol) < 0 || u.hostname !== 'link') return null;
+  var address = (u.searchParams.get('address') || '').trim();
+  var key = (u.searchParams.get('key') || '').trim();
+  if (!address || !key) return null;
+  try {
+    var a = new URL(address);
+    if (a.protocol !== 'http:' && a.protocol !== 'https:') return null;
+  } catch { return null; }
+  return { url: address, apiKey: key };
+}
+
+/**
+ * What stops the Link button, or null when nothing does. A missing name has a
+ * message of its own: it is the field a pasted link leaves empty, and the
+ * address and key the form already holds stay where they are.
+ *
+ * @param {{ name: string, url: string, apiKey: string }} body
+ * @returns {string | null}
+ */
+export function linkAddMissing(body) {
+  if (!body.url || !body.apiKey) return 'Fill in its address and its proxy key, or paste its link.';
+  if (!body.name) return 'You need to name this machine: enter a name under Name it, then click Link again.';
+  return null;
 }
 
 /**
@@ -1511,7 +1596,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -1519,7 +1604,7 @@ const SHARED_HELPERS = [
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -1540,6 +1625,7 @@ const SHARED_CONSTS = [
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
   `var PEER_LINK_FAILED = ${JSON.stringify(PEER_LINK_FAILED)};`,
+  `var INSTANCE_LINK_SCHEMES = ${JSON.stringify(INSTANCE_LINK_SCHEMES)};`,
 ].join('\n');
 
 const PAGE = `<!doctype html>
@@ -1760,6 +1846,7 @@ const PAGE = `<!doctype html>
   .actions .lbl { color: var(--dim); font-size: 12px; }
   .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .thr input.name { width: 170px; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -1918,6 +2005,14 @@ const PAGE = `<!doctype html>
 
     <section id="page-settings" style="display:none">
       <div class="card">
+        <div class="setting" id="nameRow" style="display:none">
+          <div><b>Instance name</b><span class="tag">What the Instance picker calls this machine. Empty uses the host name. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="nameVal">Name</label>
+            <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
+            <button id="nameSet" class="btn" type="button">Save</button>
+          </span>
+        </div>
         <div class="setting">
           <div><b>Switch threshold</b><span class="tag">The share of a quota window at which rotation leaves an account. Saved to the config file.</span></div>
           <span class="thr">
@@ -1954,6 +2049,7 @@ const PAGE = `<!doctype html>
         <p class="st warn" id="linkUnsupported" style="display:none">This instance runs a version that cannot be linked from the dashboard. Update it to manage its links here.</p>
         <form id="linkForm" autocomplete="off">
           <div class="sub2">Link another machine</div>
+          <div class="row"><label for="linkPaste">Its link</label><input id="linkPaste" type="password" placeholder="From its dashboard: Settings, Linked instances, Show key, Copy link" spellcheck="false"></div>
           <div class="row"><label for="linkUrl">Its address</label><input id="linkUrl" placeholder="http://100.64.0.2:3456" spellcheck="false"></div>
           <div class="row"><label for="linkKey">Its proxy key</label><input id="linkKey" type="password" placeholder="From its dashboard: Settings, Linked instances, Show key" spellcheck="false"><button id="linkTest" class="btn" type="button">Test</button></div>
           <div class="row"><label for="linkName">Name it</label><input id="linkName" maxlength="64" placeholder="e.g. desktop" spellcheck="false"></div>
@@ -1965,7 +2061,7 @@ const PAGE = `<!doctype html>
           <div id="linkBackBlocked" class="st warn" style="display:none"></div>
           <div class="row"><button id="linkAdd" class="btn primary" type="submit">Link</button><span id="linkStatus" class="st"></span></div>
         </form>
-        <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
+        <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's link, or its proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
         <div id="ownKeyBox" class="issued" style="display:none"></div>
       </div>
     </section>
@@ -2349,7 +2445,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     if (!accounts.length) {
-      acc.appendChild(el('div', 'card empty', 'No accounts yet. Add one with teamclaude login.'));
+      acc.appendChild(el('div', 'card empty', 'No accounts yet. Sign one in on the Accounts page, or run teamclaude login.'));
       return;
     }
     var probeAccounts = (s.probe || {}).accounts || [];
@@ -2504,13 +2600,7 @@ ${SHARED_HELPERS}
     // nothing but this button, which keeps its width, so no other control
     // slides under the pointer between the clicks; and a second click too
     // soon after the first is a double-click, not a decision.
-    // The only account cannot go: the server would refuse to start without it.
-    if (canRemove && (s.accounts || []).length <= 1) {
-      var lone = button('btn rm', 'Remove', function () {});
-      lone.disabled = true;
-      lone.title = 'The proxy needs at least one account to start. Sign in another account first.';
-      act.appendChild(lone);
-    } else if (canRemove) {
+    if (canRemove) {
       var armedAt = removeArmed[key];
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
       var ctlRemove = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {
@@ -2879,7 +2969,7 @@ ${SHARED_HELPERS}
     document.getElementById('linkBackText').textContent = 'Link back too: list ' + peer + ' on it, so its dashboard shows ' + peer;
     document.getElementById('linkSelfUrlLabel').textContent = peer + ', as it reaches it';
     document.getElementById('linkSelfNameLabel').textContent = 'Name for ' + peer + ' there';
-    document.getElementById('ownKeyLabel').textContent = peer + "'s proxy key and address, for linking it from another machine's dashboard.";
+    document.getElementById('ownKeyLabel').textContent = peer + "'s link, or its proxy key and address, for linking it from another machine's dashboard.";
   }
 
   function linkStatus(kind, text) {
@@ -2907,8 +2997,8 @@ ${SHARED_HELPERS}
         if (!j) return;
         var out = peerTestOutcome(j);
         linkStatus(out.kind, out.text);
-        var name = document.getElementById('linkName');
-        if (j.ok && j.name && !name.value.trim()) name.value = j.name;
+        // Its own name is only a suggestion: naming the link is left to the operator.
+        if (j.ok && j.name) document.getElementById('linkName').placeholder = 'e.g. ' + j.name;
         // It cannot take this machine's link, so the form should not offer to send one.
         if (j.ok && j.state === 'online' && !j.linkable) { document.getElementById('linkBack').checked = false; syncLinkBack(); }
       })
@@ -2918,7 +3008,13 @@ ${SHARED_HELPERS}
 
   function doAddLink() {
     var body = { name: val('linkName'), url: val('linkUrl'), apiKey: val('linkKey') };
-    if (!body.url || !body.apiKey || !body.name) { linkStatus('error', 'Fill in its address, its proxy key and a name for it.'); return; }
+    // The form keeps what it holds, so naming it and clicking Link again is all it takes.
+    var missing = linkAddMissing(body);
+    if (missing) {
+      linkStatus('error', missing);
+      if (body.url && body.apiKey) document.getElementById('linkName').focus();
+      return;
+    }
     var cb = document.getElementById('linkBack');
     if (cb.checked && !cb.disabled) body.linkBack = { name: val('linkSelfName'), url: val('linkSelfUrl') };
     var btn = document.getElementById('linkAdd');
@@ -2930,12 +3026,28 @@ ${SHARED_HELPERS}
         var out = peerLinkOutcome(j, 'add');
         linkStatus(out.kind, out.text);
         if (j.ok) {
-          ['linkUrl', 'linkKey', 'linkName'].forEach(function (id) { document.getElementById(id).value = ''; });
+          ['linkPaste', 'linkUrl', 'linkKey', 'linkName'].forEach(function (id) { document.getElementById(id).value = ''; });
+          document.getElementById('linkName').placeholder = 'e.g. desktop';
           poll();
         }
       })
       .catch(function (e) { linkStatus('error', PEER_LINK_FAILED.add + ': ' + e.message); })
       .finally(function () { btn.disabled = false; });
+  }
+
+  // A pasted link fills in the address and key; the name is left to the operator.
+  // Typing is quiet until the field is left: a half-typed link is not an error yet.
+  function useInstanceLink(quiet) {
+    var text = val('linkPaste');
+    if (!text) return;
+    var got = parseInstanceLink(text);
+    if (!got && quiet) return;
+    if (!got) { linkStatus('error', 'That is not a link from the Linked instances card. Copy it again from the other machine: Settings, Linked instances, Show key, Copy link.'); return; }
+    if (val('linkUrl') === got.url && val('linkKey') === got.apiKey) return;
+    document.getElementById('linkUrl').value = got.url;
+    document.getElementById('linkKey').value = got.apiKey;
+    linkStatus('ok', 'Filled in its address and key from the link. Name it, then click Link.');
+    document.getElementById('linkName').focus();
   }
 
   function doRemoveLink(name, btn) {
@@ -2964,8 +3076,10 @@ ${SHARED_HELPERS}
         if (!j.ok) {
           box.appendChild(el('div', 'st error', PEER_LINK_FAILED.key + (j.error ? ': ' + j.error : '')));
         } else {
-          box.appendChild(el('div', 'lbl', 'Anyone who can see this screen can use the key. Enter both on the other machine, under Link another machine.'));
+          box.appendChild(el('div', 'lbl', 'Anyone who can see this screen, or has the link, can use the key. On the other machine, under Link another machine, paste the link or enter the address and key.'));
           var opts = linkSelfOptions(linkSelf, pageOrigin());
+          var link = opts.length ? instanceLink(opts[0], j.key) : '';
+          if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
           if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
@@ -3370,6 +3484,15 @@ ${SHARED_HELPERS}
       probeSel.value = String(probeSecs);
     }
     probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
+    // Only the operator is told the name, and a proxy too old to have one
+    // says nothing, so the row is there only when there is a name to change.
+    var inst = s.instance;
+    document.getElementById('nameRow').style.display = inst ? '' : 'none';
+    var nameInput = document.getElementById('nameVal');
+    if (inst && document.activeElement !== nameInput) {
+      nameInput.value = inst.custom ? inst.name : '';
+      nameInput.placeholder = inst.host || '';
+    }
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -3856,6 +3979,26 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doInstanceName(btn) {
+    var input = document.getElementById('nameVal');
+    btn.disabled = true;
+    var r = instanceNameRequest(input.value.trim(), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = instanceNameOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) input.value = json.custom ? json.name : '';
+        poll();
+      })
+      .catch(function (e) { note('error', 'instance name change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // Saved on pick: a select has no half-entered state to protect, so a Set
   // button would only be a second click. The select is neither disabled nor
   // blurred while it saves: either would drop keyboard focus, and arrowing
@@ -3916,7 +4059,9 @@ ${SHARED_HELPERS}
 
   // The instance picker: this machine and the linked ones it lists, each with
   // what it last answered. Hidden while there is nothing to pick.
-  function renderInstances(list) {
+  function renderInstances(list, self) {
+    var selfName = selfInstanceLabel(self);
+    document.getElementById('instanceBack').textContent = 'Back to ' + (self && self.name ? self.name : 'this machine');
     var peers = Array.isArray(list) ? list : [];
     var box = document.getElementById('instances');
     box.style.display = peers.length || peer ? '' : 'none';
@@ -3928,7 +4073,7 @@ ${SHARED_HELPERS}
     var sel = document.getElementById('instance');
     if (document.activeElement !== sel) {
       sel.textContent = '';
-      var here = el('option', '', 'This machine');
+      var here = el('option', '', selfName);
       here.value = '';
       sel.appendChild(here);
       peers.forEach(function (p) {
@@ -3940,7 +4085,7 @@ ${SHARED_HELPERS}
     }
     var noteBox = document.getElementById('instanceNote');
     noteBox.style.display = peer ? '' : 'none';
-    if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through this machine.';
+    if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through ' + (self && self.name ? self.name : 'this machine') + '.';
   }
 
   // Showing a linked instance, this machine is asked first: that read is what
@@ -3959,7 +4104,7 @@ ${SHARED_HELPERS}
         return res.json().then(function (j) {
           document.getElementById('keybox').style.display = 'none';
           document.getElementById('app').style.display = '';
-          renderInstances(j.peers);
+          renderInstances(j.peers, j.self);
           peerChecked = !!peer;
           return peerChecked;
         });
@@ -4002,7 +4147,7 @@ ${SHARED_HELPERS}
       .then(function (s) {
         if (!s) return;
         // A linked instance's status lists ITS peers; the picker lists ours.
-        if (!peer) renderInstances(s.peers);
+        if (!peer) renderInstances(s.peers, s.instance);
         document.getElementById('keybox').style.display = 'none';
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
@@ -4109,6 +4254,10 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('nameSet').addEventListener('click', function () { doInstanceName(this); });
+  document.getElementById('nameVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doInstanceName(document.getElementById('nameSet')); }
+  });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
@@ -4129,6 +4278,8 @@ ${SHARED_HELPERS}
   });
   document.getElementById('linkForm').addEventListener('submit', function (e) { e.preventDefault(); doAddLink(); });
   document.getElementById('linkTest').addEventListener('click', function () { doTestLink(this); });
+  document.getElementById('linkPaste').addEventListener('input', function () { useInstanceLink(true); });
+  document.getElementById('linkPaste').addEventListener('change', function () { useInstanceLink(false); });
   document.getElementById('linkBack').addEventListener('change', syncLinkBack);
   document.getElementById('ownKeyShow').addEventListener('click', function () { toggleOwnKey(this); });
   labelLinkCard();

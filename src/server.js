@@ -27,12 +27,12 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
-import { askPeerToLinkBack, configuredPeers, createPeerDirectory, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
+import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -430,6 +430,7 @@ function hasConfiguredKey(proxyConfig) {
 const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/probe-interval', 'a client key cannot change settings'],
+  ['/teamclaude/instance-name', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -471,6 +472,19 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
 export function callerView(client) {
   if (!client) return { kind: 'operator', client: null, refused: [] };
   return { kind: 'client', client, refused: [...CLIENT_KEY_REFUSED_PATHS.keys()] };
+}
+
+/**
+ * What this instance is called, for /teamclaude/status: the name in use, the
+ * host name it falls back to, and whether `instanceName` is what set it.
+ *
+ * @param {Record<string, any>} config
+ * @returns {{ name: string, host: string, custom: boolean }}
+ */
+export function instanceView(config) {
+  const name = instanceName(config);
+  const host = hostInstanceName();
+  return { name, host, custom: typeof config.instanceName === 'string' && config.instanceName.trim() === name };
 }
 
 /**
@@ -692,7 +706,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         if (peerRoute) { await relayToPeer(req, res, config, peerRoute); return; }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ peers: peerDirectory.list(config) }));
+        res.end(JSON.stringify({ self: { name: instanceName(config) }, peers: peerDirectory.list(config) }));
         return;
       }
 
@@ -850,7 +864,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus(),
           // The dashboard's instance picker. Names and addresses only, never
           // the keys, and only for the operator, who is the one who may use them.
-          ...(req.tcClient ? {} : { peers: peerDirectory.list(config) }) }, null, 2));
+          // `instance` is what the picker calls this machine and what the
+          // Settings page's Instance name row shows: `custom` when
+          // instanceName set it, and the host name it falls back to.
+          ...(req.tcClient ? {} : { peers: peerDirectory.list(config), instance: instanceView(config) }) }, null, 2));
         return;
       }
 
@@ -1378,6 +1395,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         console.log(`[TeamClaude] Quota probe ${saved > 0 ? `set to every ${saved}s` : 'turned off'} (dashboard)`);
         reply(200, { ok: true, quotaProbeSeconds: saved });
+        return;
+      }
+
+      // Instance name endpoint: the dashboard's Instance name row on Settings.
+      // Body: {"name": "<name>"}, or "" to go back to the host name. Written
+      // under the config lock, then reloaded, which copies it onto the
+      // running config the picker and the link-back form read.
+      if (req.method === 'POST' && req.url === '/teamclaude/instance-name') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (!hooks.reload) { reply(501, { ok: false, error: 'instance name change not supported' }); return; }
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setInstanceName(c, body.name); });
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Instance name change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'instance name change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after an instance name change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        const view = instanceView(config);
+        console.log(`[TeamClaude] Instance name ${view.custom ? `set to "${safeLine(view.name, 80)}"` : 'cleared; using the host name'} (dashboard)`);
+        reply(200, { ok: true, ...view });
         return;
       }
 
@@ -3737,6 +3788,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`,
       },
     }));
+    return;
+  }
+  if (!account && accountManager.accounts.length === 0) {
+    // A fresh install with nothing signed in yet. Not a 429: no window will
+    // reset, and a holdSeconds wait would only stall the client until a person
+    // signs in. Not a 401/403 either, which would make the client drop its own
+    // login. Answered at once, naming where the first account comes from.
+    ctx.status = 503;
+    ctx.account = '(no accounts)';
+    if (!res.headersSent) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'proxy_error', message: 'TeamClaude has no accounts yet. Sign one in from the dashboard (/teamclaude/dashboard) or with: teamclaude login' },
+      }));
+    }
     return;
   }
   if (!account) {

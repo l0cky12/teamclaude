@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -19,7 +19,7 @@ import {
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice,
+  peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { EVENT_KINDS } from '../src/event-log.js';
@@ -1153,9 +1153,11 @@ test('the page ships the same helper implementations it is tested against', () =
     meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
-    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice]) {
+    peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
+  // parseInstanceLink reads it from page scope.
+  assert.ok(html.includes('var INSTANCE_LINK_SCHEMES = ["teamrouter:","teamclaude:"];'), 'the instance-link schemes');
   // cardNoteFor reads it from page scope; without it the first render throws.
   assert.ok(html.includes(`var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`), 'the card-note age constant');
   // Both the head bootstrap and the main script must parse, not just the last.
@@ -2143,12 +2145,18 @@ test('a sign-in that landed on a file-backed account says it did not take, rathe
   assert.match(out.text, /credentials file.*Claude Code/);
 });
 
-test('the only account cannot be removed: the button is there, disabled, and says why', async () => {
+test('the only account can be removed like any other', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }] });
   const lone = page.findLast(e => e.textContent === 'Remove');
-  assert.equal(lone.disabled, true);
-  assert.match(lone.title, /at least one account/);
+  assert.equal(lone.disabled, false);
+  assert.match(lone.title, /Sign a out of TeamClaude/);
+});
+
+test('with no accounts the overview points at the sign-in on the Accounts page', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.ok(page.findLast(e => /No accounts yet\. Sign one in on the Accounts page/.test(e.textContent)));
 });
 
 test('a file-backed account in error shows where to sign in, and no Sign in again', async () => {
@@ -2370,6 +2378,48 @@ test('a page on this machine hides the picker until a peer is configured', async
   assert.equal(page.requests.length, 0, 'the picker came with the status read');
 });
 
+test('the picker calls this machine by its instance name, and the way back names it too', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }], instance: { name: 'hermes', host: 'hermes-box', custom: true } });
+  assert.ok(page.labelled('hermes') >= 1, 'the option for this machine says hermes');
+  assert.equal(page.labelled('This machine'), 0);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to hermes');
+});
+
+test('a linked instance shown names the machine it is reached through', async () => {
+  const page = bootPage({ storedInstance: 'desktop' });
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { self: { name: 'hermes' }, peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }] });
+  assert.match(page.byId('instanceText').textContent, /^Showing desktop .*, reached through hermes\.$/);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to hermes');
+});
+
+test('a proxy too old to name itself is still This machine in the picker', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }] });
+  assert.ok(page.labelled('This machine') >= 1);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to this machine');
+  assert.equal(page.byId('nameRow').style.display, 'none', 'and has no Instance name row to offer');
+});
+
+test('the Instance name row shows the name set, offers the host name, and saves what is typed', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], instance: { name: 'hermes-box', host: 'hermes-box', custom: false } });
+  assert.equal(page.byId('nameRow').style.display, '');
+  assert.equal(page.byId('nameVal').value, '', 'the host name is a placeholder, not a saved name');
+  assert.equal(page.byId('nameVal').placeholder, 'hermes-box');
+
+  page.byId('nameVal').value = '  hermes ';
+  page.byId('nameSet').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/instance-name');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { name: 'hermes' });
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
+  await page.answer(200, { ok: true, name: 'hermes', host: 'hermes-box', custom: true });
+  assert.match(page.byId('note').textContent, /this instance is now called hermes/);
+  assert.equal(page.byId('nameVal').value, 'hermes');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'and the page reads the new name back');
+});
+
 test('a linked instance that is down never hides the way back, even across a key prompt', async () => {
   const page = bootPage({ storedInstance: 'server' });
   await page.answer(401, {});
@@ -2531,8 +2581,10 @@ test('the card links another machine both ways from the form, testing it first',
     assert.equal(page.requests[0].url, '/teamclaude/peer-links/test');
     assert.deepEqual(JSON.parse(page.requests[0].init.body), { url: '100.64.0.2:3456', apiKey: 'tc-desk' });
     await page.answer(200, { ok: true, url: 'http://100.64.0.2:3456', state: 'online', linkable: true, name: 'desk' });
-    assert.equal(page.byId('linkName').value, 'desk', 'the name it calls itself fills an empty field');
+    assert.equal(page.byId('linkName').value, '', 'naming it is left to the operator');
+    assert.equal(page.byId('linkName').placeholder, 'e.g. desk', 'the name it calls itself is only suggested');
     assert.equal(page.byId('linkStatus').textContent, 'It answers to that key and calls itself desk.');
+    page.byId('linkName').value = 'desk';
 
     page.byId('linkBack').checked = true;
     page.byId('linkForm').fire('submit', { preventDefault() {} });
@@ -2618,7 +2670,63 @@ test('the form asks for what is missing instead of sending it', async () => {
     page.byId('linkTest').fire('click');
     page.byId('linkForm').fire('submit', { preventDefault() {} });
     assert.equal(page.requests.length, 0);
-    assert.match(page.byId('linkStatus').textContent, /Fill in its address, its proxy key and a name/);
+    assert.match(page.byId('linkStatus').textContent, /Fill in its address and its proxy key, or paste its link/);
+  });
+});
+
+test('instanceLink and parseInstanceLink carry an address and a key, and nothing else', () => {
+  const link = instanceLink('http://100.64.0.2:3456', 'tc-a&b=c d');
+  assert.equal(link, 'teamrouter://link?address=http%3A%2F%2F100.64.0.2%3A3456&key=tc-a%26b%3Dc%20d');
+  assert.deepEqual(parseInstanceLink(link), { url: 'http://100.64.0.2:3456', apiKey: 'tc-a&b=c d' });
+  assert.deepEqual(parseInstanceLink('  ' + link + '\n'), { url: 'http://100.64.0.2:3456', apiKey: 'tc-a&b=c d' }, 'pasted with whitespace');
+  assert.deepEqual(parseInstanceLink('teamclaude://link?address=https%3A%2F%2Fhub.ts.net&key=k'), { url: 'https://hub.ts.net', apiKey: 'k' }, 'the old spelling');
+  assert.equal(instanceLink('', 'k'), '');
+  assert.equal(instanceLink('http://h:1', ''), '');
+  for (const bad of ['', 'http://100.64.0.2:3456', 'teamrouter://other?address=http%3A%2F%2Fh&key=k', 'teamrouter://link?address=http%3A%2F%2Fh',
+    'teamrouter://link?key=k', 'teamrouter://link?address=file%3A%2F%2F%2Fetc&key=k', 'teamrouter://link?address=nope&key=k', 'tc-just-a-key']) {
+    assert.equal(parseInstanceLink(bad), null, bad);
+  }
+});
+
+test('linkAddMissing asks for a name on its own once the address and key are there', () => {
+  assert.equal(linkAddMissing({ name: 'desk', url: 'http://h:1', apiKey: 'k' }), null);
+  assert.match(linkAddMissing({ name: '', url: 'http://h:1', apiKey: 'k' }), /^You need to name this machine/);
+  assert.match(linkAddMissing({ name: 'desk', url: '', apiKey: 'k' }), /address and its proxy key/);
+  assert.match(linkAddMissing({ name: '', url: 'http://h:1', apiKey: '' }), /address and its proxy key/);
+});
+
+test('a pasted link fills the form, and Link without a name keeps it all until a name is given', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answer(200, { self: SELF, peers: [] });
+    page.byId('linkBack').checked = false;
+    page.byId('linkPaste').value = 'teamrouter://link?address=http%3A%2F%2F100.64.0.2%3A3456&ke';
+    page.byId('linkPaste').fire('input');
+    assert.equal(page.byId('linkStatus').textContent, '', 'half a link is not an error while typing');
+    page.byId('linkPaste').fire('change');
+    assert.match(page.byId('linkStatus').textContent, /not a link from the Linked instances card/);
+    assert.equal(page.byId('linkUrl').value, '');
+
+    page.byId('linkPaste').value = instanceLink('http://100.64.0.2:3456', 'tc-desk');
+    page.byId('linkPaste').fire('input');
+    assert.equal(page.byId('linkUrl').value, 'http://100.64.0.2:3456');
+    assert.equal(page.byId('linkKey').value, 'tc-desk');
+    assert.equal(page.byId('linkName').value, '', 'the link carries no name');
+    assert.match(page.byId('linkStatus').textContent, /Name it, then click Link/);
+
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.equal(page.requests.length, 0, 'nothing is sent without a name');
+    assert.match(page.byId('linkStatus').textContent, /^You need to name this machine/);
+    assert.equal(page.byId('linkUrl').value, 'http://100.64.0.2:3456', 'the address stays');
+    assert.equal(page.byId('linkKey').value, 'tc-desk', 'the key stays');
+
+    page.byId('linkName').value = 'desk';
+    page.byId('linkForm').fire('submit', { preventDefault() {} });
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links/add');
+    assert.deepEqual(JSON.parse(page.requests[0].init.body), { name: 'desk', url: 'http://100.64.0.2:3456', apiKey: 'tc-desk' });
+    await page.answer(200, { ok: true, name: 'desk', url: 'http://100.64.0.2:3456' });
+    assert.match(page.byId('linkStatus').textContent, /^Linked desk/);
+    for (const id of ['linkPaste', 'linkUrl', 'linkKey', 'linkName']) assert.equal(page.byId(id).value, '', `${id} is cleared once linked`);
   });
 });
 
@@ -2632,6 +2740,9 @@ test('Show key reads this machine\'s key and offers it with an address to copy',
     assert.equal(page.byId('ownKeyBox').style.display, '');
     assert.ok(page.findLast(e => e.value === 'tc-hub'), 'the key');
     assert.ok(page.findLast(e => e.value === 'http://100.64.0.1:3456'), 'and where to reach this machine');
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.ok(link, 'and the link that carries both');
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.1:3456', apiKey: 'tc-hub' });
     assert.equal(page.byId('ownKeyShow').textContent, 'Hide key');
     page.byId('ownKeyShow').fire('click');
     assert.equal(page.byId('ownKeyBox').style.display, 'none');
@@ -2681,4 +2792,22 @@ test('an instance from before the card says so instead of offering a form that c
     assert.equal(page.labelled('Remove'), 0);
     assert.equal(page.labelled('Open'), 0, 'its links are not in this machine\'s picker');
   }, { storedInstance: 'server' });
+});
+
+test('instanceNameRequest posts the name, and instanceNameOutcome says what it is called now', () => {
+  const r = instanceNameRequest('hermes', 'tc-k');
+  assert.equal(r.url, '/teamclaude/instance-name');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(r.init.body), { name: 'hermes' });
+  assert.deepEqual(instanceNameOutcome({ ok: true, name: 'hermes', custom: true }), { kind: 'ok', text: 'this instance is now called hermes' });
+  assert.match(instanceNameOutcome({ ok: true, name: 'box', custom: false }).text, /cleared; it goes by its host name, box$/);
+  assert.equal(instanceNameOutcome({ ok: false, error: 'bad name' }).text, 'instance name change failed: bad name');
+  assert.equal(instanceNameOutcome(null).kind, 'error');
+});
+
+test('selfInstanceLabel falls back to This machine', () => {
+  assert.equal(selfInstanceLabel({ name: 'hermes' }), 'hermes');
+  assert.equal(selfInstanceLabel(undefined), 'This machine');
+  assert.equal(selfInstanceLabel({ name: '' }), 'This machine');
 });

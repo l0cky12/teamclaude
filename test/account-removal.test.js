@@ -95,15 +95,16 @@ test('an account a reload already removed is a 404, not a second removal', async
   assert.equal(accountManager.accounts.length, 2);
 });
 
-test('the last account is refused, because a server with none will not start', async () => {
+test('the last account can be removed, because a server with none keeps running', async () => {
   const config = { accounts: [{ id: 'id-a', name: 'a@example.com', type: 'apikey', apiKey: 'sk-demo-1' }] };
   const accountManager = new AccountManager(config.accounts.map(e => ({ ...e })), 0.98);
   let saves = 0;
   const remove = createAccountRemover({ accountManager, config, exclusive: serialQueue(), persist: async () => { saves++; } });
-  await assert.rejects(remove(accountManager.accounts[0]), err => err instanceof RemovalRefused && err.status === 409 && /sign in another/.test(err.message));
-  assert.equal(accountManager.accounts.length, 1);
-  assert.equal(config.accounts.length, 1);
-  assert.equal(saves, 0);
+  const out = await remove(accountManager.accounts[0]);
+  assert.equal(out.name, 'a@example.com');
+  assert.equal(accountManager.accounts.length, 0);
+  assert.equal(config.accounts.length, 0);
+  assert.equal(saves, 1);
 });
 
 test('a reload keeps the "sign-in comes from a file" flag in step with the config', async () => {
@@ -123,18 +124,4 @@ test('a reload keeps the "sign-in comes from a file" flag in step with the confi
   assert.equal(accountManager.accounts[0].credentialsFromFile, true);
   await syncAccountsFromDisk({ accounts: [{ ...entry }] }, memConfig, accountManager);
   assert.equal(accountManager.accounts[0].credentialsFromFile, false);
-});
-
-test('the last running account is refused even when the config also holds an entry with no credential', async () => {
-  const config = { accounts: [
-    { id: 'id-a', name: 'a@example.com', type: 'apikey', apiKey: 'sk-demo-1' },
-    // resolveAccounts drops this one: it never reaches the fleet, and a server
-    // left with only it would refuse to start.
-    { id: 'id-x', name: 'x@example.com', type: 'oauth' },
-  ] };
-  const accountManager = new AccountManager([{ ...config.accounts[0] }], 0.98);
-  const remove = createAccountRemover({ accountManager, config, exclusive: serialQueue(), persist: async () => {} });
-  await assert.rejects(remove(accountManager.accounts[0]), err => err instanceof RemovalRefused && err.status === 409);
-  assert.equal(accountManager.accounts.length, 1);
-  assert.equal(config.accounts.length, 2);
 });

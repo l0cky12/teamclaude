@@ -141,11 +141,11 @@ test('remove takes the account the provider names, not its namesake', async () =
 });
 
 test('a refused removal answers with its own status and reason', async () => {
-  const removeAccount = async () => { throw new RemovalRefused('this is the only account, and the proxy needs one to start: sign in another account first', 409); };
+  const removeAccount = async () => { throw new RemovalRefused('refused for this test', 409); };
   await withServer({ removeAccount }, async (port) => {
     const res = await post(port, '/teamclaude/remove', { account: 'other@example.com' });
     assert.equal(res.status, 409);
-    assert.match((await res.json()).error, /only account/);
+    assert.match((await res.json()).error, /refused for this test/);
   });
 });
 
