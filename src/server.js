@@ -32,7 +32,7 @@ import { WebSignInError } from './web-login.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
-import { askPeerToLinkBack, createPeerDirectory, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
+import { askPeerToLinkBack, configuredPeers, createPeerDirectory, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 
@@ -454,6 +454,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/peer-links/add', 'a client key cannot manage linked instances'],
   ['/teamclaude/peer-links/remove', 'a client key cannot manage linked instances'],
   ['/teamclaude/peer-links/key', 'a client key cannot manage linked instances'],
+  // The other machines' keys, for joining two groups of linked instances.
+  ['/teamclaude/peer-links/peers', 'a client key cannot manage linked instances'],
 ]);
 
 /**
@@ -489,6 +491,21 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
   const peerDirectory = createPeerDirectory();
+
+  /**
+   * Save the entries a mesh join found for this machine, then reload so the
+   * relay reaches them at once. An entry whose name was taken in the meantime
+   * is left out rather than failing the rest.
+   * @param {{ name: string, url: string, apiKey: string }[]} entries
+   */
+  async function savePeersFromMesh(entries) {
+    await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+      for (const e of entries) {
+        try { addPeer(c, e); } catch (err) { if (!(err instanceof ConfigOpError)) throw err; }
+      }
+    });
+    await hooks.reload?.();
+  }
 
   // The log directory is made up front and synchronously, so a path that
   // cannot be a directory (a file sitting there, no permission) is reported
@@ -693,6 +710,16 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         return;
       }
 
+      // What this machine lists under `peers`, keys included, so a machine
+      // just linked to this one can link itself to them too (peers.js
+      // joinPeerMesh). No more than the operator holds already: the relay
+      // reaches each of them with these keys for any caller with this one's.
+      if (req.method === 'POST' && req.url === '/teamclaude/peer-links/peers') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, peers: configuredPeers(config) }));
+        return;
+      }
+
       // `{"url","apiKey"}`: whether that instance answers to that key, and
       // whether it can be linked back. Nothing is written.
       if (req.method === 'POST' && req.url === '/teamclaude/peer-links/test') {
@@ -718,7 +745,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // keys are, since the relay reads `peers` off the running config.
       // `linkBack` then asks the new instance to list this machine as well,
       // under that name and address and with this machine's own proxy key, so
-      // one form links both ways.
+      // one form links both ways. Once it has, the two groups become one:
+      // every instance either machine lists is linked with the other side
+      // (joinPeerMesh), unless the body says `"mesh": false`.
       if (req.method === 'POST' && (req.url === '/teamclaude/peer-links/add' || req.url === '/teamclaude/peer-links/remove')) {
         const isAdd = req.url === '/teamclaude/peer-links/add';
         if (!hooks.reload) {
@@ -766,11 +795,24 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         // The name and address only: the key never reaches the log.
         console.log(`[TeamClaude] ${isAdd ? `Linked instance "${safeLine(result.name, 80)}" at ${safeLine(result.url, 200)}` : `Removed linked instance "${safeLine(result.name, 80)}"`} (control endpoint)`);
-        const linkBack = back
-          ? await askPeerToLinkBack({ name: result.name, url: result.url, apiKey: String(body.apiKey).trim() }, { ...back, apiKey: config.proxy.apiKey })
+        const joined = { name: result.name, url: result.url, apiKey: String(body.apiKey).trim() };
+        const linkBack = back ? await askPeerToLinkBack(joined, { ...back, apiKey: config.proxy.apiKey }) : null;
+        const mesh = back && linkBack?.ok && body.mesh !== false
+          ? await joinPeerMesh({
+            self: { ...back, apiKey: config.proxy.apiKey },
+            ownPeers: configuredPeers(config),
+            joined,
+            addLocal: (entries) => savePeersFromMesh(entries),
+          }).catch((err) => {
+            console.error('[TeamClaude] Linking the other linked instances failed:', /** @type {Error} */ (err).message);
+            return { linked: [], skipped: [{ from: back.name || 'this machine', to: '*', error: 'failed; see the proxy log' }] };
+          })
           : null;
+        if (mesh?.linked.length) {
+          console.log(`[TeamClaude] Also linked: ${mesh.linked.map(l => `${safeLine(l.from, 80)} -> ${safeLine(l.to, 80)}`).join(', ')} (control endpoint)`);
+        }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, ...result, ...(linkBack ? { linkBack } : {}) }));
+        res.end(JSON.stringify({ ok: true, ...result, ...(linkBack ? { linkBack } : {}), ...(mesh ? { mesh } : {}) }));
         return;
       }
 

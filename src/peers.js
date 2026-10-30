@@ -352,3 +352,158 @@ export async function askPeerToLinkBack(peer, entry) {
   why = why.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200);
   return { ok: false, error: `${peer.name} did not add this machine (${why || 'status ' + out.status})` };
 }
+
+// A mesh join visits every instance either side lists; past this many it
+// stops, so a misbehaving peer's list cannot make one link run for minutes.
+const MESH_MAX_INSTANCES = 32;
+
+/**
+ * The linked instances a peer lists, keys included, from its
+ * /teamclaude/peer-links/peers. Null when it cannot be read: unreachable,
+ * refused, or a version without the route.
+ *
+ * @param {Peer} peer
+ * @returns {Promise<Peer[] | null>}
+ */
+export async function readPeerList(peer) {
+  try {
+    const { status, body } = await peerRequest(peer, 'peer-links/peers', { method: 'POST', body: Buffer.from('{}') });
+    if (status !== 200) return null;
+    return configuredPeers({ peers: JSON.parse(body.toString('utf8'))?.peers });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A name for `want` that `list` does not use for another instance yet: the
+ * name itself, else the name with -2, -3 and so on.
+ *
+ * @param {Peer[]} list
+ * @param {string} want
+ */
+function freeName(list, want) {
+  const base = want.slice(0, 60);
+  if (!list.some(p => p.name === base)) return base;
+  for (let n = 2; ; n++) if (!list.some(p => p.name === `${base}-${n}`)) return `${base}-${n}`;
+}
+
+/**
+ * @typedef {{ from: string, to: string }} MeshLink
+ * @typedef {{ from: string, to: string, error: string }} MeshSkip
+ */
+
+/**
+ * Join two groups of linked instances into one, after this machine and
+ * `joined` have just been linked both ways: every instance this machine
+ * lists, and this machine itself, gets linked both ways with `joined` and
+ * every instance `joined` lists. Linking desk to hub, when hub already lists
+ * a server, so also links desk and the server.
+ *
+ * Instances are told apart by their proxy key, since a name and an address
+ * are only what one machine calls another. A pair is linked one direction
+ * at a time, each by the machine that will hold the entry: it tests the
+ * address and key first (its own peer-links/test), so an address that only
+ * the listing machine can reach is reported instead of saved. The adds sent
+ * to other machines carry no linkBack, so they never start a join of their own.
+ *
+ * Nothing here is undone when a step fails: each link that was made works on
+ * its own, and the ones that were not are listed with why.
+ *
+ * @param {object} opts
+ * @param {Peer} opts.self  this machine, as `joined` lists it, with its own proxy key
+ * @param {Peer[]} opts.ownPeers  what this machine lists, `joined` included
+ * @param {Peer} opts.joined  the instance just linked
+ * @param {(entries: Peer[]) => Promise<void>} opts.addLocal  save entries to this machine's `peers`
+ * @param {typeof readPeerList} [opts.readList]
+ * @param {typeof testPeerLink} [opts.test]
+ * @param {typeof peerRequest} [opts.request]
+ * @returns {Promise<{ linked: MeshLink[], skipped: MeshSkip[] }>}
+ */
+export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList = readPeerList, test = testPeerLink, request = peerRequest }) {
+  /** @type {MeshLink[]} */ const linked = [];
+  /** @type {MeshSkip[]} */ const skipped = [];
+
+  const joinedList = await readList(joined);
+  if (!joinedList) {
+    skipped.push({ from: joined.name, to: '*', error: `could not read the instances ${joined.name} lists; it may run an older version` });
+    return { linked, skipped };
+  }
+
+  // Each side, one entry per key: this machine and what it lists, then the
+  // joined one and what it lists. An instance both list belongs to this side.
+  /** @type {Map<string, Peer>} */ const sideA = new Map([[self.apiKey, self]]);
+  for (const p of ownPeers) if (p.apiKey !== joined.apiKey && !sideA.has(p.apiKey)) sideA.set(p.apiKey, p);
+  /** @type {Map<string, Peer>} */ const sideB = new Map([[joined.apiKey, joined]]);
+  for (const p of joinedList) if (!sideA.has(p.apiKey) && !sideB.has(p.apiKey)) sideB.set(p.apiKey, p);
+  if (sideA.size + sideB.size > MESH_MAX_INSTANCES) {
+    skipped.push({ from: self.name, to: '*', error: `more than ${MESH_MAX_INSTANCES} instances between the two; link the rest by hand` });
+    return { linked, skipped };
+  }
+
+  // What each instance lists now. One that cannot be read cannot be asked to
+  // add anything either, so every pair with it is skipped.
+  /** @type {Map<string, Peer[] | null>} */ const lists = new Map([[self.apiKey, ownPeers], [joined.apiKey, joinedList]]);
+  for (const p of [...sideA.values(), ...sideB.values()]) {
+    if (!lists.has(p.apiKey)) lists.set(p.apiKey, await readList(p));
+  }
+
+  /** @type {Peer[]} */ const localAdds = [];
+  /**
+   * Have `from` list `to`, unless it does already.
+   * @param {Peer} from
+   * @param {Peer} to
+   */
+  const link = async (from, to) => {
+    const list = lists.get(from.apiKey);
+    if (!list) { skipped.push({ from: from.name, to: to.name, error: `could not reach ${from.name}` }); return; }
+    if (list.some(p => p.apiKey === to.apiKey)) return;
+    const entry = { name: freeName(list, to.name), url: to.url, apiKey: to.apiKey };
+    if (from === self) {
+      const { state } = await test(to).catch(() => ({ state: 'offline' }));
+      if (state !== 'online') { skipped.push({ from: from.name, to: to.name, error: `${to.name} is ${state} from ${from.name}` }); return; }
+      localAdds.push(entry);
+    } else {
+      const err = await remoteAdd(request, from, entry);
+      if (err) { skipped.push({ from: from.name, to: to.name, error: err }); return; }
+    }
+    list.push(entry);
+    linked.push({ from: from.name, to: entry.name });
+  };
+
+  for (const a of sideA.values()) {
+    for (const b of sideB.values()) {
+      await link(a, b);
+      await link(b, a);
+    }
+  }
+  if (localAdds.length) await addLocal(localAdds);
+  return { linked, skipped };
+}
+
+/**
+ * Ask `from` to test `entry` and, when it answers, to list it. The error to
+ * report, or null when it was added.
+ *
+ * @param {typeof peerRequest} request
+ * @param {Peer} from
+ * @param {Peer} entry
+ * @returns {Promise<string | null>}
+ */
+async function remoteAdd(request, from, entry) {
+  /** @param {Buffer} body */
+  const why = (body) => {
+    try { return String(JSON.parse(body.toString('utf8')).error || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200); } catch { return ''; }
+  };
+  try {
+    const tested = await request(from, 'peer-links/test', { method: 'POST', body: Buffer.from(JSON.stringify({ url: entry.url, apiKey: entry.apiKey })) });
+    if (tested.status !== 200) return `${from.name} could not test the link (${why(tested.body) || 'status ' + tested.status})`;
+    const state = JSON.parse(tested.body.toString('utf8'))?.state;
+    if (state !== 'online') return `${entry.name} is ${typeof state === 'string' ? state.slice(0, 20) : 'unknown'} from ${from.name}`;
+    const added = await request(from, 'peer-links/add', { method: 'POST', body: Buffer.from(JSON.stringify(entry)) });
+    if (added.status !== 200) return `${from.name} did not add ${entry.name} (${why(added.body) || 'status ' + added.status})`;
+    return null;
+  } catch (err) {
+    return `${from.name} is unreachable (${/** @type {Error} */ (err).message})`;
+  }
+}

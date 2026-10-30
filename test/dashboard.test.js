@@ -2454,6 +2454,21 @@ test('peerLinkOutcome says when a link went one way only', () => {
   assert.equal(peerLinkOutcome(null, 'remove').text, 'could not remove the link');
 });
 
+test('peerLinkOutcome names the instances the join linked across, and the ones it could not', () => {
+  const both = 'Linked hub both ways: each dashboard now shows the other in the Instance picker.';
+  assert.deepEqual(peerLinkOutcome({ ok: true, name: 'hub', linkBack: { ok: true }, mesh: { linked: [], skipped: [] } }, 'add'),
+    { kind: 'ok', text: both });
+  // Both directions of a pair read as one; a pair linked one way only keeps its arrow.
+  assert.deepEqual(peerLinkOutcome({ ok: true, name: 'hub', linkBack: { ok: true }, mesh: {
+    linked: [{ from: 'desk', to: 'server' }, { from: 'server', to: 'desk' }, { from: 'laptop', to: 'hub' }],
+    skipped: [],
+  } }, 'add'), { kind: 'ok', text: both + ' Also linked the instances they already listed: desk ↔ server, laptop → hub.' });
+  assert.deepEqual(peerLinkOutcome({ ok: true, name: 'hub', linkBack: { ok: true }, mesh: {
+    linked: [{ from: 'desk', to: 'server' }],
+    skipped: [{ from: 'server', to: 'desk', error: 'desk is offline from server' }],
+  } }, 'add'), { kind: 'warn', text: both + ' Also linked the instances they already listed: desk → server. Not linked: desk is offline from server.' });
+});
+
 test('peerTestOutcome tells a wrong key, a wrong address and an old version apart', () => {
   assert.deepEqual(peerTestOutcome({ ok: true, state: 'online', linkable: true, name: 'desk' }), { kind: 'ok', text: 'It answers to that key and calls itself desk.' });
   assert.equal(peerTestOutcome({ ok: true, state: 'online', linkable: true }).text, 'It answers to that key.');
