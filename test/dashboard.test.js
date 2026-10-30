@@ -2935,6 +2935,7 @@ test('the Instance address row saves what is typed, and the link handed out then
     await page.answer(200, { ok: true, key: 'tc-hub' });
     const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
     assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
+    assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address above)'), 'and says it is no guess');
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 

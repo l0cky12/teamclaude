@@ -2383,10 +2383,10 @@ const PAGE = `<!doctype html>
   .actions button:disabled { opacity: .5; cursor: default; }
   .actions button.sel, .chip.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
   .actions .lbl { color: var(--dim); font-size: 12px; }
-  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; max-width: 100%; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .thr input.name { width: 170px; text-align: left; }
-  .thr input.addr { width: 220px; text-align: left; }
+  .thr input.addr { width: 220px; min-width: 0; flex: 0 1 auto; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -2608,7 +2608,7 @@ const PAGE = `<!doctype html>
           </span>
         </div>
         <div class="setting" id="addrRow" style="display:none">
-          <div><b>Instance address</b><span class="tag">The address other machines reach this one at, put in the link under Linked instances. Set it when the guess is wrong, as it is in a Docker container. Empty uses the guess. Saved to the config file.</span></div>
+          <div><b>Instance address</b><span class="tag">The address the link gives other machines. Set it in a Docker container. Empty uses a guess.</span></div>
           <span class="thr">
             <label for="addrVal">Address</label>
             <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
@@ -3707,7 +3707,8 @@ ${SHARED_HELPERS}
           var opts = linkSelfOptions(linkSelf, pageOrigin());
           var link = opts.length ? instanceLink(opts[0], j.key) : '';
           if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
-          if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
+          var addrSet = !!(linkSelf && linkSelf.address && linkSelf.address === opts[0]);
+          if (opts.length) snippet(box, addrSet ? 'Address (set under Instance address above)' : 'Address (a best guess: use one the other machine can reach, or set Instance address above)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
         box.style.display = '';
