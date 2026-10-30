@@ -406,23 +406,41 @@ The Clients page has a table per client key and, with `proxy.usageDimensions` co
 
 The Insights page is graphs of what the accounts have done. A **Range** control picks the last 24 hours, 7, 30 or 90 days, or **All** (everything recorded), and every chart on the page follows it:
 
-- Four tiles: tokens and requests in the range, each compared with the period just before it (*▲ 15% vs the previous 30 days*); the accounts configured now and how many are enabled; and the share of the range's tokens that were cache reads.
+- Five tiles: tokens, the [estimated API cost](#estimated-api-cost) and requests in the range, each compared with the period just before it (*▲ 15% vs the previous 30 days*); the accounts configured now and how many are enabled (or, for all machines, how many machines were counted); and the share of the range's tokens that were cache reads.
 - **Tokens over time**, per hour for 24 hours and per day otherwise, stacked by provider, by account or by token type (**Split by**). Hovering shows each series at that point and the total.
 - **Token mix** (cache read, cache write, input, output) and **By provider** as donuts, **By account** and **Top models** as ranked bars, and **Requests** per hour or day.
+- **Estimated API cost** per hour or day, and **Cost by model**, the most expensive first.
+- With all machines shown: **By machine** as ranked bars, and **Machine** under **Split by**.
 
 Every chart has a **Table** button that shows the same numbers as a table. Tokens include cache reads and writes, which are most of a Claude Code request, so the totals are much larger than the input and output counts on the Logs page. A request here is a response that reported usage. Third-party backends are one provider, named for the backend when there is only one. In the account split, each account keeps the same colour for every range; accounts past the eighth, and accounts no longer configured, are grouped as **Other**. Models are grouped by name, so dated releases of one model count together.
 
-The comparison under each tile appears only when the history reaches back over the whole earlier period, so a fresh install shows none for its first days. The page asks for the history only while it is open, and then at most once a minute. A linked instance on an older version keeps no history, and the page says so.
+The comparison under each tile appears only when the history reaches back over the whole earlier period, so a fresh install shows none for its first days.
+
+#### All machines
+
+With [linked instances](#linked-instances), a **Machines** control appears: **All** (the default) adds every linked machine's history to this one's, and **This one** shows only the instance the picker shows. **All** is read from the machine the page was opened on, whichever instance the picker shows, since that machine's links are what reach the others. Each machine keeps its own history; the sum is made when the page asks. An account synced to several machines is counted as one account. A linked machine that cannot be read (it is down, its key in `peers` is wrong, or it runs a version without a history) is left out, and the page names it under the tiles. Days are each machine's own local days, so machines in different time zones split a late-evening request across two days; the range totals are unaffected.
+
+#### Estimated API cost
+
+The cost tile and cards show what the range's tokens would have cost on a pay-as-you-go API key, at the providers' published standard prices in US dollars. Subscription accounts (Claude Max, ChatGPT) are billed a flat fee, so for them this is what the subscription saved, not what was spent. Each model's input, output, cache-read and cache-write tokens are priced at that model's own rates, from the Anthropic and OpenAI price pages as of October 2026. It is an estimate:
+
+- Cache writes are priced at the 5-minute rate. Claude Code also writes 1-hour entries, which cost more, so the estimate can be low.
+- Long-prompt rates (Claude Haiku 5.5 over 100K tokens, OpenAI's flagship models over 272K) and fast-mode, batch and regional prices are not applied, because the history does not keep single requests.
+- Third-party backends (DeepSeek, z.ai) are not priced: they already bill by the token, at their own rates. Neither are models the table does not know. Their tokens are reported as *unpriced* and are not in any dollar figure.
+- The prices are applied when the page asks, not stored, so a price corrected in a later version applies to the whole history. The page asks for the history only while it is open, and then at most once a minute. A linked instance on an older version keeps no history, and the page says so.
 
 The history is kept by the proxy from the first request this version serves. It is not rebuilt from earlier traffic. Each response that reports usage is added to the day it arrived on, by the clock of the machine the proxy runs on, and to its hour. A year of days and the last 48 hours are kept in the state file (`teamclaude.state.json`), one row per account and model per day. A day holds at most 200 rows. After that, further models of an account are counted under `(other)`, so the totals stay correct.
 
-`GET /teamclaude/insights?range=<24h|7d|30d|90d|all>` is the endpoint behind it. A missing or unknown range is `30d`, and the reply's `range` says which one it answered. It answers `{ range, unit, buckets, since, totals, previous, requests, kinds, providers, accounts, models }`:
+`GET /teamclaude/insights?range=<24h|7d|30d|90d|all>` is the endpoint behind it. A missing or unknown range is `30d`, and the reply's `range` says which one it answered. It answers `{ range, unit, buckets, since, totals, previous, requests, kinds, cost, providers, accounts, models }`:
 
 - `unit` is `hour` or `day`. `buckets` are the hours' start times in epoch milliseconds, or the days as `YYYY-MM-DD`, oldest first.
 - `since` is when recording began, in epoch milliseconds, or `null` before the first request.
 - `totals` and `previous` are `{ requests, input, output, cacheRead, cacheWrite }` for the range and for the period before it. `previous` is `null` when the history does not cover that period, and always for `all`.
 - `requests` and each list in `kinds` (`cacheRead`, `cacheWrite`, `input`, `output`) have one number per bucket.
-- `providers` (`{ provider, tokens, values }`), `accounts` (`{ provider, account, tokens, requests, values }`) and `models` (`{ provider, model, tokens, requests }`) are sorted by tokens, most first, and `values` has one number per bucket.
+- `cost` is `{ total, values, previous, unpricedTokens }`: the estimated API cost in US dollars for the range, per bucket, and for the period before (`null` when `previous` is). `unpricedTokens` counts the tokens no figure includes.
+- `providers` (`{ provider, tokens, cost, values }`), `accounts` (`{ provider, account, tokens, requests, cost, values }`) and `models` (`{ provider, model, tokens, requests, input, output, cacheRead, cacheWrite, cost }`) are sorted by tokens, most first, and `values` has one number per bucket. A model's `cost` is `null` when it has no known price.
+
+Add `&scope=all` for every linked machine at once. The reply has the same fields, summed, plus `scope: "all"` and `instances`: one `{ name, self, state, error?, since, tokens, requests, cost, unpricedTokens, values }` per machine, this one first. `state` is `ok`, `unreachable`, `refused`, `outdated` or `error`, and only `ok` machines are in the sums. Each linked machine is asked for its own history only (no `scope`), in parallel, with 8 seconds to answer. With `scope=all`, a client key gets a 403, as it does for every route that reaches linked instances.
 
 A `provider` is `anthropic`, `codex`, or `backend:<host>` for an API key on a third-party backend. It has the same gate as `/teamclaude/status`, so a client key may read it. Accounts are named by their configured name, never an email or a token.
 

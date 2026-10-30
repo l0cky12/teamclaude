@@ -1760,6 +1760,17 @@ export function fmtTokens(n) {
   return String(Math.round(v));
 }
 
+// A dollar figure as the page prints it: $1,234 from a thousand up, cents
+// below that, and "<$0.01" for a cost that rounds to nothing but is not zero.
+/** @param {unknown} n */
+export function fmtUsd(n) {
+  var v = Number(n) || 0;
+  if (v <= 0) return '$0';
+  if (v < 0.01) return '<$0.01';
+  if (v >= 1000) return '$' + Math.round(v).toLocaleString('en-US');
+  return '$' + v.toFixed(2);
+}
+
 // The top of a value axis: the first 1, 2, 2.5 or 5 times a power of ten at or
 // above `v`, so the four gridlines under it land on round numbers.
 /** @param {number} v */
@@ -1860,8 +1871,25 @@ export function insightsSeries(data, split, accounts) {
     });
     return out;
   }
+  if (split === 'instance') {
+    // This machine first, then the linked ones in config order, which is the
+    // order the reply lists them in, so a machine keeps its colour.
+    (data.instances || []).forEach(function (/** @type {any} */ m, /** @type {number} */ i) {
+      if (m.state !== 'ok') return;
+      out.push({ key: 'instance/' + m.name, label: m.name, color: i < 8 ? 'var(--is' + (i + 1) + ')' : 'var(--dim)', values: (m.values || zeros()).slice(), total: m.tokens || 0 });
+    });
+    return out;
+  }
   if (split === 'account') {
     var known = (accounts || []).map(function (a) { return accountGroup(a) + '/' + a.name; });
+    // Every machine at once: the accounts only a linked machine has come
+    // after this one's, by name, so they too keep a colour across ranges.
+    if (data.scope === 'all') {
+      (data.accounts || []).map(function (/** @type {any} */ a) { return a.provider + '/' + a.account; })
+        .filter(function (/** @type {string} */ k) { return known.indexOf(k) < 0; })
+        .sort()
+        .forEach(function (/** @type {string} */ k) { known.push(k); });
+    }
     /** @type {Record<number, { key: string, label: string, color: string, values: number[], total: number }>} */
     var bySlot = {};
     /** @type {{ key: string, label: string, color: string, values: number[], total: number }|null} */
@@ -1965,16 +1993,23 @@ export function donutArcs(values, c, r, ir) {
  * @param {number} [limit]
  */
 export function topModels(models, limit) {
-  /** @type {Record<string, { label: string, provider: string, tokens: number, requests: number }>} */
+  /** @type {Record<string, { label: string, provider: string, tokens: number, requests: number, input: number, output: number, cacheRead: number, cacheWrite: number, cost: number|null }>} */
   var groups = {};
   /** @type {string[]} */
   var order = [];
   (models || []).forEach(function (/** @type {any} */ m) {
     var label = m.model === '(unknown)' || m.model === '(other)' ? m.model : modelLabel(m.model);
     var key = m.provider + '/' + label;
-    if (!groups[key]) { groups[key] = { label: label, provider: m.provider, tokens: 0, requests: 0 }; order.push(key); }
-    groups[key].tokens += m.tokens;
-    groups[key].requests += m.requests;
+    if (!groups[key]) { groups[key] = { label: label, provider: m.provider, tokens: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null }; order.push(key); }
+    var g = groups[key];
+    g.tokens += m.tokens;
+    g.requests += m.requests;
+    g.input += m.input || 0;
+    g.output += m.output || 0;
+    g.cacheRead += m.cacheRead || 0;
+    g.cacheWrite += m.cacheWrite || 0;
+    // Null (no price known) only while every snapshot in the group is.
+    if (typeof m.cost === 'number') g.cost = (g.cost || 0) + m.cost;
   });
   return order.map(function (k) { return groups[k]; })
     .sort(function (x, y) { return y.tokens - x.tokens; })
@@ -2003,16 +2038,40 @@ export function insightsKpis(data, accounts) {
   if (tally.codex) parts.push(tally.codex + ' Codex');
   if (tally.backend) parts.push(tally.backend + (tally.backend === 1 ? ' backend' : ' backends'));
   var enabled = list.filter(function (a) { return !a.disabled; }).length;
+  var cost = data && data.cost;
+  var costSub = !cost ? 'this proxy is too old to estimate it'
+    : insightsDelta(cost.total, cost.previous, range) || 'at API list prices';
+  if (cost && cost.unpricedTokens > 0) costSub += ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced';
+  // Every machine at once: the tile counts machines, since the accounts this
+  // page knows the state of are only this machine's.
+  var instances = data && data.scope === 'all' && Array.isArray(data.instances) ? data.instances : null;
+  var counted = instances ? instances.filter(function (/** @type {any} */ m) { return m.state === 'ok'; }).length : 0;
+  var fourth = instances
+    ? { key: 'machines', label: 'Machines', value: String(counted),
+      sub: counted === instances.length ? (counted === 1 ? 'this one; none linked' : 'all linked machines counted') : counted + ' of ' + instances.length + ' counted' }
+    : { key: 'accounts', label: 'Accounts', value: String(list.length),
+      sub: (list.length ? enabled + ' enabled' + (parts.length ? ' · ' + parts.join(' · ') : '') : 'none configured') };
   return [
     { key: 'tokens', label: 'Tokens · ' + insightsRangeText(range), value: fmtTokens(tokens),
       sub: insightsDelta(tokens, p ? p.input + p.output + p.cacheRead + p.cacheWrite : null, range) || (data && data.since == null ? 'nothing recorded yet' : 'no earlier period on record') },
+    { key: 'cost', label: 'Est. API cost', value: cost ? fmtUsd(cost.total) : '—', sub: costSub },
     { key: 'requests', label: 'Requests', value: t.requests.toLocaleString(),
       sub: insightsDelta(t.requests, p ? p.requests : null, range) || 'responses that reported usage' },
-    { key: 'accounts', label: 'Accounts', value: String(list.length),
-      sub: (list.length ? enabled + ' enabled' + (parts.length ? ' · ' + parts.join(' · ') : '') : 'none configured') },
+    fourth,
     { key: 'cache', label: 'Served from cache', value: tokens > 0 ? (t.cacheRead / tokens * 100).toFixed(1) + '%' : '—',
       sub: 'of these tokens were cache reads' },
   ];
+}
+
+// The linked machines an "All machines" reply could not count, as a sentence
+// for under the tiles, or null when every one was counted.
+/** @param {any} data  a GET /teamclaude/insights?scope=all reply */
+export function fleetMissingText(data) {
+  var missed = (data && Array.isArray(data.instances) ? data.instances : []).filter(function (/** @type {any} */ m) { return m.state !== 'ok'; });
+  if (!missed.length) return null;
+  /** @type {Record<string, string>} */
+  var why = { unreachable: 'unreachable', refused: 'refused its key', outdated: 'too old to keep a history', error: 'could not be read' };
+  return 'Not counted: ' + missed.map(function (/** @type {any} */ m) { return m.name + ' (' + (why[m.state] || m.state) + ')'; }).join(', ') + '.';
 }
 
 /** How long an action's result stays above its account card. */
@@ -2034,7 +2093,7 @@ const SHARED_HELPERS = [
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
-  fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis,
+  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fleetMissingText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -2331,6 +2390,7 @@ const PAGE = `<!doctype html>
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
   .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .insbar .lbl { color: var(--dim); font-size: 12px; }
+  .insbar .insscope { display: flex; gap: 8px 14px; align-items: center; }
   .inskpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 12px; margin-bottom: 12px; }
   .inskpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; min-width: 0; }
   .inskpi .l { color: var(--dim); font-size: 12px; }
@@ -2472,12 +2532,13 @@ const PAGE = `<!doctype html>
 
     <section id="page-insights" style="display:none">
       <div class="insbar">
+        <span id="insScopeWrap" class="insscope" style="display:none"><span class="lbl">Machines</span><div id="insScope" class="chips"></div></span>
         <span class="lbl">Range</span><div id="insRange" class="chips"></div>
         <span class="lbl">Split by</span><div id="insSplit" class="chips"></div>
       </div>
       <p class="sub" id="insNote" style="display:none"></p>
       <div id="insBody"></div>
-      <p class="hint">Tokens include cache reads and writes. Days follow this proxy's clock; a year of days and the last 48 hours are kept in its state file.</p>
+      <p class="hint">Tokens include cache reads and writes. Days follow each proxy's clock; a year of days and the last 48 hours are kept in its state file. The API cost is an estimate: what these tokens would cost at the providers' list prices, with cache writes at the 5-minute rate. Third-party backends and unknown models are not priced.</p>
     </section>
 
     <section id="page-accounts" style="display:none">
@@ -4272,9 +4333,20 @@ ${SHARED_HELPERS}
   // minute: the history moves by the request, but a day's chart is not read to
   // the second, and each read sums every bucket in the range.
   var INS_RANGES = [{ key: '24h', label: '24h' }, { key: '7d', label: '7d' }, { key: '30d', label: '30d' }, { key: '90d', label: '90d' }, { key: 'all', label: 'All' }];
-  var INS_SPLITS = [{ key: 'provider', label: 'Provider', text: 'provider' }, { key: 'account', label: 'Account', text: 'account' }, { key: 'kind', label: 'Token type', text: 'token type' }];
+  var INS_SPLITS = [{ key: 'provider', label: 'Provider', text: 'provider' }, { key: 'account', label: 'Account', text: 'account' }, { key: 'instance', label: 'Machine', text: 'machine', fleet: true }, { key: 'kind', label: 'Token type', text: 'token type' }];
+  // Every linked machine summed (GET /teamclaude/insights?scope=all), or only
+  // the instance shown. "All" is asked of the machine the page was opened on,
+  // whichever instance the picker shows: that is the one whose links reach
+  // the rest. Offered only while it has linked instances, and the default then.
+  var INS_SCOPES = [{ key: 'all', label: 'All' }, { key: 'local', label: 'This one' }];
+  var INS_SCOPE_KEY = 'teamclaude-insights-scope';
   var INSIGHTS_REFRESH_MS = 60 * 1000;
-  var ins = { range: '30d', split: 'provider', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var ins = { range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+
+  // The scope the page draws: "all" needs this machine to have linked instances.
+  function insightsScope() {
+    return ins.scope === 'all' && ins.linked > 0 ? 'all' : 'local';
+  }
   var SVGNS = 'http://www.w3.org/2000/svg';
   var insTip = null;
 
@@ -4298,7 +4370,21 @@ ${SHARED_HELPERS}
     INS_SPLITS.forEach(function (o) {
       var b = button('chip', o.label, function () { ins.split = o.key; markInsightsChips(); renderInsights(); });
       split.appendChild(b);
-      ins.chips.push({ group: 'split', key: o.key, btn: b });
+      ins.chips.push({ group: 'split', key: o.key, btn: b, fleet: !!o.fleet });
+    });
+    var scope = document.getElementById('insScope');
+    INS_SCOPES.forEach(function (o) {
+      var b = button('chip', o.label, function () {
+        if (ins.scope === o.key) return;
+        ins.scope = o.key;
+        localStorage.setItem(INS_SCOPE_KEY, o.key);
+        ins.pending = true;
+        markInsightsChips();
+        renderInsights();
+        pollInsights(true);
+      });
+      scope.appendChild(b);
+      ins.chips.push({ group: 'scope', key: o.key, btn: b });
     });
     markInsightsChips();
     if (typeof window !== 'undefined' && window.addEventListener) {
@@ -4311,21 +4397,43 @@ ${SHARED_HELPERS}
   }
 
   function markInsightsChips() {
+    var fleet = !!(ins.data && ins.data.scope === 'all');
+    document.getElementById('insScopeWrap').style.display = ins.linked > 0 ? '' : 'none';
     ins.chips.forEach(function (c) {
-      var on = c.group === 'range' ? c.key === ins.range : c.key === ins.split;
+      var on = c.group === 'range' ? c.key === ins.range : c.group === 'scope' ? c.key === insightsScope() : c.key === insightsSplit();
       c.btn.className = on ? 'chip sel' : 'chip';
+      // "Machine" splits a sum of machines; one machine has nothing to split.
+      if (c.fleet) c.btn.style.display = fleet ? '' : 'none';
     });
   }
 
+  // The split drawn: "Machine" falls back to provider on one machine's data.
+  function insightsSplit() {
+    return ins.split === 'instance' && !(ins.data && ins.data.scope === 'all') ? 'provider' : ins.split;
+  }
+
+  // This machine's linked instances, from the picker's list. Gaining or
+  // losing the first one changes what "All" means, so the page asks again.
+  function setInsightsLinked(n) {
+    if (ins.linked === n) return;
+    ins.linked = n;
+    if (ins.chips.length) markInsightsChips();
+  }
+
   function pollInsights(force) {
-    if (ins.inFlight || (peer && !peerChecked)) return;
+    var scope = insightsScope();
+    if (ins.inFlight || (scope === 'local' && peer && !peerChecked)) return;
+    var want = ins.range + '|' + scope;
     // Throttled by when it last ASKED, not when it last succeeded: a proxy that
     // answers 404 or 500 would otherwise be asked again on every status poll.
-    if (!force && Date.now() - ins.at < INSIGHTS_REFRESH_MS) return;
+    // A different range or scope from the last ask is asked for at once.
+    if (!force && want === ins.asked && Date.now() - ins.at < INSIGHTS_REFRESH_MS) return;
     ins.at = Date.now();
+    ins.asked = want;
     ins.inFlight = true;
     var range = ins.range;
-    fetch(at('/teamclaude/insights?range=' + encodeURIComponent(range)), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+    var url = '/teamclaude/insights?range=' + encodeURIComponent(range);
+    fetch(scope === 'all' ? url + '&scope=all' : at(url), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         // A linked instance on an older proxy has no history to read.
@@ -4335,18 +4443,19 @@ ${SHARED_HELPERS}
       })
       .then(function (d) {
         if (d) {
-          // A reply for a range the page has since left is not drawn; the
-          // finally below asks for the one it is on now.
-          if (d.range !== ins.range) return;
+          // A reply for a range or scope the page has since left is not
+          // drawn; the finally below asks for the one it is on now.
+          if (d.range !== ins.range || (d.scope === 'all') !== (insightsScope() === 'all')) return;
           ins.data = d;
           ins.missing = false;
           ins.pending = false;
         }
         ins.error = null;
+        markInsightsChips();
         renderInsights();
       })
       .catch(function (e) { ins.error = e.message; ins.pending = false; renderInsights(); })
-      .finally(function () { ins.inFlight = false; if (ins.range !== range) pollInsights(true); });
+      .finally(function () { ins.inFlight = false; if (ins.range + '|' + insightsScope() !== want) pollInsights(true); });
   }
 
   function svgEl(tag, attrs, parent) {
@@ -4476,16 +4585,21 @@ ${SHARED_HELPERS}
     hit.addEventListener('mouseleave', function () { cross.style.opacity = '0'; hideInsightsTip(); });
   }
 
-  function drawBars(host, d, values, color, name) {
+  // fmt prints a value on the axis and in the tooltip; counts by default.
+  function drawBars(host, d, values, color, name, fmt) {
+    var axisFmt = fmt || fmtTokens;
+    var tipFmt = fmt || function (v) { return v.toLocaleString(); };
     var W = Math.max(260, host.clientWidth || 520);
     var H = 200;
     var m = { l: 44, r: 8, t: 10, b: 24 };
     var pw = W - m.l - m.r;
     var ph = H - m.t - m.b;
     var n = values.length;
-    var top = 4 * niceStep(Math.max.apply(null, values.concat([0])) / 4);
+    var peak = Math.max.apply(null, values.concat([0]));
+    // Dollars are not counted in ones, so their axis may land on $2.50.
+    var top = fmt ? niceCeil(peak) : 4 * niceStep(peak / 4);
     var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': name }, host);
-    insightsAxis(s, W, H, m, top, fmtTokens);
+    insightsAxis(s, W, H, m, top, axisFmt);
     var band = pw / n;
     var gap = Math.max(1, Math.min(band * 0.25, 8));
     var bw = Math.max(1, band - gap);
@@ -4496,7 +4610,7 @@ ${SHARED_HELPERS}
       if (h > 0) paint(svgEl('path', { d: barPath(x, m.t + ph - h, bw, h) }, s), color);
       if (i % every === 0) svgEl('text', { x: x + bw / 2, y: H - 6, 'text-anchor': 'middle' }, s).textContent = insightsBucketLabel(d.buckets[i], d.unit, false);
       var hit = svgEl('rect', { x: m.l + i * band, y: m.t, width: band, height: ph, fill: 'transparent' }, s);
-      hit.addEventListener('mousemove', function (e) { showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), [{ label: name, value: v.toLocaleString(), color: color }]); });
+      hit.addEventListener('mousemove', function (e) { showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), [{ label: name, value: tipFmt(v), color: color }]); });
       hit.addEventListener('mouseleave', hideInsightsTip);
     });
   }
@@ -4551,7 +4665,7 @@ ${SHARED_HELPERS}
       fill.style.background = it.color;
       track.appendChild(fill);
       row.appendChild(track);
-      row.appendChild(el('span', 'v', fmtTokens(it.value)));
+      row.appendChild(el('span', 'v', it.text != null ? it.text : fmtTokens(it.value)));
       row.addEventListener('mousemove', function (e) { showInsightsTip(e, it.label, it.tip); });
       row.addEventListener('mouseleave', hideInsightsTip);
       host.appendChild(row);
@@ -4632,6 +4746,9 @@ ${SHARED_HELPERS}
     var perBucket = d.unit === 'hour' ? 'per hour' : 'per day';
     var tokensPer = d.buckets.map(function (_, i) { return d.kinds.cacheRead[i] + d.kinds.cacheWrite[i] + d.kinds.input[i] + d.kinds.output[i]; });
 
+    var usd = function (v) { return v == null ? '—' : fmtUsd(v); };
+    var cost = d.cost || null;
+    var fleet = d.scope === 'all';
     var tiles = el('div', 'inskpis');
     insightsKpis(d, accounts).forEach(function (k) {
       var c = el('div', 'inskpi');
@@ -4639,14 +4756,18 @@ ${SHARED_HELPERS}
       c.appendChild(el('div', 'v', k.value));
       c.appendChild(el('div', 'd', k.sub));
       if (k.key === 'tokens' && tokensPer.length > 1) sparkline(c, tokensPer, 'var(--is1)');
+      if (k.key === 'cost' && cost && cost.values.length > 1) sparkline(c, cost.values, 'var(--is3)');
       if (k.key === 'requests' && d.requests.length > 1) sparkline(c, d.requests, 'var(--is7)');
       tiles.appendChild(c);
     });
     body.appendChild(tiles);
+    var missed = fleet ? fleetMissingText(d) : null;
+    if (missed) body.appendChild(el('p', 'sub', missed));
     if (d.since == null) return;
 
-    var split = INS_SPLITS.filter(function (o) { return o.key === ins.split; })[0];
-    var series = insightsSeries(d, ins.split, accounts);
+    var splitKey = insightsSplit();
+    var split = INS_SPLITS.filter(function (o) { return o.key === splitKey; })[0];
+    var series = insightsSeries(d, splitKey, accounts);
     insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text, function (host) {
       drawTimeline(host, d, series);
       insightsLegend(host, series);
@@ -4657,6 +4778,20 @@ ${SHARED_HELPERS}
       };
     });
 
+    // Every machine at once: what each one spent, across the page, since it
+    // is what that view is for.
+    if (fleet) {
+      var machines = (d.instances || []).filter(function (m) { return m.state === 'ok'; });
+      insightsCard(body, 'machines', 'By machine', 'tokens and estimated API cost, ' + rangeText, function (host) {
+        var colors = insightsSeries(d, 'instance', accounts);
+        drawRanked(host, machines.map(function (m, i) {
+          return { label: m.name + (m.self ? ' (this one)' : ''), value: m.tokens, text: fmtTokens(m.tokens) + ' · ' + usd(m.cost), color: colors[i] ? colors[i].color : 'var(--dim)',
+            tip: [{ label: 'Tokens', value: fmtTokens(m.tokens) }, { label: 'Requests', value: num(m.requests) }, { label: 'Est. API cost', value: usd(m.cost) }] };
+        }));
+      }, function () {
+        return { cols: ['Machine', 'Requests', 'Tokens', 'Est. API cost'], rows: machines.map(function (m) { return [m.name, num(m.requests), num(m.tokens), usd(m.cost)]; }) };
+      });
+    }
     var grid = el('div', 'insgrid');
     body.appendChild(grid);
     var t = d.totals;
@@ -4676,10 +4811,10 @@ ${SHARED_HELPERS}
     insightsCard(grid, 'accounts', 'By account', 'tokens, ' + rangeText, function (host) {
       drawRanked(host, d.accounts.map(function (a) {
         return { label: a.account, value: a.tokens, color: 'var(--ip-' + providerTone(a.provider) + ')',
-          tip: [{ label: 'Tokens', value: fmtTokens(a.tokens) }, { label: 'Requests', value: num(a.requests) }, { label: 'Provider', value: groupLabel(a.provider) }] };
+          tip: [{ label: 'Tokens', value: fmtTokens(a.tokens) }, { label: 'Requests', value: num(a.requests) }, { label: 'Est. API cost', value: usd(a.cost) }, { label: 'Provider', value: groupLabel(a.provider) }] };
       }));
     }, function () {
-      return { cols: ['Account', 'Provider', 'Requests', 'Tokens'], rows: d.accounts.map(function (a) { return [a.account, groupLabel(a.provider), num(a.requests), num(a.tokens)]; }) };
+      return { cols: ['Account', 'Provider', 'Requests', 'Tokens', 'Est. API cost'], rows: d.accounts.map(function (a) { return [a.account, groupLabel(a.provider), num(a.requests), num(a.tokens), usd(a.cost)]; }) };
     });
 
     var wide = el('div', 'insgrid wide');
@@ -4693,10 +4828,37 @@ ${SHARED_HELPERS}
     insightsCard(wide, 'models', 'Top models', 'tokens, ' + rangeText, function (host) {
       drawRanked(host, models.map(function (mo) {
         return { label: mo.label, value: mo.tokens, color: 'var(--ip-' + providerTone(mo.provider) + ')',
-          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
+          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
       }));
     }, function () {
       return { cols: ['Model', 'Provider', 'Requests', 'Tokens'], rows: topModels(d.models, 1000).map(function (mo) { return [mo.label, groupLabel(mo.provider), num(mo.requests), num(mo.tokens)]; }) };
+    });
+
+    // What the same tokens would have cost on an API key: per bucket, and by
+    // model, the dearest first. The table shows the token kinds behind each
+    // figure, since cache reads are most of the tokens and least of the cost.
+    if (!cost) return;
+    var costWide = el('div', 'insgrid wide');
+    body.appendChild(costWide);
+    insightsCard(costWide, 'cost', 'Estimated API cost', perBucket + ', at API list prices', function (host) {
+      drawBars(host, d, cost.values, 'var(--is3)', 'Est. API cost', fmtUsd);
+    }, function () {
+      return { cols: ['When', 'Est. API cost'], rows: d.buckets.map(function (b, i) { return [when(b), fmtUsd(cost.values[i])]; }).reverse() };
+    });
+    var byCost = topModels(d.models, 1000).filter(function (mo) { return mo.cost != null; })
+      .sort(function (x, y) { return y.cost - x.cost; });
+    insightsCard(costWide, 'costModels', 'Cost by model', fmtUsd(cost.total) + ', ' + rangeText + (cost.unpricedTokens > 0 ? ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced' : ''), function (host) {
+      if (!byCost.length) { host.appendChild(el('p', 'hint', 'No priced models in this range.')); return; }
+      drawRanked(host, byCost.slice(0, 6).map(function (mo) {
+        return { label: mo.label, value: mo.cost, text: fmtUsd(mo.cost), color: 'var(--ip-' + providerTone(mo.provider) + ')',
+          tip: [{ label: 'Est. API cost', value: fmtUsd(mo.cost) }, { label: 'Input', value: fmtTokens(mo.input) }, { label: 'Output', value: fmtTokens(mo.output) },
+            { label: 'Cache read', value: fmtTokens(mo.cacheRead) }, { label: 'Cache write', value: fmtTokens(mo.cacheWrite) }] };
+      }));
+    }, function () {
+      return { cols: ['Model', 'Provider', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
+        rows: topModels(d.models, 1000).sort(function (x, y) { return (y.cost || 0) - (x.cost || 0); }).map(function (mo) {
+          return [mo.label, groupLabel(mo.provider), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)];
+        }) };
     });
   }
 
@@ -5309,6 +5471,7 @@ ${SHARED_HELPERS}
     var selfName = selfInstanceLabel(self);
     document.getElementById('instanceBack').textContent = 'Back to ' + (self && self.name ? self.name : 'this machine');
     var peers = Array.isArray(list) ? list : [];
+    setInsightsLinked(peers.length);
     var box = document.getElementById('instances');
     box.style.display = peers.length || peer ? '' : 'none';
     var shown = null;

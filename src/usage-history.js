@@ -24,7 +24,11 @@
 // detail. client-usage.js makes the same choice for the same reason.
 //
 // Nothing routes on any of this. It is read by GET /teamclaude/insights and
-// persisted in the state file next to the quota.
+// persisted in the state file next to the quota. What the tokens would cost on
+// an API key is worked out when they are read (api-pricing.js), not stored, so
+// a corrected price applies to the whole history.
+
+import { costAt, priceLookup } from './api-pricing.js';
 
 /** @typedef {{ requests: number, input: number, output: number, cacheRead: number, cacheWrite: number }} Tally */
 /** @typedef {{ provider: string, account: string, model: string, tally: Tally }} Row */
@@ -49,10 +53,18 @@
  *   previous: Tally|null,
  *   requests: number[],
  *   kinds: { cacheRead: number[], cacheWrite: number[], input: number[], output: number[] },
- *   providers: { provider: string, tokens: number, values: number[] }[],
- *   accounts: { provider: string, account: string, tokens: number, requests: number, values: number[] }[],
- *   models: { provider: string, model: string, tokens: number, requests: number }[],
+ *   cost: InsightsCost,
+ *   providers: { provider: string, tokens: number, cost: number, values: number[] }[],
+ *   accounts: { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }[],
+ *   models: ({ provider: string, model: string, tokens: number, requests: number, cost: number|null } & Tally)[],
  * }} Insights
+ */
+/**
+ * The range's tokens at API list prices (api-pricing.js), in USD: in all,
+ * per bucket, and for the period before (null exactly when `previous` is).
+ * `unpricedTokens` are the range's tokens on models with no known price,
+ * which none of the figures include.
+ * @typedef {{ total: number, values: number[], previous: number|null, unpricedTokens: number }} InsightsCost
  */
 
 /** Days of history kept: a year, so the same week last year is still there. */
@@ -411,45 +423,64 @@ function summarize(range, unit, buckets, current, before, since) {
   const totals = emptyTally();
   const requests = zeros();
   const kinds = { cacheRead: zeros(), cacheWrite: zeros(), input: zeros(), output: zeros() };
-  /** @type {Map<string, { provider: string, tokens: number, values: number[] }>} */
+  const price = priceLookup();
+  /** @param {Row} row */
+  const rowCost = row => { const p = price(row.provider, row.model); return p ? costAt(p, row.tally) : null; };
+  const cost = { total: 0, values: zeros(), previous: /** @type {number|null} */ (null), unpricedTokens: 0 };
+  /** @type {Map<string, { provider: string, tokens: number, cost: number, values: number[] }>} */
   const providers = new Map();
-  /** @type {Map<string, { provider: string, account: string, tokens: number, requests: number, values: number[] }>} */
+  /** @type {Map<string, { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }>} */
   const accounts = new Map();
-  /** @type {Map<string, { provider: string, model: string, tokens: number, requests: number }>} */
+  /** @type {Map<string, { provider: string, model: string, tokens: number, cost: number|null } & Tally>} */
   const models = new Map();
   current.forEach((bucket, i) => {
     for (const row of bucket.values()) {
       const t = row.tally;
       const tokens = tallyTokens(t);
+      const usd = rowCost(row);
       addTally(totals, t);
+      if (usd == null) cost.unpricedTokens += tokens;
+      else { cost.total += usd; cost.values[i] += usd; }
       requests[i] += t.requests;
       kinds.cacheRead[i] += t.cacheRead;
       kinds.cacheWrite[i] += t.cacheWrite;
       kinds.input[i] += t.input;
       kinds.output[i] += t.output;
       let p = providers.get(row.provider);
-      if (!p) providers.set(row.provider, p = { provider: row.provider, tokens: 0, values: zeros() });
+      if (!p) providers.set(row.provider, p = { provider: row.provider, tokens: 0, cost: 0, values: zeros() });
       p.tokens += tokens;
+      p.cost += usd ?? 0;
       p.values[i] += tokens;
       const ak = rowKey(row.provider, row.account, '');
       let a = accounts.get(ak);
-      if (!a) accounts.set(ak, a = { provider: row.provider, account: row.account, tokens: 0, requests: 0, values: zeros() });
+      if (!a) accounts.set(ak, a = { provider: row.provider, account: row.account, tokens: 0, requests: 0, cost: 0, values: zeros() });
       a.tokens += tokens;
       a.requests += t.requests;
+      a.cost += usd ?? 0;
       a.values[i] += tokens;
       const mk = rowKey(row.provider, '', row.model);
       let m = models.get(mk);
-      if (!m) models.set(mk, m = { provider: row.provider, model: row.model, tokens: 0, requests: 0 });
+      // A model is priced or not as a whole, so its cost is null exactly when
+      // its every row's is.
+      if (!m) models.set(mk, m = { provider: row.provider, model: row.model, tokens: 0, cost: usd == null ? null : 0, ...emptyTally() });
       m.tokens += tokens;
-      m.requests += t.requests;
+      addTally(m, t);
+      if (usd != null) m.cost = (m.cost ?? 0) + usd;
     }
   });
   /** @type {Tally|null} */
   let previous = null;
   if (before) {
     const prev = emptyTally();
-    for (const bucket of before) for (const row of bucket.values()) addTally(prev, row.tally);
+    let prevCost = 0;
+    for (const bucket of before) {
+      for (const row of bucket.values()) {
+        addTally(prev, row.tally);
+        prevCost += rowCost(row) ?? 0;
+      }
+    }
     previous = prev;
+    cost.previous = prevCost;
   }
   /** @param {{ tokens: number }} x @param {{ tokens: number }} y */
   const byTokens = (x, y) => y.tokens - x.tokens;
@@ -462,6 +493,7 @@ function summarize(range, unit, buckets, current, before, since) {
     previous,
     requests,
     kinds,
+    cost,
     providers: [...providers.values()].sort(byTokens),
     accounts: [...accounts.values()].sort(byTokens),
     models: [...models.values()].sort(byTokens),

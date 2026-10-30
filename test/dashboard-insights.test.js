@@ -6,12 +6,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   renderDashboardHtml, fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel,
-  insightsSeries, stackSeries, donutArcs, topModels, insightsKpis,
+  insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fmtUsd, fleetMissingText,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
   const html = renderDashboardHtml();
-  for (const fn of [fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis]) {
+  for (const fn of [fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fmtUsd, fleetMissingText]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -191,7 +191,9 @@ test('the headline tiles', () => {
     { name: 'a', provider: 'anthropic' }, { name: 'b', provider: 'anthropic', disabled: true },
     { name: 'c', provider: 'codex' }, { name: 'd', provider: 'anthropic', backend: 'api.deepseek.com' },
   ];
-  const [tokens, requests, accts, cache] = insightsKpis(data, accounts);
+  /** @param {any[]} tiles */
+  const byKey = tiles => Object.fromEntries(tiles.map(t => [t.key, t]));
+  const { tokens, requests, accounts: accts, cache } = byKey(insightsKpis(data, accounts));
   assert.equal(tokens.label, 'Tokens · last 7 days');
   assert.equal(tokens.value, '1.0k');
   assert.equal(tokens.sub, '▲ 100% vs the previous 7 days');
@@ -201,10 +203,79 @@ test('the headline tiles', () => {
   assert.equal(accts.sub, '3 enabled · 2 Claude · 1 Codex · 1 backend');
   assert.equal(cache.value, '90.0%');
 
-  const fresh = insightsKpis({ ...data, previous: null }, []);
-  assert.equal(fresh[0].sub, 'no earlier period on record');
-  assert.equal(fresh[2].sub, 'none configured');
-  const empty = insightsKpis({ ...data, since: null, previous: null, totals: { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, []);
-  assert.equal(empty[0].sub, 'nothing recorded yet');
-  assert.equal(empty[3].value, '—');
+  const fresh = byKey(insightsKpis({ ...data, previous: null }, []));
+  assert.equal(fresh.tokens.sub, 'no earlier period on record');
+  assert.equal(fresh.accounts.sub, 'none configured');
+  const empty = byKey(insightsKpis({ ...data, since: null, previous: null, totals: { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }, []));
+  assert.equal(empty.tokens.sub, 'nothing recorded yet');
+  assert.equal(empty.cache.value, '—');
+});
+
+test('dollars read at a glance', () => {
+  assert.equal(fmtUsd(0), '$0');
+  assert.equal(fmtUsd(0.004), '<$0.01');
+  assert.equal(fmtUsd(0.42), '$0.42');
+  assert.equal(fmtUsd(12.345), '$12.35');
+  assert.equal(fmtUsd(999.994), '$999.99');
+  assert.equal(fmtUsd(12345.6), '$12,346');
+  assert.equal(fmtUsd(null), '$0');
+});
+
+test('the cost tile: the estimate, against the period before, and what it left out', () => {
+  const tile = (/** @type {any} */ d) => insightsKpis(d, []).find(t => t.key === 'cost');
+  const priced = { ...data, cost: { total: 30, values: [10, 20], previous: 20, unpricedTokens: 0 } };
+  assert.equal(tile(priced).label, 'Est. API cost');
+  assert.equal(tile(priced).value, '$30.00');
+  assert.equal(tile(priced).sub, '▲ 50% vs the previous 7 days');
+  const partly = { ...data, cost: { total: 30, values: [10, 20], previous: null, unpricedTokens: 150 } };
+  assert.equal(tile(partly).sub, 'at API list prices · 150 tokens unpriced');
+  // A linked instance on a proxy older than the estimate sends no cost at all.
+  assert.equal(tile(data).value, '—');
+  assert.equal(tile(data).sub, 'this proxy is too old to estimate it');
+});
+
+const fleet = {
+  ...data,
+  scope: 'all',
+  accounts: [...data.accounts, { provider: 'anthropic', account: 'z', tokens: 9, requests: 1, values: [9, 0] }, { provider: 'anthropic', account: 'm', tokens: 8, requests: 1, values: [0, 8] }],
+  instances: [
+    { name: 'desk', self: true, state: 'ok', tokens: 700, requests: 2, cost: 5, values: [300, 400] },
+    { name: 'laptop', self: false, state: 'unreachable', error: 'timed out', tokens: 0, requests: 0, cost: 0, values: [0, 0] },
+    { name: 'server', self: false, state: 'ok', tokens: 300, requests: 1, cost: 2, values: [200, 100] },
+  ],
+};
+
+test('every machine at once: the tile counts machines, and says which were missed', () => {
+  const tiles = insightsKpis(fleet, [{ name: 'a', provider: 'anthropic' }]);
+  assert.equal(tiles.find(t => t.key === 'accounts'), undefined, 'one machine\'s accounts are not the fleet\'s');
+  const machines = tiles.find(t => t.key === 'machines');
+  assert.equal(machines?.value, '2');
+  assert.equal(machines?.sub, '2 of 3 counted');
+  assert.equal(fleetMissingText(fleet), 'Not counted: laptop (unreachable).');
+  const all = { ...fleet, instances: [fleet.instances[0], fleet.instances[2]] };
+  assert.equal(insightsKpis(all, []).find(t => t.key === 'machines')?.sub, 'all linked machines counted');
+  assert.equal(fleetMissingText(all), null);
+  assert.equal(fleetMissingText(data), null);
+});
+
+test('split by machine: one series per machine counted, coloured by its place in the list', () => {
+  const s = insightsSeries(fleet, 'instance', []);
+  assert.deepEqual(s.map(x => [x.label, x.color, x.total]), [['desk', 'var(--is1)', 700], ['server', 'var(--is3)', 300]]);
+  assert.deepEqual(s[1].values, [200, 100]);
+  assert.deepEqual(insightsSeries(data, 'instance', []), [], 'one machine has no machines to split');
+});
+
+test('split by account on every machine: a linked machine\'s accounts follow this one\'s, by name', () => {
+  const s = insightsSeries(fleet, 'account', [{ name: 'a', provider: 'anthropic' }, { name: 'b', provider: 'anthropic' }]);
+  // a and b from this config, then codex/gone, anthropic/m, anthropic/z sorted.
+  assert.deepEqual(s.map(x => [x.label, x.color]), [['a', 'var(--is1)'], ['b', 'var(--is2)'], ['m', 'var(--is3)'], ['z', 'var(--is4)'], ['gone', 'var(--is5)']]);
+});
+
+test('models carry their cost, null only while no snapshot of them is priced', () => {
+  const top = topModels([
+    { provider: 'anthropic', model: 'claude-haiku-4-5-20251001', tokens: 30, requests: 1, input: 10, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 },
+    { provider: 'anthropic', model: 'claude-haiku-4-5', tokens: 40, requests: 1, input: 40, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.25 },
+    { provider: 'codex', model: '(unknown)', tokens: 5, requests: 1, cost: null },
+  ], 6);
+  assert.deepEqual(top.map(m => [m.label, m.cost, m.input]), [['Haiku 4.5', 0.75, 50], ['(unknown)', null, 0]]);
 });

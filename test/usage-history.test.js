@@ -225,3 +225,39 @@ test('insightsRange reads ?range= and falls back to the default', () => {
   assert.equal(insightsRange('/teamclaude/insights?range=1y'), DEFAULT_INSIGHTS_RANGE);
   assert.equal(insightsRange(undefined), DEFAULT_INSIGHTS_RANGE);
 });
+
+test('insights price each row at its model\'s API rate, and say what they could not price', () => {
+  const c = clock();
+  const h = new UsageHistory({ now: c.now });
+  const big = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_input_tokens: 10_000_000, cache_creation_input_tokens: 2_000_000 };
+  h.record({ provider: 'anthropic', account: 'a', model: 'claude-opus-5-5', usage: big });
+  h.record({ provider: 'codex', account: 'cx', model: 'gpt-5', usage: { input_tokens: 2_000_000, output_tokens: 0 } });
+  h.record({ provider: 'backend:api.deepseek.com', account: 'ds', model: 'deepseek-v4', usage: { input_tokens: 500, output_tokens: 0 } });
+  h.record({ provider: 'anthropic', account: 'a', model: null, usage: { input_tokens: 7, output_tokens: 0 } });
+  const d = h.insights('7d');
+  // Opus 5.5: 4 + 20 + 10M × $0.20 + 2M × $5 = 36. gpt-5: 2M × $1.25 = 2.50.
+  assert.equal(d.cost.total, 38.5);
+  assert.equal(d.cost.values[6], 38.5, 'today, the last bucket');
+  assert.equal(d.cost.unpricedTokens, 507, 'the backend and the unnamed model');
+  assert.equal(d.cost.previous, null, 'none when `previous` is none');
+  assert.deepEqual(d.accounts.map(a => [a.account, a.cost]), [['a', 36], ['cx', 2.5], ['ds', 0]]);
+  assert.deepEqual(d.providers.map(p => [p.provider, p.cost]), [['anthropic', 36], ['codex', 2.5], ['backend:api.deepseek.com', 0]]);
+  const opus = d.models.find(m => m.model === 'claude-opus-5-5');
+  assert.equal(opus?.cost, 36);
+  assert.deepEqual([opus?.input, opus?.output, opus?.cacheRead, opus?.cacheWrite, opus?.requests], [1_000_000, 1_000_000, 10_000_000, 2_000_000, 1]);
+  assert.equal(d.models.find(m => m.provider === 'backend:api.deepseek.com')?.cost, null);
+  assert.equal(d.models.find(m => m.model === UNKNOWN_MODEL)?.cost, null);
+});
+
+test('the cost of the period before is priced the same way', () => {
+  // Recording begins on the first day of the 7 days before the last 7.
+  const c = clock(new Date(new Date(noonToday()).setDate(new Date().getDate() - 13)).getTime());
+  const h = new UsageHistory({ now: c.now });
+  h.record({ provider: 'anthropic', account: 'a', model: 'claude-haiku-4-5', usage: { input_tokens: 1_000_000, output_tokens: 0 } });
+  c.set(noonToday());
+  h.record({ provider: 'anthropic', account: 'a', model: 'claude-haiku-4-5', usage: { input_tokens: 3_000_000, output_tokens: 0 } });
+  const d = h.insights('7d');
+  assert.equal(d.cost.total, 3);
+  assert.equal(d.cost.previous, 1);
+  assert.equal(h.insights('all').cost.previous, null);
+});

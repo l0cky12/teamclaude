@@ -34,6 +34,7 @@ import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
 import { insightsRange } from './usage-history.js';
+import { fleetInsights, insightsScope } from './fleet-insights.js';
 import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
 
@@ -953,12 +954,25 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // The usage history behind the dashboard's Insights page (usage-history.js),
       // summed for one `?range=` (24h, 7d, 30d, 90d or all). Same gate as /status
       // and /logs, client keys included, and the same naming: accounts by their
-      // configured name, never an email or a token.
+      // configured name, never an email or a token. `?scope=all` adds every
+      // linked instance's own (fleet-insights.js); that one is operator only,
+      // like the relay, since it reads the other machines with their keys.
       if (req.method === 'GET' && /^\/teamclaude\/insights(\?|$)/.test(req.url || '')) {
         const body = accountManager.usageHistory?.insights(insightsRange(req.url));
         if (!body) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'insights not supported' }));
+          return;
+        }
+        if (insightsScope(req.url) === 'all') {
+          if (req.tcClient) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'a client key cannot reach linked instances' }));
+            return;
+          }
+          const fleet = await fleetInsights({ local: body, selfName: instanceName(config), peers: configuredPeers(config) });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(fleet));
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
