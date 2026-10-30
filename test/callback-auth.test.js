@@ -459,6 +459,64 @@ test('a write from before a sign-out is refused afterwards', async (t) => {
   assert.equal((await loadCallbackToken()).access_token, 'a');
 });
 
+test('a reply held past a sign-out cannot renew the old session back', async (t) => {
+  await tempConfig(t);
+  // The API honours another token, so the held reply says this one expired.
+  const api = await mockApi(t, { access: 'at-current' });
+  await saveCallbackToken({ access_token: 'at-stale', refresh_token: 'rt-1', expires_in: 3600, client_id: CLIENT, obtained_at: 1 });
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  let reached = () => {};
+  const atMe = new Promise((resolve) => { reached = resolve; });
+  let first = true;
+  const fetchImpl = async (url, init) => {
+    const path = String(url);
+    if (path.endsWith('OAuth2:me') && first) { first = false; reached(); const res = await fetch(url, init); await held; return res; }
+    // The revoke cannot be reached: the session is only forgotten locally.
+    if (path.endsWith('OAuth2:revoke')) throw new TypeError('fetch failed');
+    return fetch(url, init);
+  };
+  const call = callbackWhoami({ base: api.base, now: () => 5, fetchImpl }).then(() => 'ok', (err) => err);
+  await atMe;
+  assert.deepEqual(await logoutCallback({ base: api.base, fetchImpl }), { wasSignedIn: true, revoked: false });
+  release();
+  const result = await call;
+  assert.ok(result instanceof Error && result.loginRequired, 'the call learns the session is gone');
+  assert.equal(api.state.seen.filter((x) => x.path === 'OAuth2:token').length, 0, 'no renewal was sent');
+  assert.equal(await loadCallbackToken(), null, 'nothing was written back');
+});
+
+test('overlapping sign-outs share one, and a sign-in after them stays', async (t) => {
+  await tempConfig(t);
+  const api = await mockApi(t);
+  await saveCallbackToken({ access_token: 'at-1', refresh_token: 'rt-1', client_id: CLIENT, obtained_at: 1 });
+  let releaseRevoke = () => {};
+  const revokeHeld = new Promise((resolve) => { releaseRevoke = resolve; });
+  let atRevoke = () => {};
+  const revoking = new Promise((resolve) => { atRevoke = resolve; });
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('OAuth2:revoke')) { atRevoke(); await revokeHeld; }
+    return fetch(url, init);
+  };
+  const a = logoutCallback({ base: api.base, fetchImpl });
+  await revoking;
+  let bDone = false;
+  const b = logoutCallback({ base: api.base, fetchImpl }).then((r) => { bDone = true; return r; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bDone, false, 'the second sign-out does not finish before the first');
+  // While they run, no session can be written.
+  await assert.rejects(saveCallbackTokenIn({ access_token: 'at-new', refresh_token: 'rt-new', client_id: CLIENT, obtained_at: 2 }, callbackSessionEpoch()), (err) => err.loginRequired === true);
+  releaseRevoke();
+  const [ra, rb] = await Promise.all([a, b]);
+  assert.deepEqual(ra, { wasSignedIn: true, revoked: true });
+  assert.deepEqual(rb, ra, 'one sign-out, one result');
+  assert.deepEqual(api.state.revoked, ['rt-1'], 'revoked once');
+  // A sign-in after both: nothing still running deletes it.
+  await saveCallbackTokenIn({ access_token: 'at-new', refresh_token: 'rt-new', client_id: CLIENT, obtained_at: 2 }, callbackSessionEpoch());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await loadCallbackToken())?.access_token, 'at-new');
+});
+
 // ── the command ──────────────────────────────────────────────
 
 function runCli(configPath, base, cliArgs) {
