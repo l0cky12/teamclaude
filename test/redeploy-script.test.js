@@ -28,7 +28,10 @@ if [ "$1" = compose ]; then
     "ps -q") [ -f "$s/running" ] && echo cid1 ;;
     "ps -aq") [ -f "$s/running" ] && echo cid1 ;;
     build*) [ -f "$s/build_fails" ] && exit 1; echo new > "$s/local" ;;
-    up*) cp "$s/local" "$s/container"; touch "$s/running" ;;
+    up*)
+      # up_fails_once: compose removed the old container, then failed.
+      if [ -f "$s/up_fails_once" ]; then rm -f "$s/up_fails_once" "$s/running"; exit 1; fi
+      cp "$s/local" "$s/container"; touch "$s/running" ;;
     logs*) echo "fake log line" ;;
   esac
   exit 0
@@ -55,7 +58,10 @@ case $1 in
       teamclaude:previous) echo "$src" > "$s/previous" ;;
       teamclaude:local) echo "$src" > "$s/local" ;;
     esac ;;
-  exec) [ "$(get container)" != new ] || [ -f "$s/new_is_healthy" ] ;;
+  exec)
+    # probe_hangs: the new image's health check never answers.
+    if [ "$(get container)" = new ] && [ -f "$s/probe_hangs" ]; then exec sleep 60; fi
+    [ "$(get container)" != new ] || [ -f "$s/new_is_healthy" ] ;;
 esac
 `;
 
@@ -106,7 +112,7 @@ async function setup({ running = true } = {}) {
     run: (...args) => {
       const env = { ...process.env, ...gitEnv, PATH: `${bin}:${process.env.PATH}`, STUB_DIR: stub, TEAMCLAUDE_REDEPLOY_TIMEOUT: '0' };
       for (const key of ['COMPOSE_FILE', 'COMPOSE_PROJECT_NAME', 'TEAMCLAUDE_SERVICE']) delete env[key];
-      return spawnSync(join(repo, 'scripts', 'redeploy.sh'), args, { cwd: root, env, encoding: 'utf8', timeout: 60_000 });
+      return spawnSync(join(repo, 'scripts', 'redeploy.sh'), args, { cwd: root, env, encoding: 'utf8', timeout: 30_000 });
     },
     calls: async () => (await readFile(join(stub, 'calls'), 'utf8')).trim().split('\n'),
     state: async (/** @type {string} */ name) => (await readFile(join(stub, name), 'utf8')).trim(),
@@ -152,6 +158,37 @@ test('an unhealthy new container is rolled back to the previous image', async ()
   }
 });
 
+test('a failed compose up is rolled back too, even with the old container gone', async () => {
+  const t = await setup();
+  try {
+    await writeFile(join(t.stub, 'up_fails_once'), '');
+    const r = t.run('--no-pull');
+    assert.equal(r.status, 1);
+    assert.ok((await t.calls()).includes('tag teamclaude:previous teamclaude:local'));
+    assert.ok(existsSync(join(t.stub, 'running')));
+    assert.equal(await t.state('container'), 'old');
+    assert.match(r.stderr, /rolled back/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('a health probe that never answers is cut off and rolled back', async () => {
+  const t = await setup();
+  try {
+    // The stand-in probe would block for 60 s; the spawn timeout (30 s) fails
+    // the test unless the script stops waiting for it on its own.
+    await writeFile(join(t.stub, 'probe_hangs'), '');
+    const r = t.run('--no-pull');
+    assert.equal(r.error, undefined);
+    assert.equal(r.status, 1);
+    assert.equal(await t.state('container'), 'old');
+    assert.match(r.stderr, /rolled back/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test('a failed build leaves the running container alone', async () => {
   const t = await setup();
   try {
@@ -180,6 +217,20 @@ test('does nothing when the container already runs the checked-out commit, unles
     assert.equal(forced.status, 0, forced.stderr);
     assert.ok((await t.calls()).some((c) => c.startsWith('compose build')));
     assert.equal(await t.state('container'), 'new');
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('a second run straight after a successful one is not locked out', async () => {
+  const t = await setup();
+  try {
+    await writeFile(join(t.stub, 'new_is_healthy'), '');
+    const first = t.run('--no-pull', '--force');
+    assert.equal(first.status, 0, first.stderr);
+    const second = t.run('--no-pull', '--force');
+    assert.equal(second.status, 0, second.stderr);
+    assert.doesNotMatch(second.stderr, /already running/);
   } finally {
     await t.cleanup();
   }

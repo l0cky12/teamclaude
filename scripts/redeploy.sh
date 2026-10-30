@@ -104,7 +104,7 @@ built=$(docker image inspect -f '{{.Id}}' "$image")
 # 0: healthy. 1: not yet. 2: the container stopped or is crash-looping, so
 # there is no point waiting out the timeout. The check is the image's own
 # HEALTHCHECK command, run now rather than at Docker's next scheduled probe
-# (every 30 s).
+# (every 30 s). Called from wait_healthy, whose $deadline it reads.
 healthy() {
   local id check
   id=$(docker compose ps -aq "$service")
@@ -115,7 +115,22 @@ healthy() {
     *) return 1 ;;
   esac
   check=$(docker inspect -f '{{with .Config.Healthcheck}}{{if eq (index .Test 0) "CMD-SHELL"}}{{index .Test 1}}{{end}}{{end}}' "$id")
-  [ -z "$check" ] || docker exec "$id" sh -c "$check" >/dev/null 2>&1
+  [ -n "$check" ] || return 0
+  # A probe that hangs must not hold up the rollback, so it gets at most 10 s
+  # and never more than what is left of wait_healthy's deadline.
+  local limit=$((deadline - SECONDS)) probe watcher
+  [ "$limit" -le 10 ] || limit=10
+  [ "$limit" -ge 1 ] || limit=1
+  # 9>&-: the background jobs must not inherit the redeploy lock, or the
+  # watcher's leftover sleep would hold it after the script exits.
+  docker exec "$id" sh -c "$check" >/dev/null 2>&1 9>&- &
+  probe=$!
+  { sleep "$limit"; kill "$probe"; } >/dev/null 2>&1 9>&- &
+  watcher=$!
+  local rc=0
+  wait "$probe" || rc=1
+  kill "$watcher" 2>/dev/null || true
+  return "$rc"
 }
 
 wait_healthy() {
@@ -138,10 +153,10 @@ drop_if_untagged() {
   fi
 }
 
+# A failed `up` goes through the rollback too: compose may already have
+# removed the old container when it fails to start the new one.
 say "Restarting $service"
-docker compose up -d --no-build "$service"
-
-if wait_healthy; then
+if docker compose up -d --no-build "$service" && wait_healthy; then
   drop_if_untagged "$old_previous"
   say "Done: $service is healthy on $(git rev-parse --short HEAD)"
   exit 0
@@ -153,8 +168,8 @@ docker compose logs --tail 40 "$service" >&2 || true
 
 say "Rolling back to the previous image"
 docker tag "$previous" "$image"
-docker compose up -d --no-build "$service"
-wait_healthy || die "the previous image is not healthy either; check 'docker compose logs $service'"
+docker compose up -d --no-build "$service" && wait_healthy \
+  || die "the previous image did not come up healthy either; check 'docker compose logs $service'"
 drop_if_untagged "$built"
 drop_if_untagged "$old_previous"
 die "rolled back; the proxy is running the previous image. The checkout stays at $(git rev-parse --short HEAD) so you can fix it and re-run."
