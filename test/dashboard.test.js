@@ -1228,7 +1228,7 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
     removeAttribute: k => rootAttrs.delete(k),
     getAttribute: k => (rootAttrs.has(k) ? rootAttrs.get(k) : null),
   };
-  const document = { getElementById: byId, createElement: () => stubEl(), documentElement };
+  const document = { getElementById: byId, createElement: () => stubEl(), createElementNS: () => stubEl(), documentElement };
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   let poll;
@@ -1262,6 +1262,60 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   // click by (an input the page made for itself).
   const findLast = pred => built.slice().reverse().find(pred);
   return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, poll: () => { mark = built.length; poll(); } };
+}
+
+// The Insights page reads /teamclaude/insights only while it is open, like the
+// log; a status poll does not ask again while the copy is fresh, a new range
+// asks at once, and a linked instance too old to keep history says so.
+const INSIGHTS = {
+  range: '30d', unit: 'day', buckets: ['2026-01-01', '2026-01-02'], since: 1,
+  totals: { requests: 2, input: 1, output: 1, cacheRead: 8, cacheWrite: 0 }, previous: null, requests: [1, 1],
+  kinds: { cacheRead: [4, 4], cacheWrite: [0, 0], input: [1, 0], output: [0, 1] },
+  providers: [{ provider: 'anthropic', tokens: 10, values: [5, 5] }],
+  accounts: [{ provider: 'anthropic', account: 'a', tokens: 10, requests: 2, values: [5, 5] }],
+  models: [{ provider: 'anthropic', model: 'claude-opus-5-5', tokens: 10, requests: 2 }],
+};
+
+test('the Insights page asks for history only while open, once per range, and says when an instance has none', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  assert.deepEqual(page.requests, [], 'nothing fetched for a page that is not open');
+
+  page.click('Insights');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=30d']);
+  await page.answer(200, INSIGHTS);
+  assert.equal(page.byId('insNote').style.display, 'none', 'drawn, with no note');
+
+  page.poll();
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/status']);
+  await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic' }] });
+  assert.deepEqual(page.requests, [], 'a fresh copy is not fetched again on the status poll');
+
+  page.click('7d');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=7d']);
+  await page.answer(404, {});
+  assert.match(page.byId('insNote').textContent, /older proxy that keeps no usage history/);
+});
+
+// A failed read is throttled like a successful one: a proxy answering 404 or
+// 500 must not be asked again on every five-second status poll.
+for (const status of [404, 500]) {
+  test(`a ${status} from the history is not asked for again on the next status poll`, async () => {
+    const page = bootPage();
+    await page.answer(200, { accounts: [] });
+    page.click('Insights');
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=30d']);
+    await page.answer(status, {});
+    for (let i = 0; i < 3; i++) {
+      page.poll();
+      assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/status']);
+      await page.answer(200, { accounts: [] });
+      assert.deepEqual(page.requests, [], `poll ${i + 1} asks for status only`);
+    }
+    // Choosing a range is the person asking: that goes out at once.
+    page.click('7d');
+    assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/insights?range=7d']);
+  });
 }
 
 test('the quota refresh picker keeps keyboard focus and coalesces steps made while saving', async () => {

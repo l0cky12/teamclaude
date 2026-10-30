@@ -4,9 +4,11 @@
 
 Config is stored at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME/teamclaude.json`). A random proxy API key is generated on first use.
 
-Volatile runtime state (observed quota, per-client and per-dimension usage) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic, and usage windows refill from the next day's traffic (the lifetime counters do not come back).
+Volatile runtime state (observed quota, per-client and per-dimension usage, and the usage history behind the dashboard's [Insights page](usage.md#insights)) is written separately to `teamclaude.state.json` alongside the config, so the config file stays clean and hand-editable. The state file is safe to delete — quota is simply re-learned from traffic, and usage windows refill from the next day's traffic (the lifetime counters and the Insights history do not come back).
 
 That file is small for a typical fleet, but it is no longer trivially small: usage is kept per 15-minute slot for a day (see [Usage windows](usage.md#status-dashboard-browser)). Every client key and dimension value ever seen keeps a row of lifetime counters, as it always has, and those are never deleted; what the day of slots adds is carried only by the keys **active in the last 24 hours**, because a key that goes quiet drops its slots the next time it is read or written. So a dimension that merely accumulates stale values does not accumulate slots with them.
+
+The Insights history adds one line per day, holding a row per account and model used that day, for a year, plus the last 48 hours. A pool of five accounts and a dozen models comes to roughly 300 KiB after a year, and the file stops growing then.
 
 At the 500-value cap that means a file of a few MiB when every value is genuinely active at once (the file is pretty-printed, so that is bytes on disk), and on the order of a hundred KiB when the values churn — one busy day each — or when only the lifetime rows remain. The write is synchronous: serialising the all-active case costs tens of milliseconds before the `fsync`, once a minute. A fleet with a handful of client keys is unaffected either way, but a deployment pointing a high-cardinality dimension at this on slow storage should know the shape of it.
 

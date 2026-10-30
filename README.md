@@ -105,6 +105,7 @@ Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`
 
 - **Quota:** how much is left on every account, as 5-hour, weekly and Fable bars with reset times. Tabs for Claude, Codex and each backend, plus pooled summary cards. Accounts that are out of quota are hidden until you ask to see them. Enabled accounts whose quota can be read get a **Refresh quota** button, which checks it without spending any.
 - **Accounts:** **Sign in to Claude** and **Sign in to Codex** buttons add accounts from the browser, including from a phone or another computer. You can also sign an account in again, remove it, switch to it, disable it, or move it up or down the priority order.
+- **Insights:** graphs of what your accounts have done over the last 24 hours, 7, 30 or 90 days, or since you started: tokens over time split by provider, account or token type, the token mix, the busiest accounts and models, and requests per day. Each chart can also be shown as a table.
 - **Logs:** every request, sign-in, sign-out, account switch and settings change, with filters by kind, provider and account. Each request shows which client sent it. Turn on `proxy.logPrompts` to also see the prompt that started it.
 - **Clients:** create a separate key for each machine or agent. The dashboard shows the exact settings to paste into Claude Code or `~/.codex/config.toml`, and how much each key has used over the last 5 hours, 24 hours, or all time.
 - **Sessions, Routing and Settings:** what each conversation spent, which account each model goes to, the switch threshold, and the background quota check (off, or every 5 to 120 seconds).
@@ -178,6 +179,7 @@ This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the
 - The Sessions table shown by default ([#14](https://github.com/l0cky12/teamclaude/pull/14)).
 - The Logs page shows which client sent each request and, if you turn on `proxy.logPrompts`, its prompt ([#18](https://github.com/l0cky12/teamclaude/pull/18)).
 - Linked instances: link TeamRouter on your other machines and control them all from one dashboard, set up from the Settings page ([#20](https://github.com/l0cky12/teamclaude/pull/20), [#21](https://github.com/l0cky12/teamclaude/pull/21)).
+- An Insights page with graphs of your usage over the last day, week, month, 90 days or all time: tokens by provider, account or token type, the token mix, and the busiest accounts and models ([#29](https://github.com/l0cky12/teamclaude/pull/29)).
 
 **Routing**
 
