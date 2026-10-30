@@ -45,7 +45,8 @@ test('one add with a link back links two real proxies both ways', async () => {
       name: 'desk', url: deskUrl, apiKey: 'tc-desk-key', linkBack: { name: 'hub', url: hubUrl },
     });
     const body = await res.json();
-    assert.deepEqual(body, { ok: true, name: 'desk', url: deskUrl, linkBack: { ok: true } }, hub.output() + desk.output());
+    // Neither listed anyone else, so the join had nothing to link.
+    assert.deepEqual(body, { ok: true, name: 'desk', url: deskUrl, linkBack: { ok: true }, mesh: { linked: [], skipped: [] } }, hub.output() + desk.output());
 
     // Each file names the other, with the other's own key.
     assert.deepEqual(JSON.parse(await readFile(hub.configPath, 'utf-8')).peers, [{ name: 'desk', url: deskUrl, apiKey: 'tc-desk-key' }]);

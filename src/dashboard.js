@@ -955,6 +955,8 @@ export function peerLinkRequest(step, body, key) {
 /**
  * What to tell the operator after an add or a remove. An add that linked one
  * way only says so: the other machine's dashboard will not show this one yet.
+ * One that linked both ways also names the instances each side already
+ * listed that were linked across too (`mesh`), and the ones that were not.
  *
  * @param {any} res
  * @param {'add'|'remove'} step
@@ -963,7 +965,23 @@ export function peerLinkOutcome(res, step) {
   if (!res || !res.ok) return { kind: 'error', text: PEER_LINK_FAILED[step] + (res && res.error ? ': ' + res.error : '') };
   if (step === 'remove') return { kind: 'ok', text: 'Removed ' + res.name + '. If it lists this machine too, remove that link from its own dashboard.' };
   var back = res.linkBack;
-  if (back && back.ok) return { kind: 'ok', text: 'Linked ' + res.name + ' both ways: each dashboard now shows the other in the Instance picker.' };
+  if (back && back.ok) {
+    var text = 'Linked ' + res.name + ' both ways: each dashboard now shows the other in the Instance picker.';
+    var mesh = res.mesh;
+    if (!mesh) return { kind: 'ok', text: text };
+    // A pair is linked one direction at a time; both directions read as one.
+    /** @type {string[]} */
+    var also = [];
+    (Array.isArray(mesh.linked) ? mesh.linked : []).forEach(function (/** @type {any} */ l) {
+      var i = also.indexOf(l.to + ' → ' + l.from);
+      if (i >= 0) also[i] = l.to + ' ↔ ' + l.from;
+      else also.push(l.from + ' → ' + l.to);
+    });
+    var missed = (Array.isArray(mesh.skipped) ? mesh.skipped : []).map(function (/** @type {any} */ l) { return l.error; });
+    if (also.length) text += ' Also linked the instances they already listed: ' + also.join(', ') + '.';
+    if (missed.length) text += ' Not linked: ' + missed.join('; ') + '.';
+    return { kind: missed.length ? 'warn' : 'ok', text: text };
+  }
   if (back) return { kind: 'warn', text: 'Linked ' + res.name + ', but it did not link back: ' + back.error + '.' };
   return { kind: 'ok', text: 'Linked ' + res.name + '. Pick it in the Instance picker to see it.' };
 }
