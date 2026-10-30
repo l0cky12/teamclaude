@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -1155,7 +1155,7 @@ test('the page ships the same helper implementations it is tested against', () =
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
     peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-    instanceAddressRequest, instanceAddressOutcome,
+    instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress,
     accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
@@ -2936,6 +2936,51 @@ test('the Instance address row saves what is typed, and the link handed out then
     const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
     assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
     assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address above)'), 'and says it is no guess');
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
+test('linkSelfWithAddress swaps the address set and keeps the guesses', () => {
+  const self = { name: 'hub', address: 'http://100.64.0.9:3456', addresses: ['http://100.64.0.9:3456', 'http://172.30.0.2:3456'] };
+  assert.deepEqual(linkSelfWithAddress(self, 'http://100.64.0.7:3456').addresses, ['http://100.64.0.7:3456', 'http://172.30.0.2:3456']);
+  assert.deepEqual(linkSelfWithAddress(self, ''), { ...self, address: '', addresses: ['http://172.30.0.2:3456'] });
+  assert.deepEqual(linkSelfWithAddress({ name: 'hub', addresses: ['http://172.30.0.2:3456'] }, 'http://172.30.0.2:3456').addresses, ['http://172.30.0.2:3456'], 'not listed twice');
+  assert.equal(self.address, 'http://100.64.0.9:3456', 'the read it came from is left alone');
+  assert.equal(linkSelfWithAddress(null, 'x'), null);
+});
+
+test('a Show key answered before the reads that follow a save already carries the new address', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    await page.answer(200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    page.byId('addrVal').value = '100.64.0.9:3456';
+    page.byId('addrSet').fire('click');
+    await page.answerTo('/teamclaude/instance-address', 200, { ok: true, address: 'http://100.64.0.9:3456' });
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456', 'the untouched prefill follows at once');
+    page.byId('ownKeyShow').fire('click');
+    await page.answerTo('/teamclaude/peer-links/key', 200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
+    assert.ok(page.requests.some(r => r.url === '/teamclaude/status'), 'the status read is still pending');
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
+test('an address set by a reload or another browser reaches the link without a page reload', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    await page.answer(200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    page.byId('ownKeyShow').fire('click');
+    await page.answer(200, { ok: true, key: 'tc-hub' });
+    assert.equal(page.byId('ownKeyBox').style.display, '');
+
+    page.poll();
+    await page.answerTo('/teamclaude/status', 200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: 'http://100.64.0.9:3456' } });
+    assert.equal(page.byId('addrVal').value, 'http://100.64.0.9:3456');
+    assert.equal(page.byId('ownKeyBox').style.display, 'none', 'the link shown with the container address is closed');
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456');
+    page.byId('ownKeyShow').fire('click');
+    await page.answerTo('/teamclaude/peer-links/key', 200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 

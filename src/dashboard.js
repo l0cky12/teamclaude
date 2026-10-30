@@ -1100,6 +1100,22 @@ export function linkSelfOptions(self, origin) {
 }
 
 /**
+ * The `self` of GET /teamclaude/peer-links as it is once `instanceAddress` is
+ * `address`, so the page can offer a new address the moment it is saved or a
+ * status reports it, without waiting for a fresh read. The old address set
+ * leaves the list; the guesses stay.
+ *
+ * @param {any} self  the `self` of GET /teamclaude/peer-links
+ * @param {string} address  '' when none is set
+ */
+export function linkSelfWithAddress(self, address) {
+  if (!self) return self;
+  var old = typeof self.address === 'string' ? self.address : '';
+  var rest = (Array.isArray(self.addresses) ? self.addresses : []).filter(function (/** @type {string} */ a) { return a !== old && a !== address; });
+  return Object.assign({}, self, { address: address, addresses: address ? [address].concat(rest) : rest });
+}
+
+/**
  * What stands in the way of linking the instance shown back from the other
  * machine, or null when nothing does. Without a proxy key nothing can get in,
  * so that one blocks. Listening on loopback only is a warning: a reverse
@@ -2109,7 +2125,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -3560,6 +3576,15 @@ ${SHARED_HELPERS}
       .catch(function () { linkSelfState = 'unasked'; });
   }
 
+  // Brings what this instance offers in line with the address set for it,
+  // and closes a shown link that still carries the old one.
+  function useInstanceAddress(address) {
+    if (!linkSelf || linkSelf.address === address) return;
+    linkSelf = linkSelfWithAddress(linkSelf, address);
+    fillLinkSelf();
+    if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
+  }
+
   // Prefills what this machine would be called and reached at from the other
   // one, and says up front what stands in the way of linking it back.
   function fillLinkSelf() {
@@ -4943,6 +4968,8 @@ ${SHARED_HELPERS}
     document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
     var addrInput = document.getElementById('addrVal');
     if (hasAddr && document.activeElement !== addrInput) addrInput.value = inst.address;
+    // Set from a reload or another browser: the link must not keep the old one.
+    if (hasAddr) useInstanceAddress(inst.address);
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -5465,10 +5492,11 @@ ${SHARED_HELPERS}
         note(out.kind, out.text);
         if (json.ok) {
           input.value = json.address;
-          // The link under Linked instances is built from what this asked
-          // for, so ask again, and close a shown link that still has the old one.
+          // At once, so a Show key that answers before the reads below
+          // already builds its link from the new address. Then ask again, for
+          // guesses the old address may have hidden.
+          useInstanceAddress(json.address);
           linkSelfState = 'unasked';
-          if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
         }
         poll();
       })
