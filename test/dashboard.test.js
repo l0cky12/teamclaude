@@ -2143,12 +2143,18 @@ test('a sign-in that landed on a file-backed account says it did not take, rathe
   assert.match(out.text, /credentials file.*Claude Code/);
 });
 
-test('the only account cannot be removed: the button is there, disabled, and says why', async () => {
+test('the only account can be removed like any other', async () => {
   const page = bootPage();
   await page.answer(200, { accounts: [{ name: 'a', provider: 'anthropic', type: 'apikey', quota: {} }] });
   const lone = page.findLast(e => e.textContent === 'Remove');
-  assert.equal(lone.disabled, true);
-  assert.match(lone.title, /at least one account/);
+  assert.equal(lone.disabled, false);
+  assert.match(lone.title, /Sign a out of TeamClaude/);
+});
+
+test('with no accounts the overview points at the sign-in on the Accounts page', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  assert.ok(page.findLast(e => /No accounts yet\. Sign one in on the Accounts page/.test(e.textContent)));
 });
 
 test('a file-backed account in error shows where to sign in, and no Sign in again', async () => {

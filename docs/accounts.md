@@ -20,6 +20,10 @@ account. Retry after confirming the credential is valid, or pass
 credential the upstream rejects with 401 (and that cannot be refreshed) is
 refused regardless of `--name` — log in again to get a fresh one.
 
+## Starting with no accounts
+
+The server starts with no accounts, so a new install (a fresh Docker container, for example) can sign its first one in from the [dashboard](#signing-in-from-the-dashboard). Until it has one, every Claude Code and Codex request through the proxy gets a `503` saying TeamClaude has no accounts yet. It is not held for `holdSeconds`, because no quota window will bring an account back. Requests go through as soon as the first sign-in finishes. No restart is needed.
+
 ## Signing in from the dashboard
 
 The [web dashboard](usage.md#status-dashboard-browser)'s **Accounts** page has a **Sign in to Claude** button and a **Sign in to Codex** button. Either one starts the same sign-in as `teamclaude login` (or `login --codex`) inside the running server, and opens a panel:
@@ -39,7 +43,7 @@ The server runs one dashboard sign-in at a time. Starting another cancels the fi
 
 ## Removing an account
 
-**Remove** on an account's row in the dashboard's **Accounts** page signs that one account out of TeamClaude, and leaves every other account alone. The first click arms it, and the button turns into **Confirm remove** for a few seconds. The second click removes. The only account cannot be removed this way: a config with no accounts stops the server from starting, and the dashboard with it. Sign in another account first, or use `teamclaude remove` with the server stopped. A removal waits for a config reload that is under way, so the two never interleave. This does the same as `teamclaude remove <name>`: the account leaves the running fleet at once, and its entry, credentials included, leaves the config file. A conversation pinned to it moves to another account on its next request.
+**Remove** on an account's row in the dashboard's **Accounts** page signs that one account out of TeamClaude, and leaves every other account alone. The first click arms it, and the button turns into **Confirm remove** for a few seconds. The second click removes. Removing the last account leaves the server running with none, the same as a [fresh install](#starting-with-no-accounts). A removal waits for a config reload that is under way, so the two never interleave. This does the same as `teamclaude remove <name>`: the account leaves the running fleet at once, and its entry, credentials included, leaves the config file. A conversation pinned to it moves to another account on its next request.
 
 Nothing is revoked with Anthropic or OpenAI. You stay signed in to claude.ai, ChatGPT, Claude Code and the Codex CLI wherever else you use the account. TeamClaude only forgets its copy of the tokens. This matters because an account imported from Claude Code shares that sign-in, and revoking it would sign Claude Code out too. To undo a removal, sign the account in again.
 
