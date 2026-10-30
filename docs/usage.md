@@ -33,6 +33,27 @@ The config is created on first start with a random `proxy.apiKey`. Anything reac
 
 Build it yourself with `docker build -t teamclaude .` from a checkout.
 
+#### Updating a compose deployment in one command
+
+If your proxy runs with `docker compose` from a git checkout (a `docker-compose.yml` with a `build:` section next to the source), `scripts/redeploy.sh` updates it in one step:
+
+```bash
+scripts/redeploy.sh            # pull, rebuild, restart, check health
+scripts/redeploy.sh --force    # rebuild and restart even if nothing changed
+scripts/redeploy.sh --no-pull  # rebuild what is checked out, without pulling
+```
+
+It runs from any directory. It finds the checkout it lives in. What it does:
+
+1. `git pull --ff-only`. If the pull fails, it stops, and nothing is rebuilt.
+2. If the container already runs the checked-out commit, it stops there. Each build is stamped with its commit, so it can tell.
+3. It tags the running image `<name>:previous` (for example `teamclaude:previous`) as the rollback target.
+4. It builds the new image. The old container keeps serving during the build, so Claude Code and Codex keep working. If the build fails, the running proxy is not touched.
+5. It recreates the container. The proxy is down only for these few seconds.
+6. It runs the image's health check until the new container answers. If the container stops or does not answer within 90 seconds (`TEAMCLAUDE_REDEPLOY_TIMEOUT`), the script prints its last log lines, puts the `:previous` image back, and exits with an error.
+
+The proxy stays up during the build, and a failed update rolls back, so an agent that uses the proxy can run the script itself. The service is `teamclaude` by default. Set `TEAMCLAUDE_SERVICE` to use another one, and `COMPOSE_FILE` if your compose file is not in the checkout root. A shell alias makes it one word: `alias tc-update=~/path/to/teamclaude/scripts/redeploy.sh`.
+
 #### Previewing a branch
 
 `docker/docker-compose.preview.yml` builds a second proxy from a checkout and runs it beside the one you use, for trying a branch's dashboard from another machine on your [Tailscale](https://tailscale.com) network. Every `docker compose` command for it needs `TAILSCALE_IP`, so export it once:

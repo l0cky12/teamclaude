@@ -47,7 +47,7 @@ A git checkout never updates itself. Use `git pull` to update it.
 
 **Other ways to run it:**
 
-- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container).
+- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container). If you build it with `docker compose` from a checkout, `scripts/redeploy.sh` pulls, rebuilds and restarts it in one command, and rolls back if the new build is unhealthy. See [Updating a compose deployment](docs/usage.md#updating-a-compose-deployment-in-one-command).
 - **Nix:** a flake with NixOS and Home Manager modules. See [nix/README.md](nix/README.md).
 - **As a background service:** `teamclaude service install` starts the proxy at login and restarts it if it stops (systemd on Linux, a LaunchAgent on macOS).
 
