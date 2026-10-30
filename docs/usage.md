@@ -37,7 +37,7 @@ docker run -d --name teamclaude -p 3456:3456 \
 docker exec teamclaude node -e "console.log(require('/data/teamclaude.json').proxy.apiKey)"
 ```
 
-Open `http://<host>:3456/teamclaude/dashboard`, enter the proxy key the second command prints, and use **Sign in to Claude** or **Sign in to Codex** on the **Accounts** page ([Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)). Until the first account is signed in, the proxy answers every Claude Code and Codex request with a `503` that says it has no accounts yet.
+Open `http://<host>:3456/teamclaude/dashboard`, enter the proxy key the second command prints, and use **Sign in to Claude** or **Sign in to Codex** on the **Accounts** page ([Signing in from the dashboard](accounts.md#signing-in-from-the-dashboard)). Until the first account is signed in, the proxy answers the Claude Code and Codex requests it handles with a `503` that says it has no accounts yet (see [Starting with no accounts](accounts.md#starting-with-no-accounts)).
 
 The entrypoint starts as root only long enough to match the runtime user to the owner of the mounted config (or of `/data` when the file does not exist yet), then drops privileges — so a file owned by your user stays writable without a `chown`. `TEAMCLAUDE_UID` (and optional `TEAMCLAUDE_GID`) override the detected owner. stderr is folded into stdout so `docker logs` shows one stream; set `TEAMCLAUDE_SPLIT_STDERR=1` to keep them apart. Auto-update is disabled in the image; pull a new tag to upgrade. The image ships without npm or yarn: the proxy has no runtime dependencies, and leaving the base image's package managers out keeps the image small and free of their known vulnerabilities.
 
