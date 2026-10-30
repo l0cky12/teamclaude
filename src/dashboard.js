@@ -601,6 +601,37 @@ export function probeIntervalOutcome(res) {
   return { kind: 'ok', text: res.quotaProbeSeconds > 0 ? 'quota refreshes every ' + res.quotaProbeSeconds + 's' : 'quota refresh turned off' };
 }
 
+/**
+ * @param {string} name  '' goes back to the host name
+ * @param {string|null|undefined} key
+ */
+export function instanceNameRequest(name, key) {
+  return {
+    url: '/teamclaude/instance-name',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ name: name }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function instanceNameOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'instance name change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.custom ? 'this instance is now called ' + res.name : 'instance name cleared; it goes by its host name, ' + res.name };
+}
+
+// What the Instance picker calls the machine the page was opened on: its
+// name, or "This machine" from a proxy too old to say.
+/** @param {any} self  { name } from /teamclaude/peers, or status.instance */
+export function selfInstanceLabel(self) {
+  return self && typeof self.name === 'string' && self.name ? self.name : 'This machine';
+}
+
 // What to tell the operator afterwards. The endpoint answers `ok` for the choice
 // being recorded and `eligible` for whether traffic will actually follow it —
 // two different things, and a bare "done" would be a lie for a spent target.
@@ -1547,7 +1578,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -1797,6 +1828,7 @@ const PAGE = `<!doctype html>
   .actions .lbl { color: var(--dim); font-size: 12px; }
   .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .thr input.name { width: 170px; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -1955,6 +1987,14 @@ const PAGE = `<!doctype html>
 
     <section id="page-settings" style="display:none">
       <div class="card">
+        <div class="setting" id="nameRow" style="display:none">
+          <div><b>Instance name</b><span class="tag">What the Instance picker calls this machine, and the name it suggests when another machine links to it. Leave it empty to use the host name. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="nameVal">Name</label>
+            <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
+            <button id="nameSet" class="btn" type="button">Save</button>
+          </span>
+        </div>
         <div class="setting">
           <div><b>Switch threshold</b><span class="tag">The share of a quota window at which rotation leaves an account. Saved to the config file.</span></div>
           <span class="thr">
@@ -3426,6 +3466,15 @@ ${SHARED_HELPERS}
       probeSel.value = String(probeSecs);
     }
     probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
+    // Only the operator is told the name, and a proxy too old to have one
+    // says nothing, so the row is there only when there is a name to change.
+    var inst = s.instance;
+    document.getElementById('nameRow').style.display = inst ? '' : 'none';
+    var nameInput = document.getElementById('nameVal');
+    if (inst && document.activeElement !== nameInput) {
+      nameInput.value = inst.custom ? inst.name : '';
+      nameInput.placeholder = inst.host || '';
+    }
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -3912,6 +3961,26 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doInstanceName(btn) {
+    var input = document.getElementById('nameVal');
+    btn.disabled = true;
+    var r = instanceNameRequest(input.value.trim(), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = instanceNameOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) input.value = json.custom ? json.name : '';
+        poll();
+      })
+      .catch(function (e) { note('error', 'instance name change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // Saved on pick: a select has no half-entered state to protect, so a Set
   // button would only be a second click. The select is neither disabled nor
   // blurred while it saves: either would drop keyboard focus, and arrowing
@@ -3972,7 +4041,9 @@ ${SHARED_HELPERS}
 
   // The instance picker: this machine and the linked ones it lists, each with
   // what it last answered. Hidden while there is nothing to pick.
-  function renderInstances(list) {
+  function renderInstances(list, self) {
+    var selfName = selfInstanceLabel(self);
+    document.getElementById('instanceBack').textContent = 'Back to ' + (self && self.name ? self.name : 'this machine');
     var peers = Array.isArray(list) ? list : [];
     var box = document.getElementById('instances');
     box.style.display = peers.length || peer ? '' : 'none';
@@ -3984,7 +4055,7 @@ ${SHARED_HELPERS}
     var sel = document.getElementById('instance');
     if (document.activeElement !== sel) {
       sel.textContent = '';
-      var here = el('option', '', 'This machine');
+      var here = el('option', '', selfName);
       here.value = '';
       sel.appendChild(here);
       peers.forEach(function (p) {
@@ -3996,7 +4067,7 @@ ${SHARED_HELPERS}
     }
     var noteBox = document.getElementById('instanceNote');
     noteBox.style.display = peer ? '' : 'none';
-    if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through this machine.';
+    if (peer) document.getElementById('instanceText').textContent = 'Showing ' + peer + (peerUrl ? ' (' + peerUrl + ')' : '') + ', reached through ' + (self && self.name ? self.name : 'this machine') + '.';
   }
 
   // Showing a linked instance, this machine is asked first: that read is what
@@ -4015,7 +4086,7 @@ ${SHARED_HELPERS}
         return res.json().then(function (j) {
           document.getElementById('keybox').style.display = 'none';
           document.getElementById('app').style.display = '';
-          renderInstances(j.peers);
+          renderInstances(j.peers, j.self);
           peerChecked = !!peer;
           return peerChecked;
         });
@@ -4058,7 +4129,7 @@ ${SHARED_HELPERS}
       .then(function (s) {
         if (!s) return;
         // A linked instance's status lists ITS peers; the picker lists ours.
-        if (!peer) renderInstances(s.peers);
+        if (!peer) renderInstances(s.peers, s.instance);
         document.getElementById('keybox').style.display = 'none';
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
@@ -4165,6 +4236,10 @@ ${SHARED_HELPERS}
   document.getElementById('reload').addEventListener('click', function () { doControl('/teamclaude/reload', 'config reload', this); });
   document.getElementById('probe').addEventListener('click', function () { doControl('/teamclaude/probe', 'quota probe', this); });
   document.getElementById('thrSet').addEventListener('click', function () { doThreshold(this); });
+  document.getElementById('nameSet').addEventListener('click', function () { doInstanceName(this); });
+  document.getElementById('nameVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doInstanceName(document.getElementById('nameSet')); }
+  });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
