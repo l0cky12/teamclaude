@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
+import { CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { logoDataUrl, logoMarkup } from './logo.js';
 
 export function renderDashboardHtml() {
@@ -213,6 +214,70 @@ export function redeemResetOutcome(res) {
   if (r.code === 'nothing_to_reset') return { kind: 'warn', text: 'nothing to reset yet: no limit on this account is spent, so no reset was used' };
   if (r.code === 'no_credit') return { kind: 'warn', text: 'no resets left on this account' };
   return { kind: 'error', text: 'reset failed' + (r.error ? ': ' + r.error : '') };
+}
+
+// When the soonest of a Codex account's reset credits expires, or null when the
+// page cannot say: no credit, no dates read yet (the quota refresh reads them),
+// the count changed since they were read (a credit granted, spent or expired),
+// or the rows read did not match the count.
+/** @param {any} account @param {number|null} [now] */
+export function codexResetExpiry(account, now) {
+  var at = now == null ? Date.now() : now;
+  if (!codexResetsLeft(account, at)) return null;
+  var r = (account.quota || {}).resetCredits || {};
+  if (!Array.isArray(r.expiries) || r.expiriesFor !== r.available || r.expiries.length !== r.available) return null;
+  /** @type {number|null} */
+  var soonest = null;
+  r.expiries.forEach(function (/** @type {any} */ t) {
+    if (typeof t === 'number' && isFinite(t) && t > at && (soonest == null || t < soonest)) soonest = t;
+  });
+  return soonest;
+}
+
+/** @param {number} ts */
+function shortDate(ts) {
+  return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
+// "2 resets left", with the soonest expiry when the page knows it.
+/** @param {number} n @param {number|null} [expiry] */
+export function resetsLeftText(n, expiry) {
+  var text = n ? n + (n === 1 ? ' reset left' : ' resets left') : 'no resets left';
+  return n && expiry != null ? text + ' \u00b7 expires ' + shortDate(expiry) : text;
+}
+
+// The Quota page's reset-credit banner: a Codex account that got a credit in
+// the last RESET_ALERT_NEW_MS, and one whose soonest credit expires within
+// CREDIT_EXPIRY_WINDOW_MS (the same window autoRedeemResets treats as "use it
+// or lose it"). Each has a key naming the event, so dismissing one hides that
+// event and not the next one like it.
+/** @param {any[]} accounts @param {string[]|null} [dismissed] @param {number|null} [now] */
+export function resetCreditAlerts(accounts, dismissed, now) {
+  var at = now == null ? Date.now() : now;
+  var hidden = dismissed || [];
+  /** @type {{kind: string, key: string, text: string}[]} */
+  var out = [];
+  var day = 24 * 60 * 60 * 1000;
+  (accounts || []).forEach(function (a) {
+    var left = codexResetsLeft(a, at);
+    if (!left) return;
+    var r = a.quota.resetCredits;
+    var expiry = codexResetExpiry(a, at);
+    if (expiry != null && expiry - at <= CREDIT_EXPIRY_WINDOW_MS) {
+      var days = Math.ceil((expiry - at) / day);
+      out.push({
+        kind: 'warn', key: 'expiring:' + a.name + ':' + expiry,
+        text: a.name + ': a free reset credit expires ' + (days <= 1 ? 'within a day' : 'in ' + days + ' days') + ' (' + shortDate(expiry) + '). Use it before then.',
+      });
+    }
+    if (typeof r.grantedAt === 'number' && isFinite(r.grantedAt) && r.grantedAt <= at && at - r.grantedAt < RESET_ALERT_NEW_MS) {
+      out.push({
+        kind: 'ok', key: 'granted:' + a.name + ':' + r.grantedAt,
+        text: a.name + ' got a new free reset credit on ' + shortDate(r.grantedAt) + ': ' + resetsLeftText(left, expiry) + '.',
+      });
+    }
+  });
+  return out.filter(function (x) { return hidden.indexOf(x.key) < 0; });
 }
 
 // The rows a third-party backend's own reading draws on its card (#530). The
@@ -1683,6 +1748,7 @@ export function providerTabs(accounts) {
 export var LOG_KINDS = [
   { key: 'all', label: 'All' }, { key: 'usage', label: 'Usage' }, { key: 'signin', label: 'Sign-in' },
   { key: 'auth', label: 'Auth' }, { key: 'rotation', label: 'Rotation' }, { key: 'control', label: 'Changes' },
+  { key: 'credits', label: 'Resets' },
 ];
 
 // Fold one GET /teamclaude/logs reply into what the page holds: the log's
@@ -1746,13 +1812,14 @@ export function logEventClient(event) {
 }
 
 // How loudly a log row is drawn: red for what lost an account or a request,
-// amber for what will clear on its own, green for a sign-in that worked.
+// amber for what will clear on its own or is about to be lost (a reset credit
+// expiring), green for a sign-in that worked or a reset credit granted.
 /** @param {any} event */
 export function logEventTone(event) {
   var e = event || {};
   if (['signin_failed', 'signed_out', 'credential_rejected', 'exhausted'].indexOf(e.type) >= 0) return 'bad';
-  if (['rate_limited', 'signin_timeout', 'hold'].indexOf(e.type) >= 0) return 'warn';
-  if (e.type === 'signin_succeeded') return 'ok';
+  if (['rate_limited', 'signin_timeout', 'hold', 'credit_expiring'].indexOf(e.type) >= 0) return 'warn';
+  if (e.type === 'signin_succeeded' || e.type === 'credit_granted') return 'ok';
   if (typeof e.status === 'number') return e.status >= 500 ? 'bad' : e.status >= 400 ? 'warn' : '';
   return '';
 }
@@ -2116,6 +2183,9 @@ export function fleetMissingText(data) {
   return 'Not counted: ' + missed.map(function (/** @type {any} */ m) { return m.name + ' (' + (why[m.state] || m.state) + ')'; }).join(', ') + '.';
 }
 
+/** How long the Quota page's banner says a Codex account got a new reset credit. */
+export const RESET_ALERT_NEW_MS = 7 * 24 * 60 * 60 * 1000;
+
 /** How long an action's result stays above its account card. */
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
@@ -2129,6 +2199,7 @@ const SHARED_HELPERS = [
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
+  codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -2147,6 +2218,8 @@ const SHARED_CONSTS = [
   `var STARVED_MIN = ${STARVED_MIN};`,
   `var STARVED_LIST_MAX = ${STARVED_LIST_MAX};`,
   `var RESET_CREDIT_MAX_AGE_MS = ${RESET_CREDIT_MAX_AGE_MS};`,
+  `var CREDIT_EXPIRY_WINDOW_MS = ${CREDIT_EXPIRY_WINDOW_MS};`,
+  `var RESET_ALERT_NEW_MS = ${RESET_ALERT_NEW_MS};`,
   `var THRESHOLD_BUCKET_KEYS = ${JSON.stringify(THRESHOLD_BUCKET_KEYS)};`,
   `var THRESHOLD_BUCKET_LABELS = ${JSON.stringify(THRESHOLD_BUCKET_LABELS)};`,
   `var USAGE_VIEWS = ${JSON.stringify(USAGE_VIEWS)};`,
@@ -2426,6 +2499,9 @@ const PAGE = `<!doctype html>
   .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
   .plist .bad { background: rgba(248,81,73,.12); border: 1px solid var(--bad); color: var(--bad); }
   .plist .warn { background: rgba(210,153,34,.12); border: 1px solid var(--warn); color: var(--warn); }
+  .plist .ok { background: rgba(63,185,80,.12); border: 1px solid var(--ok); color: var(--ok); }
+  #resetAlerts div { display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+  #resetAlerts button { flex: none; }
   #err { color: var(--bad); margin: 12px 0; display: none; }
   #problems { display: none; margin: 0 0 16px; }
   #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
@@ -2534,6 +2610,7 @@ const PAGE = `<!doctype html>
 
     <section id="page-quota">
       <div id="tabs" class="tabs"></div>
+      <div id="resetAlerts" class="plist"></div>
       <div id="summaryCards" class="cards"></div>
       <div id="quotaVisibility" class="filters"></div>
       <div id="accounts"></div>
@@ -2598,7 +2675,7 @@ const PAGE = `<!doctype html>
         <span class="hint" id="logCount"></span>
       </div>
       <div class="card" style="padding:4px 6px"><table id="logs"></table></div>
-      <p class="hint">Requests, sign-ins, sign-outs, rotation and changes, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
+      <p class="hint">Requests, sign-ins, sign-outs, rotation, changes and Codex reset credits, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
     </section>
 
     <section id="page-problems" style="display:none">
@@ -2916,7 +2993,7 @@ ${SHARED_HELPERS}
       ctl.appendChild(sw);
     }
     if (canRedeemReset(a, s.caller)) ctl.appendChild(resetButton(a, key));
-    if (resetsLeft != null) ctl.appendChild(el('div', 'resets' + (resetsLeft ? '' : ' none'), resetsLeftText(resetsLeft)));
+    if (resetsLeft != null) ctl.appendChild(el('div', 'resets' + (resetsLeft ? '' : ' none'), resetsLeftText(resetsLeft, codexResetExpiry(a))));
     row.appendChild(ctl);
 
     var x = el('div', 'rowx');
@@ -3034,6 +3111,30 @@ ${SHARED_HELPERS}
     return card;
   }
 
+  // Dismissed reset-credit alerts, by event key (resetCreditAlerts). Kept in
+  // the browser, so a dismissal holds across reloads; the newest are kept.
+  var RESET_ALERTS_KEY = 'teamclaude-dashboard-reset-alerts';
+  function dismissedResetAlerts() {
+    try {
+      var list = JSON.parse(localStorage.getItem(RESET_ALERTS_KEY) || '[]');
+      return Array.isArray(list) ? list.filter(function (k) { return typeof k === 'string'; }) : [];
+    } catch (e) { return []; }
+  }
+
+  function renderResetAlerts(accounts) {
+    var box = document.getElementById('resetAlerts');
+    box.textContent = '';
+    resetCreditAlerts(accounts, dismissedResetAlerts()).forEach(function (x) {
+      var row = el('div', x.kind);
+      row.appendChild(el('span', '', x.text));
+      row.appendChild(button('more', 'Dismiss', function () {
+        localStorage.setItem(RESET_ALERTS_KEY, JSON.stringify(dismissedResetAlerts().concat([x.key]).slice(-50)));
+        renderResetAlerts(accounts);
+      }));
+      box.appendChild(row);
+    });
+  }
+
   function renderQuota(s) {
     var accounts = s.accounts || [];
     var tabs = providerTabs(accounts);
@@ -3065,6 +3166,7 @@ ${SHARED_HELPERS}
       toggle.setAttribute('aria-pressed', String(showAllAccounts));
       visibility.appendChild(toggle);
     }
+    renderResetAlerts(accounts);
     var cards = document.getElementById('summaryCards');
     cards.textContent = '';
     var acc = document.getElementById('accounts');
@@ -3193,7 +3295,8 @@ ${SHARED_HELPERS}
     tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
     if (withResets) {
       var left = codexResetsLeft(a);
-      tr.appendChild(el('td', 'num', left == null ? '—' : String(left)));
+      var expiry = codexResetExpiry(a);
+      tr.appendChild(el('td', 'num', left == null ? '—' : String(left) + (expiry == null ? '' : ' \u00b7 expires ' + shortDate(expiry))));
     }
     var act = el('td', 'num');
     // Signed out upstream: the one thing that brings it back is a sign-in,
@@ -5109,10 +5212,6 @@ ${SHARED_HELPERS}
   // in flight stay disabled across the polls that rebuild them.
   var resetArmed = Object.create(null);
   var resetBusy = Object.create(null);
-
-  function resetsLeftText(n) {
-    return n ? n + (n === 1 ? ' reset left' : ' resets left') : 'no resets left';
-  }
 
   function resetButton(account, key) {
     if (resetBusy[key]) {

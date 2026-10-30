@@ -1513,6 +1513,24 @@ test('a confirmed reset posts the card\'s account, then polls for the cleared ba
   assert.equal(page.requests[0].url, '/teamclaude/status');
 });
 
+test('the Quota page warns of an expiring reset credit and remembers a dismissal', async () => {
+  const page = bootPage();
+  // One expiry for both polls: the server reports the same date each time, and the date is the alert's identity.
+  const expiry = Date.now() + 2 * 24 * 3600_000;
+  const status = () => ({ accounts: [{ name: 'cx', provider: 'codex', quota: { resetCredits: { available: 1, seenAt: Date.now(), expiries: [expiry], expiriesFor: 1 } } }] });
+  await page.answer(200, status());
+  const banner = () => page.built.filter(e => typeof e.textContent === 'string' && /^cx: a free reset credit expires in 2 days/.test(e.textContent));
+  assert.equal(banner().length, 1);
+  page.click('Dismiss');
+  const kept = JSON.parse(page.store.get('teamclaude-dashboard-reset-alerts'));
+  assert.equal(kept.length, 1);
+  assert.match(kept[0], /^expiring:cx:/);
+  const before = banner().length;
+  page.poll();
+  await page.answer(200, status());
+  assert.equal(banner().length, before, 'a dismissed alert is not drawn again');
+});
+
 test('a confirmation left past its window arms again instead of spending, even with no render between', async () => {
   const page = bootPage();
   await page.answer(200, RESET_STATUS());

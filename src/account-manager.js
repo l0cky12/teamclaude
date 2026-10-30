@@ -16,6 +16,7 @@ import { parseRoutingUrl, describeRouting, routingToUrl, isRoutingFailure } from
 import { isSelfProxy } from './upstream-proxy.js';
 import { envVar } from './brand.js';
 import { EventLog } from './event-log.js';
+import { heldCreditExpiries, CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { UsageHistory } from './usage-history.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
@@ -209,7 +210,8 @@ const FAMILY_WEEKLY_BUCKETS = [
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, expiries?: Array<number|null>, expiriesAt?: number, expiriesFor?: number|null, grantedAt?: number}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ *   A Codex reading also carries, once the credit rows have been read, `expiries` (when each held credit expires, soonest first, null for none), `expiriesAt` (when they were read), `expiriesFor` (the count they describe, or null once a count change has left them out of step until the next read) and `grantedAt` (when the count last went up).
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
@@ -589,6 +591,10 @@ export class AccountManager {
     // What the dashboard's Insights page reads (usage-history.js), booked in
     // recordTokenUsage. One per manager for the same reason as the log.
     this.usageHistory = usageHistory ?? new UsageHistory();
+    // The Codex reset-credit expiries already announced in the log, per account,
+    // so each credit is said to be expiring once rather than on every read.
+    /** @type {WeakMap<object, Set<number>>} */
+    this._creditExpiryAnnounced = new WeakMap();
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
@@ -5413,7 +5419,7 @@ export class AccountManager {
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
     // age is the only thing that says how much the number is worth.
-    if (usage.resetCredits) q.resetCredits = { ...usage.resetCredits, seenAt: Date.now() };
+    if (usage.resetCredits) q.resetCredits = this._nextCodexResetCredits(account, q.resetCredits, usage.resetCredits);
     if (Array.isArray(usage.modelBuckets)) {
       q.codexModelBuckets = Object.fromEntries(usage.modelBuckets.slice(0, MAX_CODEX_MODEL_BUCKETS)
         .filter(bucket => bucket?.slug)
@@ -5427,6 +5433,88 @@ export class AccountManager {
     if (account.probing && q.unified7dReset != null) {
       account.probing = false;
       account.requalify = true;
+    }
+  }
+
+  /**
+   * The Codex reset-credit reading that follows `prev` once a usage read states
+   * `next`. The count and its stamp come from the read; what only the credit rows
+   * know (when each credit expires) and when the count last went up are carried
+   * over, since a usage read says neither.
+   *
+   * A count that went up is a credit granted since the last read, and is logged.
+   * Any change to the count leaves the dates on hand out of step until the rows
+   * are read again: which credit went is not something a count can say (a
+   * redemption skips a credit the plan cannot spend, so it is not always the
+   * soonest to expire).
+   *
+   * @param {Record<string, any>} account
+   * @param {Record<string, any>|undefined} prev
+   * @param {{available: number, applicable: number|null}} next
+   * @returns {NonNullable<CodexLearnedQuota['resetCredits']>}
+   */
+  _nextCodexResetCredits(account, prev, next) {
+    const now = Date.now();
+    /** @type {NonNullable<CodexLearnedQuota['resetCredits']>} */
+    const reading = { ...next, seenAt: now };
+    if (Number.isFinite(prev?.grantedAt)) reading.grantedAt = prev?.grantedAt;
+    const before = prev?.available;
+    if (Array.isArray(prev?.expiries) && Number.isFinite(prev?.expiriesAt)) {
+      reading.expiries = prev?.expiries;
+      reading.expiriesAt = prev?.expiriesAt;
+      // Null once the count moves, and it stays null until the rows are read
+      // again: otherwise a grant followed by a redemption lands back on the old
+      // count, and the credit left would wear the spent one's date.
+      const unchanged = Number.isFinite(before) && prev?.expiriesFor === before && next.available === before;
+      reading.expiriesFor = unchanged ? prev?.expiriesFor : null;
+    }
+    if (Number.isFinite(before) && next.available > before) {
+      reading.grantedAt = now;
+      const gained = next.available - before;
+      this.events.add({
+        kind: 'credits', type: 'credit_granted', provider: 'codex', account: account.name,
+        message: `Got ${gained === 1 ? 'a free reset credit' : `${gained} free reset credits`}: ${next.available} left`,
+      });
+    }
+    return reading;
+  }
+
+  /**
+   * Store when each of a Codex account's reset credits expires, from the credit
+   * rows (codex-reset-credits.js), and log a credit that expires within
+   * CREDIT_EXPIRY_WINDOW_MS, once per credit.
+   *
+   * @param {number} accountIndex
+   * @param {import('./codex-reset-credits.js').ResetCredit[]} credits
+   */
+  applyResetCreditDetails(accountIndex, credits) {
+    const account = this.accounts[accountIndex];
+    if (!account || !Array.isArray(credits)) return;
+    /** @type {typeof account.quota & CodexLearnedQuota} */
+    const q = account.quota;
+    const expiries = heldCreditExpiries(credits);
+    const now = Date.now();
+    // Stamped with the count they were read against: the usage read owns the
+    // count, and a later one that differs is what says these dates are out of
+    // date (creditDetailsDue). With no usage read yet, the rows are the count.
+    const available = q.resetCredits?.available ?? expiries.length;
+    q.resetCredits = {
+      ...(q.resetCredits || { applicable: null, seenAt: now }),
+      available,
+      expiries,
+      expiriesAt: now,
+      expiriesFor: available,
+    };
+    let announced = this._creditExpiryAnnounced.get(account);
+    if (!announced) this._creditExpiryAnnounced.set(account, announced = new Set());
+    for (const at of expiries) {
+      if (at == null || at <= now || at - now > CREDIT_EXPIRY_WINDOW_MS || announced.has(at)) continue;
+      announced.add(at);
+      const days = Math.max(1, Math.ceil((at - now) / (24 * 60 * 60 * 1000)));
+      this.events.add({
+        kind: 'credits', type: 'credit_expiring', provider: 'codex', account: account.name,
+        message: `A free reset credit expires in ${days === 1 ? 'a day' : `${days} days`} (${new Date(at).toISOString().slice(0, 10)}): use it before then`,
+      });
     }
   }
 

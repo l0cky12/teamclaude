@@ -282,6 +282,44 @@ function byExpiry(a, b) {
 }
 
 /**
+ * When each credit an account still holds expires, soonest first, as the
+ * dashboard shows it: one entry per `available` row, `null` for a credit that
+ * does not expire. Capped at the count's own two-digit ceiling (codex-usage.js).
+ *
+ * @param {ResetCredit[]} [credits]
+ * @returns {Array<number|null>}
+ */
+export function heldCreditExpiries(credits = []) {
+  return credits
+    .filter(credit => credit?.status === 'available')
+    .map(credit => credit.expiresAt)
+    .sort(byExpiry)
+    .slice(0, 99);
+}
+
+/** After a credit-row read that failed, how long before a probe tries again. */
+export const CREDIT_DETAILS_RETRY_MS = RETRY_COOLDOWN_MS;
+
+/**
+ * Whether a usage read that just landed should be followed by a read of the
+ * credit rows, to learn when the credits it counted expire.
+ *
+ * Only an account holding a credit, and only when the dates on hand were not
+ * read against this count or are older than DETAIL_TTL_MS. A count that went up
+ * is a new credit whose date we do not know yet; one that stayed put needs no
+ * second read until the dates are worth checking again.
+ *
+ * @param {{available?: number, expiries?: unknown, expiriesFor?: number|null, expiriesAt?: number}|null|undefined} reading  `quota.resetCredits`
+ * @param {number} [now]
+ */
+export function creditDetailsDue(reading, now = Date.now()) {
+  if (!reading || !Number.isFinite(reading.available) || /** @type {number} */ (reading.available) <= 0) return false;
+  if (!Array.isArray(reading.expiries) || !Number.isFinite(reading.expiriesAt)) return true;
+  if (reading.expiriesFor !== reading.available) return true;
+  return now - /** @type {number} */ (reading.expiriesAt) >= DETAIL_TTL_MS;
+}
+
+/**
  * The one credit out of a list worth spending, or null when the list names none.
  *
  * `is_supported_by_plan` is as hard a gate as `status`, so it is applied BEFORE
@@ -728,6 +766,8 @@ export class ResetCreditRedeemer {
     const credits = result?.credits || [];
     state.credits = credits;
     state.creditsAt = now;
+    // The same rows tell the dashboard when this account's credits expire.
+    this.am.applyResetCreditDetails(account.index, credits);
     return { credits };
   }
 
