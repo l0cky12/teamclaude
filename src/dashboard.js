@@ -1988,7 +1988,7 @@ const PAGE = `<!doctype html>
     <section id="page-settings" style="display:none">
       <div class="card">
         <div class="setting" id="nameRow" style="display:none">
-          <div><b>Instance name</b><span class="tag">What the Instance picker calls this machine, and the name it suggests when another machine links to it. Leave it empty to use the host name. Saved to the config file.</span></div>
+          <div><b>Instance name</b><span class="tag">What the Instance picker calls this machine. Empty uses the host name. Saved to the config file.</span></div>
           <span class="thr">
             <label for="nameVal">Name</label>
             <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
