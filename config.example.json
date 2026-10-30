@@ -85,6 +85,7 @@
     "ttlSeconds": 30,
     "holdSeconds": 120
   },
+  "instanceName": "hermes",
   "peers": [
     {
       "name": "server",

@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -2378,6 +2378,48 @@ test('a page on this machine hides the picker until a peer is configured', async
   assert.equal(page.requests.length, 0, 'the picker came with the status read');
 });
 
+test('the picker calls this machine by its instance name, and the way back names it too', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }], instance: { name: 'hermes', host: 'hermes-box', custom: true } });
+  assert.ok(page.labelled('hermes') >= 1, 'the option for this machine says hermes');
+  assert.equal(page.labelled('This machine'), 0);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to hermes');
+});
+
+test('a linked instance shown names the machine it is reached through', async () => {
+  const page = bootPage({ storedInstance: 'desktop' });
+  assert.equal(page.requests[0].url, '/teamclaude/peers');
+  await page.answer(200, { self: { name: 'hermes' }, peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }] });
+  assert.match(page.byId('instanceText').textContent, /^Showing desktop .*, reached through hermes\.$/);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to hermes');
+});
+
+test('a proxy too old to name itself is still This machine in the picker', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], peers: [{ name: 'desktop', url: 'http://100.64.0.1:3456', state: 'online' }] });
+  assert.ok(page.labelled('This machine') >= 1);
+  assert.equal(page.byId('instanceBack').textContent, 'Back to this machine');
+  assert.equal(page.byId('nameRow').style.display, 'none', 'and has no Instance name row to offer');
+});
+
+test('the Instance name row shows the name set, offers the host name, and saves what is typed', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], instance: { name: 'hermes-box', host: 'hermes-box', custom: false } });
+  assert.equal(page.byId('nameRow').style.display, '');
+  assert.equal(page.byId('nameVal').value, '', 'the host name is a placeholder, not a saved name');
+  assert.equal(page.byId('nameVal').placeholder, 'hermes-box');
+
+  page.byId('nameVal').value = '  hermes ';
+  page.byId('nameSet').fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/instance-name');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { name: 'hermes' });
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
+  await page.answer(200, { ok: true, name: 'hermes', host: 'hermes-box', custom: true });
+  assert.match(page.byId('note').textContent, /this instance is now called hermes/);
+  assert.equal(page.byId('nameVal').value, 'hermes');
+  assert.equal(page.requests[0].url, '/teamclaude/status', 'and the page reads the new name back');
+});
+
 test('a linked instance that is down never hides the way back, even across a key prompt', async () => {
   const page = bootPage({ storedInstance: 'server' });
   await page.answer(401, {});
@@ -2735,4 +2777,22 @@ test('an instance from before the card says so instead of offering a form that c
     assert.equal(page.labelled('Remove'), 0);
     assert.equal(page.labelled('Open'), 0, 'its links are not in this machine\'s picker');
   }, { storedInstance: 'server' });
+});
+
+test('instanceNameRequest posts the name, and instanceNameOutcome says what it is called now', () => {
+  const r = instanceNameRequest('hermes', 'tc-k');
+  assert.equal(r.url, '/teamclaude/instance-name');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(r.init.body), { name: 'hermes' });
+  assert.deepEqual(instanceNameOutcome({ ok: true, name: 'hermes', custom: true }), { kind: 'ok', text: 'this instance is now called hermes' });
+  assert.match(instanceNameOutcome({ ok: true, name: 'box', custom: false }).text, /cleared; it goes by its host name, box$/);
+  assert.equal(instanceNameOutcome({ ok: false, error: 'bad name' }).text, 'instance name change failed: bad name');
+  assert.equal(instanceNameOutcome(null).kind, 'error');
+});
+
+test('selfInstanceLabel falls back to This machine', () => {
+  assert.equal(selfInstanceLabel({ name: 'hermes' }), 'hermes');
+  assert.equal(selfInstanceLabel(undefined), 'This machine');
+  assert.equal(selfInstanceLabel({ name: '' }), 'This machine');
 });

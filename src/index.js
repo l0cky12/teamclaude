@@ -645,6 +645,9 @@ async function serverCommand() {
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
     // Linked instances (peers.js) are read per request off this object.
     config.peers = diskConfig.peers;
+    // So is the name this instance goes by in the picker and offers to a link.
+    if (diskConfig.instanceName === undefined) delete config.instanceName;
+    else config.instanceName = diskConfig.instanceName;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.
