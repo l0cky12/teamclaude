@@ -2701,7 +2701,7 @@ async function distributeCommand() {
 
   if (arg === undefined) {
     console.log(`Session distribution: ${current}`);
-    console.log('Set with: teamclaude distribute <on|off|adaptive|affinity|drain>');
+    console.log('Set with: teamclaude distribute <on|off|adaptive|affinity|drain|load>');
     console.log('On: each session stays on its account for cache reuse, and new sessions spread');
     console.log('across equal-priority accounts by load. Off: quota-driven rotation only.');
     console.log('Adaptive: spread by remaining weekly credit and load rather than evenly, so the');
@@ -2710,6 +2710,8 @@ async function distributeCommand() {
     console.log('conversation stays on its account until that account is out of usage.');
     console.log('Drain: no spreading; all sessions use the account whose weekly quota resets');
     console.log('soonest until it runs out, then the next closest to its reset.');
+    console.log('Load: spread new sessions by the requests each account served in the last ten');
+    console.log('minutes rather than by session count.');
     return;
   }
 

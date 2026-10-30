@@ -4145,6 +4145,7 @@ ${SHARED_HELPERS}
     adaptive: 'adaptive: new conversations go where the quota burns slowest',
     affinity: 'affinity: conversations stay on the account holding their cache',
     drain: 'drain: the account whose weekly quota resets soonest is used until it runs out',
+    load: 'load: new conversations go to the account that served the fewest requests in the last ten minutes',
   };
   function renderRouting(s) {
     var card = document.getElementById('modeCard');
