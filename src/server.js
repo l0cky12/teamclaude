@@ -29,6 +29,7 @@ import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { WebSignInError } from './web-login.js';
+import { AccountSyncError } from './web-account-sync.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
@@ -458,6 +459,14 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/peer-links/key', 'a client key cannot manage linked instances'],
   // The other machines' keys, for joining two groups of linked instances.
   ['/teamclaude/peer-links/peers', 'a client key cannot manage linked instances'],
+  // Account sync decides where this install's tokens are copied to, so every
+  // step is the operator's: a sign-in would send the next renewals to the
+  // store of whoever approved it.
+  ['/teamclaude/account-sync/start', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/status', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/cancel', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/sync', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/sign-out', 'a client key cannot manage account sync'],
 ]);
 
 /**
@@ -850,6 +859,64 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, ...result, ...(linkBack ? { linkBack } : {}), ...(mesh ? { mesh } : {}) }));
         return;
+      }
+
+      // Account sync through callback.net (web-account-sync.js), for the
+      // dashboard's Account sync card: the GET says whether this install is
+      // signed in and as whom; `start` begins a sign-in and answers with the
+      // link to approve, `status` {"id"} says how it went, `cancel` {"id"}
+      // stops waiting, `sync` runs a pass now and `sign-out` ends the session.
+      // Operator only, like the linked instances: the POSTs are in the
+      // client-key refusal list above, and the GET is refused here. A linked
+      // instance reaches these through the relay, which is how one dashboard
+      // sets up every machine.
+      if (req.method === 'GET' && req.url === '/teamclaude/account-sync') {
+        if (req.tcClient) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'a client key cannot manage account sync' }));
+          return;
+        }
+        if (!hooks.accountSync) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'account sync is not supported by this server' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, ...await hooks.accountSync.view() }));
+        return;
+      }
+      if (req.method === 'POST' && /^\/teamclaude\/account-sync\/(start|status|cancel|sync|sign-out)$/.test(req.url || '')) {
+        const sync = hooks.accountSync;
+        if (!sync) {
+          res.writeHead(501, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'account sync is not supported by this server' }));
+          return;
+        }
+        const step = (req.url || '').slice('/teamclaude/account-sync/'.length);
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        const reply = (/** @type {number} */ code, /** @type {Record<string, any>} */ payload) => {
+          res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        try {
+          if (step === 'start') return reply(200, { ok: true, ...await sync.start() });
+          if (step === 'sync') return reply(200, { ok: true, result: await sync.syncNow() });
+          if (step === 'sign-out') return reply(200, { ok: true, ...await sync.signOut() });
+          if (typeof body.id !== 'string' || !body.id) return reply(400, { ok: false, error: 'missing "id"' });
+          if (step === 'status') return reply(200, { ok: true, ...sync.status(body.id) });
+          // The state after it, so the page can tell a sign-in that was
+          // already approved (and went through) from one that stopped.
+          const cancelled = sync.cancel(body.id);
+          return reply(200, { ok: true, cancelled, state: sync.status(body.id).state });
+        } catch (err) {
+          if (err instanceof AccountSyncError) return reply(400, { ok: false, error: err.message });
+          // callback-auth.js strips what callback.net says before it gets
+          // here, so the reason can go to the page as well as the log.
+          const why = safeLine(String(/** @type {Error} */ (err)?.message || err), 160);
+          console.error(`[TeamClaude] Account sync (${step}) failed: ${why}`);
+          return reply(502, { ok: false, error: `callback.net: ${why}` });
+        }
       }
 
       // Status endpoint

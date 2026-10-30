@@ -475,6 +475,8 @@ An **Instance** picker appears at the top of the sidebar, with the machine you o
 
 The picker lists the machine you opened the page on under its host name. To call it something else, enter a name under **Instance name** on the **Settings** page and press **Save**, for example `hermes`. Clear the field and save to go back to the host name. The name is saved to the config file as [`instanceName`](configuration.md). It is also the name that machine suggests when another machine links to it. Linked instances keep the names you gave them when you linked them. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
 
+Linking shares the dashboard, not the accounts: each machine still signs in to its own. To keep the same accounts signed in on every machine, turn on [account sync](accounts.md#syncing-accounts-across-machines-callbacknet). The **Account sync** column of the Linked instances table shows each machine's state, and **Set up** starts the sign-in on a machine where it is off, from this page.
+
 The browser still talks only to the machine it opened the page on. That proxy forwards each request to the linked one as `/teamclaude/peers/<name>/<route>`, using the key from `peers`, so the browser never holds the other machine's key. Only the control routes are forwarded, never model traffic. Only the operator can use the forwarding: the shared `proxy.apiKey`, or a key-exempt loopback browser. A `proxy.clientKeys` key gets a 403. If a linked machine is down, its pages show why and the rest keep working. If the machine you opened the page on is down, open the dashboard on another one instead.
 
 ## MCP endpoint

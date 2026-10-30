@@ -144,6 +144,17 @@ teamclaude callback sync       # reconcile the running server with the store now
 teamclaude callback logout     # revoke the session and stop syncing
 ```
 
+**From the dashboard.** The **Settings** page has an **Account sync** card that does the same without a terminal:
+
+- **Turn on account sync** starts the sign-in and shows the approval link (**Open callback.net**, plus the link itself to copy to another device). Approve it at callback.net and the card finishes by itself: the token is saved and the first pass runs.
+- When it is on, the card shows which callback.net account this machine uses, how many accounts the store holds, when it last synced, and how many accounts wait for a sign-in. **Sync now** runs a pass at once. **Sign out** (click it twice) revokes the session and stops syncing; the accounts stay on the machine.
+- While this machine is signed in, the card refuses to start another sign-in. To move the machine to another callback.net account, sign out first. That way a sign-in can never quietly send this machine's tokens to a different store.
+- With [linked instances](usage.md#linked-instances), the **Linked instances** table has an **Account sync** column for each machine. It shows whether that machine syncs and as whom, and warns when it uses a different callback.net account from this one (then the two share nothing). A machine where sync is off has a **Set up** button, which starts its sign-in from this page through the link. You approve it in the same way, so one dashboard can turn sync on for every machine. To see or change the full card for a linked machine, pick it in the Instance picker.
+
+Like the other control routes that change accounts, the card is for the operator only: a [`proxy.clientKeys`](configuration.md) key does not see it, and the server refuses it every step.
+
+An account reaches the store when a machine signs it in or next renews it, not when sync is turned on (see **Only fresh tokens are stored** below). So a machine where an account needs a sign-in picks up the working one at its first pass after the machine that holds it next renews it. **Sync now** on that machine runs the pass at once.
+
 The sign-in is a poll-token OAuth2 flow: the URL can be opened on any machine, so it works over SSH and in a container, and no local port is listened on. The session token is this install's own and lives beside the config (`<config>.callback.json`, mode `0600`), never in the config itself. Being signed in is the whole opt-in; there is no config key. `logout` turns it off.
 
 **What callback.net does with the data.** It stores your tokens and nothing else: the rows are the account's identity and its access and refresh tokens, encrypted in transit (TLS) and at rest, readable only with your callback.net login, and never used by the service itself — it holds them so your other installs can read them. The service is provided free of charge, as a convenience for exactly this: syncing your own tokens between your own computers. Use it for that and nothing else; in particular, it is not a place to share accounts with other people, and the pool's per-client keys and routing are the tools for sharing a proxy.

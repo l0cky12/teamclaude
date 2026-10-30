@@ -369,14 +369,67 @@ export function callbackTokenLapsed(token, at, marginMs = 0) {
 /** @type {Map<string, Promise<CallbackToken>>} */
 const renewing = new Map();
 
+// Sign-out against the writers still running in this process. A renewal or a
+// sign-in that started before a sign-out must not write its token after the
+// sign-out has deleted the file: that would sign this install back in, with
+// a session the sign-out may not have managed to revoke. So every write is
+// tied to the SESSION EPOCH it began in, which a sign-out bumps before it does
+// anything else; a write is refused once the epoch has moved or while a
+// sign-out runs; and the sign-out waits for the writes already under way
+// before it deletes the file. Another process's writes are not covered: the
+// CLI and the server each guard their own.
+let sessionEpoch = 0;
+/** @type {Promise<{ wasSignedIn: boolean, revoked: boolean }> | null} */
+let signingOut = null;
+/** @type {Set<Promise<void>>} */
+const writes = new Set();
+
+/** The current session epoch, for a writer to hand back to saveCallbackTokenIn. */
+export function callbackSessionEpoch() {
+  return sessionEpoch;
+}
+
+function signedOutError() {
+  /** @type {CallbackApiError} */
+  const err = new Error('signed out of callback.net meanwhile');
+  err.loginRequired = true;
+  return err;
+}
+
+/**
+ * Save a token obtained during session epoch `epoch` (callbackSessionEpoch at
+ * the writer's start), unless a sign-out has begun since. Rejects with
+ * `loginRequired` when it has; a sign-out that begins during the write waits
+ * for it to finish, then deletes what it wrote.
+ *
+ * @param {CallbackToken} token
+ * @param {number} epoch
+ */
+export async function saveCallbackTokenIn(token, epoch) {
+  // The check and the registration are synchronous together: no sign-out can
+  // start between them.
+  if (signingOut || epoch !== sessionEpoch) throw signedOutError();
+  const write = saveCallbackToken(token);
+  writes.add(write);
+  try {
+    await write;
+  } finally {
+    writes.delete(write);
+  }
+}
+
 /**
  * Renew the stored token and save what comes back.
  *
  * @param {CallbackToken} token
  * @param {CallOptions & { now?: () => number }} opts
+ * @param {number} epoch  the session epoch `token` was read in: a renewal of a
+ *   token read before a sign-out is refused, joined or not, so a reply that
+ *   arrives after the sign-out can never write the old session back
  * @returns {Promise<CallbackToken>}
  */
-function renewCallbackToken(token, opts) {
+function renewCallbackToken(token, opts, epoch) {
+  if (signingOut || epoch !== sessionEpoch) return Promise.reject(signedOutError());
   const key = token.refresh_token || '';
   const pending = renewing.get(key);
   if (pending) return pending;
@@ -390,7 +443,7 @@ function renewCallbackToken(token, opts) {
       if (err && typeof err.code === 'number' && err.code >= 400 && err.code < 500) err.loginRequired = true;
       throw err;
     }
-    await saveCallbackToken(fresh);
+    await saveCallbackTokenIn(fresh, epoch);
     return fresh;
   })().finally(() => { renewing.delete(key); });
   renewing.set(key, renewal);
@@ -414,6 +467,9 @@ export async function callbackCall(method, path, params = null, opts = {}) {
   // `opts` goes to the plain calls as it is: they read only the fields they know.
   const call = opts;
   const now = opts.now || Date.now;
+  // Before the read: the token is the session of this epoch, and any renewal
+  // of it below belongs to it too (see renewCallbackToken).
+  const epoch = sessionEpoch;
   let token = await loadCallbackToken();
   if (!token) {
     /** @type {CallbackApiError} */
@@ -424,7 +480,7 @@ export async function callbackCall(method, path, params = null, opts = {}) {
   let renewed = false;
   if (token.refresh_token && callbackTokenLapsed(token, now(), RENEW_AHEAD_MS)) {
     try {
-      token = await renewCallbackToken(token, opts);
+      token = await renewCallbackToken(token, opts, epoch);
       renewed = true;
     } catch (/** @type {any} */ err) {
       // Refused: the session is over. Unreached: the current token has a
@@ -438,7 +494,7 @@ export async function callbackCall(method, path, params = null, opts = {}) {
     const refused = err?.code === 401 || err?.code === 403;
     if (renewed || !(err?.tokenExpired || (refused && callbackTokenLapsed(token, now())))) throw err;
   }
-  const fresh = await renewCallbackToken(token, opts);
+  const fresh = await renewCallbackToken(token, opts, epoch);
   return callbackApi(method, path, params, { ...call, accessToken: fresh.access_token });
 }
 
@@ -460,10 +516,37 @@ export async function callbackWhoami(opts = {}) {
  * Sign out: revoke the token upstream (best effort — a server that cannot be
  * reached must not keep the token on disk) and forget it locally.
  *
+ * The session epoch moves first, so no renewal or sign-in under way can save
+ * its token from then on, and the writes already started are waited for
+ * before the file is read and deleted (see saveCallbackTokenIn). A sign-out
+ * called while another runs shares that one's result.
+ *
  * @param {CallOptions} [opts]
  * @returns {Promise<{ wasSignedIn: boolean, revoked: boolean }>}
  */
 export async function logoutCallback(opts = {}) {
+  // One sign-out at a time: a second one while the first runs shares it, so
+  // the guard below is not dropped by whichever finishes first while the
+  // other is still deleting.
+  if (signingOut) return signingOut;
+  sessionEpoch++;
+  const run = (async () => {
+    await Promise.allSettled([...renewing.values(), ...writes]);
+    return signOutNow(opts);
+  })();
+  signingOut = run;
+  try {
+    return await run;
+  } finally {
+    if (signingOut === run) signingOut = null;
+  }
+}
+
+/**
+ * @param {CallOptions} opts
+ * @returns {Promise<{ wasSignedIn: boolean, revoked: boolean }>}
+ */
+async function signOutNow(opts) {
   const token = await loadCallbackToken();
   if (!token) {
     await clearCallbackToken();
