@@ -625,6 +625,30 @@ export function instanceNameOutcome(res) {
   return { kind: 'ok', text: res.custom ? 'this instance is now called ' + res.name : 'instance name cleared; it goes by its host name, ' + res.name };
 }
 
+/**
+ * @param {string} address  '' goes back to the guess
+ * @param {string|null|undefined} key
+ */
+export function instanceAddressRequest(address, key) {
+  return {
+    url: '/teamclaude/instance-address',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ address: address }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function instanceAddressOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'instance address change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.address ? 'other machines are now given ' + res.address : 'instance address cleared; the link uses a guess again' };
+}
+
 // What the Instance picker calls the machine the page was opened on: its
 // name, or "This machine" from a proxy too old to say.
 /** @param {any} self  { name } from /teamclaude/peers, or status.instance */
@@ -1056,9 +1080,10 @@ export function linkAddMissing(body) {
 
 /**
  * The addresses to offer for "this machine, as the other one reaches it",
- * best first: the address this page was opened at, when that is not this
- * machine's loopback and the page shows this machine, then what the server
- * found on its own interfaces.
+ * best first: the address set on the Settings page (`instanceAddress`), then
+ * the address this page was opened at, when that is not this machine's
+ * loopback and the page shows this machine, then what the server found on its
+ * own interfaces.
  *
  * @param {any} self  the `self` of GET /teamclaude/peer-links
  * @param {string} origin  location.origin, or '' when the page shows a linked instance
@@ -1068,9 +1093,26 @@ export function linkSelfOptions(self, origin) {
   var out = [];
   var host = '';
   try { host = origin ? new URL(origin).hostname : ''; } catch { host = ''; }
-  if (host && !isLoopbackHost(host)) out.push(origin);
+  if (self && typeof self.address === 'string' && self.address) out.push(self.address);
+  if (host && !isLoopbackHost(host) && out.indexOf(origin) < 0) out.push(origin);
   (self && Array.isArray(self.addresses) ? self.addresses : []).forEach(function (/** @type {string} */ a) { if (out.indexOf(a) < 0) out.push(a); });
   return out;
+}
+
+/**
+ * The `self` of GET /teamclaude/peer-links as it is once `instanceAddress` is
+ * `address`, so the page can offer a new address the moment it is saved or a
+ * status reports it, without waiting for a fresh read. The old address set
+ * leaves the list; the guesses stay.
+ *
+ * @param {any} self  the `self` of GET /teamclaude/peer-links
+ * @param {string} address  '' when none is set
+ */
+export function linkSelfWithAddress(self, address) {
+  if (!self) return self;
+  var old = typeof self.address === 'string' ? self.address : '';
+  var rest = (Array.isArray(self.addresses) ? self.addresses : []).filter(function (/** @type {string} */ a) { return a !== old && a !== address; });
+  return Object.assign({}, self, { address: address, addresses: address ? [address].concat(rest) : rest });
 }
 
 /**
@@ -2083,7 +2125,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -2357,9 +2399,10 @@ const PAGE = `<!doctype html>
   .actions button:disabled { opacity: .5; cursor: default; }
   .actions button.sel, .chip.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
   .actions .lbl { color: var(--dim); font-size: 12px; }
-  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; max-width: 100%; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .thr input.name { width: 170px; text-align: left; }
+  .thr input.addr { width: 220px; min-width: 0; flex: 0 1 auto; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -2578,6 +2621,14 @@ const PAGE = `<!doctype html>
             <label for="nameVal">Name</label>
             <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
             <button id="nameSet" class="btn" type="button">Save</button>
+          </span>
+        </div>
+        <div class="setting" id="addrRow" style="display:none">
+          <div><b>Instance address</b><span class="tag">The address the link gives other machines. Set it in a Docker container. Empty uses a guess.</span></div>
+          <span class="thr">
+            <label for="addrVal">Address</label>
+            <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
+            <button id="addrSet" class="btn" type="button">Save</button>
           </span>
         </div>
         <div class="setting">
@@ -3434,6 +3485,12 @@ ${SHARED_HELPERS}
   // Remove is armed by a first click, like Revoke.
   var linkSelf = null;
   var linkSelfState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'unsupported'
+  var linkSelfPrefill = '';
+  // Saves of the Instance address so far. A status or /peer-links read that
+  // was asked before the latest one may answer after it, with the address it
+  // replaced, so such a read is not let near the address.
+  var addrSaves = 0;
+  var statusAddrStale = false;
   var linkRemoveArmed = Object.create(null);
 
   // The address this page was opened at, which is this machine as the browser
@@ -3507,6 +3564,7 @@ ${SHARED_HELPERS}
 
   function loadLinkSelf() {
     linkSelfState = 'asking';
+    var saves = addrSaves;
     fetch(at('/teamclaude/peer-links'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // An instance from before this card: no such route.
@@ -3515,6 +3573,8 @@ ${SHARED_HELPERS}
         return res.json();
       })
       .then(function (j) {
+        // Asked before a save: it may offer the address that save replaced.
+        if (saves !== addrSaves) { linkSelfState = 'unasked'; if (lastStatus) renderLinks(lastStatus); return; }
         linkSelfState = j.unsupported ? 'unsupported' : 'done';
         linkSelf = j.self || null;
         fillLinkSelf();
@@ -3522,6 +3582,18 @@ ${SHARED_HELPERS}
       })
       // Asked again on a later render, not now: a loop on a proxy that keeps failing helps no one.
       .catch(function () { linkSelfState = 'unasked'; });
+  }
+
+  // Brings what this instance offers in line with the address set for it,
+  // and closes a shown link that still carries the old one.
+  // Then asks for it again: the address set may also have been the one guess
+  // the server found, which the swap dropped along with it.
+  function useInstanceAddress(address) {
+    if (!linkSelf || linkSelf.address === address) return;
+    linkSelf = linkSelfWithAddress(linkSelf, address);
+    fillLinkSelf();
+    if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
+    linkSelfState = 'unasked';
   }
 
   // Prefills what this machine would be called and reached at from the other
@@ -3532,7 +3604,8 @@ ${SHARED_HELPERS}
     list.textContent = '';
     opts.forEach(function (o) { var op = el('option'); op.value = o; list.appendChild(op); });
     var url = document.getElementById('linkSelfUrl');
-    if (!url.value && opts.length) url.value = opts[0];
+    // A prefill nobody has typed over follows a new Instance address.
+    if ((!url.value || url.value === linkSelfPrefill) && opts.length) url.value = linkSelfPrefill = opts[0];
     var name = document.getElementById('linkSelfName');
     if (!name.value && linkSelf && linkSelf.name) name.value = linkSelf.name;
     var notice = linkBackNotice(linkSelf);
@@ -3670,7 +3743,8 @@ ${SHARED_HELPERS}
           var opts = linkSelfOptions(linkSelf, pageOrigin());
           var link = opts.length ? instanceLink(opts[0], j.key) : '';
           if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
-          if (opts.length) snippet(box, 'Address (a best guess: use one the other machine can reach)', opts[0], 0);
+          var addrSet = !!(linkSelf && linkSelf.address && linkSelf.address === opts[0]);
+          if (opts.length) snippet(box, addrSet ? 'Address (set under Instance address above)' : 'Address (a best guess: use one the other machine can reach, or set Instance address above)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
         box.style.display = '';
@@ -4900,6 +4974,15 @@ ${SHARED_HELPERS}
       nameInput.value = inst.custom ? inst.name : '';
       nameInput.placeholder = inst.host || '';
     }
+    // A proxy too old to say its address has no row for it either.
+    var hasAddr = !!inst && typeof inst.address === 'string';
+    document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
+    var addrInput = document.getElementById('addrVal');
+    if (hasAddr && !statusAddrStale) {
+      if (document.activeElement !== addrInput) addrInput.value = inst.address;
+      // Set from a reload or another browser: the link must not keep the old one.
+      useInstanceAddress(inst.address);
+    }
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -5407,6 +5490,36 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doInstanceAddress(btn) {
+    var input = document.getElementById('addrVal');
+    btn.disabled = true;
+    var r = instanceAddressRequest(input.value.trim(), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = instanceAddressOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) {
+          input.value = json.address;
+          // At once, so a Show key that answers before the reads below
+          // already builds its link from the new address. Then ask again, for
+          // guesses the old address may have hidden.
+          addrSaves++;
+          // The status the page holds was read before the save, so a
+          // re-render from it must not bring the old address back either.
+          statusAddrStale = true;
+          useInstanceAddress(json.address);
+        }
+        poll();
+      })
+      .catch(function (e) { note('error', 'instance address change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // Saved on pick: a select has no half-entered state to protect, so a Set
   // button would only be a second click. The select is neither disabled nor
   // blurred while it saves: either would drop keyboard focus, and arrowing
@@ -5542,6 +5655,7 @@ ${SHARED_HELPERS}
   }
 
   function pollStatus() {
+    var saves = addrSaves;
     fetch(at('/teamclaude/status'), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
         // 403 is the loopback exemption refusing a key-less request (a Host
@@ -5555,6 +5669,7 @@ ${SHARED_HELPERS}
       })
       .then(function (s) {
         if (!s) return;
+        statusAddrStale = saves !== addrSaves;
         // A linked instance's status lists ITS peers; the picker lists ours.
         if (!peer) renderInstances(s.peers, s.instance);
         document.getElementById('keybox').style.display = 'none';
@@ -5672,6 +5787,10 @@ ${SHARED_HELPERS}
   document.getElementById('nameSet').addEventListener('click', function () { doInstanceName(this); });
   document.getElementById('nameVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); doInstanceName(document.getElementById('nameSet')); }
+  });
+  document.getElementById('addrSet').addEventListener('click', function () { doInstanceAddress(this); });
+  document.getElementById('addrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doInstanceAddress(document.getElementById('addrSet')); }
   });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for

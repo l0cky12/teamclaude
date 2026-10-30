@@ -86,6 +86,7 @@
     "holdSeconds": 120
   },
   "instanceName": "hermes",
+  "instanceAddress": "http://100.64.0.1:3456",
   "peers": [
     {
       "name": "server",

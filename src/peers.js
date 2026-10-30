@@ -303,18 +303,36 @@ export function instanceName(config) {
 }
 
 /**
+ * The address set as `instanceAddress` (the dashboard's Instance address row
+ * on Settings), or '' when none is. It is the one guess that is not a guess:
+ * in a Docker container the interfaces are the container's own, and the
+ * host's address is nowhere the proxy can see it.
+ *
+ * @param {Record<string, any>} config
+ */
+export function instanceAddress(config) {
+  return typeof config?.instanceAddress === 'string' ? config.instanceAddress.trim() : '';
+}
+
+/**
  * What the dashboard needs to offer this machine to another: a name to list
- * it under there, the addresses it may be reached at, and whether it can be
- * linked at all (it listens off this machine and has a proxy key to hand out).
+ * it under there, the address set for it, the addresses it may be reached at
+ * (that one first), and whether it can be linked at all (it listens off this
+ * machine and has a proxy key to hand out).
  *
  * @param {Record<string, any>} config
  * @param {string | null | undefined} bindHost
  * @param {number} port  the port the asking request came in on
  */
 export function selfLinkInfo(config, bindHost, port) {
+  const address = instanceAddress(config);
+  // Offered even on loopback: a reverse proxy or Tailscale Serve in front of
+  // the proxy is an address the other machine can use.
+  const guessed = selfAddresses(bindHost, port).filter(a => a !== address);
   return {
     name: instanceName(config),
-    addresses: selfAddresses(bindHost, port),
+    address,
+    addresses: address ? [address, ...guessed] : guessed,
     offBox: !bindsLoopbackOnly(bindHost),
     hasKey: !!config.proxy?.apiKey,
   };
