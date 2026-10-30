@@ -235,6 +235,7 @@ Step by step: [docs/routing.md](docs/routing.md#request-lifecycle).
 | --- | --- |
 | [Accounts](docs/accounts.md) | Signing in from the CLI or dashboard, API keys, several organisations, Codex accounts, third-party backends, export/import, callback.net sync, per-account proxies, signing in over SSH |
 | [Usage](docs/usage.md) | The server and terminal UI, running Claude Code, the web dashboard, linked instances, the MCP endpoint, every command, logging, Docker |
+| [VS Code](docs/vscode.md) | The Claude Code extension for VS Code through the proxy: settings, a check, updates |
 | [Routing](docs/routing.md) | How accounts are chosen, the distribution modes, model routes, pinning, the prompt cache |
 | [Quota](docs/quota.md) | How quota is read, probing, keep-warm, thresholds, spending caps, extra usage, holding |
 | [Configuration](docs/configuration.md) | The config file, every setting, environment variables |

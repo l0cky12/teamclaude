@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
 import { logoDataUrl, logoMarkup } from './logo.js';
@@ -474,6 +474,14 @@ export function sessionRows(sessions) {
     row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
     return row;
   });
+}
+
+// "pinned: 3f2a1b9c → api-1, 9d0e4c11 → work" — the sessions an operator held
+// on one account (`teamclaude switch --session`), or '' when there are none.
+/** @param {any} pins */
+export function sessionPinsText(pins) {
+  if (!Array.isArray(pins) || !pins.length) return '';
+  return 'pinned: ' + pins.map(function (p) { return (p && p.session || '?') + ' \u2192 ' + (p && p.account || '?'); }).join(', ');
 }
 
 export function filterSessionRows(rows, filters) {
@@ -1540,7 +1548,7 @@ export function accountMeters(account, fable, now) {
       });
     }
     if (a.provider === 'codex' ? q.unified5h != null : showSessionRow(q)) slots[1] = quotaMeter('5-hour limit', q.unified5h, q.unified5hReset);
-    slots[2] = quotaMeter('7-day limit', q.unified7d, q.unified7dReset);
+    if (showWeeklyRow(q)) slots[2] = quotaMeter('7-day limit', q.unified7d, q.unified7dReset);
     // Show usable session capacity: a fresh session cannot bypass an empty
     // weekly bucket. Keep upstream's reading intact for routing and persistence.
     var weekly = [slots[0], slots[2]].filter(function (m) { return exhaustedMeter(m, at); });
@@ -2081,10 +2089,10 @@ export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have gone through. Refresh quota to check before trying again.';
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
-  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
@@ -4927,6 +4935,8 @@ ${SHARED_HELPERS}
     // saying "sessions" here and "conversations" there would read as two
     // different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var pinsText = sessionPinsText(s.sessionPins);
+    if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
