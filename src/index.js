@@ -651,6 +651,9 @@ async function serverCommand() {
     // So is the name this instance goes by in the picker and offers to a link.
     if (diskConfig.instanceName === undefined) delete config.instanceName;
     else config.instanceName = diskConfig.instanceName;
+    // And the address it offers for itself when linked from another machine.
+    if (diskConfig.instanceAddress === undefined) delete config.instanceAddress;
+    else config.instanceAddress = diskConfig.instanceAddress;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.

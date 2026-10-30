@@ -653,6 +653,25 @@ export function setInstanceName(config, raw) {
   return name;
 }
 
+/**
+ * Set the address other machines reach this one at (`instanceAddress`): what
+ * the dashboard offers first when it hands out this machine's link, ahead of
+ * the address the page was opened at and the proxy's guess from its own
+ * interfaces. Stored in the form a linked instance's address is. An empty
+ * address drops the key, and the guess is used again.
+ *
+ * @param {Config} config
+ * @param {unknown} raw
+ * @returns {string}  the address saved, or '' when it was cleared
+ */
+export function setInstanceAddress(config, raw) {
+  if (typeof raw !== 'string') throw new ConfigOpError('the instance address must be text');
+  if (!raw.trim()) { delete config.instanceAddress; return ''; }
+  const address = peerAddress(raw);
+  config.instanceAddress = address;
+  return address;
+}
+
 /** @param {any} entry  one element of config.peers, as found in the file */
 function peerEntryName(entry) {
   return typeof entry?.name === 'string' ? entry.name.trim() : '';

@@ -625,6 +625,30 @@ export function instanceNameOutcome(res) {
   return { kind: 'ok', text: res.custom ? 'this instance is now called ' + res.name : 'instance name cleared; it goes by its host name, ' + res.name };
 }
 
+/**
+ * @param {string} address  '' goes back to the guess
+ * @param {string|null|undefined} key
+ */
+export function instanceAddressRequest(address, key) {
+  return {
+    url: '/teamclaude/instance-address',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ address: address }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function instanceAddressOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'instance address change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.address ? 'other machines are now given ' + res.address : 'instance address cleared; the link uses a guess again' };
+}
+
 // What the Instance picker calls the machine the page was opened on: its
 // name, or "This machine" from a proxy too old to say.
 /** @param {any} self  { name } from /teamclaude/peers, or status.instance */
@@ -1056,9 +1080,10 @@ export function linkAddMissing(body) {
 
 /**
  * The addresses to offer for "this machine, as the other one reaches it",
- * best first: the address this page was opened at, when that is not this
- * machine's loopback and the page shows this machine, then what the server
- * found on its own interfaces.
+ * best first: the address set on the Settings page (`instanceAddress`), then
+ * the address this page was opened at, when that is not this machine's
+ * loopback and the page shows this machine, then what the server found on its
+ * own interfaces.
  *
  * @param {any} self  the `self` of GET /teamclaude/peer-links
  * @param {string} origin  location.origin, or '' when the page shows a linked instance
@@ -1068,7 +1093,8 @@ export function linkSelfOptions(self, origin) {
   var out = [];
   var host = '';
   try { host = origin ? new URL(origin).hostname : ''; } catch { host = ''; }
-  if (host && !isLoopbackHost(host)) out.push(origin);
+  if (self && typeof self.address === 'string' && self.address) out.push(self.address);
+  if (host && !isLoopbackHost(host) && out.indexOf(origin) < 0) out.push(origin);
   (self && Array.isArray(self.addresses) ? self.addresses : []).forEach(function (/** @type {string} */ a) { if (out.indexOf(a) < 0) out.push(a); });
   return out;
 }
@@ -2083,7 +2109,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, selfInstanceLabel,
   outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -2360,6 +2386,7 @@ const PAGE = `<!doctype html>
   .thr { display: flex; align-items: center; gap: 6px; font-size: 13px; }
   .thr input { width: 80px; font: inherit; font-size: 13px; padding: 4px 8px; text-align: right; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .thr input.name { width: 170px; text-align: left; }
+  .thr input.addr { width: 220px; text-align: left; }
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
@@ -2578,6 +2605,14 @@ const PAGE = `<!doctype html>
             <label for="nameVal">Name</label>
             <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
             <button id="nameSet" class="btn" type="button">Save</button>
+          </span>
+        </div>
+        <div class="setting" id="addrRow" style="display:none">
+          <div><b>Instance address</b><span class="tag">The address other machines reach this one at, put in the link under Linked instances. Set it when the guess is wrong, as it is in a Docker container. Empty uses the guess. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="addrVal">Address</label>
+            <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
+            <button id="addrSet" class="btn" type="button">Save</button>
           </span>
         </div>
         <div class="setting">
@@ -3434,6 +3469,7 @@ ${SHARED_HELPERS}
   // Remove is armed by a first click, like Revoke.
   var linkSelf = null;
   var linkSelfState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'unsupported'
+  var linkSelfPrefill = '';
   var linkRemoveArmed = Object.create(null);
 
   // The address this page was opened at, which is this machine as the browser
@@ -3532,7 +3568,8 @@ ${SHARED_HELPERS}
     list.textContent = '';
     opts.forEach(function (o) { var op = el('option'); op.value = o; list.appendChild(op); });
     var url = document.getElementById('linkSelfUrl');
-    if (!url.value && opts.length) url.value = opts[0];
+    // A prefill nobody has typed over follows a new Instance address.
+    if ((!url.value || url.value === linkSelfPrefill) && opts.length) url.value = linkSelfPrefill = opts[0];
     var name = document.getElementById('linkSelfName');
     if (!name.value && linkSelf && linkSelf.name) name.value = linkSelf.name;
     var notice = linkBackNotice(linkSelf);
@@ -4900,6 +4937,11 @@ ${SHARED_HELPERS}
       nameInput.value = inst.custom ? inst.name : '';
       nameInput.placeholder = inst.host || '';
     }
+    // A proxy too old to say its address has no row for it either.
+    var hasAddr = !!inst && typeof inst.address === 'string';
+    document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
+    var addrInput = document.getElementById('addrVal');
+    if (hasAddr && document.activeElement !== addrInput) addrInput.value = inst.address;
     var notice = callerNotice(s.caller);
     document.getElementById('callerText').textContent = notice || '';
     document.getElementById('caller').style.display = notice ? 'block' : 'none';
@@ -5407,6 +5449,32 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doInstanceAddress(btn) {
+    var input = document.getElementById('addrVal');
+    btn.disabled = true;
+    var r = instanceAddressRequest(input.value.trim(), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = instanceAddressOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) {
+          input.value = json.address;
+          // The link under Linked instances is built from what this asked
+          // for, so ask again, and close a shown link that still has the old one.
+          linkSelfState = 'unasked';
+          if (ownKeyOpen) toggleOwnKey(document.getElementById('ownKeyShow'));
+        }
+        poll();
+      })
+      .catch(function (e) { note('error', 'instance address change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   // Saved on pick: a select has no half-entered state to protect, so a Set
   // button would only be a second click. The select is neither disabled nor
   // blurred while it saves: either would drop keyboard focus, and arrowing
@@ -5672,6 +5740,10 @@ ${SHARED_HELPERS}
   document.getElementById('nameSet').addEventListener('click', function () { doInstanceName(this); });
   document.getElementById('nameVal').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); doInstanceName(document.getElementById('nameSet')); }
+  });
+  document.getElementById('addrSet').addEventListener('click', function () { doInstanceAddress(this); });
+  document.getElementById('addrVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); doInstanceAddress(document.getElementById('addrSet')); }
   });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
   // A client key is a valid key, so nothing else on the page would ever ask for

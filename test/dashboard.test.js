@@ -10,7 +10,7 @@ import {
   sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, routeRows, problems, STARVED_MIN, STARVED_LIST_MAX,
   thresholdRequest, thresholdPercentText, thresholdOutcome,
-  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, selfInstanceLabel,
+  probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, selfInstanceLabel,
   usageFor, USAGE_VIEWS, backendQuotaRows,
   callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, CARD_NOTE_MAX_AGE_MS,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
@@ -1155,6 +1155,7 @@ test('the page ships the same helper implementations it is tested against', () =
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
     peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
+    instanceAddressRequest, instanceAddressOutcome,
     accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
@@ -2614,6 +2615,14 @@ test('linkSelfOptions puts the address the page was opened at first, unless that
   assert.deepEqual(linkSelfOptions(null, 'not a url'), []);
 });
 
+test('linkSelfOptions puts the Instance address set ahead of the page address and the guess', () => {
+  // A Docker container guesses its own bridge address; the address set is the host's.
+  const self = { address: 'http://100.64.0.9:3456', addresses: ['http://100.64.0.9:3456', 'http://172.30.0.2:3456'] };
+  assert.deepEqual(linkSelfOptions(self, 'http://localhost:3456'), ['http://100.64.0.9:3456', 'http://172.30.0.2:3456']);
+  assert.deepEqual(linkSelfOptions(self, 'http://hub.lan:3456'), ['http://100.64.0.9:3456', 'http://hub.lan:3456', 'http://172.30.0.2:3456']);
+  assert.deepEqual(linkSelfOptions({ ...self, address: '' }, 'http://localhost:3456'), self.addresses);
+});
+
 test('linkBackNotice blocks a machine without a key, and only warns about one on loopback', () => {
   assert.equal(linkBackNotice({ offBox: true, hasKey: true }), null);
   assert.equal(linkBackNotice(null), null);
@@ -2884,6 +2893,55 @@ test('instanceNameRequest posts the name, and instanceNameOutcome says what it i
   assert.match(instanceNameOutcome({ ok: true, name: 'box', custom: false }).text, /cleared; it goes by its host name, box$/);
   assert.equal(instanceNameOutcome({ ok: false, error: 'bad name' }).text, 'instance name change failed: bad name');
   assert.equal(instanceNameOutcome(null).kind, 'error');
+});
+
+test('instanceAddressRequest posts the address, and instanceAddressOutcome says what other machines get', () => {
+  const r = instanceAddressRequest('http://100.64.0.9:3456', 'tc-k');
+  assert.equal(r.url, '/teamclaude/instance-address');
+  assert.equal(r.init.method, 'POST');
+  assert.equal(r.init.headers['x-api-key'], 'tc-k');
+  assert.deepEqual(JSON.parse(r.init.body), { address: 'http://100.64.0.9:3456' });
+  assert.deepEqual(instanceAddressOutcome({ ok: true, address: 'http://100.64.0.9:3456' }), { kind: 'ok', text: 'other machines are now given http://100.64.0.9:3456' });
+  assert.match(instanceAddressOutcome({ ok: true, address: '' }).text, /cleared; the link uses a guess again$/);
+  assert.equal(instanceAddressOutcome({ ok: false, error: 'bad' }).text, 'instance address change failed: bad');
+  assert.equal(instanceAddressOutcome(null).kind, 'error');
+});
+
+test('the Instance address row saves what is typed, and the link handed out then carries it', async () => {
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    assert.equal(page.byId('addrRow').style.display, '');
+    assert.equal(page.byId('addrVal').value, '');
+    await page.answer(200, { self: { ...SELF, addresses: ['http://172.30.0.2:3456'] }, peers: [] });
+    assert.equal(page.byId('linkSelfUrl').value, 'http://172.30.0.2:3456', 'the container guess, before an address is set');
+    page.byId('ownKeyShow').fire('click');
+    await page.answer(200, { ok: true, key: 'tc-hub' });
+
+    page.byId('addrVal').value = ' 100.64.0.9:3456 ';
+    page.byId('addrSet').fire('click');
+    assert.equal(page.requests[0].url, '/teamclaude/instance-address');
+    assert.deepEqual(JSON.parse(page.requests[0].init.body), { address: '100.64.0.9:3456' });
+    await page.answer(200, { ok: true, address: 'http://100.64.0.9:3456' });
+    assert.match(page.byId('note').textContent, /other machines are now given http:\/\/100\.64\.0\.9:3456/);
+    assert.equal(page.byId('addrVal').value, 'http://100.64.0.9:3456');
+    assert.equal(page.byId('ownKeyBox').style.display, 'none', 'the link shown with the old address is closed');
+    assert.equal(page.requests[0].url, '/teamclaude/status');
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: 'http://100.64.0.9:3456' } });
+    assert.equal(page.requests[0].url, '/teamclaude/peer-links', 'what this machine offers is asked again');
+    await page.answer(200, { self: { ...SELF, address: 'http://100.64.0.9:3456', addresses: ['http://100.64.0.9:3456', 'http://172.30.0.2:3456'] }, peers: [] });
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456', 'the untouched prefill follows it');
+
+    page.byId('ownKeyShow').fire('click');
+    await page.answer(200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
+test('a proxy too old to say its address has no Instance address row', async () => {
+  const page = bootPage();
+  await page.answer(200, { accounts: [], instance: { name: 'hub', host: 'hub', custom: false } });
+  assert.equal(page.byId('addrRow').style.display, 'none');
 });
 
 test('selfInstanceLabel falls back to This machine', () => {
