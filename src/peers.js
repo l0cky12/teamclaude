@@ -515,12 +515,22 @@ export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList 
     });
 
     // Each missing direction once, in a fixed order, so the report reads the
-    // same whatever finishes first.
+    // same whatever finishes first. An entry with an instance's key at an
+    // address that instance was not seen at may be it, or another install
+    // sharing the key: that direction is reported, not made or taken as made.
     /** @type {{ from: Peer, to: Peer }[]} */ const pairs = [];
     for (const [u, from] of nodes) {
       const list = lists.get(u);
       if (!list) continue;
-      for (const [v, to] of nodes) if (u !== v && !list.some(p => p.apiKey === v)) pairs.push({ from, to });
+      for (const [v, to] of nodes) {
+        if (u === v) continue;
+        const same = list.filter(p => p.apiKey === v);
+        if (!same.length) { pairs.push({ from, to }); continue; }
+        const known = seenAt.get(v) || new Set();
+        if (!same.some(p => known.has(p.url))) {
+          skipped.push({ from: from.name, to: to.name, error: `${from.name} lists ${same[0].name} at ${same[0].url} with the proxy key of ${to.name}, which is at ${[...known].join(' and ')}; it cannot be told whether that is ${to.name}, so link them by hand if it is not` });
+        }
+      }
     }
 
     /** @type {(MeshLink | MeshSkip | null)[]} */ const results = pairs.map(() => null);
@@ -543,7 +553,7 @@ export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList 
           if (out.state !== 'online') { skip(`${to.name} is ${out.state} from ${from.name}`); continue; }
           localAdds.push({ index, entry });
         } else {
-          const err = await bounded(remoteAdd(request, from, entry));
+          const err = await bounded(remoteAdd(request, from, entry, () => timedOut));
           if (err === TIMED_OUT) { skip(`ran out of time waiting for ${from.name}; it may have linked ${to.name} anyway`); continue; }
           if (err) { skip(err); continue; }
           results[index] = { from: from.name, to: entry.name };
@@ -553,9 +563,17 @@ export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList 
     }));
 
     // Saved last and in one go: one write under the config lock, one reload.
-    // A link counts only once it is saved.
+    // A link counts only once it is saved. Within the budget too: a write
+    // still going when it runs out finishes on its own, so those links are
+    // reported as perhaps made.
     if (localAdds.length) {
-      const saved = await addLocal(localAdds.map(a => a.entry)).catch(() => localAdds.map(() => 'could not save it; see the proxy log'));
+      /** @type {(string | null)[]} */ let saved;
+      if (timedOut) {
+        saved = localAdds.map(() => 'ran out of time before saving it');
+      } else {
+        const out = await bounded(addLocal(localAdds.map(a => a.entry)).catch(() => localAdds.map(() => 'could not save it; see the proxy log')));
+        saved = out === TIMED_OUT ? localAdds.map(() => 'ran out of time while saving it; it may be saved all the same') : out;
+      }
       localAdds.forEach(({ index, entry }, i) => {
         const why = saved[i];
         results[index] = why ? { from: self.name, to: pairs[index].to.name, error: why } : { from: self.name, to: entry.name };
@@ -573,14 +591,16 @@ export async function joinPeerMesh({ self, ownPeers, joined, addLocal, readList 
 
 /**
  * Ask `from` to test `entry` and, when it answers, to list it. The error to
- * report, or null when it was added.
+ * report, or null when it was added. `expired` is asked before the add: a
+ * test that answers after the join has given up must not change anything.
  *
  * @param {typeof peerRequest} request
  * @param {Peer} from
  * @param {Peer} entry
+ * @param {() => boolean} expired
  * @returns {Promise<string | null>}
  */
-async function remoteAdd(request, from, entry) {
+async function remoteAdd(request, from, entry, expired) {
   /** @param {Buffer} body */
   const why = (body) => {
     try { return String(JSON.parse(body.toString('utf8')).error || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200); } catch { return ''; }
@@ -590,6 +610,7 @@ async function remoteAdd(request, from, entry) {
     if (tested.status !== 200) return `${from.name} could not test the link (${why(tested.body) || 'status ' + tested.status})`;
     const state = JSON.parse(tested.body.toString('utf8'))?.state;
     if (state !== 'online') return `${entry.name} is ${typeof state === 'string' ? state.slice(0, 20) : 'unknown'} from ${from.name}`;
+    if (expired()) return 'ran out of time';
     const added = await request(from, 'peer-links/add', { method: 'POST', body: Buffer.from(JSON.stringify(entry)), timeoutMs: MESH_STEP_TIMEOUT_MS });
     if (added.status !== 200) return `${from.name} did not add ${entry.name} (${why(added.body) || 'status ' + added.status})`;
     return null;

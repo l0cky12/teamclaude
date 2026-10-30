@@ -255,3 +255,57 @@ test('an add that already used up the time links nothing more, and says so', asy
   assert.match(out.skipped[0].error, /linking hub took all the time this request has/);
   assert.deepEqual(w.calls, [], 'nothing was asked');
 });
+
+test('a later list naming another address under a known key is reported, not taken as linked', async () => {
+  // The server lists some other install that shares desk's key.
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  w.machines.server.list.push({ name: 'old-desk', url: 'http://old-desk.test:3456', apiKey: 'desk-key' });
+  const out = await join(w, 'desk', 'hub');
+  assert.deepEqual(out.linked, [{ from: 'desk', to: 'server' }]);
+  assert.equal(out.skipped.length, 1);
+  assert.deepEqual([out.skipped[0].from, out.skipped[0].to], ['server', 'desk']);
+  assert.match(out.skipped[0].error, /server lists old-desk at http:\/\/old-desk\.test:3456 with the proxy key of desk/);
+  assert.ok(!w.calls.some(([step, name]) => step === 'peer-links/add' && name === 'server'), 'the server was not asked to add anything');
+});
+
+test('a save still going when time runs out does not hold up the answer', async () => {
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  let expire;
+  const expiry = new Promise((resolve) => { expire = resolve; });
+  const out = await joinPeerMesh({
+    self: w.peer('desk'),
+    ownPeers: w.machines.desk.list.map(p => ({ ...p })),
+    joined: w.peer('hub'),
+    // The write never finishes, and time runs out while it waits.
+    addLocal: () => { expire(); return new Promise(() => {}); },
+    readList: w.readList,
+    test: w.test,
+    request: w.request,
+    expiry,
+  });
+  assert.deepEqual(out.linked, [{ from: 'server', to: 'desk' }]);
+  assert.deepEqual(out.skipped, [{ from: 'desk', to: 'server', error: 'ran out of time while saving it; it may be saved all the same' }]);
+});
+
+test('a remote test that answers after the join gave up adds nothing', async () => {
+  const w = world({ hub: ['server', 'desk'], server: ['hub'], desk: ['hub'] });
+  let expire;
+  const expiry = new Promise((resolve) => { expire = resolve; });
+  let answer;
+  const request = w.request;
+  w.request = (from, rest, opts) => {
+    if (from.name === 'server' && rest === 'peer-links/test') {
+      w.calls.push([rest, from.name]);
+      expire();
+      return new Promise((resolve) => { answer = () => resolve({ status: 200, body: Buffer.from(JSON.stringify({ ok: true, state: 'online' })) }); });
+    }
+    return request(from, rest, opts);
+  };
+  const out = await join(w, 'desk', 'hub', { expiry });
+  assert.match(Object.fromEntries(out.skipped.map(s => [`${s.from}>${s.to}`, s.error]))['server>desk'], /ran out of time waiting for server/);
+  // The late answer arrives; let everything it would set off run.
+  answer();
+  await new Promise(setImmediate);
+  assert.ok(!w.calls.some(([step, name]) => step === 'peer-links/add' && name === 'server'));
+  assert.deepEqual(w.lists('server'), ['hub']);
+});
