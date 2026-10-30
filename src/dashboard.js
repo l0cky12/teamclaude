@@ -5509,6 +5509,9 @@ ${SHARED_HELPERS}
           // already builds its link from the new address. Then ask again, for
           // guesses the old address may have hidden.
           addrSaves++;
+          // The status the page holds was read before the save, so a
+          // re-render from it must not bring the old address back either.
+          statusAddrStale = true;
           useInstanceAddress(json.address);
         }
         poll();

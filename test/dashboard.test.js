@@ -3018,6 +3018,25 @@ test('a /peer-links read asked before a save is asked again rather than used', a
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 
+test('a re-render from the status held before a save cannot put the old address back', async () => {
+  await onSettings(async (page) => {
+    const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
+    await page.answer(200, { accounts: [], peers, caller: OPERATOR, instance: { name: 'hub', host: 'hub', custom: false, address: '' } });
+    await page.answer(200, { self: { ...SELF, address: '', addresses: ['http://172.30.0.2:3456'] }, peers });
+    page.byId('addrVal').value = '100.64.0.9:3456';
+    page.byId('addrSet').fire('click');
+    await page.answerTo('/teamclaude/instance-address', 200, { ok: true, address: 'http://100.64.0.9:3456' });
+    // The reads that follow the save stay unanswered; arming Remove re-renders
+    // from the status the page already holds, which still has no address.
+    page.click('Remove');
+    assert.equal(page.byId('linkSelfUrl').value, 'http://100.64.0.9:3456');
+    page.byId('ownKeyShow').fire('click');
+    await page.answerTo('/teamclaude/peer-links/key', 200, { ok: true, key: 'tc-hub' });
+    const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
+    assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
+  }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
+});
+
 test('an address cleared elsewhere that was also the only guess is read back from the server', async () => {
   await onSettings(async (page) => {
     const set = { name: 'hub', host: 'hub', custom: false, address: 'http://172.30.0.2:3456' };
