@@ -47,7 +47,7 @@ A git checkout never updates itself. Use `git pull` to update it.
 
 **Other ways to run it:**
 
-- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container).
+- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container). If you build it with `docker compose` from a checkout, `scripts/redeploy.sh` pulls, rebuilds and restarts it in one command, and rolls back if the new build is unhealthy. See [Updating a compose deployment](docs/usage.md#updating-a-compose-deployment-in-one-command).
 - **Nix:** a flake with NixOS and Home Manager modules. See [nix/README.md](nix/README.md).
 - **As a background service:** `teamclaude service install` starts the proxy at login and restarts it if it stops (systemd on Linux, a LaunchAgent on macOS).
 
@@ -109,7 +109,7 @@ Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`
 - **Logs:** every request, sign-in, sign-out, account switch and settings change, with filters by kind, provider and account. Each request shows which client sent it. Turn on `proxy.logPrompts` to also see the prompt that started it.
 - **Clients:** create a separate key for each machine or agent. The dashboard shows the exact settings to paste into Claude Code or `~/.codex/config.toml`, and how much each key has used over the last 5 hours, 24 hours, or all time.
 - **Sessions, Routing and Settings:** what each conversation spent, which account each model goes to, the switch threshold, and the background quota check (off, or every 5 to 120 seconds).
-- **Linked instances:** run TeamRouter on more than one machine (a desktop and a server, say) and link them from **Settings**. One dashboard can then show and control all of them. Off until you link something.
+- **Linked instances:** run TeamRouter on more than one machine (a desktop and a server, say) and link them from **Settings**. One dashboard can then show and control all of them. Linking a machine to one that is already linked to others links it to those too. Off until you link something.
 
 Light and dark themes follow your system, and the layout fits a phone. Full tour: [docs/usage.md](docs/usage.md#status-dashboard-browser).
 

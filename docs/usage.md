@@ -45,6 +45,27 @@ The config is created on first start with a random `proxy.apiKey`. Anything reac
 
 Build it yourself with `docker build -t teamclaude .` from a checkout.
 
+#### Updating a compose deployment in one command
+
+If your proxy runs with `docker compose` from a git checkout (a `docker-compose.yml` with a `build:` section next to the source), `scripts/redeploy.sh` updates it in one step:
+
+```bash
+scripts/redeploy.sh            # pull, rebuild, restart, check health
+scripts/redeploy.sh --force    # rebuild and restart even if nothing changed
+scripts/redeploy.sh --no-pull  # rebuild what is checked out, without pulling
+```
+
+It runs from any directory. It finds the checkout it lives in. What it does:
+
+1. `git pull --ff-only`. If the pull fails, it stops, and nothing is rebuilt.
+2. If the container already runs the checked-out commit, it stops there. Each build is stamped with its commit, so it can tell.
+3. It tags the running image `<name>:previous` (for example `teamclaude:previous`) as the rollback target.
+4. It builds the new image. The old container keeps serving during the build, so Claude Code and Codex keep working. If the build fails, the running proxy is not touched.
+5. It recreates the container. The proxy is down only for these few seconds.
+6. It runs the image's health check until the new container answers. If the container stops or does not answer within 90 seconds (`TEAMCLAUDE_REDEPLOY_TIMEOUT`), the script prints its last log lines, puts the `:previous` image back, and exits with an error.
+
+The proxy stays up during the build, and a failed update rolls back, so an agent that uses the proxy can run the script itself. The service is `teamclaude` by default. Set `TEAMCLAUDE_SERVICE` to use another one, and `COMPOSE_FILE` if your compose file is not in the checkout root. A shell alias makes it one word: `alias tc-update=~/path/to/teamclaude/scripts/redeploy.sh`.
+
 #### Previewing a branch
 
 `docker/docker-compose.preview.yml` builds a second proxy from a checkout and runs it beside the one you use, for trying a branch's dashboard from another machine on your [Tailscale](https://tailscale.com) network. Every `docker compose` command for it needs `TAILSCALE_IP`, so export it once:
@@ -430,6 +451,14 @@ Each machine needs to listen beyond itself, on a Tailscale or LAN address (set `
 4. Leave **Link back too** ticked to link both ways in one step. This machine then asks the other one to list it as well, under the address and name in the two fields below the box (prefilled with this machine's best guess). To do that it sends the other machine this machine's own proxy key, the same way you just gave this machine the other one's. The box is unticked and locked when this machine has no proxy key, since the other machine could not get in. When it listens on itself only, the card warns you: linking back then works only through something that forwards to it, such as a reverse proxy or Tailscale Serve, so enter that address.
 5. Press **Link**. The link is saved to the config file and takes effect at once, without a restart.
 
+**Linking groups of machines.** When you link both ways, the machines each one already links to are linked too, so the two groups become one where every machine lists every other. Say hub and server are linked, and you link desk to hub: desk and server are then linked both ways as well. If desk was already linked to a laptop, the laptop is also linked with hub and server. A link missing inside either group is added too. The message under the form names each extra pair it linked.
+
+To do this, this machine asks the other one for its linked instances, keys included, through `/teamclaude/peer-links/peers`. That route is for the operator only, like the rest of the linking routes. Each new link is made by the machine that will hold it: it tests the other's address and key before saving it, so an address that only one machine can reach is not saved. Linking two groups therefore gives every machine in either group the proxy keys of every machine in the other.
+
+Machines are told apart by their proxy key, since each machine may call another by a different name. If two machines share one `proxy.apiKey`, or one machine is listed at two different addresses, the join can't tell which it is and leaves that machine out. Give each machine its own key to avoid this.
+
+The extra linking stops after 15 seconds, so the page always gets an answer. A machine that is down, refuses its key, runs an older version, or didn't answer in time is left out. The message says which links were not made; make those from the machines' own dashboards. Removing a link still removes it on one machine only.
+
 To unlink a machine, press **Remove** next to it. That removes it from this machine only. If the other machine lists this one too, remove that link from the other machine's dashboard (pick it in the Instance picker, then go to **Settings**).
 
 **By hand.** On each machine, list the other ones under [`peers`](configuration.md) with an address this machine can reach and that proxy's own `proxy.apiKey`:
@@ -442,7 +471,9 @@ To unlink a machine, press **Remove** next to it. That removes it from this mach
 
 Then reload with **Reload config** on the Settings page, or `curl -X POST http://localhost:3456/teamclaude/reload` on that machine.
 
-An **Instance** picker appears at the top of the sidebar, with **This machine** and each linked instance. Pick one and every page shows that machine: quota, accounts, logs, routing and settings. Every button acts on it too, sign-in included. A line above the page says which instance you are looking at, with **Back to this machine**. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
+An **Instance** picker appears at the top of the sidebar, with the machine you opened the page on and each linked instance. Pick one and every page shows that machine: quota, accounts, logs, routing and settings. Every button acts on it too, sign-in included. A line above the page says which instance you are looking at, with a **Back to** button for the machine you opened the page on.
+
+The picker lists the machine you opened the page on under its host name. To call it something else, enter a name under **Instance name** on the **Settings** page and press **Save**, for example `hermes`. Clear the field and save to go back to the host name. The name is saved to the config file as [`instanceName`](configuration.md). It is also the name that machine suggests when another machine links to it. Linked instances keep the names you gave them when you linked them. The picker marks an instance it cannot reach as `offline`, and one that refuses its key as `refused`. It checks each one at most every 15 seconds, and only while something reads the status.
 
 The browser still talks only to the machine it opened the page on. That proxy forwards each request to the linked one as `/teamclaude/peers/<name>/<route>`, using the key from `peers`, so the browser never holds the other machine's key. Only the control routes are forwarded, never model traffic. Only the operator can use the forwarding: the shared `proxy.apiKey`, or a key-exempt loopback browser. A `proxy.clientKeys` key gets a 403. If a linked machine is down, its pages show why and the rest keep working. If the machine you opened the page on is down, open the dashboard on another one instead.
 

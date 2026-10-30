@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConfigOpError, addPeer, peerAddress, removePeer } from '../src/config-ops.js';
+import { ConfigOpError, addPeer, peerAddress, removePeer, setInstanceName } from '../src/config-ops.js';
 import { configuredPeers } from '../src/peers.js';
 
 // The rules behind the dashboard's Linked instances card: what an entry of
@@ -68,4 +68,23 @@ test('removePeer drops every entry under the name and refuses one that is not th
   assert.throws(() => removePeer(config, 'a'), /no linked instance is named "a"/);
   assert.throws(() => removePeer(config, ''), /name the linked instance/);
   assert.throws(() => removePeer({}, 'a'), ConfigOpError);
+});
+
+test('setInstanceName stores a trimmed name, and an empty one drops the key', () => {
+  const config = {};
+  assert.equal(setInstanceName(config, '  hermes '), 'hermes');
+  assert.equal(config.instanceName, 'hermes');
+  assert.equal(setInstanceName(config, ''), '');
+  assert.equal('instanceName' in config, false, 'cleared, so the host name is used again');
+});
+
+test('setInstanceName refuses a name a link could not store, and anything but text', () => {
+  for (const bad of ['my laptop', '.hidden', '-x', 'a'.repeat(65), 'a/b']) {
+    const config = { instanceName: 'kept' };
+    assert.throws(() => setInstanceName(config, bad), ConfigOpError, bad);
+    assert.equal(config.instanceName, 'kept');
+  }
+  for (const bad of [undefined, null, 5, {}]) {
+    assert.throws(() => setInstanceName({}, bad), /must be text/);
+  }
 });

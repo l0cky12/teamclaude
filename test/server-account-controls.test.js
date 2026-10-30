@@ -245,9 +245,9 @@ test('status reports the caller, and its refused list is what the gate refuses',
     assert.equal(client.client, 'ci');
     assert.deepEqual([...client.refused].sort(), [
       '/teamclaude/client-keys/create', '/teamclaude/client-keys/revoke', '/teamclaude/client-keys/show',
-      '/teamclaude/disable',
+      '/teamclaude/disable', '/teamclaude/instance-name',
       '/teamclaude/login/cancel', '/teamclaude/login/code', '/teamclaude/login/start', '/teamclaude/login/status',
-      '/teamclaude/peer-links/add', '/teamclaude/peer-links/key', '/teamclaude/peer-links/remove', '/teamclaude/peer-links/test',
+      '/teamclaude/peer-links/add', '/teamclaude/peer-links/key', '/teamclaude/peer-links/peers', '/teamclaude/peer-links/remove', '/teamclaude/peer-links/test',
       '/teamclaude/priority', '/teamclaude/probe-interval', '/teamclaude/remove', '/teamclaude/reset-credits/redeem', '/teamclaude/threshold',
     ]);
     for (const path of client.refused) {
