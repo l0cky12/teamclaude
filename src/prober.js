@@ -11,7 +11,7 @@ import { fetchUsage } from './oauth.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 import { providerOf } from './provider.js';
 import { fetchCodexUsage } from './codex-usage.js';
-import { fetchResetCreditDetails, creditDetailsDue } from './codex-reset-credits.js';
+import { fetchResetCreditDetails, creditDetailsDue, CREDIT_DETAILS_RETRY_MS } from './codex-reset-credits.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
 // coerced to 1 ms, so an interval large enough to mean "practically never"
@@ -59,6 +59,11 @@ export class Prober {
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
     this.codexCreditsFn = codexCreditsFn;
+    // When each Codex account's last credit-row read failed. A failure leaves
+    // the dates as due as they were, so without this a 429 or a timeout would
+    // be retried on every probe cycle instead of every CREDIT_DETAILS_RETRY_MS.
+    /** @type {WeakMap<object, number>} */
+    this._creditReadFailedAt = new WeakMap();
     this.profileFn = profileFn;
     this.backendFn = backendFn;
     this.timeoutMs = timeoutMs;
@@ -263,9 +268,15 @@ export class Prober {
       // they expire; the credit rows do. Read them only when that count is new
       // or the dates are old, so a probe costs one more read at most that often.
       // Best effort: the quota reading above stands whatever this returns.
-      if (creditDetailsDue(account.quota?.resetCredits)) {
+      const failedAt = this._creditReadFailedAt.get(account);
+      if (creditDetailsDue(account.quota?.resetCredits) && !(failedAt != null && Date.now() - failedAt < CREDIT_DETAILS_RETRY_MS)) {
         const details = await this._withTimeout(this.codexCreditsFn(account, { timeoutMs: this.timeoutMs })).catch(() => null);
-        if (details && !details.error && Array.isArray(details.credits)) this.am.applyResetCreditDetails(account.index, details.credits);
+        if (details && !details.error && Array.isArray(details.credits)) {
+          this._creditReadFailedAt.delete(account);
+          this.am.applyResetCreditDetails(account.index, details.credits);
+        } else {
+          this._creditReadFailedAt.set(account, Date.now());
+        }
       }
       const finishedAt = Date.now();
       return this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });

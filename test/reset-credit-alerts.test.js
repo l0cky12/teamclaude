@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
 import { Prober } from '../src/prober.js';
-import { CREDIT_EXPIRY_WINDOW_MS, creditDetailsDue, heldCreditExpiries } from '../src/codex-reset-credits.js';
+import { CREDIT_DETAILS_RETRY_MS, CREDIT_EXPIRY_WINDOW_MS, creditDetailsDue, heldCreditExpiries } from '../src/codex-reset-credits.js';
 import { codexResetExpiry, resetsLeftText, resetCreditAlerts, logEventTone, RESET_ALERT_NEW_MS } from '../src/dashboard.js';
 
 // Telling the operator about Codex reset credits: when each one expires, a
@@ -82,6 +82,24 @@ test('a usage read carries the expiry dates over, and drops the soonest when the
   assert.equal(creditDetailsDue(q), false);
 });
 
+test('dates left out of step by a grant stay untrusted when the count falls back', () => {
+  const now = Date.now();
+  const am = new AccountManager([codex('a')], 0.98);
+  am.applyCodexUsageData(0, usage(1));
+  am.applyResetCreditDetails(0, [row(now + DAY)]);
+  // A grant whose date was never read, then the OLD credit redeemed: the count
+  // is back to 1, but the date on hand is the spent credit's.
+  am.applyCodexUsageData(0, usage(2));
+  am.applyCodexUsageData(0, usage(1));
+  const q = am.accounts[0].quota.resetCredits;
+  assert.equal(q.expiriesFor, null);
+  assert.equal(creditDetailsDue(q), true, 'the rows must be read again');
+  assert.equal(codexResetExpiry({ name: 'a', provider: 'codex', quota: am.accounts[0].quota }), null, 'and the page shows no date meanwhile');
+
+  am.applyResetCreditDetails(0, [row(now + 30 * DAY)]);
+  assert.equal(codexResetExpiry({ name: 'a', provider: 'codex', quota: am.accounts[0].quota }), now + 30 * DAY);
+});
+
 test('a credit expiring within the window is logged once, a later one not at all', () => {
   const now = Date.now();
   const am = new AccountManager([codex('a')], 0.98);
@@ -134,6 +152,30 @@ test('a failed credit-row read leaves the probe ok and the dates unknown', async
   await prober.probeAll();
   assert.equal(prober.getStatus().accounts[0].status, 'ok');
   assert.equal(am.accounts[0].quota.resetCredits.expiries, undefined);
+});
+
+test('a failed credit-row read is not retried on every probe, only after the retry wait', async () => {
+  const am = new AccountManager([codex('a')], 0.98);
+  let rowReads = 0;
+  let fail = true;
+  const prober = new Prober(am, {
+    intervalMs: 0,
+    codexProbeFn: async () => usage(1),
+    codexCreditsFn: async () => { rowReads++; return fail ? { error: 'HTTP 429', status: 429 } : { credits: [row(Date.now() + 10 * DAY)] }; },
+    log: () => {},
+  });
+  await prober.probeAll();
+  await prober.probeAll();
+  await prober.probeAll();
+  assert.equal(rowReads, 1, 'one failed read holds the next ones back');
+
+  // The wait elapsing, stated as the mechanism rather than by moving a clock.
+  prober._creditReadFailedAt.set(am.accounts[0], Date.now() - CREDIT_DETAILS_RETRY_MS - 1);
+  fail = false;
+  await prober.probeAll();
+  assert.equal(rowReads, 2);
+  assert.equal(am.accounts[0].quota.resetCredits.expiries.length, 1);
+  assert.equal(prober._creditReadFailedAt.has(am.accounts[0]), false, 'a read that worked clears the wait');
 });
 
 /** A status-payload Codex row. @param {Record<string, any>} credits */

@@ -210,8 +210,8 @@ const FAMILY_WEEKLY_BUCKETS = [
  *
  * @typedef {object} CodexLearnedQuota
  * @property {string} [planType]  the Codex subscription tier
- * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, expiries?: Array<number|null>, expiriesAt?: number, expiriesFor?: number, grantedAt?: number}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
- *   A Codex reading also carries, once the credit rows have been read, `expiries` (when each held credit expires, soonest first, null for none), `expiriesAt` (when they were read), `expiriesFor` (the count they were read against) and `grantedAt` (when the count last went up).
+ * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, expiries?: Array<number|null>, expiriesAt?: number, expiriesFor?: number|null, grantedAt?: number}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
+ *   A Codex reading also carries, once the credit rows have been read, `expiries` (when each held credit expires, soonest first, null for none), `expiriesAt` (when they were read), `expiriesFor` (the count they describe, or null once a count change has left them out of step until the next read) and `grantedAt` (when the count last went up).
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
  * @property {Record<string, string>} [codexModelLimits]  which limit each model was last metered on, from `x-codex-active-limit`: a `codexModelBuckets` slug, or the name upstream gives the account-wide limit
  * @property {boolean} [sessionWindowStated]  whether the last reading that stated a window stated a 5-hour one; `false` says the subscription meters no session window
@@ -5457,13 +5457,25 @@ export class AccountManager {
     /** @type {NonNullable<CodexLearnedQuota['resetCredits']>} */
     const reading = { ...next, seenAt: now };
     if (Number.isFinite(prev?.grantedAt)) reading.grantedAt = prev?.grantedAt;
-    if (Array.isArray(prev?.expiries) && Number.isFinite(prev?.expiriesAt)) {
-      const lost = (prev?.expiriesFor ?? 0) - next.available;
-      reading.expiries = lost > 0 ? prev?.expiries.slice(lost) : prev?.expiries;
-      reading.expiriesAt = prev?.expiriesAt;
-      reading.expiriesFor = lost > 0 ? next.available : prev?.expiriesFor;
-    }
     const before = prev?.available;
+    if (Array.isArray(prev?.expiries) && Number.isFinite(prev?.expiriesAt)) {
+      reading.expiries = prev?.expiries;
+      reading.expiriesAt = prev?.expiriesAt;
+      // The dates follow the count only from a reading they fully described. A
+      // count that went up, or dates already out of step with it, stay out of
+      // step (null) until the rows are read again: otherwise a grant followed
+      // by a redemption lands back on the old count and the new credit would
+      // wear the spent one's date.
+      const complete = Number.isFinite(before) && prev?.expiriesFor === before;
+      if (!complete || next.available > /** @type {number} */ (before)) {
+        reading.expiriesFor = null;
+      } else if (next.available < /** @type {number} */ (before)) {
+        reading.expiries = prev?.expiries.slice(/** @type {number} */ (before) - next.available);
+        reading.expiriesFor = next.available;
+      } else {
+        reading.expiriesFor = prev?.expiriesFor;
+      }
+    }
     if (Number.isFinite(before) && next.available > before) {
       reading.grantedAt = now;
       const gained = next.available - before;

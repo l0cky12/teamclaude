@@ -297,6 +297,9 @@ export function heldCreditExpiries(credits = []) {
     .slice(0, 99);
 }
 
+/** After a credit-row read that failed, how long before a probe tries again. */
+export const CREDIT_DETAILS_RETRY_MS = RETRY_COOLDOWN_MS;
+
 /**
  * Whether a usage read that just landed should be followed by a read of the
  * credit rows, to learn when the credits it counted expire.
@@ -306,7 +309,7 @@ export function heldCreditExpiries(credits = []) {
  * is a new credit whose date we do not know yet; one that stayed put needs no
  * second read until the dates are worth checking again.
  *
- * @param {{available?: number, expiries?: unknown, expiriesFor?: number, expiriesAt?: number}|null|undefined} reading  `quota.resetCredits`
+ * @param {{available?: number, expiries?: unknown, expiriesFor?: number|null, expiriesAt?: number}|null|undefined} reading  `quota.resetCredits`
  * @param {number} [now]
  */
 export function creditDetailsDue(reading, now = Date.now()) {

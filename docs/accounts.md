@@ -520,7 +520,7 @@ When an account holds a credit, the same probe also reads its credit list
 (`GET /wham/rate-limit-reset-credits`) to learn when each credit expires. It does
 this only when the count is new to it or the dates are more than 6 hours old, so
 a probe costs at most one extra read that often, and an account with no credits
-costs none. Like the count, the dates are only read where you already run the
+costs none. A read that fails is not tried again for 30 minutes. Like the count, the dates are only read where you already run the
 probe or press **Refresh quota**.
 
 #### Being told about a credit
