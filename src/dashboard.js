@@ -4055,13 +4055,19 @@ ${SHARED_HELPERS}
       acts.appendChild(out);
     }
     if (acts.childNodes.length) body.appendChild(acts);
-    if (syncView.ok && !on && !syncSigningIn() && syncView.instance && syncView.instance.supported) body.appendChild(ownSyncBox(syncView.instance));
+    var callbackHint = 'You approve the sign-in at callback.net, in any browser. Use the same callback.net account on every machine. callback.net keeps the sign-ins encrypted, readable only with your login.';
+    var offer = syncView.ok && !on && !syncSigningIn() && syncView.instance && syncView.instance.supported;
+    // Offered both ways, each hint stays under its own button.
+    if (offer) {
+      body.appendChild(el('p', 'hint', callbackHint));
+      body.appendChild(ownSyncBox(syncView.instance));
+    }
     if (syncNote) body.appendChild(el('div', 'st ' + syncNote.kind, syncNote.text));
     hint.textContent = own
       ? 'Each machine shares the Claude and Codex sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
       : syncView.signedIn
         ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
-        : 'You approve the sign-in at callback.net, in any browser. Use the same callback.net account on every machine. callback.net keeps the sign-ins encrypted, readable only with your login.';
+        : offer ? '' : callbackHint;
   }
 
   // The other way to turn it on: no outside account, one of your own
