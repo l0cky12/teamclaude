@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, stat, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
 import { CredentialSync, syncKeyFor } from '../src/credential-sync.js';
@@ -296,4 +297,46 @@ test('switching stores lets a renewal under way finish in the store it locked', 
     const rows = await store.call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 });
     assert.equal(JSON.parse(rows[0].Data).refreshToken, 'rt-new');
   });
+});
+
+test('rows from before a machine (re)starts keeping the store are seeds, and never replace a newer token', async () => {
+  await withStore(async ({ store, now, tick }) => {
+    // The store from an earlier stint holds rt-a-1, renewed under its lock then.
+    const old = install('hub', [claude('a')], { store, now, tick, seedsAll: false });
+    old.am.accounts[0]._minted = true;
+    await old.sync.sync('start');
+    const key = syncKeyFor(old.am.accounts[0]);
+    // Meanwhile, with sync off, desk renewed on its own to rt-a-2.
+    assert.equal(await store.reseed(), 1);
+    assert.equal(await store.reseed(), 0, 'marked once');
+    const desk = install('desk', [claude('a', { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 9 * H })], { store, now, tick });
+    tick(10 * H);
+    await desk.am.ensureTokenFresh(0);
+    assert.deepEqual(desk.refreshed, ['rt-a-2'], 'its own newer token, never the old row');
+    const row = (await store.call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 })).find(r => r.Key === key);
+    assert.equal(JSON.parse(row.Data).refreshToken, 'rt-a-2-renewed-rt');
+  });
+});
+
+test('two processes writing one store file lose nothing', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-store-procs-'));
+  try {
+    const path = join(dir, 'teamclaude.sync-store.json');
+    const mod = new URL('../src/sync-store.js', import.meta.url).href;
+    const writer = (tag) => new Promise((resolve, reject) => {
+      const script = `const { createSyncStore } = await import(${JSON.stringify(mod)});
+        const store = createSyncStore({ path: ${JSON.stringify(path)} });
+        for (let i = 0; i < 25; i++) await store.call('POST', 'User/Credential', { Key: '${tag}.' + i, Data: '{}' });`;
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, TEAMCLAUDE_CONFIG_LOCK_WAIT_MS: '10000' } });
+      let err = '';
+      child.stderr.on('data', (c) => { err += c; });
+      child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(err))));
+    });
+    await Promise.all([writer('one'), writer('two')]);
+    const keys = (await createSyncStore({ path }).call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 })).map(r => r.Key);
+    assert.equal(keys.length, 50);
+    assert.equal(new Set(keys).size, 50);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

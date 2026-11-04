@@ -231,5 +231,27 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     throw new SyncStoreError('error_bad_request', 'unknown route');
   }
 
-  return { path, call };
+  /**
+   * Mark every row as a seed (credential-sync.js heldElsewhere): what the
+   * file holds when this machine starts keeping the store, or starts again,
+   * may predate renewals the other machines made without it, so none of it
+   * may replace a newer token. A renewal under the lock clears the mark.
+   * @returns {Promise<number>} how many rows were marked
+   */
+  async function reseed() {
+    return update((store) => {
+      let n = 0;
+      for (const row of store.rows) {
+        let blob;
+        try { blob = JSON.parse(row.data); } catch { continue; }
+        if (!blob || typeof blob !== 'object' || blob._deleted != null || typeof blob.refreshToken !== 'string' || blob.seeded) continue;
+        blob.seeded = true;
+        row.data = JSON.stringify(blob);
+        n++;
+      }
+      return { result: n, changed: n > 0 };
+    });
+  }
+
+  return { path, call, reseed };
 }

@@ -1284,6 +1284,8 @@ export function accountSyncLine(view, where) {
   if (own === 'host') {
     on = 'On: ' + where + ' keeps the accounts for your other machines.';
   } else if (own === 'follow') {
+    var linked = Array.isArray(view.instance.peers) ? view.instance.peers : [];
+    if (linked.indexOf(view.instance.peer) < 0) return { kind: 'error', text: 'On, but ' + where + ' follows ' + view.instance.peer + ', which is no longer a linked instance: nothing is synced, and a sign-in that runs out is not renewed. Link it again, or turn this off.' };
     on = 'On: ' + where + ' follows the accounts kept on ' + view.instance.peer + '.';
   } else {
     if (!view.signedIn) return { kind: '', text: 'Off: ' + where + ' keeps its own sign-ins.' };

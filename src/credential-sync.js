@@ -368,7 +368,7 @@ export class CredentialSync {
    * it is forgotten once every operation against the old one is over, and a
    * pass against the new one starts at once, repeating every `intervalMs`.
    * @param {number} [intervalMs]
-   * @param {() => void} [apply]  points the api at the new store
+   * @param {() => void | Promise<void>} [apply]  points the api at the new store
    */
   async switchStore(intervalMs = SYNC_INTERVAL_MS, apply = () => {}) {
     this.stop();
@@ -378,7 +378,7 @@ export class CredentialSync {
     // pin). Switches run one after the other.
     this._switching = this._switching.then(async () => {
       while (this._ops.size) await Promise.allSettled([...this._ops]);
-      apply();
+      await apply();
       this.rows.clear();
       this.lastSyncAt = null;
       this.lastError = null;

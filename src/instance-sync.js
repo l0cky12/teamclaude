@@ -148,6 +148,10 @@ export function createSyncTransport({ getConfig, store, callback = callbackCall,
     where() {
       return storeLabel(pinned?.mode ?? { mode: 'off' });
     },
+    /** The mode pinned, 'off' before the first pin. */
+    mode() {
+      return pinned?.mode.mode ?? 'off';
+    },
     /** Whether the store pinned is one of your own (CredentialSync seedsAll). */
     ownStore() {
       return !!pinned && pinned.mode.mode !== 'off';

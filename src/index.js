@@ -495,6 +495,16 @@ async function serverCommand() {
   const syncStore = createSyncStore();
   const syncTransport = createSyncTransport({ getConfig: () => config, store: syncStore });
   syncTransport.pin(config);
+  // Pointing the sync at the store the config names now. A machine that
+  // starts keeping the store (again, or at launch) first marks what the file
+  // holds as seeds: the other machines may have renewed without it meanwhile,
+  // and an old row must never replace a newer token (sync-store.js reseed).
+  const repin = async () => {
+    if (accountSyncMode(config).mode === 'host') {
+      await syncStore.reseed().catch((/** @type {any} */ err) => console.error(`[TeamClaude] Account store: could not mark its rows as seeds: ${err?.message || err}`));
+    }
+    syncTransport.pin(config);
+  };
   const syncIntervalFor = (/** @type {Record<string, any>} */ c) => (accountSyncMode(c).mode === 'off' ? SYNC_INTERVAL_MS : INSTANCE_SYNC_INTERVAL_MS);
   const credentialSync = new CredentialSync({
     accountManager, addAccount: admitAccount, evictAccount,
@@ -613,7 +623,7 @@ async function serverCommand() {
     if (diskConfig.accountSync === undefined) delete config.accountSync;
     else config.accountSync = diskConfig.accountSync;
     config.peers = diskConfig.peers;
-    if (syncTransport.differs(config)) credentialSync.switchStore(syncIntervalFor(config), () => syncTransport.pin(config)).catch(() => {});
+    if (syncTransport.differs(config)) credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
     else credentialSync.sync('reload').catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
@@ -992,7 +1002,7 @@ async function serverCommand() {
       if (next.mode === 'off') delete config.accountSync;
       else config.accountSync = next;
       console.log(`[TeamClaude] Account sync ${next.mode === 'off' ? 'through your own instances is off' : `now goes through ${storeLabel(next)}`} (dashboard)`);
-      credentialSync.switchStore(syncIntervalFor(config), () => syncTransport.pin(config)).catch(() => {});
+      credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
     },
   });
   // POST /teamclaude/sync-store: the store, while this machine keeps it.
@@ -1170,7 +1180,10 @@ async function serverCommand() {
   // the store is reached over the network and the proxy serves meanwhile.
   // Against a store of your own, a pass every few minutes instead.
   if (accountSyncMode(config).mode !== 'off') console.log(`[TeamClaude] Account sync goes through ${storeLabel(accountSyncMode(config))}`);
-  credentialSync.start(syncIntervalFor(config)).catch(() => {});
+  if (accountSyncMode(config).mode === 'host' && !config.proxy?.apiKey) {
+    console.error('[TeamClaude] accountSync.mode is "host" but there is no proxy.apiKey: the account store stays closed to your other machines until one is set');
+  }
+  credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
 
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
@@ -2724,6 +2737,13 @@ function describeCallbackUser(/** @type {{ id: string|null, email: string|null, 
 async function callbackCommand() {
   const sub = args[1];
   if (sub === 'login') {
+    // One store per install: with accountSync set, a callback.net session
+    // would sit unused, and take over the day accountSync is turned off.
+    const own = accountSyncMode(await loadConfig() || {});
+    if (own.mode !== 'off') {
+      console.error(`Account sync goes through ${storeLabel(own)} (accountSync in the config). Turn that off first to use callback.net.`);
+      process.exit(1);
+    }
     if (!args.includes('--force') && await loadCallbackToken()) {
       try {
         const me = await callbackWhoami();

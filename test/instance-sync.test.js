@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel } from '../src/instance-sync.js';
 import { WebAccountSync, AccountSyncError } from '../src/web-account-sync.js';
 import { closedPort, spawnServer, waitForStatus } from '../test-helpers/spawn-server.js';
@@ -238,6 +238,18 @@ test('a proxy switched to follow another picks up its accounts, with no sign-in'
     assert.equal(view.instance.peer, 'hub');
     assert.equal(view.sync.rows, 1);
     assert.equal(view.sync.lastError, null);
+
+    // A hand edit and a reload turn it off just as well: the reload re-points
+    // the running sync, and the card says so.
+    const edited = JSON.parse(await readFile(desk.configPath, 'utf8'));
+    delete edited.accountSync;
+    await writeFile(desk.configPath, JSON.stringify(edited));
+    const reloaded = await post(desk.port, 'tc-desk-key', '/teamclaude/reload', {});
+    assert.equal(reloaded.status, 200, desk.output());
+    const off = await (await fetch(`http://127.0.0.1:${desk.port}/teamclaude/account-sync`, { headers: { 'x-api-key': 'tc-desk-key' } })).json();
+    assert.equal(off.instance.mode, 'off');
+    // Its accounts stay where they are.
+    assert.ok(JSON.parse(await readFile(desk.configPath, 'utf8')).accounts.some((/** @type {any} */ a) => a.accountUuid === 'uuid-shared'));
   } finally {
     await desk?.stop();
     await hub.stop();

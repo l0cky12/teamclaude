@@ -20,8 +20,11 @@ test('the own-store mode a view names', () => {
 
 test('the card line for a machine that keeps the accounts, or follows one that does', () => {
   assert.deepEqual(accountSyncLine(view({ mode: 'host' }), 'this machine'), { kind: 'ok', text: 'On: this machine keeps the accounts for your other machines. 3 accounts in the store.' });
-  assert.deepEqual(accountSyncLine(view({ mode: 'follow', peer: 'hub' }), 'desk'), { kind: 'ok', text: 'On: desk follows the accounts kept on hub. 3 accounts in the store.' });
-  assert.deepEqual(accountSyncLine(view({ mode: 'follow', peer: 'hub' }, { sync: { lastSyncAt: 1, rows: 0, lastError: 'hub is unreachable (timed out)' } }), 'this machine'),
+  assert.deepEqual(accountSyncLine(view({ mode: 'follow', peer: 'hub', peers: ['hub'] }), 'desk'), { kind: 'ok', text: 'On: desk follows the accounts kept on hub. 3 accounts in the store.' });
+  // The instance it follows was unlinked: nothing syncs, and the card says so.
+  assert.deepEqual(accountSyncLine(view({ mode: 'follow', peer: 'hub', peers: [] }), 'desk'),
+    { kind: 'error', text: 'On, but desk follows hub, which is no longer a linked instance: nothing is synced, and a sign-in that runs out is not renewed. Link it again, or turn this off.' });
+  assert.deepEqual(accountSyncLine(view({ mode: 'follow', peer: 'hub', peers: ['hub'] }, { sync: { lastSyncAt: 1, rows: 0, lastError: 'hub is unreachable (timed out)' } }), 'this machine'),
     { kind: 'error', text: 'On: this machine follows the accounts kept on hub. The last sync failed: hub is unreachable (timed out)' });
   assert.deepEqual(accountSyncLine(view({ mode: 'host' }, { sync: {} }), 'this machine'), { kind: 'ok', text: 'On: this machine keeps the accounts for your other machines. The first sync is under way.' });
   // Off both ways: as before.
