@@ -654,6 +654,10 @@ async function serverCommand() {
     // And the address it offers for itself when linked from another machine.
     if (diskConfig.instanceAddress === undefined) delete config.instanceAddress;
     else config.instanceAddress = diskConfig.instanceAddress;
+    // And the cut-off below which the "outside" read-out leaves a window out,
+    // which the status route reads off this object.
+    if (diskConfig.outsideSpendHidePercent === undefined) delete config.outsideSpendHidePercent;
+    else config.outsideSpendHidePercent = diskConfig.outsideSpendHidePercent;
     // Sampled off this object when each request is dispatched (server.js
     // shouldStripOverageHeaders / shouldSynthesizeQuotaHeaders), so the reload
     // applies to subsequent requests.

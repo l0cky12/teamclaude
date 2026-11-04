@@ -672,6 +672,25 @@ export function setInstanceAddress(config, raw) {
   return address;
 }
 
+/**
+ * Set the share at or below which a measured outside-spend window is left out
+ * of the read-out (`outsideSpendHidePercent`, see outside-spend.js). Stored
+ * in tenths of a percent, the precision the read-out prints. 0 shows every
+ * window.
+ *
+ * @param {Config} config
+ * @param {unknown} raw  a percentage from 0 to 100
+ * @returns {number}  the percentage saved
+ */
+export function setOutsideSpendHidePercent(config, raw) {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0 || raw > 100) {
+    throw new ConfigOpError('The outside-spend cut-off is a percentage from 0 to 100.');
+  }
+  const value = Math.round(raw * 10) / 10;
+  config.outsideSpendHidePercent = value;
+  return value;
+}
+
 /** @param {any} entry  one element of config.peers, as found in the file */
 function peerEntryName(entry) {
   return typeof entry?.name === 'string' ? entry.name.trim() : '';

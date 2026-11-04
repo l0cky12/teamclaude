@@ -21,6 +21,7 @@
   "distributeSessions": false,
   "advisorEligibility": "strict",
   "quotaProbeSeconds": 0,
+  "outsideSpendHidePercent": 5,
   "autoUpdate": true,
   "autoRedeemResets": false,
   "expiryRouting": {

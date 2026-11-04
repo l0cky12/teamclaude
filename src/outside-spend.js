@@ -73,6 +73,28 @@ export function outsideSpendKey(bucket) {
   return bucket;
 }
 
+/**
+ * The share, in percent, at or below which `teamclaude status` and the
+ * dashboard leave a measured window out of the "outside" read-out
+ * (`outsideSpendHidePercent`). A few percent elsewhere is noise on most
+ * accounts, and the line is only worth reading when it says something. The
+ * status payload still carries every window. status-renderer.js's
+ * outsideSpendText repeats this number, since the dashboard serializes it
+ * without its module scope; a test keeps the two in step.
+ */
+export const OUTSIDE_SPEND_HIDE_DEFAULT = 5;
+
+/**
+ * The configured `outsideSpendHidePercent`, or the default when it is unset
+ * or not a percentage. 0 shows every measured window.
+ * @param {Record<string, any>|null|undefined} config
+ * @returns {number}
+ */
+export function outsideSpendHidePercent(config) {
+  const v = config?.outsideSpendHidePercent;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100 ? v : OUTSIDE_SPEND_HIDE_DEFAULT;
+}
+
 export const OUTSIDE_SPEND_STATES = Object.freeze({
   MEASURED: 'measured',
   NOT_MEASURABLE: 'not_measurable',

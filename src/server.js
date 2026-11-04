@@ -27,7 +27,8 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setOutsideSpendHidePercent, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
 import { AccountSyncError } from './web-account-sync.js';
 import { RemovalRefused } from './account-removal.js';
@@ -435,6 +436,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/probe-interval', 'a client key cannot change settings'],
   ['/teamclaude/instance-name', 'a client key cannot change settings'],
   ['/teamclaude/instance-address', 'a client key cannot change settings'],
+  ['/teamclaude/outside-spend-hide', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -933,6 +935,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // Clients page lists a key that has not been used yet, which the usage
         // table cannot, since it only holds names that spent something.
         res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus(),
+          // The share at or below which the "outside" read-out leaves a window
+          // out (outside-spend.js). A display setting, so a client key reads it too.
+          outsideSpendHidePercent: outsideSpendHidePercent(config),
           // The dashboard's instance picker. Names and addresses only, never
           // the keys, and only for the operator, who is the one who may use them.
           // `instance` is what the picker calls this machine and what the
@@ -1563,6 +1568,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const address = instanceAddress(config);
         console.log(`[TeamClaude] Instance address ${address ? `set to ${safeLine(address, 200)}` : 'cleared; using the guess'} (dashboard)`);
         reply(200, { ok: true, address });
+        return;
+      }
+
+      // Outside-spend cut-off endpoint: the dashboard's Outside spend row on
+      // Settings. Body: {"percent": <0..100>}. Written and reloaded like the
+      // instance name; the status read after it carries the new cut-off, and
+      // the read-outs drop the windows at or below it.
+      if (req.method === 'POST' && req.url === '/teamclaude/outside-spend-hide') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (!hooks.reload) { reply(501, { ok: false, error: 'outside-spend cut-off change not supported' }); return; }
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setOutsideSpendHidePercent(c, body.percent); });
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Outside-spend cut-off change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'outside-spend cut-off change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after an outside-spend cut-off change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        const percent = outsideSpendHidePercent(config);
+        console.log(`[TeamClaude] Outside spend ${percent > 0 ? `at or below ${percent}% now hidden` : 'now shown at every share'} (dashboard)`);
+        reply(200, { ok: true, outsideSpendHidePercent: percent });
         return;
       }
 
