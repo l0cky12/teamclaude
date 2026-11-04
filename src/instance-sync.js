@@ -86,8 +86,27 @@ export function peerStoreApi(peer, { request = peerRequest } = {}) {
 }
 
 /**
- * The `api`, `isSignedIn` and `where` the account sync is built with, picking
- * the store by the config each time it is asked.
+ * The store a config names, with the peer entry a follower reaches it
+ * through: what an operation is pinned to.
+ * @param {Record<string, any>} config
+ * @returns {{ mode: SyncMode, peer: import('./peers.js').Peer | null }}
+ */
+export function storeTarget(config) {
+  const mode = accountSyncMode(config);
+  const peer = mode.mode === 'follow' ? configuredPeers(config).find(p => p.name === mode.peer) || null : null;
+  return { mode, peer };
+}
+
+/**
+ * The `api`, `isSignedIn` and `where` the account sync is built with.
+ *
+ * Every call goes to the store the transport is PINNED to, not to whatever
+ * the config says at that moment: a renewal that locked a row in one store
+ * has to store and unlock in that same store, so a change of mode (or of the
+ * address a follower uses) takes effect only through `pin`, which the server
+ * calls once the running operations are done (CredentialSync.switchStore).
+ * Until the first `pin`, the first call pins to the config as `getConfig`
+ * reads it then, which is what a one-shot CLI command wants.
  *
  * @param {object} opts
  * @param {() => Record<string, any> | Promise<Record<string, any>>} opts.getConfig  the config as it is now
@@ -97,19 +116,24 @@ export function peerStoreApi(peer, { request = peerRequest } = {}) {
  * @param {typeof peerRequest} [opts.request]
  */
 export function createSyncTransport({ getConfig, store, callback = callbackCall, callbackSignedIn = async () => !!(await loadCallbackToken()), request = peerRequest }) {
-  // The mode as last read, for the log lines, which are written synchronously.
-  /** @type {SyncMode} */
-  let last = { mode: 'off' };
-  const mode = async () => (last = accountSyncMode(await getConfig()));
+  /** @type {ReturnType<typeof storeTarget> | null} */
+  let pinned = null;
+  const target = async () => (pinned ??= storeTarget(await getConfig()));
   return {
+    /** Point every later call at the store `config` names. @param {Record<string, any>} config */
+    pin(config) {
+      pinned = storeTarget(config);
+    },
+    /** Whether `config` names another store than the one pinned. @param {Record<string, any>} config */
+    differs(config) {
+      return JSON.stringify(storeTarget(config)) !== JSON.stringify(pinned);
+    },
     /** @type {Api} */
     async api(method, path, params = null, opts = {}) {
-      const m = await mode();
-      if (m.mode === 'host') return store.call(method, path, params, opts);
-      if (m.mode === 'follow') {
-        const config = await getConfig();
-        const peer = configuredPeers(config).find(p => p.name === m.peer);
-        if (!peer) throw new Error(`no linked instance named ${safeLine(m.peer, 64)} (accountSync.peer)`);
+      const { mode, peer } = await target();
+      if (mode.mode === 'host') return store.call(method, path, params, opts);
+      if (mode.mode === 'follow') {
+        if (!peer) throw new Error(`no linked instance named ${safeLine(mode.peer, 64)} (accountSync.peer)`);
         return peerStoreApi(peer, { request })(method, path, params, opts);
       }
       return callback(method, path, params, opts);
@@ -118,11 +142,15 @@ export function createSyncTransport({ getConfig, store, callback = callbackCall,
     // the sync then holds back renewals instead of renewing on its own and
     // signing the other machines out.
     async isSignedIn() {
-      const m = await mode();
-      return m.mode !== 'off' || callbackSignedIn();
+      const { mode } = await target();
+      return mode.mode !== 'off' || callbackSignedIn();
     },
     where() {
-      return storeLabel(last);
+      return storeLabel(pinned?.mode ?? { mode: 'off' });
+    },
+    /** Whether the store pinned is one of your own (CredentialSync seedsAll). */
+    ownStore() {
+      return !!pinned && pinned.mode.mode !== 'off';
     },
   };
 }

@@ -12,8 +12,11 @@
 // already hold (`accountSync.mode: "follow"`, instance-sync.js).
 //
 // Every write is a read-modify-write under the same advisory file lock the
-// config uses (config.js withConfigLock), so the server and a CLI command on
-// this machine can both use the store directly. The file holds live refresh
+// config uses (config.js withConfigLock), in its strict form: a write never
+// goes ahead without it, so the server and a CLI command on this machine can
+// both use the store directly and never hand one renewal lock to two callers.
+// A lock that cannot be had is refused (error_store_busy), which the sync
+// treats like an unreachable store: it holds the renewal back. The file holds live refresh
 // tokens, like the config does: it is written atomically with mode 0600.
 //
 // A file that does not parse is never written over: a lost store would cost
@@ -39,7 +42,7 @@ const PATH_RE = /^User\/Credential(?:\/([^/:]+)(?::(lock|unlock))?)?$/;
 /**
  * A refusal with the token the sync reads (`err.token`), as callback.net
  * answers: error_not_found, error_key_exists, error_credential_locked,
- * error_bad_request, error_store_full, error_store_unreadable.
+ * error_bad_request, error_store_full, error_store_unreadable, error_store_busy.
  */
 export class SyncStoreError extends Error {
   /**
@@ -125,6 +128,9 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
       const { result, changed } = fn(store);
       if (changed) await writeJsonAtomic(path, store);
       return result;
+    }, { strict: true }).catch((/** @type {any} */ err) => {
+      if (err?.code === 'LOCK_BUSY') throw new SyncStoreError('error_store_busy', 'the account store is busy; try again');
+      throw err;
     });
   }
 

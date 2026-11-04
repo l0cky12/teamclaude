@@ -4,6 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel } from '../src/instance-sync.js';
 import { WebAccountSync, AccountSyncError } from '../src/web-account-sync.js';
 import { closedPort, spawnServer, waitForStatus } from '../test-helpers/spawn-server.js';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
 
 // Account sync through one of your own instances (instance-sync.js): the
 // config names the store — this machine (`host`) or a linked instance
@@ -24,7 +26,7 @@ test('the mode is read from the config, and anything malformed is off', () => {
   assert.equal(storeLabel({ mode: 'follow', peer: 'desk' }), 'the account store on desk');
 });
 
-test('each call goes to the store the config names now', async () => {
+test('each call goes to the store the transport is pinned to, and a config change waits for pin', async () => {
   const calls = [];
   const config = { peers: [{ name: 'hub', url: 'http://127.0.0.1:9', apiKey: 'tc-hub' }] };
   const transport = createSyncTransport({
@@ -33,34 +35,47 @@ test('each call goes to the store the config names now', async () => {
     callback: async (...a) => { calls.push(['callback', ...a]); return 'cb'; },
     callbackSignedIn: async () => false,
     request: async (peer, rest, opts) => {
-      calls.push(['peer', peer.name, rest, JSON.parse(opts.body.toString())]);
+      calls.push(['peer', peer.name, peer.url, rest, JSON.parse(opts.body.toString())]);
       return { status: 200, body: Buffer.from(JSON.stringify({ ok: true, result: 'remote' })) };
     },
   });
 
-  // Off: callback.net, and signed in only when it is.
+  // Not pinned yet: the first call pins to the config as it is. Off: callback.net.
   assert.equal(await transport.isSignedIn(), false);
   assert.equal(await transport.api('GET', 'User/Credential'), 'cb');
   assert.equal(transport.where(), 'callback.net');
+  assert.equal(transport.ownStore(), false);
 
+  // The config changes; the calls stay where they were until pin.
   config.accountSync = { mode: 'host' };
+  assert.equal(transport.differs(config), true);
+  assert.equal(await transport.api('GET', 'User/Credential'), 'cb');
+  transport.pin(config);
+  assert.equal(transport.differs(config), false);
   assert.equal(await transport.isSignedIn(), true);
   assert.equal(await transport.api('GET', 'User/Credential', { page_no: 1 }, { envelope: true }), 'local');
   assert.equal(transport.where(), 'the account store on this machine');
+  assert.equal(transport.ownStore(), true);
 
   config.accountSync = { mode: 'follow', peer: 'hub' };
+  transport.pin(config);
+  // A follower's peer address moving is a different store too.
+  config.peers = [{ name: 'hub', url: 'http://127.0.0.1:10', apiKey: 'tc-hub' }];
+  assert.equal(transport.differs(config), true);
   assert.equal(await transport.api('POST', 'User/Credential/x:lock', { timeout: 30 }), 'remote');
   assert.equal(transport.where(), 'the account store on hub');
 
   assert.deepEqual(calls, [
     ['callback', 'GET', 'User/Credential', null, {}],
+    ['callback', 'GET', 'User/Credential', null, {}],
     ['store', 'GET', 'User/Credential', { page_no: 1 }, { envelope: true }],
-    ['peer', 'hub', 'sync-store', { method: 'POST', path: 'User/Credential/x:lock', params: { timeout: 30 }, envelope: false }],
+    ['peer', 'hub', 'http://127.0.0.1:9', 'sync-store', { method: 'POST', path: 'User/Credential/x:lock', params: { timeout: 30 }, envelope: false }],
   ]);
 
   // Following an instance this machine does not list: an error, which makes
   // the sync hold its renewals back rather than renew on its own.
   config.accountSync = { mode: 'follow', peer: 'gone' };
+  transport.pin(config);
   assert.equal(await transport.isSignedIn(), true);
   await assert.rejects(transport.api('GET', 'User/Credential'), /no linked instance named gone/);
 });
@@ -125,6 +140,36 @@ test('the card switches the store, and refuses what would leave an install on tw
   await refused({ probe: async () => { throw new Error('hub does not keep the accounts; turn that on there first'); } },
     { mode: 'follow', peer: 'hub' }, /could not use the account store on hub: hub does not keep the accounts/);
   await refused({}, { mode: 'everywhere' }, /must be host, follow or off/);
+});
+
+test('the store answers only a caller holding this machine\'s proxy key, never a keyless one', async () => {
+  const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+  const calls = [];
+  const hooks = { syncStore: () => ({ call: async (...a) => { calls.push(a); return []; } }) };
+  const ask = (port, key) => fetch(`http://127.0.0.1:${port}/teamclaude/sync-store`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(key ? { 'x-api-key': key } : {}) },
+    body: JSON.stringify({ method: 'GET', path: 'User/Credential' }),
+  });
+  const run = async (proxy, fn) => {
+    const server = createProxyServer(new AccountManager([{ name: 'k', type: 'apikey', apiKey: 'sk-demo-1' }], 0.98), { proxy: { port: 3, ...proxy } }, hooks);
+    const port = await listen(server);
+    try { await fn(port); } finally { server.closeAllConnections?.(); server.close(); }
+  };
+  // No key at all: the gate would let anyone in; the store does not.
+  await run({}, async (port) => {
+    const res = await ask(port, null);
+    assert.equal(res.status, 401);
+    assert.match((await res.json()).error, /no proxy key/);
+  });
+  await run({ apiKey: 'tc-host', clientKeys: [{ name: 'laptop', key: 'tc-client' }] }, async (port) => {
+    // Loopback without a key passes the gate, and is refused here.
+    assert.equal((await ask(port, null)).status, 401);
+    assert.equal((await ask(port, 'wrong')).status, 401);
+    assert.equal((await ask(port, 'tc-client')).status, 403);
+    assert.equal((await ask(port, 'tc-host')).status, 200);
+  });
+  assert.equal(calls.length, 1);
 });
 
 // ---- Two real proxies ------------------------------------------------------

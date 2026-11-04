@@ -98,7 +98,7 @@ export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
  * @typedef {{ v: number, provider: string, name: string, accountUuid?: string, orgUuid?: string, orgName?: string,
  *   accountId?: string, userId?: string, organizationType?: string, rateLimitTier?: string, seatTier?: string,
  *   hasClaudeMax?: boolean|null, hasClaudePro?: boolean|null, accessToken: string, refreshToken: string,
- *   expiresAt: number, updatedAt: number, by: string }} Blob
+ *   expiresAt: number, updatedAt: number, by: string, seeded?: boolean }} Blob
  * @typedef {{ id: string, key: string, blob: Blob|null, deletedAt: number|null, updated: number }} Row
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
  */
@@ -139,10 +139,11 @@ export function syncKeyFor(a) {
  * The row's contents for an account, with the tokens it should carry.
  * @param {Record<string, any>} a
  * @param {Tokens} tokens
- * @param {{ now?: number, by?: string }} [opts]
+ * @param {{ now?: number, by?: string, seeded?: boolean }} [opts]  seeded: the tokens were not
+ *   minted here, only read from this install's config (a store of your own, see seedsAll)
  * @returns {Blob}
  */
-export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}) {
+export function encodeBlob(a, tokens, { now = Date.now(), by = hostname(), seeded = false } = {}) {
   /** @type {any} */
   const blob = { v: BLOB_VERSION, provider: providerOf(a), name: a.name };
   for (const f of IDENTITY_FIELDS) if (a[f] != null) blob[f] = a[f];
@@ -151,6 +152,7 @@ export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}
   blob.expiresAt = tokens.expiresAt;
   blob.updatedAt = now;
   blob.by = by;
+  if (seeded) blob.seeded = true;
   return blob;
 }
 
@@ -232,6 +234,12 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
  * rotated away. The one exception is a row this install wrote itself with an
  * older token than it now holds: its own renewal whose PATCH did not land, and
  * taking that back would revive a refresh token it already rotated.
+ *
+ * A SEEDED row (a store of your own, see seedsAll) was not written by a
+ * renewal: an install stored what its config held, which may be a copy
+ * another install has since rotated away. It is taken only when it is newer
+ * than ours — a renewal always pushes expiresAt forward — never over a newer
+ * token, since sending the older one to the provider could cost the family.
  * @param {Blob|null} blob
  * @param {Record<string, any>} account
  * @param {string} by  this install's name, as it signs the rows it writes
@@ -239,6 +247,7 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
 function heldElsewhere(blob, account, by) {
   if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
+  if (blob.seeded && blob.expiresAt <= (Number(account.expiresAt) || 0)) return false;
   return !(blob.by === by && blob.expiresAt < (Number(account.expiresAt) || 0));
 }
 
@@ -313,6 +322,10 @@ export class CredentialSync {
     this.by = by;
     this.where = where;
     this.seedsAll = seedsAll;
+    /** Operations under way (switchStore waits for them). @type {Set<Promise<any>>} */
+    this._ops = new Set();
+    /** @type {Promise<void>} */
+    this._switching = Promise.resolve();
     /** What the store holds, as last seen: key → row. */
     this.rows = new Map();
     /** @type {Promise<any>|null} */
@@ -352,16 +365,38 @@ export class CredentialSync {
   /**
    * The store changed (instance-sync.js: callback.net, this machine, or a
    * linked instance). What the old one held says nothing about the new one, so
-   * it is forgotten once any pass still running against the old one is over,
-   * and a pass against the new one starts at once, repeating every `intervalMs`.
+   * it is forgotten once every operation against the old one is over, and a
+   * pass against the new one starts at once, repeating every `intervalMs`.
    * @param {number} [intervalMs]
+   * @param {() => void} [apply]  points the api at the new store
    */
-  async switchStore(intervalMs = SYNC_INTERVAL_MS) {
-    if (this._syncing) await this._syncing.catch(() => {});
-    this.rows.clear();
-    this.lastSyncAt = null;
-    this.lastError = null;
+  async switchStore(intervalMs = SYNC_INTERVAL_MS, apply = () => {}) {
+    this.stop();
+    // Every operation already under way finishes against the store it began
+    // with: a renewal that locked a row there also stores and unlocks there.
+    // Only then does \`apply\` point the api at the new store (instance-sync.js
+    // pin). Switches run one after the other.
+    this._switching = this._switching.then(async () => {
+      while (this._ops.size) await Promise.allSettled([...this._ops]);
+      apply();
+      this.rows.clear();
+      this.lastSyncAt = null;
+      this.lastError = null;
+    });
+    await this._switching;
     return this.start(intervalMs);
+  }
+
+  /**
+   * Count an operation as under way until it settles, for switchStore.
+   * @template T
+   * @param {Promise<T>} op
+   * @returns {Promise<T>}
+   */
+  _track(op) {
+    this._ops.add(op);
+    op.then(() => this._ops.delete(op), () => this._ops.delete(op));
+    return op;
   }
 
   /** Every row of ours in the store, keyed. */
@@ -391,7 +426,7 @@ export class CredentialSync {
    */
   sync(reason = 'manual') {
     if (this._syncing) return this._syncing;
-    this._syncing = this._sync(reason).finally(() => { this._syncing = null; });
+    this._syncing = this._track(this._sync(reason).finally(() => { this._syncing = null; }));
     return this._syncing;
   }
 
@@ -425,7 +460,7 @@ export class CredentialSync {
           // is what turning it on is for, and a token that turns out dead is
           // emptied by the first machine it fails on (see _markNeedsSignIn).
           if (broken || (!isMinted(account) && !this.seedsAll())) continue;
-          await this._create(account, this._tokens(account));
+          await this._create(account, this._tokens(account), { seeded: !isMinted(account) });
           result.created++;
           continue;
         }
@@ -454,6 +489,11 @@ export class CredentialSync {
           result.adopted++;
         } else if (isMinted(account) && this._isAhead(row, account)) {
           await this._patch(row, account, this._tokens(account));
+          result.pushed++;
+        } else if (this.seedsAll() && row.blob?.seeded && row.blob.expiresAt < (Number(account.expiresAt) || 0)) {
+          // A seed older than the copy here (an install that started from an
+          // old config): the newer copy replaces it, still marked a seed.
+          await this._patch(row, account, this._tokens(account), { seeded: true });
           result.pushed++;
         }
       }
@@ -520,9 +560,9 @@ export class CredentialSync {
     this.am.updateAccountTokens(account.index, tokensOf(blob));
   }
 
-  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens) {
+  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, { seeded = false } = {}) {
     const key = /** @type {string} */ (syncKeyFor(account));
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by });
+    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded });
     let r;
     try {
       r = await this.api('POST', 'User/Credential', { Key: key, Data: JSON.stringify(blob) });
@@ -537,8 +577,8 @@ export class CredentialSync {
     return row;
   }
 
-  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens) {
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by });
+  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, { seeded = false } = {}) {
+    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded });
     const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(blob) });
     const fresh = rowOf({ ...r, Data: JSON.stringify(blob) });
     this.rows.set(fresh.key, fresh);
@@ -552,7 +592,16 @@ export class CredentialSync {
    * @param {number} index
    * @param {Tokens} tokens
    */
-  async onLocalTokens(index, tokens) {
+  onLocalTokens(index, tokens) {
+    return this._track(this._onLocalTokens(index, tokens));
+  }
+
+  /**
+   * The body of onLocalTokens, which tracks it (switchStore).
+   * @param {number} index
+   * @param {Tokens} tokens
+   */
+  async _onLocalTokens(index, tokens) {
     const account = this.am.accounts[index];
     if (!account || !syncKeyFor(account) || !tokens?.accessToken || !tokens?.refreshToken) return;
     // A re-import of a rejected refresh token, say: nothing the others can use.
@@ -581,7 +630,16 @@ export class CredentialSync {
    * @param {Record<string, any>} account
    * @returns {Promise<boolean>}
    */
-  async onAccountError(account) {
+  onAccountError(account) {
+    return this._track(this._onAccountError(account));
+  }
+
+  /**
+   * The body of onAccountError, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _onAccountError(account) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     try {
       if (!this.rows.size) this.rows = await this._list();
@@ -660,7 +718,16 @@ export class CredentialSync {
    * @param {Record<string, any>} account
    * @returns {Promise<boolean>}
    */
-  async onAccountRemoved(account) {
+  onAccountRemoved(account) {
+    return this._track(this._onAccountRemoved(account));
+  }
+
+  /**
+   * The body of onAccountRemoved, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _onAccountRemoved(account) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     try {
       if (!this.rows.size) this.rows = await this._list();
@@ -687,7 +754,16 @@ export class CredentialSync {
    * @param {Record<string, any>} entry  the config entry, tokens included
    * @returns {Promise<boolean>} whether the store was written
    */
-  async storeSignIn(entry) {
+  storeSignIn(entry) {
+    return this._track(this._storeSignIn(entry));
+  }
+
+  /**
+   * The body of storeSignIn, which tracks it (switchStore).
+   * @param {Record<string, any>} entry
+   * @returns {Promise<boolean>}
+   */
+  async _storeSignIn(entry) {
     const account = { ...entry, credential: entry.accessToken, index: -1 };
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     const tokens = this._tokens(account);
@@ -725,7 +801,18 @@ export class CredentialSync {
    * @param {{ force?: boolean }} [info]  force: the token was just rejected, so keeping it is not an option
    * @returns {Promise<Tokens|null>}
    */
-  async coordinateRefresh(account, refresh, { force = false } = {}) {
+  coordinateRefresh(account, refresh, { force = false } = {}) {
+    return this._track(this._coordinateRefresh(account, refresh, { force }));
+  }
+
+  /**
+   * The body of coordinateRefresh, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @param {(opts?: { budgetMs?: number }) => Promise<Tokens>} refresh
+   * @param {{ force?: boolean }} [info]
+   * @returns {Promise<Tokens|null>}
+   */
+  async _coordinateRefresh(account, refresh, { force = false } = {}) {
     if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
     let row;
@@ -837,14 +924,18 @@ export class CredentialSync {
     // A dead token is not stored for the others to pick up (see isInError),
     // nor one not minted here (isMinted): renewed without a lock, which no
     // other install can need, and the fresh token stored (onLocalTokens).
-    if (row || !keyed || isInError(account) || !isMinted(account)) return row;
+    //
+    // Against a store of your own (seedsAll), a token read from the config is
+    // stored too, as a seed, before it is renewed: two installs that started
+    // from one copy of it then renew under one lock, not each on its own.
+    if (row || !keyed || isInError(account) || (!isMinted(account) && !this.seedsAll())) return row;
     // First here: stored as it stands, then locked like any other. Created by
     // another install meanwhile, theirs is the row — which a create racing it
     // on the live API can also learn as a plain database error, not only as
     // error_key_exists: whatever the failure, look again before giving up.
     let created = null;
     try {
-      created = await this._create(account, this._tokens(account));
+      created = await this._create(account, this._tokens(account), { seeded: !isMinted(account) });
     } catch (err) {
       this.rows = await this._list();
       row = find();

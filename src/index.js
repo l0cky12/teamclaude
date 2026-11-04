@@ -83,7 +83,7 @@ function cliSyncOptions() {
     api: transport.api,
     isSignedIn: transport.isSignedIn,
     where: transport.where,
-    seedsAll: () => false,
+    seedsAll: transport.ownStore,
   };
 }
 
@@ -494,13 +494,14 @@ async function serverCommand() {
   // then also runs every few minutes, and stores the accounts the store lacks.
   const syncStore = createSyncStore();
   const syncTransport = createSyncTransport({ getConfig: () => config, store: syncStore });
+  syncTransport.pin(config);
   const syncIntervalFor = (/** @type {Record<string, any>} */ c) => (accountSyncMode(c).mode === 'off' ? SYNC_INTERVAL_MS : INSTANCE_SYNC_INTERVAL_MS);
   const credentialSync = new CredentialSync({
     accountManager, addAccount: admitAccount, evictAccount,
     api: syncTransport.api,
     isSignedIn: syncTransport.isSignedIn,
     where: syncTransport.where,
-    seedsAll: () => accountSyncMode(config).mode !== 'off',
+    seedsAll: syncTransport.ownStore,
   });
   activeCredentialSync = credentialSync;
   accountManager.setRefreshCoordinator((account, refresh, info) => credentialSync.coordinateRefresh(account, refresh, info));
@@ -609,11 +610,10 @@ async function serverCommand() {
     // instances a follower reaches it through (peers.js) are both read per
     // call off this object, so they are taken first: the pass runs against
     // the store the file names now. A different store starts over with it.
-    const storeBefore = JSON.stringify(accountSyncMode(config));
     if (diskConfig.accountSync === undefined) delete config.accountSync;
     else config.accountSync = diskConfig.accountSync;
     config.peers = diskConfig.peers;
-    if (JSON.stringify(accountSyncMode(config)) !== storeBefore) credentialSync.switchStore(syncIntervalFor(config)).catch(() => {});
+    if (syncTransport.differs(config)) credentialSync.switchStore(syncIntervalFor(config), () => syncTransport.pin(config)).catch(() => {});
     else credentialSync.sync('reload').catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
@@ -992,7 +992,7 @@ async function serverCommand() {
       if (next.mode === 'off') delete config.accountSync;
       else config.accountSync = next;
       console.log(`[TeamClaude] Account sync ${next.mode === 'off' ? 'through your own instances is off' : `now goes through ${storeLabel(next)}`} (dashboard)`);
-      credentialSync.switchStore(syncIntervalFor(config)).catch(() => {});
+      credentialSync.switchStore(syncIntervalFor(config), () => syncTransport.pin(config)).catch(() => {});
     },
   });
   // POST /teamclaude/sync-store: the store, while this machine keeps it.

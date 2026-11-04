@@ -96,6 +96,29 @@ test('what a caller sends is bounded: unknown routes, bad ids, oversized data', 
   });
 });
 
+test('a store write never goes ahead without the file lock: a live holder makes it refuse', async () => {
+  await withStore(async ({ store }) => {
+    await store.call('POST', 'User/Credential', { Key: 'teamrouter.a', Data: '{}' });
+    const before = await readFile(store.path, 'utf8');
+    // Held by a live process (this one), taken just now.
+    await writeFile(`${store.path}.lock`, JSON.stringify({ pid: process.pid, at: Date.now() }));
+    const saved = process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS;
+    process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS = '30';
+    try {
+      await assert.rejects(store.call('POST', 'User/Credential', { Key: 'teamrouter.b', Data: '{}' }), refusal('error_store_busy'));
+      const { User_Credential__: id } = (await store.call('GET', 'User/Credential'))[0];
+      await assert.rejects(store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 }), refusal('error_store_busy'));
+      assert.equal(await readFile(store.path, 'utf8'), before);
+    } finally {
+      if (saved === undefined) delete process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS;
+      else process.env.TEAMCLAUDE_CONFIG_LOCK_WAIT_MS = saved;
+      await rm(`${store.path}.lock`, { force: true });
+    }
+    // Released: writes go ahead again.
+    await store.call('POST', 'User/Credential', { Key: 'teamrouter.b', Data: '{}' });
+  });
+});
+
 test('the file holds the tokens: written 0600, and one it cannot read is never written over', { skip: process.platform === 'win32' }, async () => {
   await withStore(async ({ store }) => {
     await store.call('POST', 'User/Credential', { Key: 'teamrouter.a', Data: '{}' });
@@ -116,7 +139,7 @@ const claude = (name, extra = {}) => ({
 });
 
 /** One install: the real account manager and sync, the provider stubbed. */
-function install(by, entries, { store, now, seedsAll = true }) {
+function install(by, entries, { store, now, tick = () => {}, seedsAll = true, api = store.call }) {
   const refreshed = [];
   const am = new AccountManager(entries, 0.98, {
     refreshFn: async (rt) => {
@@ -125,11 +148,12 @@ function install(by, entries, { store, now, seedsAll = true }) {
     },
   });
   const sync = new CredentialSync({
-    accountManager: am, api: store.call, by, now, log: () => {},
+    accountManager: am, api, by, now, log: () => {},
     isSignedIn: async () => true,
     seedsAll: () => seedsAll,
     where: () => 'the account store',
-    sleep: async () => {},
+    // Waiting moves the clock, as it would: a lock holder's lease runs out.
+    sleep: async (ms) => { tick(ms); },
     addAccount: (entry) => am.addAccount(entry),
   });
   am.onTokenRefresh((idx, tokens) => { sync.onLocalTokens(idx, tokens); });
@@ -187,5 +211,89 @@ test('a renewal on one install goes through the store lock, and the other adopts
     await host.am.ensureTokenFresh(hostA.index);
     assert.deepEqual(host.refreshed, []);
     assert.equal(hostA.refreshToken, 'rt-a-1-renewed-rt');
+  });
+});
+
+test('a seed from an install that started with an old copy never replaces the newer token another holds', async () => {
+  await withStore(async ({ store, now, tick }) => {
+    // desk's config still has rt-a-1, which hub has since renewed to rt-a-2.
+    const desk = install('desk', [claude('a', { expiresAt: T0 + 1 * H })], { store, now, tick });
+    const hub = install('hub', [claude('a', { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H })], { store, now, tick });
+    await desk.sync.sync('start');
+    const key = syncKeyFor(desk.am.accounts[0]);
+    const rowsByKey = {};
+    const read = async () => {
+      for (const r of await store.call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 })) rowsByKey[r.Key] = r.Data;
+      return JSON.parse(rowsByKey[key]);
+    };
+    assert.deepEqual([(await read()).refreshToken, (await read()).seeded], ['rt-a-1', true]);
+
+    // hub renews before its own pass runs: under the lock it finds the older
+    // seed, keeps its newer token and renews that, never rt-a-1.
+    tick(8 * H);
+    await hub.am.ensureTokenFresh(hub.am.accounts[0].index);
+    assert.deepEqual(hub.refreshed, ['rt-a-2']);
+    const stored = await read();
+    assert.equal(stored.refreshToken, 'rt-a-2-renewed-rt');
+    assert.equal(stored.seeded, undefined, 'a renewal is no seed');
+  });
+});
+
+test('a pass replaces a seed older than the copy it holds', async () => {
+  await withStore(async ({ store, now, tick }) => {
+    const desk = install('desk', [claude('a', { expiresAt: T0 + 1 * H })], { store, now, tick });
+    const hub = install('hub', [claude('a', { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H })], { store, now, tick });
+    await desk.sync.sync('start');
+    assert.equal((await hub.sync.sync('start')).pushed, 1);
+    // And desk takes the newer copy at its next pass, with no renewal anywhere.
+    assert.equal((await desk.sync.sync('daily')).adopted, 1);
+    assert.equal(desk.am.accounts[0].refreshToken, 'rt-a-2');
+    assert.deepEqual([...desk.refreshed, ...hub.refreshed], []);
+  });
+});
+
+test('two installs that start from one copy and renew before any pass renew it once, under one lock', async () => {
+  await withStore(async ({ store, now, tick }) => {
+    const a = install('a-box', [claude('a')], { store, now, tick });
+    const b = install('b-box', [claude('a')], { store, now, tick });
+    tick(9 * H);
+    await Promise.all([a.am.ensureTokenFresh(0), b.am.ensureTokenFresh(0)]);
+    // One provider call between them; the other install took its result.
+    assert.equal(a.refreshed.length + b.refreshed.length, 1);
+    assert.equal(a.am.accounts[0].refreshToken, 'rt-a-1-renewed-rt');
+    assert.equal(b.am.accounts[0].refreshToken, 'rt-a-1-renewed-rt');
+  });
+});
+
+test('switching stores lets a renewal under way finish in the store it locked', async () => {
+  await withStore(async ({ store, now, tick, dir }) => {
+    const other = createSyncStore({ path: join(dir, 'other.sync-store.json'), now });
+    let current = store;
+    const calls = [];
+    const api = (method, path, params, opts) => { calls.push([current === store ? 'A' : 'B', method, path]); return current.call(method, path, params, opts); };
+    const hub = install('hub', [claude('a')], { store, now, tick, api });
+    await hub.sync.sync('start');
+    tick(9 * H);
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const refresh = hub.sync.coordinateRefresh(hub.am.accounts[0], async () => { await gate; return { accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: now() + 8 * H }; });
+    // Let the refresh take its lock before the switch is asked for.
+    while (!calls.some(([, , path]) => path.endsWith(':lock'))) await new Promise((r) => setImmediate(r));
+    let applied = false;
+    const switched = hub.sync.switchStore(60_000, () => { applied = true; current = other; });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(applied, false, 'not while the renewal holds its lock');
+    release();
+    await refresh;
+    await switched;
+    hub.sync.stop();
+    assert.equal(applied, true);
+    // The lock, the store of the renewal and the unlock all went to A.
+    const renewal = calls.slice(calls.findIndex(([, , p]) => p.endsWith(':lock')));
+    const end = renewal.findIndex(([, , p]) => p.endsWith(':unlock'));
+    assert.ok(end > 0, JSON.stringify(calls));
+    assert.ok(renewal.slice(0, end + 1).every(([s]) => s === 'A'), JSON.stringify(calls));
+    const rows = await store.call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 });
+    assert.equal(JSON.parse(rows[0].Data).refreshToken, 'rt-new');
   });
 });

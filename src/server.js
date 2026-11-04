@@ -944,6 +944,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify(payload));
         };
+        // Checked here, not left to the gate above: that gate admits every
+        // caller when no key is configured, and a loopback one without a key.
+        // The store hands out every shared account's tokens, so it answers
+        // only a caller that presented this machine's own proxy key.
+        const shared = config.proxy?.apiKey;
+        if (!shared || !safeKeyEqual(req.headers['x-api-key'], shared)) {
+          return reply(401, { ok: false, error: shared ? 'the account store answers only to this machine\'s proxy key' : 'this machine has no proxy key (proxy.apiKey), so its account store is closed' });
+        }
         const store = hooks.syncStore?.() || null;
         if (!store) return reply(404, { ok: false, token: 'error_not_host', error: 'this instance does not keep the accounts for your other machines' });
         const body = await readControlJson(req, res);
