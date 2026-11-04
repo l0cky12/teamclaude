@@ -1224,7 +1224,7 @@ export function linkBackNotice(self) {
 }
 
 // The start of a failed account-sync step's message. A page constant too: see SHARED_CONSTS.
-const ACCOUNT_SYNC_FAILED = { view: 'could not read account sync', start: 'could not start the sign-in', status: 'could not check the sign-in', cancel: 'could not cancel the sign-in', sync: 'could not sync', 'sign-out': 'could not sign out' };
+const ACCOUNT_SYNC_FAILED = { view: 'could not read account sync', start: 'could not start the sign-in', status: 'could not check the sign-in', cancel: 'could not cancel the sign-in', sync: 'could not sync', 'sign-out': 'could not sign out', mode: 'could not change account sync' };
 
 /**
  * One request of the Account sync card: `view` is the GET of
@@ -1232,7 +1232,7 @@ const ACCOUNT_SYNC_FAILED = { view: 'could not read account sync', start: 'could
  * the instance shown (at()) or, for a row of Linked instances, through the
  * relay to that one.
  *
- * @param {'view'|'start'|'status'|'cancel'|'sync'|'sign-out'} step
+ * @param {'view'|'start'|'status'|'cancel'|'sync'|'sign-out'|'mode'} step
  * @param {Record<string, any>|null} body
  * @param {string|null} key  the proxy key the page holds
  */
@@ -1261,6 +1261,17 @@ export function accountSyncUser(view) {
 }
 
 /**
+ * The store of your own instances a view names: 'host' (the instance keeps
+ * it), 'follow' (it uses a linked one's), or '' when neither.
+ *
+ * @param {any} view  GET /teamclaude/account-sync
+ */
+export function accountSyncOwnMode(view) {
+  var m = view && view.instance && view.instance.mode;
+  return m === 'host' || m === 'follow' ? m : '';
+}
+
+/**
  * What the card says about the instance shown.
  *
  * @param {any} view  GET /teamclaude/account-sync, or a failed read's `{ ok: false, error }`
@@ -1268,10 +1279,20 @@ export function accountSyncUser(view) {
  */
 export function accountSyncLine(view, where) {
   if (!view || !view.ok) return { kind: 'error', text: ACCOUNT_SYNC_FAILED.view + (view && view.error ? ': ' + view.error : '') };
-  if (!view.signedIn) return { kind: '', text: 'Off: ' + where + ' keeps its own sign-ins.' };
-  var who = accountSyncUser(view);
-  var on = 'On' + (who ? ', as ' + who : '') + '.';
-  if (view.userError) return { kind: 'warn', text: 'On, but callback.net did not say who is signed in: ' + view.userError };
+  var own = accountSyncOwnMode(view);
+  var on;
+  if (own === 'host') {
+    on = 'On: ' + where + ' keeps the accounts for your other machines.';
+  } else if (own === 'follow') {
+    var linked = Array.isArray(view.instance.peers) ? view.instance.peers : [];
+    if (linked.indexOf(view.instance.peer) < 0) return { kind: 'error', text: 'On, but ' + where + ' follows ' + view.instance.peer + ', which is no longer a linked instance: nothing is synced, and a sign-in that runs out is not renewed. Link it again, or turn this off.' };
+    on = 'On: ' + where + ' follows the accounts kept on ' + view.instance.peer + '.';
+  } else {
+    if (!view.signedIn) return { kind: '', text: 'Off: ' + where + ' keeps its own sign-ins.' };
+    var who = accountSyncUser(view);
+    on = 'On' + (who ? ', as ' + who : '') + '.';
+    if (view.userError) return { kind: 'warn', text: 'On, but callback.net did not say who is signed in: ' + view.userError };
+  }
   var s = view.sync || {};
   if (s.lastError) return { kind: 'error', text: on + ' The last sync failed: ' + s.lastError };
   if (!s.lastSyncAt) return { kind: 'ok', text: on + ' The first sync is under way.' };
@@ -1295,7 +1316,12 @@ export function peerSyncCell(view, httpStatus, own) {
   if (httpStatus === 404 || httpStatus === 501) return { kind: 'warn', text: 'needs an update', setUp: false };
   if (!view) return { kind: '', text: '…', setUp: false };
   if (!view.ok) return { kind: 'error', text: 'unknown', setUp: false };
-  if (!view.signedIn) return { kind: '', text: 'off', setUp: true };
+  var mode = accountSyncOwnMode(view);
+  if (mode === 'host') return { kind: 'ok', text: 'keeps the accounts', setUp: false };
+  if (mode === 'follow') return { kind: 'ok', text: 'follows ' + view.instance.peer, setUp: false };
+  // Off there. A callback.net sign-in is offered only while this machine
+  // syncs that way too: beside a store of your own it would be a second one.
+  if (!view.signedIn) return { kind: '', text: 'off', setUp: !accountSyncOwnMode(own) };
   var who = accountSyncUser(view);
   var theirs = view.user && (view.user.email || view.user.name);
   var mine = own && own.ok && own.signedIn && own.user ? (own.user.email || own.user.name) : null;
@@ -1350,13 +1376,20 @@ export function accountSyncCancelOutcome(res, where) {
 }
 
 /**
- * What to tell the operator after Sync now or Sign out.
+ * What to tell the operator after Sync now, Sign out, or a switch of the
+ * store of your own instances (`mode`).
  *
  * @param {any} res
- * @param {'sync'|'sign-out'} step
+ * @param {'sync'|'sign-out'|'mode'} step
+ * @param {string} [where]  for `mode`: 'this machine', or the linked instance's name
  */
-export function accountSyncOutcome(res, step) {
+export function accountSyncOutcome(res, step, where) {
   if (!res || !res.ok) return { kind: 'error', text: ACCOUNT_SYNC_FAILED[step] + (res && res.error ? ': ' + res.error : '') };
+  if (step === 'mode') {
+    if (res.mode === 'host') return { kind: 'ok', text: 'On: ' + where + ' keeps the accounts. On each of your other machines, choose Follow ' + (where === 'this machine' ? 'it' : where) + ' here.' };
+    if (res.mode === 'follow') return { kind: 'ok', text: 'On: ' + where + ' follows ' + res.peer + '. The accounts arrive with the first sync, in a moment.' };
+    return { kind: 'ok', text: 'Off. The accounts stay where they are.' };
+  }
   if (step === 'sign-out') {
     if (!res.wasSignedIn) return { kind: 'ok', text: 'It was not signed in.' };
     return { kind: 'ok', text: res.revoked
@@ -2231,7 +2264,7 @@ const SHARED_HELPERS = [
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-  accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
+  accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
   fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fleetMissingText,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -2467,6 +2500,10 @@ const PAGE = `<!doctype html>
   .links ol li + li { margin-top: 6px; }
   .links .issued .line input { flex: 1 1 220px; min-width: 0; }
   .links td.sync .btn { margin-left: 6px; }
+  /* The store of your own instances, under the callback.net controls. */
+  .links .ownsync { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .links .ownsync .hint { margin: 4px 0 0; }
+  .links .ownsync select { flex: 0 1 220px; min-width: 0; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .links .own { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
   .badge.meta { color: var(--dim); }
   .badge.sessions { color: var(--text); }
@@ -2773,7 +2810,7 @@ const PAGE = `<!doctype html>
         </div>
       </div>
       <div id="acctSync" class="card ckeys links" style="display:none">
-        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude and Codex sign-ins between your own machines, through your callback.net account. Sign each machine in to the same callback.net account: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out.</span></div>
+        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude and Codex sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
         <div id="syncBody"></div>
         <div id="syncSignIn"></div>
         <p class="hint" id="syncHint"></p>
@@ -3993,33 +4030,73 @@ ${SHARED_HELPERS}
     var row = el('div', 'syncline');
     row.appendChild(el('span', 'st ' + line.kind, line.text));
     var sum = syncView.sync || {};
-    if (syncView.signedIn && sum.lastSyncAt) row.appendChild(el('span', 'when', 'Last synced ' + fmtAgo(sum.lastSyncAt) + '.'));
+    var own = accountSyncOwnMode(syncView);
+    var on = syncView.signedIn || !!own;
+    if (on && sum.lastSyncAt) row.appendChild(el('span', 'when', 'Last synced ' + fmtAgo(sum.lastSyncAt) + '.'));
     body.appendChild(row);
     var acts = el('div', 'row acts');
-    if (syncView.ok && !syncView.signedIn) {
+    if (syncView.ok && !on) {
       if (!syncSigningIn()) acts.appendChild(button('btn primary', 'Turn on account sync', function () { startSyncSignIn(''); }));
     } else if (syncView.ok) {
       var now = button('btn', syncBusy === 'sync' ? 'Syncing…' : 'Sync now', function () { doSync('sync'); });
       now.disabled = !!syncBusy;
-      now.title = 'Compare with callback.net now instead of at the daily sync';
+      now.title = own ? 'Compare with the store now instead of at the next sync, a few minutes away' : 'Compare with callback.net now instead of at the daily sync';
       acts.appendChild(now);
       var armedAt = syncSignOutArmedAt;
       var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
-      var out = button(armed ? 'btn rm danger' : 'btn rm', syncBusy === 'sign-out' ? 'Signing out…' : armed ? 'Confirm sign out' : 'Sign out', function () {
+      var label = own ? (armed ? 'Confirm turn off' : 'Turn off') : (armed ? 'Confirm sign out' : 'Sign out');
+      var out = button(armed ? 'btn rm danger' : 'btn rm', syncBusy === 'sign-out' ? 'Signing out…' : syncBusy === 'mode' ? 'Turning off…' : label, function () {
         if (!armed) { syncSignOutArmedAt = Date.now(); renderSync(s); return; }
         if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
         syncSignOutArmedAt = null;
-        doSync('sign-out');
+        if (own) doSync('mode', { mode: 'off' });
+        else doSync('sign-out');
       });
       out.disabled = !!syncBusy;
       out.title = armed ? 'Click again: ' + syncWhere('') + ' stops sharing sign-ins' : 'Stop sharing sign-ins on ' + syncWhere('');
       acts.appendChild(out);
     }
     if (acts.childNodes.length) body.appendChild(acts);
+    var callbackHint = 'You approve the sign-in at callback.net, in any browser. Use the same callback.net account on every machine. callback.net keeps the sign-ins encrypted, readable only with your login.';
+    var offer = syncView.ok && !on && !syncSigningIn() && syncView.instance && syncView.instance.supported;
+    // Offered both ways, each hint stays under its own button.
+    if (offer) {
+      body.appendChild(el('p', 'hint', callbackHint));
+      body.appendChild(ownSyncBox(syncView.instance));
+    }
     if (syncNote) body.appendChild(el('div', 'st ' + syncNote.kind, syncNote.text));
-    hint.textContent = syncView.signedIn
-      ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
-      : 'You approve the sign-in at callback.net, in any browser. Use the same callback.net account on every machine. callback.net keeps the sign-ins encrypted, readable only with your login.';
+    hint.textContent = own
+      ? 'Each machine shares the Claude and Codex sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
+      : syncView.signedIn
+        ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
+        : offer ? '' : callbackHint;
+  }
+
+  // The other way to turn it on: no outside account, one of your own
+  // machines keeps the sign-ins (instance-sync.js). Keep them here, or follow
+  // a linked instance that keeps them.
+  function ownSyncBox(inst) {
+    var box = el('div', 'ownsync');
+    box.appendChild(el('div', 'sub2', 'Or keep them on one of your own machines'));
+    box.appendChild(el('p', 'hint', 'No account needed. One machine keeps the sign-ins; each of your other machines follows it over its link (Linked instances, below).'));
+    var acts = el('div', 'row acts');
+    var host = button('btn', syncBusy === 'mode' ? 'Turning on…' : 'Keep them on ' + syncWhere(''), function () { doSync('mode', { mode: 'host' }); });
+    host.disabled = !!syncBusy || !inst.canHost;
+    host.title = inst.canHost ? syncWhere('') + ' keeps the sign-ins, and your other machines follow it' : syncWhere('') + ' has no proxy key, so your other machines could not reach it';
+    acts.appendChild(host);
+    var peers = Array.isArray(inst.peers) ? inst.peers : [];
+    if (peers.length) {
+      var pick = el('select');
+      pick.setAttribute('aria-label', 'Linked instance to follow');
+      peers.forEach(function (n) { var o = el('option', '', n); o.value = n; pick.appendChild(o); });
+      acts.appendChild(pick);
+      var follow = button('btn', 'Follow', function () { doSync('mode', { mode: 'follow', peer: pick.value }); });
+      follow.disabled = !!syncBusy;
+      follow.title = syncWhere('') + ' uses the sign-ins the chosen machine keeps';
+      acts.appendChild(follow);
+    }
+    box.appendChild(acts);
+    return box;
   }
 
   // Rebuilt only when the sign-in changes, not on every poll, so the link
@@ -4159,13 +4236,13 @@ ${SHARED_HELPERS}
       });
   }
 
-  // Sync now and Sign out, on the instance shown.
-  function doSync(step) {
+  // Sync now, Sign out and the store switch, on the instance shown.
+  function doSync(step, body) {
     syncBusy = step;
     syncNote = null;
     if (lastStatus) renderSync(lastStatus);
-    syncFetch(step, {}, '')
-      .then(function (j) { if (j) syncNote = accountSyncOutcome(j, step); })
+    syncFetch(step, body || {}, '')
+      .then(function (j) { if (j) syncNote = accountSyncOutcome(j, step, syncWhere('')); })
       .catch(function (e) { syncNote = { kind: 'error', text: ACCOUNT_SYNC_FAILED[step] + ': ' + e.message }; })
       .finally(function () {
         syncBusy = '';

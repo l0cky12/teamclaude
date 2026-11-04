@@ -16,10 +16,17 @@
 // One sign-in at a time, and none while signed in: switching the store an
 // install syncs with is done by signing out first, on purpose, so a sign-in
 // can never quietly move an install's tokens to someone else's store.
+//
+// The card also switches the sync to a store one of your own instances keeps
+// (instance-sync.js), for those who would rather not use an outside service:
+// `mode` makes this machine keep it, follow a linked instance that does, or
+// stops either. The same rule holds: one store at a time, so neither is
+// turned on while the other is.
 
 import { randomBytes } from 'node:crypto';
 import { loginCallback, loadCallbackToken, saveCallbackTokenIn, callbackSessionEpoch, callbackWhoami, logoutCallback } from './callback-auth.js';
 import { safeLine } from './safe-text.js';
+import { storeLabel } from './instance-sync.js';
 
 // The user's name and email are read from callback.net for the card. A page
 // that cannot get them quickly still shows the rest.
@@ -28,6 +35,10 @@ const WHOAMI_TIMEOUT_MS = 5000;
 /**
  * @typedef {{ email: string|null, name: string|null }} SyncUser
  * @typedef {'waiting' | 'finishing' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'} SyncSignInState
+ */
+
+/**
+ * @typedef {import('./instance-sync.js').SyncMode} SyncMode
  */
 
 /**
@@ -101,9 +112,19 @@ export class WebAccountSync {
    * @param {typeof logoutCallback} [opts.logout]
    * @param {typeof fetch} [opts.fetchImpl]
    * @param {(line: string) => void} [opts.log]
+   * @param {() => SyncMode} [opts.mode]  the store setting as it is now (instance-sync.js)
+   * @param {((next: SyncMode) => Promise<void>) | null} [opts.setMode]  saves and applies a new one
+   * @param {() => string[]} [opts.peerNames]  the linked instances this machine lists
+   * @param {() => boolean} [opts.canHost]  whether other machines can reach this one (it has a proxy key)
+   * @param {(peer: string) => Promise<unknown>} [opts.probe]  one read of a linked instance's store
    */
-  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackTokenIn, epoch = callbackSessionEpoch, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l) }) {
+  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackTokenIn, epoch = callbackSessionEpoch, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l), mode = () => ({ mode: 'off' }), setMode = null, peerNames = () => [], canHost = () => false, probe = () => Promise.reject(new Error('not supported')) }) {
     this._sync = sync;
+    this._mode = mode;
+    this._setMode = setMode;
+    this._peerNames = peerNames;
+    this._canHost = canHost;
+    this._probe = probe;
     this._login = login;
     this._load = load;
     this._save = save;
@@ -128,13 +149,17 @@ export class WebAccountSync {
   /**
    * What the card shows: whether this install is signed in, as whom, what
    * the last pass found, and the dashboard sign-in in progress, if any.
-   * @returns {Promise<{ signedIn: boolean, user: SyncUser | null, userError: string | null, sync: Record<string, any>, signIn: { id: string, state: SyncSignInState } | null }>}
+   * `instance` is the store of your own instances: off, kept here (host) or
+   * followed on a linked instance, with what the card offers to switch to.
+   * @returns {Promise<{ signedIn: boolean, user: SyncUser | null, userError: string | null, sync: Record<string, any>, signIn: { id: string, state: SyncSignInState } | null, instance: { mode: SyncMode['mode'], peer: string | null, peers: string[], canHost: boolean, supported: boolean } }>}
    */
   async view() {
     const token = await this._load().catch(() => null);
+    const m = this._mode();
     let user = null;
     let userError = null;
-    if (token) {
+    // A session the sync does not use is not worth asking callback.net about.
+    if (token && m.mode === 'off') {
       const key = token.refresh_token || token.access_token;
       if (this._who?.key === key) {
         user = this._who.user;
@@ -157,7 +182,63 @@ export class WebAccountSync {
       userError,
       sync: this._sync.summary(),
       signIn: cur && (cur.state === 'waiting' || cur.state === 'finishing') ? { id: cur.id, state: cur.state } : null,
+      instance: {
+        mode: m.mode,
+        peer: m.mode === 'follow' ? m.peer : null,
+        peers: this._peerNames(),
+        canHost: this._canHost(),
+        supported: !!this._setMode,
+      },
     };
+  }
+
+  /** What the store is called in a message: callback.net, or the instance that keeps it. */
+  storeName() {
+    return storeLabel(this._mode());
+  }
+
+  /**
+   * Switch the store to one of your own instances, or off again: `host`
+   * keeps it on this machine, `follow` {peer} uses the one a linked instance
+   * keeps (checked first, so a follower is never pointed at a machine that
+   * does not keep one), `off` goes back to callback.net or to nothing. The
+   * accounts stay where they are either way; only where they are shared
+   * through changes. The first pass starts at once.
+   * @param {{ mode?: unknown, peer?: unknown }} body
+   * @returns {Promise<{ mode: SyncMode['mode'], peer: string | null }>}
+   */
+  async changeMode(body) {
+    if (!this._setMode) throw new AccountSyncError('this server cannot switch account sync from the dashboard');
+    const want = body?.mode;
+    /** @type {SyncMode} */
+    let next;
+    if (want === 'off') {
+      next = { mode: 'off' };
+    } else if (want === 'host' || want === 'follow') {
+      if (this._current && (this._current.state === 'waiting' || this._current.state === 'finishing')) {
+        throw new AccountSyncError('a callback.net sign-in is in progress; cancel it first');
+      }
+      if (await this._load().catch(() => null)) {
+        throw new AccountSyncError('this machine is signed in to callback.net; sign out first, so it syncs with one store only');
+      }
+      if (want === 'host') {
+        if (!this._canHost()) throw new AccountSyncError('this machine has no proxy key (proxy.apiKey), so your other machines could not reach its store; set one first');
+        next = { mode: 'host' };
+      } else {
+        const peer = typeof body?.peer === 'string' ? body.peer.trim() : '';
+        if (!peer || !this._peerNames().includes(peer)) throw new AccountSyncError('choose one of the linked instances of this machine');
+        try {
+          await this._probe(peer);
+        } catch (err) {
+          throw new AccountSyncError(`could not use the account store on ${safeLine(peer, 64)}: ${syncError(err)}`);
+        }
+        next = { mode: 'follow', peer };
+      }
+    } else {
+      throw new AccountSyncError('"mode" must be host, follow or off');
+    }
+    await this._setMode(next);
+    return { mode: next.mode, peer: next.mode === 'follow' ? next.peer : null };
   }
 
   /**
@@ -180,6 +261,9 @@ export class WebAccountSync {
     // and this one is refused rather than replacing it.
     if (signedIn || this._saves !== saves) {
       throw new AccountSyncError('already signed in to callback.net; sign out first to use another callback.net account');
+    }
+    if (this._mode().mode !== 'off') {
+      throw new AccountSyncError('account sync goes through your own instances; turn that off first to use callback.net');
     }
     if (this._current?.state === 'finishing') {
       throw new AccountSyncError('the last sign-in was approved and is still finishing; try again in a moment');
@@ -269,7 +353,7 @@ export class WebAccountSync {
    * @returns {Promise<Record<string, any>>}  what the pass changed
    */
   async syncNow() {
-    if (!await this._load().catch(() => null)) throw new AccountSyncError('not signed in to callback.net');
+    if (this._mode().mode === 'off' && !await this._load().catch(() => null)) throw new AccountSyncError('not signed in to callback.net');
     return this._sync.sync('dashboard');
   }
 

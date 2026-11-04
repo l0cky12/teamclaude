@@ -213,7 +213,11 @@ function lockWaitMs() {
   return env > 0 ? env : LOCK_WAIT_MS;
 }
 
-function lockIsStale(lockPath) {
+// A strict lock (see withConfigLock) is never written past: it is taken over
+// only from a holder that is gone, or one that has sat on it for a minute.
+const STRICT_LOCK_STALE_MS = 60_000;
+
+function lockIsStale(lockPath, staleMs = LOCK_STALE_MS) {
   let pid, at;
   try {
     ({ pid, at } = JSON.parse(readFileSync(lockPath, 'utf8')));
@@ -221,15 +225,18 @@ function lockIsStale(lockPath) {
     if (err.code === 'ENOENT') return false; // released under us; the retry takes it
     // Empty or garbled: the holder is between its open and its write, or died
     // there. Only the file's age can tell those apart.
-    try { return Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { return false; }
+    try { return Date.now() - statSync(lockPath).mtimeMs > staleMs; } catch { return false; }
   }
-  if (Date.now() - at > LOCK_STALE_MS) return true;
+  if (Date.now() - at > staleMs) return true;
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return false; } catch (err) { return err.code === 'ESRCH'; }
 }
 
-/** True when the lock is ours; false when we gave up and proceed without it. */
-async function acquireConfigLock(lockPath) {
+/**
+ * True when the lock is ours; false when we gave up and proceed without it
+ * (or, `strict`, refuse to: the caller decides, and nothing is logged here).
+ */
+async function acquireConfigLock(lockPath, strict = false) {
   const waitMs = lockWaitMs();
   const deadline = Date.now() + waitMs;
   for (;;) {
@@ -239,16 +246,16 @@ async function acquireConfigLock(lockPath) {
       return true;
     } catch (err) {
       if (err.code !== 'EEXIST') {
-        console.error(`[TeamClaude] Cannot create ${lockPath} (${err.code || err.message}); writing the config without it`);
+        if (!strict) console.error(`[TeamClaude] Cannot create ${lockPath} (${err.code || err.message}); writing the config without it`);
         return false;
       }
     }
-    if (lockIsStale(lockPath)) {
+    if (lockIsStale(lockPath, strict ? STRICT_LOCK_STALE_MS : LOCK_STALE_MS)) {
       await unlink(lockPath).catch(() => {});
       continue;
     }
     if (Date.now() >= deadline) {
-      console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
+      if (!strict) console.error(`[TeamClaude] ${lockPath} is still held by another process after ${waitMs}ms; writing the config without it`);
       return false;
     }
     await new Promise(resolve => setTimeout(resolve, LOCK_POLL_MS));
@@ -264,12 +271,26 @@ const lockQueues = new Map();
  * Run `fn` while holding the advisory lock for `configPath` (protocol above).
  * Same-process callers are queued; other processes are held off by the file.
  * The lock is released whether `fn` resolves or throws.
+ *
+ * `strict`: never go ahead after giving up on the lock. Where the config
+ * degrades to a possible lost update, the account store (sync-store.js) would
+ * hand one renewal lock to two machines, so a lock that cannot be had rejects
+ * with code LOCK_BUSY instead, and a holder still alive keeps it for up to a
+ * minute. A lock left by a process that died is still taken over by the
+ * delete-and-retry above, which two waiters can race; that needs a crash
+ * first, and the store's renewal lock still has its own lease behind it.
+ * @template T
+ * @param {string} configPath
+ * @param {() => Promise<T>} fn
+ * @param {{ strict?: boolean }} [opts]
+ * @returns {Promise<T>}
  */
-export function withConfigLock(configPath, fn) {
+export function withConfigLock(configPath, fn, { strict = false } = {}) {
   const lockPath = `${configPath}.lock`;
   const run = async () => {
     await mkdir(dirname(lockPath), { recursive: true });
-    const held = await acquireConfigLock(lockPath);
+    const held = await acquireConfigLock(lockPath, strict);
+    if (!held && strict) throw Object.assign(new Error(`${lockPath} is held by another process`), { code: 'LOCK_BUSY' });
     try {
       return await fn();
     } finally {

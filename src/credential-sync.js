@@ -98,7 +98,7 @@ export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
  * @typedef {{ v: number, provider: string, name: string, accountUuid?: string, orgUuid?: string, orgName?: string,
  *   accountId?: string, userId?: string, organizationType?: string, rateLimitTier?: string, seatTier?: string,
  *   hasClaudeMax?: boolean|null, hasClaudePro?: boolean|null, accessToken: string, refreshToken: string,
- *   expiresAt: number, updatedAt: number, by: string }} Blob
+ *   expiresAt: number, updatedAt: number, by: string, seeded?: boolean }} Blob
  * @typedef {{ id: string, key: string, blob: Blob|null, deletedAt: number|null, updated: number }} Row
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
  */
@@ -139,10 +139,11 @@ export function syncKeyFor(a) {
  * The row's contents for an account, with the tokens it should carry.
  * @param {Record<string, any>} a
  * @param {Tokens} tokens
- * @param {{ now?: number, by?: string }} [opts]
+ * @param {{ now?: number, by?: string, seeded?: boolean }} [opts]  seeded: the tokens were not
+ *   minted here, only read from this install's config (a store of your own, see seedsAll)
  * @returns {Blob}
  */
-export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}) {
+export function encodeBlob(a, tokens, { now = Date.now(), by = hostname(), seeded = false } = {}) {
   /** @type {any} */
   const blob = { v: BLOB_VERSION, provider: providerOf(a), name: a.name };
   for (const f of IDENTITY_FIELDS) if (a[f] != null) blob[f] = a[f];
@@ -151,6 +152,7 @@ export function encodeBlob(a, tokens, { now = Date.now(), by = hostname() } = {}
   blob.expiresAt = tokens.expiresAt;
   blob.updatedAt = now;
   blob.by = by;
+  if (seeded) blob.seeded = true;
   return blob;
 }
 
@@ -232,6 +234,12 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
  * rotated away. The one exception is a row this install wrote itself with an
  * older token than it now holds: its own renewal whose PATCH did not land, and
  * taking that back would revive a refresh token it already rotated.
+ *
+ * A SEEDED row (a store of your own, see seedsAll) was not written by a
+ * renewal: an install stored what its config held, which may be a copy
+ * another install has since rotated away. It is taken only when it is newer
+ * than ours — a renewal always pushes expiresAt forward — never over a newer
+ * token, since sending the older one to the provider could cost the family.
  * @param {Blob|null} blob
  * @param {Record<string, any>} account
  * @param {string} by  this install's name, as it signs the rows it writes
@@ -239,6 +247,7 @@ function supersedes(/** @type {Blob|null} */ blob, /** @type {Record<string, any
 function heldElsewhere(blob, account, by) {
   if (!blob || needsSignIn(blob)) return false;
   if (blob.accessToken === account.credential && blob.refreshToken === account.refreshToken) return false;
+  if (blob.seeded && blob.expiresAt <= (Number(account.expiresAt) || 0)) return false;
   return !(blob.by === by && blob.expiresAt < (Number(account.expiresAt) || 0));
 }
 
@@ -296,8 +305,12 @@ export class CredentialSync {
    * @param {() => number} [opts.now]
    * @param {(ms: number) => Promise<void>} [opts.sleep]
    * @param {string} [opts.by]
+   * @param {() => string} [opts.where]  what the log lines call the store (instance-sync.js)
+   * @param {() => boolean} [opts.seedsAll]  whether a pass stores an account the store lacks even
+   *   when its token was not renewed here: true for a store of your own, which the operator turned
+   *   on to share the accounts each machine already has (instance-sync.js)
    */
-  constructor({ accountManager, addAccount, evictAccount = () => {}, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname() }) {
+  constructor({ accountManager, addAccount, evictAccount = () => {}, api = callbackCall, isSignedIn = async () => !!(await loadCallbackToken()), log = (l) => console.log(l), now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), by = hostname(), where = () => 'callback.net', seedsAll = () => false }) {
     this.am = accountManager;
     this.addAccount = addAccount;
     this.evictAccount = evictAccount;
@@ -307,6 +320,17 @@ export class CredentialSync {
     this.now = now;
     this.sleep = sleep;
     this.by = by;
+    this.where = where;
+    this.seedsAll = seedsAll;
+    /** Operations under way (switchStore waits for them). @type {Set<Promise<any>>} */
+    this._ops = new Set();
+    /** @type {Promise<void>} */
+    this._switching = Promise.resolve();
+    /** Open while no switch is pending; operations wait on it otherwise. @type {Promise<void> | null} */
+    this._gate = null;
+    /** @type {(() => void) | null} */
+    this._openGate = null;
+    this._pendingSwitches = 0;
     /** What the store holds, as last seen: key → row. */
     this.rows = new Map();
     /** @type {Promise<any>|null} */
@@ -343,6 +367,62 @@ export class CredentialSync {
     this._timer = null;
   }
 
+  /**
+   * The store changed (instance-sync.js: callback.net, this machine, or a
+   * linked instance). What the old one held says nothing about the new one, so
+   * it is forgotten once every operation against the old one is over, and a
+   * pass against the new one starts at once, repeating every `intervalMs`.
+   * @param {number} [intervalMs]
+   * @param {() => void | Promise<void>} [apply]  points the api at the new store
+   */
+  async switchStore(intervalMs = SYNC_INTERVAL_MS, apply = () => {}) {
+    this.stop();
+    // From now until the switch is done, no operation starts: one that began
+    // while `apply` runs could lock a row in the old store and store in the
+    // new one. Every operation already under way finishes against the store
+    // it began with, then `apply` points the api at the new store
+    // (instance-sync.js pin). Switches run one after the other. The price: a
+    // renewal asked for meanwhile waits for the old store's work to finish,
+    // which a store that stopped answering can drag out to its timeouts. A
+    // switch is an operator's action, and rare.
+    this._pendingSwitches++;
+    if (!this._gate) this._gate = new Promise((resolve) => { this._openGate = resolve; });
+    const turn = this._switching.then(async () => {
+      while (this._ops.size) await Promise.allSettled([...this._ops]);
+      await apply();
+      this.rows.clear();
+      this.lastSyncAt = null;
+      this.lastError = null;
+    });
+    this._switching = turn.catch(() => {});
+    try {
+      await turn;
+    } finally {
+      if (--this._pendingSwitches === 0) {
+        const open = this._openGate;
+        this._gate = null;
+        this._openGate = null;
+        open?.();
+      }
+    }
+    return this.start(intervalMs);
+  }
+
+  /**
+   * Start an operation, and count it as under way until it settles, for
+   * switchStore. During a switch it starts once the switch is done.
+   * @template T
+   * @param {() => Promise<T>} start
+   * @returns {Promise<T>}
+   */
+  _track(start) {
+    if (this._gate) return this._gate.then(() => this._track(start));
+    const op = start();
+    this._ops.add(op);
+    op.then(() => this._ops.delete(op), () => this._ops.delete(op));
+    return op;
+  }
+
   /** Every row of ours in the store, keyed. */
   async _list() {
     /** @type {Map<string, Row>} */
@@ -370,7 +450,7 @@ export class CredentialSync {
    */
   sync(reason = 'manual') {
     if (this._syncing) return this._syncing;
-    this._syncing = this._sync(reason).finally(() => { this._syncing = null; });
+    this._syncing = this._track(() => this._sync(reason)).finally(() => { this._syncing = null; });
     return this._syncing;
   }
 
@@ -398,9 +478,13 @@ export class CredentialSync {
         const row = this._rowFor(account);
         const broken = isInError(account);
         if (!row) {
-          // Only a token renewed here is stored for the others to pick up.
-          if (broken || !isMinted(account)) continue;
-          await this._create(account, this._tokens(account));
+          // Only a token renewed here is stored for the others to pick up —
+          // on callback.net. A store of your own takes what each machine has
+          // when the account is not in it yet, the way an import would: that
+          // is what turning it on is for, and a token that turns out dead is
+          // emptied by the first machine it fails on (see _markNeedsSignIn).
+          if (broken || (!isMinted(account) && !this.seedsAll())) continue;
+          await this._create(account, this._tokens(account), { seeded: !isMinted(account) });
           result.created++;
           continue;
         }
@@ -430,6 +514,10 @@ export class CredentialSync {
         } else if (isMinted(account) && this._isAhead(row, account)) {
           await this._patch(row, account, this._tokens(account));
           result.pushed++;
+        } else if (this.seedsAll() && row.blob?.seeded && row.blob.expiresAt < (Number(account.expiresAt) || 0)) {
+          // A seed older than the copy here (an install that started from an
+          // old config): the newer copy replaces it, still marked a seed.
+          if (await this._replaceSeed(row, account)) result.pushed++;
         }
       }
 
@@ -443,18 +531,52 @@ export class CredentialSync {
         const idx = this.addAccount(entry);
         if (idx == null) continue;
         result.added++;
-        this.log(`[TeamClaude] Account "${safeLine(entry.name, 64)}" added from callback.net (signed in on ${safeLine(row.blob.by, 48)})`);
+        this.log(`[TeamClaude] Account "${safeLine(entry.name, 64)}" added from ${this.where()} (signed in on ${safeLine(row.blob.by, 48)})`);
       }
       this.lastSyncAt = this.now();
       this.lastError = null;
       if (result.adopted || result.pushed || result.created || result.added || result.evicted || result.expired || result.emptied) {
-        this.log(`[TeamClaude] callback.net sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added, ${result.evicted} removed, ${result.expired} tombstones expired, ${result.emptied} emptied`);
+        this.log(`[TeamClaude] ${this.where()} sync (${reason}): ${result.adopted} adopted, ${result.pushed} updated, ${result.created} stored, ${result.added} added, ${result.evicted} removed, ${result.expired} tombstones expired, ${result.emptied} emptied`);
       }
       return result;
     } catch (/** @type {any} */ err) {
       this.lastError = safeLine(err?.message || String(err), 200);
-      this.log(`[TeamClaude] callback.net sync (${reason}) failed: ${this.lastError}`);
+      this.log(`[TeamClaude] ${this.where()} sync (${reason}) failed: ${this.lastError}`);
       throw err;
+    }
+  }
+
+  /**
+   * Replace a seed older than the copy this install holds, under the row's
+   * lock and only if the row is still that older seed once locked: since the
+   * pass listed the rows, another install may have renewed the token and
+   * stored it, and writing the older copy back over that would hand the
+   * others a refresh token already spent. Locked elsewhere, it is left for the
+   * next pass. Resolves with whether the row was written.
+   * @param {Row} row
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _replaceSeed(row, account) {
+    const leaseStart = this.now();
+    let locked;
+    try {
+      locked = await this.api('POST', `User/Credential/${row.id}:lock`, { timeout: LOCK_TIMEOUT_S });
+    } catch {
+      return false;
+    }
+    const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
+    try {
+      const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
+      this.rows.set(current.key, current);
+      if (current.deletedAt != null || !current.blob?.seeded || current.blob.expiresAt >= (Number(account.expiresAt) || 0)) return false;
+      // The lock call ate the lease: the write could land after the lock has
+      // passed to someone else. The next pass tries again.
+      if (this.now() > leaseEnd - STORE_RESERVE_MS) return false;
+      await this._patch(current, account, this._tokens(account), { seeded: true });
+      return true;
+    } finally {
+      await this._unlock(row, leaseEnd, locked);
     }
   }
 
@@ -495,9 +617,9 @@ export class CredentialSync {
     this.am.updateAccountTokens(account.index, tokensOf(blob));
   }
 
-  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens) {
+  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, { seeded = false } = {}) {
     const key = /** @type {string} */ (syncKeyFor(account));
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by });
+    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded });
     let r;
     try {
       r = await this.api('POST', 'User/Credential', { Key: key, Data: JSON.stringify(blob) });
@@ -512,8 +634,8 @@ export class CredentialSync {
     return row;
   }
 
-  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens) {
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by });
+  async _patch(/** @type {Row} */ row, /** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, { seeded = false } = {}) {
+    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded });
     const r = await this.api('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(blob) });
     const fresh = rowOf({ ...r, Data: JSON.stringify(blob) });
     this.rows.set(fresh.key, fresh);
@@ -527,7 +649,16 @@ export class CredentialSync {
    * @param {number} index
    * @param {Tokens} tokens
    */
-  async onLocalTokens(index, tokens) {
+  onLocalTokens(index, tokens) {
+    return this._track(() => this._onLocalTokens(index, tokens));
+  }
+
+  /**
+   * The body of onLocalTokens, which tracks it (switchStore).
+   * @param {number} index
+   * @param {Tokens} tokens
+   */
+  async _onLocalTokens(index, tokens) {
     const account = this.am.accounts[index];
     if (!account || !syncKeyFor(account) || !tokens?.accessToken || !tokens?.refreshToken) return;
     // A re-import of a rejected refresh token, say: nothing the others can use.
@@ -544,7 +675,7 @@ export class CredentialSync {
       if (row) await this._patch(row, account, tokens);
       else await this._create(account, tokens);
     } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not store the new token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      this.log(`[TeamClaude] ${this.where()}: could not store the new token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
     }
   }
 
@@ -556,7 +687,16 @@ export class CredentialSync {
    * @param {Record<string, any>} account
    * @returns {Promise<boolean>}
    */
-  async onAccountError(account) {
+  onAccountError(account) {
+    return this._track(() => this._onAccountError(account));
+  }
+
+  /**
+   * The body of onAccountError, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _onAccountError(account) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     try {
       if (!this.rows.size) this.rows = await this._list();
@@ -577,7 +717,7 @@ export class CredentialSync {
       if (holdsRejectedToken(row.blob, account)) await this._markNeedsSignIn(account, row);
       return false;
     } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not look for a newer token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      this.log(`[TeamClaude] ${this.where()}: could not look for a newer token for "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
       return false;
     }
   }
@@ -602,7 +742,7 @@ export class CredentialSync {
     } catch (/** @type {any} */ err) {
       // Locked: another install is renewing, and what it stores settles it.
       // Anything else: the row is left as it is, and the next pass tries again.
-      if (err?.token !== 'error_credential_locked') this.log(`[TeamClaude] callback.net: could not lock "${name}" to mark it as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
+      if (err?.token !== 'error_credential_locked') this.log(`[TeamClaude] ${this.where()}: could not lock "${name}" to mark it as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
       return false;
     }
     const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
@@ -617,13 +757,13 @@ export class CredentialSync {
       }
       const blob = /** @type {Blob} */ (current.blob);
       await this._patch(current, account, { accessToken: blob.accessToken, refreshToken: '', expiresAt: blob.expiresAt });
-      this.log(`[TeamClaude] Account "${name}": its token on callback.net was rejected; emptied it there, so it waits for a sign-in or an install with a working token`);
+      this.log(`[TeamClaude] Account "${name}": its token on ${this.where()} was rejected; emptied it there, so it waits for a sign-in or an install with a working token`);
       return true;
     } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not mark "${name}" as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
+      this.log(`[TeamClaude] ${this.where()}: could not mark "${name}" as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
       return false;
     } finally {
-      await this._unlock(row, leaseEnd);
+      await this._unlock(row, leaseEnd, locked);
     }
   }
 
@@ -635,7 +775,16 @@ export class CredentialSync {
    * @param {Record<string, any>} account
    * @returns {Promise<boolean>}
    */
-  async onAccountRemoved(account) {
+  onAccountRemoved(account) {
+    return this._track(() => this._onAccountRemoved(account));
+  }
+
+  /**
+   * The body of onAccountRemoved, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _onAccountRemoved(account) {
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     try {
       if (!this.rows.size) this.rows = await this._list();
@@ -650,7 +799,7 @@ export class CredentialSync {
       this.rows.set(fresh.key, fresh);
       return true;
     } catch (/** @type {any} */ err) {
-      this.log(`[TeamClaude] callback.net: could not record the removal of "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
+      this.log(`[TeamClaude] ${this.where()}: could not record the removal of "${safeLine(account.name, 64)}": ${safeLine(err?.message || String(err), 160)}`);
       return false;
     }
   }
@@ -662,7 +811,16 @@ export class CredentialSync {
    * @param {Record<string, any>} entry  the config entry, tokens included
    * @returns {Promise<boolean>} whether the store was written
    */
-  async storeSignIn(entry) {
+  storeSignIn(entry) {
+    return this._track(() => this._storeSignIn(entry));
+  }
+
+  /**
+   * The body of storeSignIn, which tracks it (switchStore).
+   * @param {Record<string, any>} entry
+   * @returns {Promise<boolean>}
+   */
+  async _storeSignIn(entry) {
     const account = { ...entry, credential: entry.accessToken, index: -1 };
     if (!syncKeyFor(account) || !await this.isSignedIn()) return false;
     const tokens = this._tokens(account);
@@ -700,14 +858,31 @@ export class CredentialSync {
    * @param {{ force?: boolean }} [info]  force: the token was just rejected, so keeping it is not an option
    * @returns {Promise<Tokens|null>}
    */
-  async coordinateRefresh(account, refresh, { force = false } = {}) {
+  coordinateRefresh(account, refresh, { force = false } = {}) {
+    // The tokens as they are now, which are the ones `refresh` will send: an
+    // operation that waits behind a store switch may find the account has
+    // adopted newer ones meanwhile, and comparing the store with those would
+    // send the old refresh token all the same. Compared against this copy, a
+    // newer token in the store is taken and `refresh` is never called.
+    const asked = { ...account };
+    return this._track(() => this._coordinateRefresh(asked, refresh, { force }));
+  }
+
+  /**
+   * The body of coordinateRefresh, which tracks it (switchStore).
+   * @param {Record<string, any>} account
+   * @param {(opts?: { budgetMs?: number }) => Promise<Tokens>} refresh
+   * @param {{ force?: boolean }} [info]
+   * @returns {Promise<Tokens|null>}
+   */
+  async _coordinateRefresh(account, refresh, { force = false } = {}) {
     if (!await this.isSignedIn()) return refresh();
     const name = safeLine(account.name, 64);
     let row;
     try {
       row = await this._rowToLock(account);
     } catch (/** @type {any} */ err) {
-      return this._standDown(account, force, `callback.net could not be read (${safeLine(err?.message || String(err), 120)})`);
+      return this._standDown(account, force, `${this.where()} could not be read (${safeLine(err?.message || String(err), 120)})`);
     }
     // No copy of this token in the store, so none on any other install.
     if (!row) return refresh();
@@ -724,13 +899,13 @@ export class CredentialSync {
           // make, the row it is now.
           this.rows.delete(row.key);
           try { row = await this._rowToLock(account); } catch { row = null; }
-          if (!row) return this._standDown(account, force, 'its callback.net row went away');
+          if (!row) return this._standDown(account, force, `its row on ${this.where()} went away`);
           continue;
         }
         if (err?.token !== 'error_credential_locked') {
           // A lock call that failed in flight may still have taken it; either
           // way this install does not hold it, so it does not renew.
-          return this._standDown(account, force, `the callback.net lock could not be taken (${safeLine(err?.message || String(err), 120)})`);
+          return this._standDown(account, force, `the ${this._lockName()} could not be taken (${safeLine(err?.message || String(err), 120)})`);
         }
         // Another install is renewing. A token that still works serves this
         // request as it is; the renewal arrives through the store, and the
@@ -758,20 +933,20 @@ export class CredentialSync {
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
       if (current.deletedAt == null && heldElsewhere(current.blob, account, this.by)) {
-        await this._unlock(row, leaseEnd);
+        await this._unlock(row, leaseEnd, locked);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);
         return tokensOf(/** @type {Blob} */ (current.blob));
       }
       const budgetMs = leaseEnd - STORE_RESERVE_MS - this.now();
       if (budgetMs < MIN_REFRESH_BUDGET_MS) {
         // The lock call itself ate the lease.
-        await this._unlock(row, leaseEnd);
-        this.log(`[TeamClaude] Account "${name}": the callback.net lock took too long to answer; trying it again`);
+        await this._unlock(row, leaseEnd, locked);
+        this.log(`[TeamClaude] Account "${name}": the ${this._lockName()} took too long to answer; trying it again`);
         continue;
       }
       try {
         const tokens = await refresh({ budgetMs });
-        if (this.now() > leaseEnd) this.log(`[TeamClaude] Account "${name}": the renewal outlasted the callback.net lock (${LOCK_TIMEOUT_S}s)`);
+        if (this.now() > leaseEnd) this.log(`[TeamClaude] Account "${name}": the renewal outlasted the ${this._lockName()} (${LOCK_TIMEOUT_S}s)`);
         if (current.deletedAt != null) {
           // Removed on another install since the last pass. This request still
           // gets its token, renewed under the lock and never written over the
@@ -783,14 +958,14 @@ export class CredentialSync {
         try {
           await this._patch(current, account, tokens);
         } catch (/** @type {any} */ err) {
-          this.log(`[TeamClaude] callback.net: could not store the renewed token for "${name}": ${safeLine(err?.message || String(err), 120)}`);
+          this.log(`[TeamClaude] ${this.where()}: could not store the renewed token for "${name}": ${safeLine(err?.message || String(err), 120)}`);
         }
         return tokens;
       } finally {
-        await this._unlock(row, leaseEnd);
+        await this._unlock(row, leaseEnd, locked);
       }
     }
-    return this._standDown(account, force, `the callback.net lock was not to be had in ${MAX_LOCK_ROUNDS} rounds`);
+    return this._standDown(account, force, `the ${this._lockName()} was not to be had in ${MAX_LOCK_ROUNDS} rounds`);
   }
 
   /**
@@ -812,14 +987,18 @@ export class CredentialSync {
     // A dead token is not stored for the others to pick up (see isInError),
     // nor one not minted here (isMinted): renewed without a lock, which no
     // other install can need, and the fresh token stored (onLocalTokens).
-    if (row || !keyed || isInError(account) || !isMinted(account)) return row;
+    //
+    // Against a store of your own (seedsAll), a token read from the config is
+    // stored too, as a seed, before it is renewed: two installs that started
+    // from one copy of it then renew under one lock, not each on its own.
+    if (row || !keyed || isInError(account) || (!isMinted(account) && !this.seedsAll())) return row;
     // First here: stored as it stands, then locked like any other. Created by
     // another install meanwhile, theirs is the row — which a create racing it
     // on the live API can also learn as a plain database error, not only as
     // error_key_exists: whatever the failure, look again before giving up.
     let created = null;
     try {
-      created = await this._create(account, this._tokens(account));
+      created = await this._create(account, this._tokens(account), { seeded: !isMinted(account) });
     } catch (err) {
       this.rows = await this._list();
       row = find();
@@ -851,14 +1030,29 @@ export class CredentialSync {
       this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; keeping the current token`);
       return null;
     }
-    this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (\`teamclaude callback logout\` renews without one)`);
-    throw Object.assign(new Error(`not renewed without the callback.net lock: ${why}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
+    this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (${this.where() === 'callback.net' ? '`teamclaude callback logout`' : 'turning account sync off'} renews without one)`);
+    throw Object.assign(new Error(`not renewed without the ${this._lockName()}: ${why}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
+  }
+
+  /** The lock, as the log names it: "the callback.net lock", "the lock on the account store on desk". */
+  _lockName() {
+    const where = this.where();
+    return where === 'callback.net' ? 'callback.net lock' : `lock on ${where}`;
   }
 
   /** Release the lock, unless the lease has run out: then it may be someone else's. */
-  async _unlock(/** @type {Row} */ row, /** @type {number} */ leaseEnd) {
+  /**
+   * The lease a store of your own names the lock with (sync-store.js) goes
+   * back with the unlock, so one that arrives late cannot release the next
+   * holder's lock. callback.net names none, and is sent none.
+   * @param {Row} row
+   * @param {number} leaseEnd
+   * @param {any} [locked]  what the :lock answered
+   */
+  async _unlock(row, leaseEnd, locked) {
     if (this.now() >= leaseEnd) return;
-    try { await this.api('POST', `User/Credential/${row.id}:unlock`, {}); } catch { /* the lock times out on its own */ }
+    const lease = typeof locked?.Lease === 'string' ? locked.Lease : null;
+    try { await this.api('POST', `User/Credential/${row.id}:unlock`, lease ? { Lease: lease } : {}); } catch { /* the lock times out on its own */ }
   }
 }
 
@@ -867,7 +1061,7 @@ export class CredentialSync {
  * an account's tokens — through the same lock the proxy's go through.
  * @param {Record<string, any>} entry  config-entry shaped: accessToken, refreshToken, expiresAt, and the identity when known
  * @param {(opts?: { budgetMs?: number }) => Promise<Tokens>} refresh
- * @param {{ force?: boolean, log?: (line: string) => void, api?: Api, isSignedIn?: () => Promise<boolean> }} [opts]
+ * @param {{ force?: boolean, log?: (line: string) => void, api?: Api, isSignedIn?: () => Promise<boolean>, where?: () => string, seedsAll?: () => boolean }} [opts]
  * @returns {Promise<Tokens|null>}
  */
 export function refreshOutsideProxy(entry, refresh, { force = false, ...opts } = {}) {
