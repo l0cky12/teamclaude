@@ -378,12 +378,13 @@ export class CredentialSync {
   async switchStore(intervalMs = SYNC_INTERVAL_MS, apply = () => {}) {
     this.stop();
     // From now until the switch is done, no operation starts: one that began
-    // while \`apply\` runs could lock a row in the old store and store in the
-    // new one. The price: a renewal asked for meanwhile waits for the old
-    // store's work to finish, which a store that stopped answering can drag
-    // out to its timeouts. A switch is an operator's action, and rare. Every operation already under way finishes against the store
-    // it began with, then \`apply\` points the api at the new store
-    // (instance-sync.js pin). Switches run one after the other.
+    // while `apply` runs could lock a row in the old store and store in the
+    // new one. Every operation already under way finishes against the store
+    // it began with, then `apply` points the api at the new store
+    // (instance-sync.js pin). Switches run one after the other. The price: a
+    // renewal asked for meanwhile waits for the old store's work to finish,
+    // which a store that stopped answering can drag out to its timeouts. A
+    // switch is an operator's action, and rare.
     this._pendingSwitches++;
     if (!this._gate) this._gate = new Promise((resolve) => { this._openGate = resolve; });
     const turn = this._switching.then(async () => {
@@ -858,11 +859,11 @@ export class CredentialSync {
    * @returns {Promise<Tokens|null>}
    */
   coordinateRefresh(account, refresh, { force = false } = {}) {
-    // The tokens as they are now, which are the ones \`refresh\` will send: an
+    // The tokens as they are now, which are the ones `refresh` will send: an
     // operation that waits behind a store switch may find the account has
     // adopted newer ones meanwhile, and comparing the store with those would
     // send the old refresh token all the same. Compared against this copy, a
-    // newer token in the store is taken and \`refresh\` is never called.
+    // newer token in the store is taken and `refresh` is never called.
     const asked = { ...account };
     return this._track(() => this._coordinateRefresh(asked, refresh, { force }));
   }
@@ -1029,7 +1030,7 @@ export class CredentialSync {
       this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; keeping the current token`);
       return null;
     }
-    this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (${this.where() === 'callback.net' ? '\`teamclaude callback logout\`' : 'turning account sync off'} renews without one)`);
+    this.log(`[TeamClaude] Account "${name}": not renewing, ${why}; it waits for the lock (${this.where() === 'callback.net' ? '`teamclaude callback logout`' : 'turning account sync off'} renews without one)`);
     throw Object.assign(new Error(`not renewed without the ${this._lockName()}: ${why}`), { code: 'CALLBACK_LOCK_UNAVAILABLE' });
   }
 
