@@ -714,6 +714,32 @@ export function instanceAddressOutcome(res) {
   return { kind: 'ok', text: res.address ? 'other machines are now given ' + res.address : 'instance address cleared; the link uses a guess again' };
 }
 
+/**
+ * @param {number} percent  0 shows every share
+ * @param {string|null|undefined} key
+ */
+export function outsideSpendHideRequest(percent, key) {
+  return {
+    url: '/teamclaude/outside-spend-hide',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ percent: percent }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function outsideSpendHideOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'outside spend change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.outsideSpendHidePercent > 0
+    ? 'outside spend at or below ' + res.outsideSpendHidePercent + '% is now hidden'
+    : 'outside spend is now shown at every share' };
+}
+
 // What the Instance picker calls the machine the page was opened on: its
 // name, or "This machine" from a proxy too old to say.
 /** @param {any} self  { name } from /teamclaude/peers, or status.instance */
@@ -2196,7 +2222,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
-  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
+  outsideSpendHideRequest, outsideSpendHideOutcome, outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
@@ -2728,6 +2754,15 @@ const PAGE = `<!doctype html>
             <select id="probeEvery"></select>
           </span>
         </div>
+        <div class="setting" id="ospRow" style="display:none">
+          <div><b>Outside spend</b><span class="tag">Hide an account's "outside" share when it is at or below this. 0 shows every share. Saved to the config file.</span></div>
+          <span class="thr">
+            <label for="ospVal">Hide at or below</label>
+            <input id="ospVal" type="number" min="0" max="100" step="0.1" inputmode="decimal">
+            <span>%</span>
+            <button id="ospSet" class="btn" type="button">Set</button>
+          </span>
+        </div>
         <div class="setting">
           <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
           <button id="probe" class="btn" type="button">Probe quotas</button>
@@ -3004,7 +3039,7 @@ ${SHARED_HELPERS}
     if (meters.text) { x.appendChild(el('div', 'usage', meters.text)); said++; }
     var q = a.quota || {};
     // Spend on this account that did not come through the proxy (#475).
-    var outside = outsideSpendText(q.outsideSpend);
+    var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent);
     if (outside) { x.appendChild(el('div', 'usage', 'outside: ' + outside)); said++; }
     var forecast = forecastText(q.forecast, Date.now());
     if (forecast) { x.appendChild(el('div', 'usage', 'forecast: ' + forecast)); said++; }
@@ -5068,6 +5103,15 @@ ${SHARED_HELPERS}
       probeSel.value = String(probeSecs);
     }
     probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
+    // Like the threshold field. A proxy too old to send the cut-off has no
+    // row for it: there is nothing it could save to.
+    var hasOsp = typeof s.outsideSpendHidePercent === 'number';
+    document.getElementById('ospRow').style.display = hasOsp ? '' : 'none';
+    var ospInput = document.getElementById('ospVal');
+    if (hasOsp && document.activeElement !== ospInput) ospInput.value = String(s.outsideSpendHidePercent);
+    var canOsp = callerCan(s.caller, '/teamclaude/outside-spend-hide');
+    ospInput.disabled = !canOsp;
+    document.getElementById('ospSet').style.display = canOsp ? '' : 'none';
     // Only the operator is told the name, and a proxy too old to have one
     // says nothing, so the row is there only when there is a name to change.
     var inst = s.instance;
@@ -5569,6 +5613,31 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doOutsideSpendHide(btn) {
+    var input = document.getElementById('ospVal');
+    var raw = input.value.trim();
+    // As for the threshold: an empty box would reach the server as a missing
+    // number, and "enter a percentage" is what the operator needs to read.
+    if (!raw) { note('error', 'outside spend: enter a percentage from 0 to 100'); return; }
+    btn.disabled = true;
+    var r = outsideSpendHideRequest(Number(raw), localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = outsideSpendHideOutcome(json);
+        note(out.kind, out.text);
+        // The stored number, which is rounded to tenths.
+        if (json.ok) input.value = String(json.outsideSpendHidePercent);
+        poll();
+      })
+      .catch(function (e) { note('error', 'outside spend change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   function doInstanceName(btn) {
     var input = document.getElementById('nameVal');
     btn.disabled = true;
@@ -5892,6 +5961,10 @@ ${SHARED_HELPERS}
     if (e.key === 'Enter') { e.preventDefault(); doInstanceAddress(document.getElementById('addrSet')); }
   });
   document.getElementById('probeEvery').addEventListener('change', function () { doProbeInterval(this); });
+  document.getElementById('ospSet').addEventListener('click', function () { doOutsideSpendHide(this); });
+  document.getElementById('ospVal').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('ospSet').click(); }
+  });
   // A client key is a valid key, so nothing else on the page would ever ask for
   // another one: the operator needs a way back to the key box.
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }

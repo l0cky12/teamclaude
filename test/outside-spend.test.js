@@ -330,6 +330,7 @@ test('the proxy holds the account busy from dispatch until the stream ends', asy
 
 // ── the read-out ──────────────────────────────────────────────────────────
 
+// A cut-off of 0 shows every share; outside-spend-hide.test.js covers the default.
 test('outsideSpendText names each window and never shows 0% for "no answer"', () => {
   const since = '2026-10-05T08:00:00.000Z';
   assert.equal(outsideSpendText(null), null);
@@ -338,8 +339,8 @@ test('outsideSpendText names each window and never shows 0% for "no answer"', ()
     'scoped:opus': { share: 0.1, state: 'measured', since },
     unified7dFable: { share: null, state: 'not_measurable', since },
     unified7d: { share: 0.04, state: 'measured', since },
-  }), '4.0% of the week went elsewhere · 10.0% of the Opus week went elsewhere · Fable week: not measurable');
-  assert.equal(outsideSpendText({ unified7d: { share: 0, state: 'measured', since } }), '0.0% of the week went elsewhere');
+  }, 0), '4.0% of the week went elsewhere · 10.0% of the Opus week went elsewhere · Fable week: not measurable');
+  assert.equal(outsideSpendText({ unified7d: { share: 0, state: 'measured', since } }, 0), '0.0% of the week went elsewhere');
   const unknown = outsideSpendText({ unified7d: { share: null, state: 'not_observed', since: null } });
   assert.equal(unknown, 'week: not observed (quota probe off?)');
   assert.doesNotMatch(unknown, /0%/);
