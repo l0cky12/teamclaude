@@ -853,7 +853,13 @@ export class CredentialSync {
    * @returns {Promise<Tokens|null>}
    */
   coordinateRefresh(account, refresh, { force = false } = {}) {
-    return this._track(() => this._coordinateRefresh(account, refresh, { force }));
+    // The tokens as they are now, which are the ones \`refresh\` will send: an
+    // operation that waits behind a store switch may find the account has
+    // adopted newer ones meanwhile, and comparing the store with those would
+    // send the old refresh token all the same. Compared against this copy, a
+    // newer token in the store is taken and \`refresh\` is never called.
+    const asked = { ...account };
+    return this._track(() => this._coordinateRefresh(asked, refresh, { force }));
   }
 
   /**

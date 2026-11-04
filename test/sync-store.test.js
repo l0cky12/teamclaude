@@ -404,3 +404,33 @@ test('a renewal asked for while a switch is re-pointing the store starts only af
     assert.equal(hub.am.accounts[0].refreshToken, 'rt-a-1-renewed-rt');
   });
 });
+
+test('a renewal queued behind a switch whose new store holds a newer token takes it, and never sends the old one', async () => {
+  await withStore(async ({ store, now, tick, dir }) => {
+    const other = createSyncStore({ path: join(dir, 'other.sync-store.json'), now });
+    // The store being switched to holds rt-a-2, renewed on another install.
+    const elsewhere = install('elsewhere', [claude('a', { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 20 * H })], { store: other, now, tick });
+    elsewhere.am.accounts[0]._minted = true;
+    await elsewhere.sync.sync('start');
+    let current = store;
+    const api = (method, path, params, opts) => current.call(method, path, params, opts);
+    const hub = install('hub', [claude('a')], { store, now, tick, api });
+    tick(9 * H);
+    let finishApply;
+    const applying = new Promise((r) => { finishApply = r; });
+    let entered;
+    const inApply = new Promise((r) => { entered = r; });
+    const switched = hub.sync.switchStore(60_000, async () => { entered(); await applying; current = other; });
+    await inApply;
+    // Asked for with rt-a-1 in hand; it waits for the switch.
+    const renewal = hub.am.ensureTokenFresh(0);
+    finishApply();
+    await switched;
+    await renewal;
+    hub.sync.stop();
+    assert.deepEqual(hub.refreshed, [], 'rt-a-1 never reached the provider');
+    assert.equal(hub.am.accounts[0].refreshToken, 'rt-a-2');
+    const rows = await other.call('GET', 'User/Credential', { results_per_page: 100, page_no: 1 });
+    assert.equal(JSON.parse(rows[0].Data).refreshToken, 'rt-a-2');
+  });
+});

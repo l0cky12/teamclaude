@@ -226,7 +226,14 @@ test('a proxy switched to follow another picks up its accounts, with no sign-in'
     // The desk's first pass against the hub's store brings the account in.
     const status = await waitForStatus(desk.port, (s) => s.accounts?.some((/** @type {any} */ a) => a.name === 'shared@example.com'));
     assert.ok(status, desk.output());
-    const saved = JSON.parse(await readFile(desk.configPath, 'utf8'));
+    // The running fleet has it; the config write that keeps it follows on its
+    // own, so the file is read until it says so (the runner's timeout bounds it).
+    let saved;
+    for (;;) {
+      saved = JSON.parse(await readFile(desk.configPath, 'utf8'));
+      if (saved.accounts.some((/** @type {any} */ a) => a.accountUuid === 'uuid-shared')) break;
+      await new Promise((r) => setTimeout(r, 25));
+    }
     assert.deepEqual(saved.accountSync, { mode: 'follow', peer: 'hub' });
     const copy = saved.accounts.find((/** @type {any} */ a) => a.accountUuid === 'uuid-shared');
     assert.equal(copy.refreshToken, 'rt-shared-1');
