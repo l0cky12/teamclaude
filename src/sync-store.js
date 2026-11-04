@@ -64,7 +64,7 @@ export function getSyncStorePath(configPath = getConfigPath()) {
 }
 
 /**
- * @typedef {{ id: string, key: string, data: string, updated: number, lockedAt: number|null }} StoreRow
+ * @typedef {{ id: string, key: string, data: string, updated: number, lockedAt: number|null, lease?: string|null }} StoreRow
  * @typedef {{ v: number, rows: StoreRow[] }} StoreFile
  */
 
@@ -91,7 +91,7 @@ function parseStore(text) {
   const rows = [];
   for (const r of doc.rows) {
     if (!r || typeof r.id !== 'string' || typeof r.key !== 'string' || typeof r.data !== 'string') continue;
-    rows.push({ id: r.id, key: r.key, data: r.data, updated: Number(r.updated) || 0, lockedAt: Number.isFinite(r.lockedAt) ? r.lockedAt : null });
+    rows.push({ id: r.id, key: r.key, data: r.data, updated: Number(r.updated) || 0, lockedAt: Number.isFinite(r.lockedAt) ? r.lockedAt : null, lease: typeof r.lease === 'string' ? r.lease : null });
   }
   return { v: STORE_VERSION, rows };
 }
@@ -197,16 +197,20 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
         if (row.lockedAt != null && now() - row.lockedAt < timeoutS * 1000) {
           throw new SyncStoreError('error_credential_locked', 'the credential is locked');
         }
+        // Named, so the unlock has to name it too: one that arrives after the
+        // lock was handed over releases nothing.
         row.lockedAt = now();
-        return { result: view(row), changed: true };
+        row.lease = randomBytes(12).toString('hex');
+        return { result: { ...view(row), Lease: row.lease }, changed: true };
       });
     }
     if (action === 'unlock' && method === 'POST') {
       return update((store) => {
         const row = find(store, id);
-        const changed = row.lockedAt != null;
+        if (row.lockedAt == null || (row.lease && p.Lease !== row.lease)) return { result: view(row), changed: false };
         row.lockedAt = null;
-        return { result: view(row), changed };
+        row.lease = null;
+        return { result: view(row), changed: true };
       });
     }
     if (action) throw new SyncStoreError('error_bad_request', 'unknown route');

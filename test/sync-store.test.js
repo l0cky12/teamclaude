@@ -73,7 +73,9 @@ test('a lock refuses the next taker until it is released or older than the lease
     // The lock answers with the row, Data included: the sync reads it under the lock.
     assert.equal(locked.Data, 'd');
     await assert.rejects(store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 }), refusal('error_credential_locked'));
-    await store.call('POST', `User/Credential/${id}:unlock`, {});
+    // The unlock names the lease the lock answered with.
+    assert.match(locked.Lease, /^[0-9a-f]{24}$/);
+    await store.call('POST', `User/Credential/${id}:unlock`, { Lease: locked.Lease });
     await store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
 
     // Held 29s: still refused. Held 30s: handed over.
@@ -82,6 +84,22 @@ test('a lock refuses the next taker until it is released or older than the lease
     tick(1_000);
     await store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
     await assert.rejects(store.call('POST', 'User/Credential/ucr-nope:lock', { timeout: 30 }), refusal('error_not_found'));
+  });
+});
+
+test('an unlock that arrives after its lock was handed over releases nothing', async () => {
+  await withStore(async ({ store, tick }) => {
+    const { User_Credential__: id } = await store.call('POST', 'User/Credential', { Key: 'teamrouter.a', Data: 'd' });
+    const a = await store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
+    tick(30_000);
+    // A's lease ran out and B took the lock; A's late unlock arrives now.
+    const b = await store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
+    await store.call('POST', `User/Credential/${id}:unlock`, { Lease: a.Lease });
+    await store.call('POST', `User/Credential/${id}:unlock`, {});
+    tick(1_000);
+    await assert.rejects(store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 }), refusal('error_credential_locked'), 'still B\'s');
+    await store.call('POST', `User/Credential/${id}:unlock`, { Lease: b.Lease });
+    await store.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
   });
 });
 
@@ -356,5 +374,33 @@ test('a pass that replaces an older seed re-reads it under the lock, and leaves 
     await store.call('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(blob) });
     assert.equal(await desk.sync._replaceSeed(row, desk.am.accounts[0]), false);
     assert.equal(JSON.parse((await store.call('GET', `User/Credential/${row.id}`)).Data).refreshToken, 'rt-a-3');
+  });
+});
+
+test('a renewal asked for while a switch is re-pointing the store starts only after it, in the new store', async () => {
+  await withStore(async ({ store, now, tick, dir }) => {
+    const other = createSyncStore({ path: join(dir, 'other.sync-store.json'), now });
+    let current = store;
+    const calls = [];
+    const api = (method, path, params, opts) => { calls.push([current === store ? 'A' : 'B', method, path]); return current.call(method, path, params, opts); };
+    const hub = install('hub', [claude('a')], { store, now, tick, api });
+    tick(9 * H);
+    let finishApply;
+    const applying = new Promise((r) => { finishApply = r; });
+    let entered;
+    const inApply = new Promise((r) => { entered = r; });
+    const switched = hub.sync.switchStore(60_000, async () => { entered(); await applying; current = other; });
+    await inApply;
+    // The switch is re-pointing (an async apply: the host's reseed). A renewal now:
+    const renewal = hub.am.ensureTokenFresh(0);
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(calls, [], 'nothing reached either store mid-switch');
+    finishApply();
+    await switched;
+    await renewal;
+    hub.sync.stop();
+    assert.ok(calls.length > 0);
+    assert.ok(calls.every(([s]) => s === 'B'), JSON.stringify(calls));
+    assert.equal(hub.am.accounts[0].refreshToken, 'rt-a-1-renewed-rt');
   });
 });

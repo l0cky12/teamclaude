@@ -326,6 +326,11 @@ export class CredentialSync {
     this._ops = new Set();
     /** @type {Promise<void>} */
     this._switching = Promise.resolve();
+    /** Open while no switch is pending; operations wait on it otherwise. @type {Promise<void> | null} */
+    this._gate = null;
+    /** @type {(() => void) | null} */
+    this._openGate = null;
+    this._pendingSwitches = 0;
     /** What the store holds, as last seen: key → row. */
     this.rows = new Map();
     /** @type {Promise<any>|null} */
@@ -372,28 +377,44 @@ export class CredentialSync {
    */
   async switchStore(intervalMs = SYNC_INTERVAL_MS, apply = () => {}) {
     this.stop();
-    // Every operation already under way finishes against the store it began
-    // with: a renewal that locked a row there also stores and unlocks there.
-    // Only then does \`apply\` point the api at the new store (instance-sync.js
-    // pin). Switches run one after the other.
-    this._switching = this._switching.then(async () => {
+    // From now until the switch is done, no operation starts: one that began
+    // while \`apply\` runs could lock a row in the old store and store in the
+    // new one. Every operation already under way finishes against the store
+    // it began with, then \`apply\` points the api at the new store
+    // (instance-sync.js pin). Switches run one after the other.
+    this._pendingSwitches++;
+    if (!this._gate) this._gate = new Promise((resolve) => { this._openGate = resolve; });
+    const turn = this._switching.then(async () => {
       while (this._ops.size) await Promise.allSettled([...this._ops]);
       await apply();
       this.rows.clear();
       this.lastSyncAt = null;
       this.lastError = null;
     });
-    await this._switching;
+    this._switching = turn.catch(() => {});
+    try {
+      await turn;
+    } finally {
+      if (--this._pendingSwitches === 0) {
+        const open = this._openGate;
+        this._gate = null;
+        this._openGate = null;
+        open?.();
+      }
+    }
     return this.start(intervalMs);
   }
 
   /**
-   * Count an operation as under way until it settles, for switchStore.
+   * Start an operation, and count it as under way until it settles, for
+   * switchStore. During a switch it starts once the switch is done.
    * @template T
-   * @param {Promise<T>} op
+   * @param {() => Promise<T>} start
    * @returns {Promise<T>}
    */
-  _track(op) {
+  _track(start) {
+    if (this._gate) return this._gate.then(() => this._track(start));
+    const op = start();
     this._ops.add(op);
     op.then(() => this._ops.delete(op), () => this._ops.delete(op));
     return op;
@@ -426,7 +447,7 @@ export class CredentialSync {
    */
   sync(reason = 'manual') {
     if (this._syncing) return this._syncing;
-    this._syncing = this._track(this._sync(reason).finally(() => { this._syncing = null; }));
+    this._syncing = this._track(() => this._sync(reason)).finally(() => { this._syncing = null; });
     return this._syncing;
   }
 
@@ -549,7 +570,7 @@ export class CredentialSync {
       await this._patch(current, account, this._tokens(account), { seeded: true });
       return true;
     } finally {
-      await this._unlock(row, leaseEnd);
+      await this._unlock(row, leaseEnd, locked);
     }
   }
 
@@ -623,7 +644,7 @@ export class CredentialSync {
    * @param {Tokens} tokens
    */
   onLocalTokens(index, tokens) {
-    return this._track(this._onLocalTokens(index, tokens));
+    return this._track(() => this._onLocalTokens(index, tokens));
   }
 
   /**
@@ -661,7 +682,7 @@ export class CredentialSync {
    * @returns {Promise<boolean>}
    */
   onAccountError(account) {
-    return this._track(this._onAccountError(account));
+    return this._track(() => this._onAccountError(account));
   }
 
   /**
@@ -736,7 +757,7 @@ export class CredentialSync {
       this.log(`[TeamClaude] ${this.where()}: could not mark "${name}" as needing a sign-in: ${safeLine(err?.message || String(err), 120)}`);
       return false;
     } finally {
-      await this._unlock(row, leaseEnd);
+      await this._unlock(row, leaseEnd, locked);
     }
   }
 
@@ -749,7 +770,7 @@ export class CredentialSync {
    * @returns {Promise<boolean>}
    */
   onAccountRemoved(account) {
-    return this._track(this._onAccountRemoved(account));
+    return this._track(() => this._onAccountRemoved(account));
   }
 
   /**
@@ -785,7 +806,7 @@ export class CredentialSync {
    * @returns {Promise<boolean>} whether the store was written
    */
   storeSignIn(entry) {
-    return this._track(this._storeSignIn(entry));
+    return this._track(() => this._storeSignIn(entry));
   }
 
   /**
@@ -832,7 +853,7 @@ export class CredentialSync {
    * @returns {Promise<Tokens|null>}
    */
   coordinateRefresh(account, refresh, { force = false } = {}) {
-    return this._track(this._coordinateRefresh(account, refresh, { force }));
+    return this._track(() => this._coordinateRefresh(account, refresh, { force }));
   }
 
   /**
@@ -900,14 +921,14 @@ export class CredentialSync {
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
       if (current.deletedAt == null && heldElsewhere(current.blob, account, this.by)) {
-        await this._unlock(row, leaseEnd);
+        await this._unlock(row, leaseEnd, locked);
         this.log(`[TeamClaude] Account "${name}": already renewed on ${safeLine(/** @type {Blob} */ (current.blob).by, 48)}; taking that token`);
         return tokensOf(/** @type {Blob} */ (current.blob));
       }
       const budgetMs = leaseEnd - STORE_RESERVE_MS - this.now();
       if (budgetMs < MIN_REFRESH_BUDGET_MS) {
         // The lock call itself ate the lease.
-        await this._unlock(row, leaseEnd);
+        await this._unlock(row, leaseEnd, locked);
         this.log(`[TeamClaude] Account "${name}": the ${this._lockName()} took too long to answer; trying it again`);
         continue;
       }
@@ -929,7 +950,7 @@ export class CredentialSync {
         }
         return tokens;
       } finally {
-        await this._unlock(row, leaseEnd);
+        await this._unlock(row, leaseEnd, locked);
       }
     }
     return this._standDown(account, force, `the ${this._lockName()} was not to be had in ${MAX_LOCK_ROUNDS} rounds`);
@@ -1008,9 +1029,18 @@ export class CredentialSync {
   }
 
   /** Release the lock, unless the lease has run out: then it may be someone else's. */
-  async _unlock(/** @type {Row} */ row, /** @type {number} */ leaseEnd) {
+  /**
+   * The lease a store of your own names the lock with (sync-store.js) goes
+   * back with the unlock, so one that arrives late cannot release the next
+   * holder's lock. callback.net names none, and is sent none.
+   * @param {Row} row
+   * @param {number} leaseEnd
+   * @param {any} [locked]  what the :lock answered
+   */
+  async _unlock(row, leaseEnd, locked) {
     if (this.now() >= leaseEnd) return;
-    try { await this.api('POST', `User/Credential/${row.id}:unlock`, {}); } catch { /* the lock times out on its own */ }
+    const lease = typeof locked?.Lease === 'string' ? locked.Lease : null;
+    try { await this.api('POST', `User/Credential/${row.id}:unlock`, lease ? { Lease: lease } : {}); } catch { /* the lock times out on its own */ }
   }
 }
 
