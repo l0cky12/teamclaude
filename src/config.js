@@ -272,10 +272,13 @@ const lockQueues = new Map();
  * Same-process callers are queued; other processes are held off by the file.
  * The lock is released whether `fn` resolves or throws.
  *
- * `strict`: never run `fn` without the lock. Where the config degrades to a
- * possible lost update, the account store (sync-store.js) would hand one
- * renewal lock to two machines, so a lock that cannot be had rejects with
- * code LOCK_BUSY instead, and a holder still alive keeps it for up to a minute.
+ * `strict`: never go ahead after giving up on the lock. Where the config
+ * degrades to a possible lost update, the account store (sync-store.js) would
+ * hand one renewal lock to two machines, so a lock that cannot be had rejects
+ * with code LOCK_BUSY instead, and a holder still alive keeps it for up to a
+ * minute. A lock left by a process that died is still taken over by the
+ * delete-and-retry above, which two waiters can race; that needs a crash
+ * first, and the store's renewal lock still has its own lease behind it.
  * @template T
  * @param {string} configPath
  * @param {() => Promise<T>} fn

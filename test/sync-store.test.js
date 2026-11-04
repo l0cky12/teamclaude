@@ -340,3 +340,21 @@ test('two processes writing one store file lose nothing', async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('a pass that replaces an older seed re-reads it under the lock, and leaves a renewal stored since alone', async () => {
+  await withStore(async ({ store, now, tick }) => {
+    const old = install('old', [claude('a', { expiresAt: T0 + 1 * H })], { store, now, tick });
+    await old.sync.sync('start');
+    const key = syncKeyFor(old.am.accounts[0]);
+    const desk = install('desk', [claude('a', { accessToken: 'at-a-2', refreshToken: 'rt-a-2', expiresAt: T0 + 8 * H })], { store, now, tick });
+    // desk lists the rows (and sees the old seed); then, before it writes,
+    // another install renews and stores rt-a-3.
+    desk.sync.rows = await desk.sync._list();
+    const row = desk.sync.rows.get(key);
+    const blob = { ...JSON.parse((await store.call('GET', `User/Credential/${row.id}`)).Data), accessToken: 'at-a-3', refreshToken: 'rt-a-3', expiresAt: T0 + 9 * H, by: 'hub' };
+    delete blob.seeded;
+    await store.call('PATCH', `User/Credential/${row.id}`, { Data: JSON.stringify(blob) });
+    assert.equal(await desk.sync._replaceSeed(row, desk.am.accounts[0]), false);
+    assert.equal(JSON.parse((await store.call('GET', `User/Credential/${row.id}`)).Data).refreshToken, 'rt-a-3');
+  });
+});

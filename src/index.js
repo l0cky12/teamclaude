@@ -1005,7 +1005,11 @@ async function serverCommand() {
       credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
     },
   });
-  // POST /teamclaude/sync-store: the store, while this machine keeps it.
+  // POST /teamclaude/sync-store: the store, while this machine keeps it. Read
+  // off the live config, so turning it off closes the route at once: a
+  // follower renewing at that moment keeps its new token, and the row's lock
+  // runs out on its own lease (30 s). Turning the store off ends sharing
+  // anyway (docs/accounts.md), so nothing waits for that.
   hooks.syncStore = () => (accountSyncMode(config).mode === 'host' ? syncStore : null);
 
   // The dashboard's Remove (POST /teamclaude/remove).

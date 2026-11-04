@@ -493,8 +493,7 @@ export class CredentialSync {
         } else if (this.seedsAll() && row.blob?.seeded && row.blob.expiresAt < (Number(account.expiresAt) || 0)) {
           // A seed older than the copy here (an install that started from an
           // old config): the newer copy replaces it, still marked a seed.
-          await this._patch(row, account, this._tokens(account), { seeded: true });
-          result.pushed++;
+          if (await this._replaceSeed(row, account)) result.pushed++;
         }
       }
 
@@ -520,6 +519,37 @@ export class CredentialSync {
       this.lastError = safeLine(err?.message || String(err), 200);
       this.log(`[TeamClaude] ${this.where()} sync (${reason}) failed: ${this.lastError}`);
       throw err;
+    }
+  }
+
+  /**
+   * Replace a seed older than the copy this install holds, under the row's
+   * lock and only if the row is still that older seed once locked: since the
+   * pass listed the rows, another install may have renewed the token and
+   * stored it, and writing the older copy back over that would hand the
+   * others a refresh token already spent. Locked elsewhere, it is left for the
+   * next pass. Resolves with whether the row was written.
+   * @param {Row} row
+   * @param {Record<string, any>} account
+   * @returns {Promise<boolean>}
+   */
+  async _replaceSeed(row, account) {
+    const leaseStart = this.now();
+    let locked;
+    try {
+      locked = await this.api('POST', `User/Credential/${row.id}:lock`, { timeout: LOCK_TIMEOUT_S });
+    } catch {
+      return false;
+    }
+    const leaseEnd = leaseStart + LOCK_TIMEOUT_S * 1000 - LEASE_SAFETY_MS;
+    try {
+      const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
+      this.rows.set(current.key, current);
+      if (current.deletedAt != null || !current.blob?.seeded || current.blob.expiresAt >= (Number(account.expiresAt) || 0)) return false;
+      await this._patch(current, account, this._tokens(account), { seeded: true });
+      return true;
+    } finally {
+      await this._unlock(row, leaseEnd);
     }
   }
 
