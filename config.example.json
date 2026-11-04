@@ -94,5 +94,9 @@
       "url": "http://100.64.0.2:3456",
       "apiKey": "your-server-proxy-key"
     }
-  ]
+  ],
+  "accountSync": {
+    "mode": "follow",
+    "peer": "server"
+  }
 }

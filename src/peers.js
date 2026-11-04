@@ -30,8 +30,9 @@ const MAX_BODY_BYTES = 64 * 1024;
 // /teamclaude/ on the peer's side.
 const REST_RE = /^([a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)*)(\?[^#]*)?$/;
 // Not relayed: the page itself, the MCP endpoint (its own client and session),
-// and another relay hop — a peer's peers are not ours to reach.
-const NOT_RELAYED = new Set(['dashboard', 'mcp', 'peers']);
+// another relay hop — a peer's peers are not ours to reach — and the account
+// store a peer may keep (sync-store.js), which only a sync of its own reads.
+const NOT_RELAYED = new Set(['dashboard', 'mcp', 'peers', 'sync-store']);
 
 /**
  * @typedef {{ name: string, url: string, apiKey: string }} Peer

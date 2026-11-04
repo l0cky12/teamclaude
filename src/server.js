@@ -31,6 +31,7 @@ import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, remo
 import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
 import { AccountSyncError } from './web-account-sync.js';
+import { SyncStoreError } from './sync-store.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
@@ -471,6 +472,10 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/account-sync/cancel', 'a client key cannot manage account sync'],
   ['/teamclaude/account-sync/sync', 'a client key cannot manage account sync'],
   ['/teamclaude/account-sync/sign-out', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/mode', 'a client key cannot manage account sync'],
+  // The store this machine keeps for your other ones holds every shared
+  // account's tokens: only a proxy key, the one a linked instance holds, reads it.
+  ['/teamclaude/sync-store', 'a client key cannot read the account store'],
 ]);
 
 /**
@@ -890,7 +895,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ ok: true, ...await hooks.accountSync.view() }));
         return;
       }
-      if (req.method === 'POST' && /^\/teamclaude\/account-sync\/(start|status|cancel|sync|sign-out)$/.test(req.url || '')) {
+      if (req.method === 'POST' && /^\/teamclaude\/account-sync\/(start|status|cancel|sync|sign-out|mode)$/.test(req.url || '')) {
         const sync = hooks.accountSync;
         if (!sync) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
@@ -908,6 +913,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           if (step === 'start') return reply(200, { ok: true, ...await sync.start() });
           if (step === 'sync') return reply(200, { ok: true, result: await sync.syncNow() });
           if (step === 'sign-out') return reply(200, { ok: true, ...await sync.signOut() });
+          // {"mode": "host" | "follow" | "off", "peer"?}: the store of your own
+          // instances (instance-sync.js) instead of callback.net.
+          if (step === 'mode') return reply(200, { ok: true, ...await sync.changeMode(body) });
           if (typeof body.id !== 'string' || !body.id) return reply(400, { ok: false, error: 'missing "id"' });
           if (step === 'status') return reply(200, { ok: true, ...sync.status(body.id) });
           // The state after it, so the page can tell a sign-in that was
@@ -917,10 +925,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         } catch (err) {
           if (err instanceof AccountSyncError) return reply(400, { ok: false, error: err.message });
           // callback-auth.js strips what callback.net says before it gets
-          // here, so the reason can go to the page as well as the log.
+          // here, and instance-sync.js what a linked instance says, so the
+          // reason can go to the page as well as the log.
           const why = safeLine(String(/** @type {Error} */ (err)?.message || err), 160);
           console.error(`[TeamClaude] Account sync (${step}) failed: ${why}`);
-          return reply(502, { ok: false, error: `callback.net: ${why}` });
+          return reply(502, { ok: false, error: `${sync.storeName?.() || 'callback.net'}: ${why}` });
+        }
+      }
+
+      // The account store this machine keeps for your other instances
+      // (accountSync.mode "host", sync-store.js): {"method","path","params",
+      // "envelope"} is one call of the store's API, which a follower's sync
+      // makes through its peers entry (instance-sync.js). Answered only while
+      // this machine keeps the store, and only to a proxy key: the client-key
+      // refusal above covers it, and the relay never forwards it (peers.js).
+      if (req.method === 'POST' && req.url === '/teamclaude/sync-store') {
+        const reply = (/** @type {number} */ code, /** @type {Record<string, any>} */ payload) => {
+          res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        const store = hooks.syncStore?.() || null;
+        if (!store) return reply(404, { ok: false, token: 'error_not_host', error: 'this instance does not keep the accounts for your other machines' });
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (typeof body.method !== 'string' || typeof body.path !== 'string') return reply(400, { ok: false, token: 'error_bad_request', error: 'missing "method" or "path"' });
+        try {
+          const result = await store.call(body.method, body.path, body.params ?? null, { envelope: body.envelope === true });
+          return reply(200, { ok: true, result });
+        } catch (err) {
+          if (err instanceof SyncStoreError) {
+            const code = err.token === 'error_not_found' ? 404 : err.token === 'error_bad_request' ? 400 : 409;
+            return reply(code, { ok: false, token: err.token, error: err.message });
+          }
+          console.error(`[TeamClaude] Account store call failed: ${safeLine(String(/** @type {Error} */ (err)?.message || err), 160)}`);
+          return reply(500, { ok: false, error: 'the account store failed; see the proxy log on that machine' });
         }
       }
 

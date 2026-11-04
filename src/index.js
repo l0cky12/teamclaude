@@ -59,8 +59,11 @@ import { upstreamFor } from './provider.js';
 import { startEventLoopMonitor } from './event-loop-monitor.js';
 import { envVar } from './brand.js';
 import { loginCallback, loadCallbackToken, saveCallbackToken, callbackWhoami, logoutCallback, callbackClientId, getCallbackAuthPath } from './callback-auth.js';
-import { CredentialSync, refreshOutsideProxy } from './credential-sync.js';
+import { CredentialSync, refreshOutsideProxy, SYNC_INTERVAL_MS } from './credential-sync.js';
 import { WebAccountSync } from './web-account-sync.js';
+import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel, INSTANCE_SYNC_INTERVAL_MS } from './instance-sync.js';
+import { createSyncStore } from './sync-store.js';
+import { configuredPeers } from './peers.js';
 import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
@@ -68,35 +71,54 @@ import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, che
 /** @type {CredentialSync|null} */
 let activeCredentialSync = null;
 
+/**
+ * The store options of a sync that runs outside the server: the store the
+ * config on disk names (instance-sync.js), read when the sync asks. In host
+ * mode that is the store file itself, which the file lock lets a CLI command
+ * share with the running server.
+ */
+function cliSyncOptions() {
+  const transport = createSyncTransport({ getConfig: async () => (await loadConfig()) || {}, store: createSyncStore() });
+  return {
+    api: transport.api,
+    isSignedIn: transport.isSignedIn,
+    where: transport.where,
+    seedsAll: () => false,
+  };
+}
+
 /** A sync over the config alone, for a command running outside the server. */
 function standaloneCredentialSync() {
-  return activeCredentialSync || new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, log: () => {} });
+  return activeCredentialSync || new CredentialSync({ accountManager: /** @type {any} */ ({ accounts: [], updateAccountTokens() {} }), addAccount: () => null, log: () => {}, ...cliSyncOptions() });
 }
 
 /**
  * An explicit sign-in (`login`, `import`): store the entry's tokens, over a
- * tombstone included, when this install is signed in to callback.net. Never
- * fatal — the account is in the config either way, and its next renewal stores it.
+ * tombstone included, when this install syncs its accounts (callback.net, or
+ * a store one of your instances keeps). Never fatal — the account is in the
+ * config either way, and its next renewal stores it.
  * @param {Record<string, any>} entry
  */
 async function recordSignInWithCallback(entry) {
+  const sync = standaloneCredentialSync();
   try {
-    if (await standaloneCredentialSync().storeSignIn(entry)) console.log('Stored on callback.net for your other installs.');
+    if (await sync.storeSignIn(entry)) console.log(`Stored on ${sync.where()} for your other installs.`);
   } catch (/** @type {any} */ err) {
-    console.error(`Could not store the sign-in on callback.net (${err?.message || err}); its next renewal will.`);
+    console.error(`Could not store the sign-in on ${sync.where()} (${err?.message || err}); its next renewal will.`);
   }
 }
 
 /**
  * An account removed by hand (`remove`): leave the tombstone the other
- * installs act on, when this install is signed in to callback.net.
+ * installs act on, when this install syncs its accounts.
  * @param {Record<string, any>} entry
  */
 async function recordRemovalWithCallback(entry) {
+  const sync = standaloneCredentialSync();
   try {
-    if (await standaloneCredentialSync().onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log('Recorded on callback.net: your other installs will remove it too.');
+    if (await sync.onAccountRemoved({ ...entry, credential: entry.accessToken })) console.log(`Recorded on ${sync.where()}: your other installs will remove it too.`);
   } catch (/** @type {any} */ err) {
-    console.error(`Could not record the removal on callback.net: ${err?.message || err}`);
+    console.error(`Could not record the removal on ${sync.where()}: ${err?.message || err}`);
   }
 }
 
@@ -464,7 +486,22 @@ async function serverCommand() {
   // refresh goes through its lock, every local token change is stored, a
   // removal here leaves a tombstone the other installs act on, and a pass at
   // start, on reload and daily brings the fleet level with the store.
-  const credentialSync = new CredentialSync({ accountManager, addAccount: admitAccount, evictAccount });
+  //
+  // With `accountSync` set (instance-sync.js) the store is one of your own
+  // instances instead: this one (`host`, the file sync-store.js keeps beside
+  // the config) or a linked one (`follow`). Read off the running config on
+  // every call, so the dashboard's switch and a reload apply at once. A pass
+  // then also runs every few minutes, and stores the accounts the store lacks.
+  const syncStore = createSyncStore();
+  const syncTransport = createSyncTransport({ getConfig: () => config, store: syncStore });
+  const syncIntervalFor = (/** @type {Record<string, any>} */ c) => (accountSyncMode(c).mode === 'off' ? SYNC_INTERVAL_MS : INSTANCE_SYNC_INTERVAL_MS);
+  const credentialSync = new CredentialSync({
+    accountManager, addAccount: admitAccount, evictAccount,
+    api: syncTransport.api,
+    isSignedIn: syncTransport.isSignedIn,
+    where: syncTransport.where,
+    seedsAll: () => accountSyncMode(config).mode !== 'off',
+  });
   activeCredentialSync = credentialSync;
   accountManager.setRefreshCoordinator((account, refresh, info) => credentialSync.coordinateRefresh(account, refresh, info));
   // Not awaited: the removal is done; the tombstone follows.
@@ -567,7 +604,17 @@ async function serverCommand() {
     // `teamclaude callback login` notifies through a reload, so this is where a
     // fresh sign-in brings the store's accounts in; the pass is also what makes
     // an import or login on this install reach the other ones.
-    credentialSync.sync('reload').catch(() => {});
+    //
+    // The store it uses (accountSync, instance-sync.js) and the linked
+    // instances a follower reaches it through (peers.js) are both read per
+    // call off this object, so they are taken first: the pass runs against
+    // the store the file names now. A different store starts over with it.
+    const storeBefore = JSON.stringify(accountSyncMode(config));
+    if (diskConfig.accountSync === undefined) delete config.accountSync;
+    else config.accountSync = diskConfig.accountSync;
+    config.peers = diskConfig.peers;
+    if (JSON.stringify(accountSyncMode(config)) !== storeBefore) credentialSync.switchStore(syncIntervalFor(config)).catch(() => {});
+    else credentialSync.sync('reload').catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -646,9 +693,9 @@ async function serverCommand() {
     // not wait for a restart.
     config.autoRedeemResets = diskConfig.autoRedeemResets === true;
     config.blockedModels = Array.isArray(diskConfig.blockedModels) ? diskConfig.blockedModels : [];
-    // Linked instances (peers.js) are read per request off this object.
-    config.peers = diskConfig.peers;
-    // So is the name this instance goes by in the picker and offers to a link.
+    // Linked instances (peers.js) are read per request off this object too,
+    // and taken above, before the sync pass. So is the name this instance
+    // goes by in the picker and offers to a link.
     if (diskConfig.instanceName === undefined) delete config.instanceName;
     else config.instanceName = diskConfig.instanceName;
     // And the address it offers for itself when linked from another machine.
@@ -924,8 +971,32 @@ async function serverCommand() {
   });
 
   // The dashboard's Account sync card (/teamclaude/account-sync): the
-  // callback.net sign-in `teamclaude callback login` runs, from a browser.
-  hooks.accountSync = new WebAccountSync({ sync: credentialSync });
+  // callback.net sign-in `teamclaude callback login` runs, from a browser,
+  // and the switch to a store one of your own instances keeps instead
+  // (POST /teamclaude/account-sync/mode, instance-sync.js).
+  hooks.accountSync = new WebAccountSync({
+    sync: credentialSync,
+    mode: () => accountSyncMode(config),
+    peerNames: () => configuredPeers(config).map(p => p.name),
+    canHost: () => !!config.proxy?.apiKey,
+    probe: (name) => {
+      const peer = configuredPeers(config).find(p => p.name === name);
+      if (!peer) return Promise.reject(new Error(`no linked instance named ${name}`));
+      return peerStoreApi(peer)('GET', 'User/Credential', { results_per_page: 1, page_no: 1 }, { envelope: true });
+    },
+    setMode: async (next) => {
+      await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+        if (next.mode === 'off') delete c.accountSync;
+        else c.accountSync = next;
+      });
+      if (next.mode === 'off') delete config.accountSync;
+      else config.accountSync = next;
+      console.log(`[TeamClaude] Account sync ${next.mode === 'off' ? 'through your own instances is off' : `now goes through ${storeLabel(next)}`} (dashboard)`);
+      credentialSync.switchStore(syncIntervalFor(config)).catch(() => {});
+    },
+  });
+  // POST /teamclaude/sync-store: the store, while this machine keeps it.
+  hooks.syncStore = () => (accountSyncMode(config).mode === 'host' ? syncStore : null);
 
   // The dashboard's Remove (POST /teamclaude/remove).
   hooks.removeAccount = createAccountRemover({
@@ -1097,7 +1168,9 @@ async function serverCommand() {
 
   // The first credential-sync pass, and the daily one after it. Not awaited:
   // the store is reached over the network and the proxy serves meanwhile.
-  credentialSync.start().catch(() => {});
+  // Against a store of your own, a pass every few minutes instead.
+  if (accountSyncMode(config).mode !== 'off') console.log(`[TeamClaude] Account sync goes through ${storeLabel(accountSyncMode(config))}`);
+  credentialSync.start(syncIntervalFor(config)).catch(() => {});
 
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
@@ -1974,7 +2047,7 @@ async function accountsCommand() {
       // proxy's own refreshes are: another install, or the proxy on this one,
       // may be renewing this same token.
       const routing = accountRouting(a, localListener(config));
-      const newTokens = await refreshOutsideProxy(a, (o) => refreshAccessToken(a.refreshToken, undefined, routing, o));
+      const newTokens = await refreshOutsideProxy(a, (o) => refreshAccessToken(a.refreshToken, undefined, routing, o), cliSyncOptions());
       if (!newTokens) return; // another install is renewing it, and the current one still serves
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
@@ -3265,7 +3338,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
   // signed in there: the token being imported may be one the store holds, and
   // so one other installs hold too.
   const identified = await profileForCredentials(creds, routing, {
-    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true })
+    renew: (c) => refreshOutsideProxy({ name: name || 'imported account', type: 'oauth', accessToken: c.accessToken, refreshToken: c.refreshToken, expiresAt: c.expiresAt }, (o) => refreshAccessToken(c.refreshToken, undefined, routing, o), { force: true, ...cliSyncOptions() })
       .then((t) => t ?? Promise.reject(new Error('token not renewed'))),
   });
   creds = identified.creds;
