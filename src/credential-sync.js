@@ -379,7 +379,9 @@ export class CredentialSync {
     this.stop();
     // From now until the switch is done, no operation starts: one that began
     // while \`apply\` runs could lock a row in the old store and store in the
-    // new one. Every operation already under way finishes against the store
+    // new one. The price: a renewal asked for meanwhile waits for the old
+    // store's work to finish, which a store that stopped answering can drag
+    // out to its timeouts. A switch is an operator's action, and rare. Every operation already under way finishes against the store
     // it began with, then \`apply\` points the api at the new store
     // (instance-sync.js pin). Switches run one after the other.
     this._pendingSwitches++;
@@ -567,6 +569,9 @@ export class CredentialSync {
       const current = rowOf({ ...locked, Data: locked?.Data ?? '' });
       this.rows.set(current.key, current);
       if (current.deletedAt != null || !current.blob?.seeded || current.blob.expiresAt >= (Number(account.expiresAt) || 0)) return false;
+      // The lock call ate the lease: the write could land after the lock has
+      // passed to someone else. The next pass tries again.
+      if (this.now() > leaseEnd - STORE_RESERVE_MS) return false;
       await this._patch(current, account, this._tokens(account), { seeded: true });
       return true;
     } finally {

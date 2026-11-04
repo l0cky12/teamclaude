@@ -460,7 +460,7 @@ async function serverCommand() {
     const idx = accountManager.addAccount(entry);
     atomicConfigUpdate((/** @type {any} */ diskConfig) => {
       if (!diskConfig.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) diskConfig.accounts.push(entry);
-    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from callback.net: ${err.message}`));
+    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from ${credentialSync.where()}: ${err.message}`));
     return idx;
   };
 
