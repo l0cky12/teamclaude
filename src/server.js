@@ -3927,6 +3927,31 @@ export async function peekStreamFailure(stream, bounds = {}) {
   };
 }
 
+/**
+ * Honor upstream cooldown clocks even when a session proxy strips the unified
+ * quota headers. A headerless usage rejection has no clock, so wait one hour.
+ * @param {Headers} headers
+ * @param {number} fallbackSeconds
+ * @returns {number}
+ */
+function accountLimitWait(headers, fallbackSeconds) {
+  const now = Date.now();
+  const retry = headers.get('retry-after');
+  const seconds = retry != null && /^\d+(?:\.\d+)?$/.test(retry.trim()) ? Number(retry) : NaN;
+  const retryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(retry || '');
+  const clocks = [retryAt];
+  for (const name of ['anthropic-ratelimit-reset-requests', 'anthropic-ratelimit-requests-reset',
+    'anthropic-ratelimit-tokens-reset']) {
+    clocks.push(Date.parse(headers.get(name) || ''));
+  }
+  for (const window of ['5h', '7d']) {
+    if (headers.get(`anthropic-ratelimit-unified-${window}-status`) !== 'rejected') continue;
+    clocks.push(Number(headers.get(`anthropic-ratelimit-unified-${window}-reset`)) * 1000);
+  }
+  const future = clocks.filter(at => Number.isFinite(at) && at > now && at <= 8.64e15);
+  return future.length ? Math.max(1, (Math.max(...future) - now) / 1000) : fallbackSeconds;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -4070,11 +4095,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex != null) {
       ctx.status = 429;
       ctx.account = '(pinned account unavailable)';
+      const pinnedAccount = accountManager.accounts[ctx.pinnedIndex];
+      const resetAt = pinnedAccount?.status === 'throttled'
+        ? computeResetAt(accountManager, [pinnedAccount], ctx.model) : Date.now() + 5000;
+      const reset = new Date(resetAt).toISOString();
       if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))),
+          'anthropic-ratelimit-reset-requests': reset,
+        });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+          error: { type: 'rate_limit_error', message: `Pinned account is unavailable (rate-limited, errored, or already tried). Next account resets at ${reset}.` },
         }));
       }
       return;
@@ -4133,7 +4166,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
-    const retryAfter = computeRetryAfter(accountManager, candidates, ctx.model);
+    const resetAt = computeResetAt(accountManager, candidates, ctx.model);
+    const retryAfter = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
@@ -4164,12 +4198,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
+      'anthropic-ratelimit-reset-requests': new Date(resetAt).toISOString(),
     });
     res.end(JSON.stringify({
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: exhaustedMessage(candidates, ctx.model, retryAfter),
+        message: candidates.length > 0 && candidates.every(a => a.status === 'throttled')
+          ? `All accounts reached usage limits. Next account resets at ${new Date(resetAt).toISOString()}.`
+          : exhaustedMessage(candidates, ctx.model, retryAfter),
       },
     }));
     return;
@@ -4389,24 +4426,18 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const retryAfterHeader = upstreamRes.headers.get('retry-after');
       let retryAfter = parseInt(retryAfterHeader, 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
-      // A 429 that says nothing about the account — no retry-after, no
-      // anthropic-ratelimit-* — is about the REQUEST: a model id upstream
-      // refuses, a shape it will not take. Neither of the account-level
-      // responses below applies to it. Pausing the account made every other
-      // session on it wait out a fabricated 60s for one client's bad model id,
-      // and the inline wait then held that client for the same 60s per attempt;
-      // together they turned one request's problem into a fleet-wide stall
-      // (#288). A throttle, by contrast, always carries the headers.
-      const requestScoped = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
-      // The body is diagnostic for a request-scoped refusal (it names the
-      // reason) and noise otherwise.
+      // A headerless model refusal must not pause otherwise usable accounts
+      // (#288). Usage-limit messages still identify account exhaustion when
+      // a session proxy has removed the upstream quota headers.
+      const headerless = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
+      // Session proxies can strip the quota headers. Read their error message
+      // before deciding that a headerless 429 is a request/model refusal.
       let refusal = '';
-      if (requestScoped) {
-        const raw = await readErrorBody(upstreamRes.body).catch(() => null);
-        try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
-      } else {
-        await upstreamRes.body?.cancel();
-      }
+      const raw = await readErrorBody(upstreamRes.body).catch(() => null);
+      try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      const usageLimited = /usage[ -]?limit|quota|credits? (?:exhausted|depleted)/i.test(refusal);
+      const accountLimited = usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal)));
+      const requestScoped = headerless && !accountLimited;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
       // status means a quota bucket is spent, so waiting and retrying the SAME
@@ -4434,7 +4465,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if (generalRejected || fableRejected || codexFamilyRejected || accountLimited) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -4448,7 +4479,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // later request for it pays one refusal here before it rotates.
           console.log(`[TeamClaude] ${safeLine(spentCodexWindows.join(', '), 80)} spent on "${account.name}" — switching account for this request`);
         } else {
-          const hold = Math.min(Math.max(retryAfter, 1), 3600);
+          const hold = accountLimitWait(upstreamRes.headers, accountLimited ? 3600 : 60);
           // Name the spent window when the headers said which: "which one" is
           // the first thing an operator asks of a rejection, and a 5-hour
           // window reads very differently from a weekly one. A model-scoped
@@ -4665,7 +4696,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
       if (!res.headersSent && !clientGone(res)) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(retryAfter),
+          'anthropic-ratelimit-reset-requests': new Date(Date.now() + retryAfter * 1000).toISOString(),
+        });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
       return;
@@ -5665,6 +5700,17 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  * @returns {number}
  */
 export function computeRetryAfter(accountManager, candidates, model = null) {
+  return Math.max(1, Math.ceil((computeResetAt(accountManager, candidates, model) - Date.now()) / 1000));
+}
+
+/**
+ * Keep the absolute reset and Retry-After derived from the same pool clocks.
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} model
+ * @returns {number}
+ */
+function computeResetAt(accountManager, candidates, model) {
   const now = Date.now();
   let soonest = Infinity;
   for (const acct of candidates) {
@@ -5681,7 +5727,5 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
     if (blockedFor <= 0) blockedFor = UNTIMED_RETRY_AFTER_SECONDS * 1000;
     if (blockedFor < soonest) soonest = blockedFor;
   }
-  return soonest === Infinity
-    ? UNTIMED_RETRY_AFTER_SECONDS
-    : Math.max(1, Math.ceil(soonest / 1000));
+  return now + (soonest === Infinity ? UNTIMED_RETRY_AFTER_SECONDS * 1000 : soonest);
 }
