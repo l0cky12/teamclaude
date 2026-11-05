@@ -98,7 +98,7 @@ test('distribute drain writes and reports the fifth mode', async () => {
   const read = await runCli(configPath, ['distribute']);
   assert.equal(read.code, 0, read.stderr);
   assert.match(read.stdout, /Session distribution: drain/);
-  assert.match(read.stdout, /distribute <on\|off\|adaptive\|affinity\|drain>/);
+  assert.match(read.stdout, /distribute <on\|off\|adaptive\|affinity\|drain\|load>/);
 });
 
 test('distribute off says the running sessions drain', async () => {

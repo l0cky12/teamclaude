@@ -141,7 +141,7 @@ It is a setting, not a nudge: the number is written to the config file (under it
 
 You usually don't need to call it directly. `login`, `import`, `enable`, `disable`, `priority`, `route`, `threshold`, `distribute`, `probe` and `warmup` notify a running server themselves.
 
-Control-plane **writes** (`reload`, `switch`, `threshold`, `priority`, `disable`, `remove`, `client-keys/create`, `client-keys/revoke`, `client-keys/show` and the `login/*` sign-in steps) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. The exception is a request that presents a configured proxy key and whose `Origin` names the very host it was sent to: that is the dashboard opened at a plain-`http` address of another machine (a Tailscale or LAN IP), where browsers send `Origin` but no `Sec-Fetch-Site`. A page on another site cannot send the key, which the browser does not attach by itself. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
+Control-plane **writes** (`reload`, `switch`, `session-pin`, `threshold`, `priority`, `disable`, `remove`, `client-keys/create`, `client-keys/revoke`, `client-keys/show` and the `login/*` sign-in steps) are refused when the request carries a browser `Origin` or a cross-site `Sec-Fetch-Site`. The exception is a request that presents a configured proxy key and whose `Origin` names the very host it was sent to: that is the dashboard opened at a plain-`http` address of another machine (a Tailscale or LAN IP), where browsers send `Origin` but no `Sec-Fetch-Site`. A page on another site cannot send the key, which the browser does not attach by itself. Loopback is exempt from the proxy API key so the CLI needs no configuration, but that exemption also covers any web page you happen to visit: a page can POST to `127.0.0.1` cross-origin without a preflight, and while it cannot read the reply, the write would still land. `curl` and the CLI send neither header and are unaffected. Reads (`status`) are not restricted — the same-origin policy already stops a page from seeing the response.
 
 `GET /teamclaude/quota` is the compact read endpoint for status-line integrations. It returns tier-weighted fleet aggregates and the underlying per-account limits; see [Fleet quota endpoint](quota.md#fleet-quota-endpoint).
 
@@ -150,7 +150,10 @@ Switching the account by hand has the same headless path — the equivalent of p
 ```bash
 teamclaude switch                 # list accounts, marking the current one
 teamclaude switch me@example.com  # make that account the preferred one
+teamclaude switch me@example.com --session   # move only the session this runs in
 ```
+
+`--session [<id>]` moves one session instead of the fleet; see [Move one running session](routing.md#move-one-running-session).
 
 Both forms need a running server: the choice is runtime state and is never written to the config, so there is nothing to apply on a later restart. The command wraps `POST /teamclaude/switch` with a `{"account": "<name>"}` body, and the account can be given as its display name, its bare email, its `accountUuid`, its `orgUuid`, or the fully qualified `accountUuid/orgUuid` — the last being the only form that tells apart one email that holds accounts in several orgs. The rotation index is deliberately not accepted — it is array position, so a script pinned to `1` would silently follow a different account after a removal.
 
@@ -272,6 +275,8 @@ teamclaude alias --install    # or write it to your shell rc (--uninstall to rem
 
 This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic (so it errors when the proxy is down; add `--auto-fallback` to launch claude directly instead).
 
+The Claude Code extension for VS Code starts `claude` itself in its chat panel, so neither the alias nor `run` reaches it there. It takes the proxy settings from its own setting instead: see [VS Code extension](vscode.md). In terminal mode (`claudeCode.useTerminal`) on macOS and Linux, and on Windows in a Git Bash or WSL terminal, it types `claude` into an integrated terminal, where the alias does apply.
+
 ## Command reference
 
 ```bash
@@ -315,6 +320,8 @@ teamclaude help              # Show all commands
 `teamclaude attach` opens the terminal dashboard itself against a server that is already running, which is how you get interactive control back when the proxy runs as a background service. It polls the same status endpoint every second and can do the two things the remote control exposes: `s` switches account, `R` reloads config. The browser dashboard adds the matching **Reload config** action plus a zero-spend **Probe quotas** action; settings editing and the request activity stream still stay in the server's own TUI because they need state that only that process has. When contact with the server drops, the header marker turns from `▲` to `▼` and what is on screen is the last snapshot, not the current state.
 
 `teamclaude service install` registers the proxy as a user service that starts at login and restarts on its own — a LaunchAgent on macOS, a `systemd --user` unit on Linux (`uninstall`, `status` and `print` round it out; `print` writes the unit to stdout without touching anything). On macOS the LaunchAgent runs with `ProcessType` `Standard`: the `Background` class it used before carried a QoS clamp that starved the proxy under host contention (status timeouts, seconds of event-loop lag). The unit is only written at install time, so an existing install keeps whatever it was installed with until you re-run `teamclaude service install`.
+
+Re-running `teamclaude service install` rewrites the unit and restarts the proxy on both platforms, so the proxy also picks up an updated install. Requests in flight are dropped.
 
 ![teamclaude status output](assets/status-redacted.png)
 
@@ -525,6 +532,8 @@ It speaks both the stateless 2026-07-28 revision of the protocol and the handsha
 ## Auto-update
 
 When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
+
+Only an npm global install is updated in place. Any other copy gets a notice when a newer version is out. A pnpm global install is recognized: the notice names `pnpm add -g @karpeleslab/teamclaude@latest`, and `teamclaude update` prints that command instead of running npm, which would install a second copy and leave the one on your PATH as it was. Update a copy that another tool installed, such as Yarn or Bun, with that tool as well.
 
 Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
 

@@ -59,6 +59,10 @@
 // down, and one that served a request may still have been revoked since. An
 // account holding such a token reads like any other (adopts, follows a
 // tombstone) but neither creates nor updates its row; its next renewal does.
+// That renewal still goes through a lock: with no row yet, it makes a
+// PLACEHOLDER (the identity, no token) to lock, because the same copy may sit
+// on another install — one config on two machines — and two renewals of it
+// would kill one another.
 
 import { hostname } from 'node:os';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
@@ -153,6 +157,25 @@ export function encodeBlob(a, tokens, { now = Date.now(), by = hostname(), seede
   blob.updatedAt = now;
   blob.by = by;
   if (seeded) blob.seeded = true;
+  return blob;
+}
+
+/**
+ * The contents of a row made only to be locked: the identity, and no token. It
+ * reads as no blob (decodeBlob), so nothing adopts it, adds an account from it
+ * or counts it as needing a sign-in; a lock on it answers with nothing to take,
+ * and the renewal under that lock writes the first token. An older install
+ * reads it the same way, as a row of ours it does not understand.
+ * @param {Record<string, any>} a
+ * @param {{ now?: number, by?: string }} [opts]
+ */
+export function placeholderBlob(a, { now = Date.now(), by = hostname() } = {}) {
+  /** @type {any} */
+  const blob = { v: BLOB_VERSION, provider: providerOf(a), name: a.name };
+  for (const f of IDENTITY_FIELDS) if (a[f] != null) blob[f] = a[f];
+  blob.pending = true;
+  blob.updatedAt = now;
+  blob.by = by;
   return blob;
 }
 
@@ -617,9 +640,10 @@ export class CredentialSync {
     this.am.updateAccountTokens(account.index, tokensOf(blob));
   }
 
-  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens} */ tokens, { seeded = false } = {}) {
+  /** `tokens` null: a placeholder holding none (see placeholderBlob). `seeded`: the tokens were only read from this install's config. */
+  async _create(/** @type {Record<string, any>} */ account, /** @type {Tokens|null} */ tokens, { seeded = false } = {}) {
     const key = /** @type {string} */ (syncKeyFor(account));
-    const blob = encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded });
+    const blob = tokens ? encodeBlob(account, tokens, { now: this.now(), by: this.by, seeded }) : placeholderBlob(account, { now: this.now(), by: this.by });
     let r;
     try {
       r = await this.api('POST', 'User/Credential', { Key: key, Data: JSON.stringify(blob) });
@@ -984,21 +1008,26 @@ export class CredentialSync {
     if (row) return row;
     this.rows = await this._list();
     row = find();
-    // A dead token is not stored for the others to pick up (see isInError),
-    // nor one not minted here (isMinted): renewed without a lock, which no
-    // other install can need, and the fresh token stored (onLocalTokens).
-    //
-    // Against a store of your own (seedsAll), a token read from the config is
-    // stored too, as a seed, before it is renewed: two installs that started
-    // from one copy of it then renew under one lock, not each on its own.
-    if (row || !keyed || isInError(account) || (!isMinted(account) && !this.seedsAll())) return row;
-    // First here: stored as it stands, then locked like any other. Created by
+    // A dead token is renewed without a lock: no other install can need it,
+    // and it is never stored for the others to pick up (see isInError).
+    if (row || !keyed || isInError(account)) return row;
+    // First here. A token minted here is stored as it stands, then locked like
+    // any other. One not minted here (isMinted) is, on callback.net, never
+    // stored, but another install may hold the same copy (one config on two
+    // machines), so its row starts as a placeholder holding no token: a lock
+    // to order the renewals, which the fresh token then fills (see
+    // placeholderBlob). Against a store of your own (seedsAll), a token read
+    // from the config is stored too, as a seed, before it is renewed: two
+    // installs that started from one copy of it then renew under one lock,
+    // not each on its own. Created by
     // another install meanwhile, theirs is the row — which a create racing it
     // on the live API can also learn as a plain database error, not only as
     // error_key_exists: whatever the failure, look again before giving up.
     let created = null;
     try {
-      created = await this._create(account, this._tokens(account), { seeded: !isMinted(account) });
+      created = isMinted(account) || this.seedsAll()
+        ? await this._create(account, this._tokens(account), { seeded: !isMinted(account) })
+        : await this._create(account, null);
     } catch (err) {
       this.rows = await this._list();
       row = find();

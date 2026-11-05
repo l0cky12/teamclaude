@@ -59,6 +59,10 @@ export const DISTRIBUTE_MODES = {
     value: 'drain',
     said: 'Session distribution drain — every session uses the account whose weekly quota resets soonest until it runs out, then the next; sessions already distributed keep their accounts and drain.',
   },
+  load: {
+    value: 'load',
+    said: 'Session distribution by load — new sessions go to the account that served the fewest requests in the last ten minutes, each pinned to its own for cache reuse.',
+  },
 };
 
 const BAD_PERCENT = 'A threshold is a percentage from 1 to 100.';
@@ -217,7 +221,7 @@ export function setBucketThresholds(config, pairs) {
  */
 export function setDistribution(config, mode) {
   if (typeof mode !== 'string' || !Object.hasOwn(DISTRIBUTE_MODES, mode)) {
-    throw new ConfigOpError('Session distribution is off, even, adaptive, affinity or drain.');
+    throw new ConfigOpError('Session distribution is off, even, adaptive, affinity, drain or load.');
   }
   // Compared as modes, not stored values: a hand-written `"on"` already means
   // even, and rewriting it would be a read-modify-write for nothing.
