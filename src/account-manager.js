@@ -1,5 +1,5 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider, loginCommandFor } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
@@ -5965,7 +5965,7 @@ export class AccountManager {
       code,
       detail,
       since: Date.now(),
-      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      remedy: loginCommandFor(account),
     };
     return account.errorReason;
   }

@@ -15,7 +15,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequest
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, upstreamPathFor, rewritesBody, defaultHeadersTimeoutFor, providerForRequest, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -2311,7 +2311,7 @@ function hostOfAuthority(authority) {
  * or null when the request is ours to route.
  *
  * MITM terminates every intercepted host on one server, and the request path
- * routes by its PATH alone (providerForPath): `/backend-api/codex/*` is Codex,
+ * routes by its PATH (providerForRequest): `/backend-api/codex/*` is Codex,
  * everything else is Anthropic. That left every other request a Codex client
  * makes on chatgpt.com — codex-cli 0.156's workspace discovery
  * (`/backend-api/wham/accounts/check`), its plugin, MCP and settings calls —
@@ -2336,7 +2336,7 @@ export function clientPassthroughOrigin({ authority, url, config, accounts = [] 
   const provider = providerForHost(host);
   if (!provider || provider === DEFAULT_PROVIDER) return null;
   if (!interceptHostsFor(config?.accounts || []).includes(host)) return null;
-  if (providerForPath(url || '/') === provider) return null;
+  if (providerForRequest(url || '/', host) === provider) return null;
   const sample = accounts.find((a) => providerOf(a) === provider) || null;
   return upstreamFor(sample || { provider }, null);
 }
@@ -2644,7 +2644,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // this is, and a Codex Responses body carries `input`/`instructions` and
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
-      const provider = providerForPath(req.url);
+      const provider = providerForRequest(req.url, hostOfAuthority(requestAuthority(req)));
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
         ? placeConversation(accountManager, body, sessionId)
         : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
@@ -4439,7 +4439,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
 
-  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
+  const upstreamUrl = `${upstreamFor(account, upstream)}${upstreamPathFor(req.url || '', ctx.provider)}`;
   const method = req.method;
 
   // An upstream that keeps no thread state would receive only this turn's delta
