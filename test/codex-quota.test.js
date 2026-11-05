@@ -180,7 +180,7 @@ test('a probe with no session window clears a stale session reading; headers nev
 
   const weeklyOnlyProbe = codex();
   Object.assign(weeklyOnlyProbe.accounts[0].quota, stale);
-  weeklyOnlyProbe.applyCodexUsageData(0, { fiveHour: null, sevenDay: week });
+  weeklyOnlyProbe.applyPlanUsageData(0, { fiveHour: null, sevenDay: week });
   assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5h, null);
   assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5hReset, null);
   assert.equal(weeklyOnlyProbe.accounts[0].quota.unified5hSeenAt, null, 'no reading, no age');
@@ -188,7 +188,7 @@ test('a probe with no session window clears a stale session reading; headers nev
   const bothProbe = codex();
   Object.assign(bothProbe.accounts[0].quota, stale);
   const freshReset = Date.now() + 7200_000;
-  bothProbe.applyCodexUsageData(0, { fiveHour: { utilization: 0.4, resetAt: freshReset }, sevenDay: week });
+  bothProbe.applyPlanUsageData(0, { fiveHour: { utilization: 0.4, resetAt: freshReset }, sevenDay: week });
   assert.equal(bothProbe.accounts[0].quota.unified5h, 0.4, 'a probe stating the window keeps it');
   assert.equal(bothProbe.accounts[0].quota.unified5hReset, freshReset);
 

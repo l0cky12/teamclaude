@@ -199,6 +199,9 @@ const PERSISTED_QUOTA_FIELDS = [
   // Same reason: a Team seat (no shared weekly window) would draw `Wk ?` until
   // its first reading.
   'weeklyWindowStated',
+  // 'monthly' when the plan's one shared window is a month long (Grok), so a
+  // restored row keeps its label until the next reading.
+  'planPeriod',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -226,7 +229,8 @@ const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
  * does not exist.
  *
  * @typedef {object} CodexLearnedQuota
- * @property {string} [planType]  the Codex subscription tier
+ * @property {string} [planType]  the subscription tier (Codex, Grok)
+ * @property {'monthly'|null} [planPeriod]  'monthly' when the plan's shared window is a month, not a week (Grok)
  * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, expiries?: Array<number|null>, expiriesAt?: number, expiriesFor?: number|null, grantedAt?: number}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  *   A Codex reading also carries, once the credit rows have been read, `expiries` (when each held credit expires, soonest first, null for none), `expiriesAt` (when they were read), `expiriesFor` (the count they describe, or null once a count change has left them out of step until the next read) and `grantedAt` (when the count last went up).
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
@@ -4902,7 +4906,7 @@ export class AccountManager {
     // that stated a window says anything — the catalog fetch carries none — and
     // a weekly window with no 5-hour one beside it is how a subscription that
     // meters no session window reads (see codex-quota.js). The usage probe
-    // records the same fact in applyCodexUsageData.
+    // records the same fact in applyPlanUsageData.
     if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
     else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
 
@@ -5499,8 +5503,8 @@ export class AccountManager {
     }
   }
 
-  /** Apply a read-only Codex `/wham/usage` reading without counting traffic. */
-  applyCodexUsageData(accountIndex, usage) {
+  /** Apply a read-only plan usage reading (Codex `/wham/usage`, Grok billing) without counting traffic. */
+  applyPlanUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
     // The Codex-learned fields below are written here for the first time, so the
@@ -5542,6 +5546,10 @@ export class AccountManager {
     // is not observed from the null it just became.
     if (fresh5h && q.unified5h != null) this._observeBurnRate(account, ['unified5h']);
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    // A Grok plan says whether its one pool is weekly or monthly; the reading
+    // sits in the weekly fields either way, since that is the window rotation
+    // gates on, and this is what tells a renderer to name it Monthly.
+    if (usage.period !== undefined) q.planPeriod = usage.period === 'monthly' ? 'monthly' : null;
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
     // age is the only thing that says how much the number is worth.

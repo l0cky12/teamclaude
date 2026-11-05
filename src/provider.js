@@ -78,6 +78,12 @@ export const PROVIDERS = {
     // nothing else is served there: the host alone says Grok.
     wholeHost: true,
     loginCommand: 'teamclaude login --grok',
+    // Grok states no quota in response headers, so a 429 that means the plan
+    // is spent says so only in its body. These are the refusals Grok Build's
+    // own error handling is tested against (`You ran out of credits.
+    // [WKE=…:spending-limit]`, `Plan limit reached`); a match holds the account
+    // and moves the request on, as a spent Codex window does. Not seen live.
+    planRefusal: /ran out of credits|spending-limit|plan limit|usage limit/i,
     // Grok Build sends the signed-in user's identity beside the token on every
     // request. A request served by another account must not carry the first
     // one's, so these are replaced with the serving account's, and dropped

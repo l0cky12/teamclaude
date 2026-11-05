@@ -896,7 +896,7 @@ async function forwardOneRefusedRequest({ onRedeem, accounts = [codex('a')], pat
       const redeemed = await onRedeem();
       // What a real redemption leaves behind: the hold dropped and the quota
       // re-read, so the account is selectable again.
-      if (redeemed) am.applyCodexUsageData(candidates[0].index, { sevenDay: { utilization: 0, resetAt: Date.now() + 7 * DAY } });
+      if (redeemed) am.applyPlanUsageData(candidates[0].index, { sevenDay: { utilization: 0, resetAt: Date.now() + 7 * DAY } });
       return { redeemed, reason: 'test' };
     },
   } : {};
@@ -1130,7 +1130,7 @@ test('reload applies and clears an account opt-out, and mirrors memConfig', asyn
 // probe is off by default — so it has to survive a restart.
 test('the credit count survives export and restore', () => {
   const am = new AccountManager([codex('a')], 0.98);
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 1, resetAt: Date.now() + DAY }, resetCredits: { available: 1, applicable: 0 } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 1, resetAt: Date.now() + DAY }, resetCredits: { available: 1, applicable: 0 } });
   assert.equal(am.accounts[0].quota.resetCredits.available, 1);
   assert.equal(typeof am.accounts[0].quota.resetCredits.seenAt, 'number');
 
@@ -1144,8 +1144,8 @@ test('the credit count survives export and restore', () => {
 // count is the one field here with no other source.
 test('a usage reading with no credit counters leaves the last one alone', () => {
   const am = new AccountManager([codex('a')], 0.98);
-  am.applyCodexUsageData(0, { resetCredits: { available: 1, applicable: 1 } });
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + DAY } });
+  am.applyPlanUsageData(0, { resetCredits: { available: 1, applicable: 1 } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.5, resetAt: Date.now() + DAY } });
   assert.equal(am.accounts[0].quota.resetCredits.available, 1);
 });
 

@@ -4624,12 +4624,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // before deciding that a headerless 429 is a request/model refusal.
       let refusal = '';
       const raw = await readErrorBody(upstreamRes.body).catch(() => null);
-      try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      const text = raw ? raw.toString('utf8') : '';
+      try {
+        // `error` may be a bare string as well as the usual { message }.
+        const error = JSON.parse(text)?.error;
+        refusal = String((typeof error === 'string' ? error : error?.message) || '');
+      } catch { refusal = ''; }
+      // A provider that states quota in no header (Grok) says its plan is
+      // spent only in the body, and that spends the account like a rejected
+      // unified window does.
+      const planRefusal = /** @type {RegExp|undefined} */ (/** @type {Record<string, any>} */ (PROVIDERS[providerOf(account)]).planRefusal);
+      const planSpent = !!planRefusal && planRefusal.test(text);
       // A named per-minute/second ceiling is a burst throttle even without
       // headers; it must not quarantine the whole pool for an hour.
       const transientLimit = /\b(?:per[ -](?:second|minute)|[rt]pm|rps)\b/i.test(refusal);
       const usageLimited = /usage[ -]?limit|quota|credits? (?:exhausted|depleted)/i.test(refusal);
-      const accountLimited = !transientLimit && (usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
+      const accountLimited = !transientLimit && (planSpent || usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
       const requestScoped = headerless && !accountLimited && !transientLimit;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
@@ -4655,7 +4665,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const codexAccountSpent = spentCodexWindows.some(isAccountWideCodexWindow);
       const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
         || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected'
-        || codexAccountSpent;
+        || codexAccountSpent || planSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
       if (generalRejected || fableRejected || codexFamilyRejected || accountLimited) {
@@ -4678,7 +4688,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // window reads very differently from a weekly one. A model-scoped
           // label carries upstream's own text, so it goes through safeLine.
           const spent = spentCodexWindows.length
-            ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : '';
+            ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : planSpent ? ' (plan spent)' : '';
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }
