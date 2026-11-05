@@ -69,7 +69,9 @@ An account in the pool can also be used somewhere else — a local login, a cred
 }
 ```
 
-`teamclaude status` and the dashboard show the same thing in one line: `4.0% of the week went elsewhere · Fable week: not measurable`.
+`teamclaude status` and the dashboard show the same thing in one line: `14.0% of the week went elsewhere · Fable week: not measurable`.
+
+A window whose share is 5% or less is left out of that line, since a few percent elsewhere is rarely worth reading. If every window is left out, the line is not shown. "Not measurable" and "not observed" are always shown, because they mean there is no figure, not a small one. To change the cut-off, use the **Outside spend** row on the dashboard's Settings page, or set [`outsideSpendHidePercent`](configuration.md) in the config file. `0` shows every share. The row sends `POST /teamclaude/outside-spend-hide` with `{"percent": N}`, which needs the proxy key, not a client key. `/teamclaude/status` still reports every window, whatever the cut-off, and gives the cut-off in use as `outsideSpendHidePercent`.
 
 How it is attributed. Between two fresh readings of one window on one account:
 

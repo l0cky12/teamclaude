@@ -170,6 +170,34 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 
 `teamclaude status --json` carries the sync's state under `callbackSync`: the last pass, its error if it failed, how many accounts the store holds, how many tombstones, and how many rows are emptied and waiting for a sign-in (`signInNeeded`).
 
+## Syncing accounts through one of your own machines
+
+The same sync works without callback.net or any other outside account. One of your TeamClaude instances keeps the store. Your other instances follow it, over the [linked-instance](usage.md#linked-instances) connection they already have. Everything else in the section above still applies: which accounts travel, the per-account lock that stops two machines renewing the same login, tombstones for removed accounts, and rows emptied for a sign-in.
+
+**Set it up from the dashboard.** First link the machines (**Settings**, **Linked instances**). Then, in the **Account sync** card:
+
+1. On the machine that will keep the sign-ins (pick it in the Instance picker if this page shows another one), click **Keep them on this machine**. Pick one that is usually on, such as a server. It needs a proxy key (`proxy.apiKey`), since that is how the other machines reach it.
+2. On each other machine, choose the first one in the list next to **Follow** and click **Follow**. The card checks that the machine answers and keeps the store before it saves anything.
+
+The card then shows which machine keeps the accounts, how many accounts the store holds and when it last synced. **Sync now** runs a pass at once. **Turn off** (click it twice) stops sharing; the accounts stay where they are. A machine signed in to callback.net can't be switched until it signs out there, and the callback.net sign-in is refused while this is on, so a machine always syncs with one store only.
+
+**Or in the config.** On the machine that keeps the store, set `"accountSync": { "mode": "host" }`. On each of the others, set `"accountSync": { "mode": "follow", "peer": "server" }`, where `server` is the name the machine is listed under in `peers` (see [Configuration](configuration.md)). Reload, or restart, to apply it.
+
+**How it differs from callback.net.**
+
+- **What each machine already has is shared.** With callback.net, an account is stored only when a machine signs it in or next renews it. Here, each machine's pass also stores every OAuth account the store does not hold yet with the tokens it has, as `import` would. So turning it on shares every account at once. Such a row is marked as a seed: it was read from a config, not just issued, so it may be a copy another machine has since renewed. A seed never replaces a newer token: a machine holding a later one keeps it, renews that one under the lock, and replaces the seed at its next pass. An account with no row yet gets its seed before its first renewal, so two machines that started from the same copy still renew it only once. A token that turns out to be dead is emptied by the first machine it fails on, as described above.
+- **Changing the store waits for work under way.** Switching mode, or changing the address a follower reaches the store at, takes effect once any renewal already running has stored its result and released its lock in the store it started with.
+- **A pass runs every 5 minutes**, as well as at start, on reload and at **Sync now**. It is a read on your own network.
+- **The store is a file** next to the config of the machine that keeps it: `<config>.sync-store.json`, mode `0600`. It holds the same tokens the config does, so treat it like the config. A follower reads and writes it through `POST /teamclaude/sync-store` on that machine. That route answers only a request carrying that machine's `proxy.apiKey`: a [client key](configuration.md) is refused, and so is a request without a key, even from the same machine, and a machine without a proxy key keeps its store closed. It answers only on the machine that keeps the store, and is never forwarded through another instance. A server and a CLI command on that machine share the file under a lock; a write never goes ahead without it, so a busy store makes a renewal wait rather than run unlocked. The tokens cross your network on the link's address, so use an address on a network you trust, such as Tailscale or your LAN, or HTTPS through a reverse proxy.
+- **Rows from before count as seeds.** When a machine starts keeping the store, and each time it starts up while keeping it, every row already in the file is marked as a seed. The other machines may have renewed without it in the meantime, so an old row can't replace a newer token.
+- **When the machine that keeps the store is down**, the followers keep serving with the tokens they have. A token that is still good is kept. One that has expired waits until the store answers again rather than being renewed without the lock, because renewing without it could sign the other machines out. If that machine is gone for good, turn the sync off on the others, or make one of them keep a new store.
+
+**Before you turn it off.** Once two machines share an account, each holds a copy of the same login. A machine where sync is off renews its copy on its own, which signs the others out of that account. So keep it on wherever a shared account is used, or remove that account from every machine but one before you turn it off. Turning it off doesn't delete the store file: `<config>.sync-store.json` still holds the tokens it had, so delete it yourself if that machine will no longer keep the store.
+
+**Who can read the store.** On the machine that keeps it, the shared `proxy.apiKey` now reads every shared login. Give your Claude Code and Codex clients [client keys](configuration.md) instead of that key. A client key is refused by the store. While own-machine sync is on, `teamclaude callback login` is refused, so a machine never syncs with two stores.
+
+`teamclaude status --json` reports the pass under `callbackSync` for both kinds of store.
+
 ## Moving accounts to a new machine (export / import)
 
 Setting up another of your machines doesn't have to mean signing in to every account again. Export the accounts from a machine that already has them, copy the file over, and import it:

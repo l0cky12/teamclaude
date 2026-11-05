@@ -84,7 +84,7 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
-    const outside = outsideSpendText(account.quota?.outsideSpend);
+    const outside = outsideSpendText(account.quota?.outsideSpend, status.outsideSpendHidePercent);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
     const forecast = forecastText(account.quota?.forecast, now);
     if (forecast) lines.push(`  ${paint.dim('Forecast'.padEnd(8))} ${forecast}`);
@@ -217,18 +217,32 @@ export function spendLine(account, paint) {
  * share is a floor — spend elsewhere while this proxy was also serving the
  * account is not counted, and docs/quota.md says so.
  *
+ * A measured window whose share, as printed, is at or below `hidePercent` is
+ * left out (`outsideSpendHidePercent`), and with every window left out there
+ * is no line at all. The two "no answer" phrases are never hidden. 0 shows
+ * every window; a missing or bad cut-off is the default, 5, which a status
+ * from a proxy too old to send one gets too. The 5 is written out here rather
+ * than read from OUTSIDE_SPEND_HIDE_DEFAULT because of the toString() below.
+ *
  * Pure and closure-free on purpose: the dashboard serializes it into its page
  * with toString(), so the terminal and the browser say the same thing.
  *
  * @param {Record<string, {share: number|null, state: string, since: string|null}>|null|undefined} outsideSpend
+ * @param {number|null} [hidePercent]  status.outsideSpendHidePercent
  * @returns {string|null}
  */
-export function outsideSpendText(outsideSpend) {
+export function outsideSpendText(outsideSpend, hidePercent) {
   var o = outsideSpend || {};
+  var hide = typeof hidePercent === 'number' && isFinite(hidePercent) && hidePercent >= 0 && hidePercent <= 100 ? hidePercent : 5;
   var keys = Object.keys(o).sort(function (a, b) {
     if (a === 'unified7d') return -1;
     if (b === 'unified7d') return 1;
     return a < b ? -1 : a > b ? 1 : 0;
+  }).filter(function (key) {
+    /** @type {{share?: number|null, state?: string}} */
+    var v = o[key] || {};
+    if (!(hide > 0) || v.state !== 'measured' || typeof v.share !== 'number') return true;
+    return Math.round(v.share * 1000) / 10 > hide;
   });
   if (!keys.length) return null;
   var parts = keys.map(function (key) {

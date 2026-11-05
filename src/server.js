@@ -28,9 +28,11 @@ import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
 import { atomicConfigUpdate } from './config.js';
-import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setOutsideSpendHidePercent, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
+import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
 import { AccountSyncError } from './web-account-sync.js';
+import { SyncStoreError } from './sync-store.js';
 import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
@@ -436,6 +438,7 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/probe-interval', 'a client key cannot change settings'],
   ['/teamclaude/instance-name', 'a client key cannot change settings'],
   ['/teamclaude/instance-address', 'a client key cannot change settings'],
+  ['/teamclaude/outside-spend-hide', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -470,9 +473,13 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/account-sync/cancel', 'a client key cannot manage account sync'],
   ['/teamclaude/account-sync/sync', 'a client key cannot manage account sync'],
   ['/teamclaude/account-sync/sign-out', 'a client key cannot manage account sync'],
+  ['/teamclaude/account-sync/mode', 'a client key cannot manage account sync'],
   // Not a config write, but it names a session and moves it: one tenant must
   // not be able to put another tenant's session on an account of its choosing.
   ['/teamclaude/session-pin', 'a client key cannot pin sessions'],
+  // The store this machine keeps for your other ones holds every shared
+  // account's tokens: only a proxy key, the one a linked instance holds, reads it.
+  ['/teamclaude/sync-store', 'a client key cannot read the account store'],
 ]);
 
 /**
@@ -892,7 +899,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         res.end(JSON.stringify({ ok: true, ...await hooks.accountSync.view() }));
         return;
       }
-      if (req.method === 'POST' && /^\/teamclaude\/account-sync\/(start|status|cancel|sync|sign-out)$/.test(req.url || '')) {
+      if (req.method === 'POST' && /^\/teamclaude\/account-sync\/(start|status|cancel|sync|sign-out|mode)$/.test(req.url || '')) {
         const sync = hooks.accountSync;
         if (!sync) {
           res.writeHead(501, { 'Content-Type': 'application/json' });
@@ -910,6 +917,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           if (step === 'start') return reply(200, { ok: true, ...await sync.start() });
           if (step === 'sync') return reply(200, { ok: true, result: await sync.syncNow() });
           if (step === 'sign-out') return reply(200, { ok: true, ...await sync.signOut() });
+          // {"mode": "host" | "follow" | "off", "peer"?}: the store of your own
+          // instances (instance-sync.js) instead of callback.net.
+          if (step === 'mode') return reply(200, { ok: true, ...await sync.changeMode(body) });
           if (typeof body.id !== 'string' || !body.id) return reply(400, { ok: false, error: 'missing "id"' });
           if (step === 'status') return reply(200, { ok: true, ...sync.status(body.id) });
           // The state after it, so the page can tell a sign-in that was
@@ -919,10 +929,48 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         } catch (err) {
           if (err instanceof AccountSyncError) return reply(400, { ok: false, error: err.message });
           // callback-auth.js strips what callback.net says before it gets
-          // here, so the reason can go to the page as well as the log.
+          // here, and instance-sync.js what a linked instance says, so the
+          // reason can go to the page as well as the log.
           const why = safeLine(String(/** @type {Error} */ (err)?.message || err), 160);
           console.error(`[TeamClaude] Account sync (${step}) failed: ${why}`);
-          return reply(502, { ok: false, error: `callback.net: ${why}` });
+          return reply(502, { ok: false, error: `${sync.storeName?.() || 'callback.net'}: ${why}` });
+        }
+      }
+
+      // The account store this machine keeps for your other instances
+      // (accountSync.mode "host", sync-store.js): {"method","path","params",
+      // "envelope"} is one call of the store's API, which a follower's sync
+      // makes through its peers entry (instance-sync.js). Answered only while
+      // this machine keeps the store, and only to a proxy key: the client-key
+      // refusal above covers it, and the relay never forwards it (peers.js).
+      if (req.method === 'POST' && req.url === '/teamclaude/sync-store') {
+        const reply = (/** @type {number} */ code, /** @type {Record<string, any>} */ payload) => {
+          res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        // Checked here, not left to the gate above: that gate admits every
+        // caller when no key is configured, and a loopback one without a key.
+        // The store hands out every shared account's tokens, so it answers
+        // only a caller that presented this machine's own proxy key.
+        const shared = config.proxy?.apiKey;
+        if (!shared || !safeKeyEqual(req.headers['x-api-key'], shared)) {
+          return reply(401, { ok: false, error: shared ? 'the account store answers only to this machine\'s proxy key' : 'this machine has no proxy key (proxy.apiKey), so its account store is closed' });
+        }
+        const store = hooks.syncStore?.() || null;
+        if (!store) return reply(404, { ok: false, token: 'error_not_host', error: 'this instance does not keep the accounts for your other machines' });
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (typeof body.method !== 'string' || typeof body.path !== 'string') return reply(400, { ok: false, token: 'error_bad_request', error: 'missing "method" or "path"' });
+        try {
+          const result = await store.call(body.method, body.path, body.params ?? null, { envelope: body.envelope === true });
+          return reply(200, { ok: true, result });
+        } catch (err) {
+          if (err instanceof SyncStoreError) {
+            const code = err.token === 'error_not_found' ? 404 : err.token === 'error_bad_request' ? 400 : 409;
+            return reply(code, { ok: false, token: err.token, error: err.message });
+          }
+          console.error(`[TeamClaude] Account store call failed: ${safeLine(String(/** @type {Error} */ (err)?.message || err), 160)}`);
+          return reply(500, { ok: false, error: 'the account store failed; see the proxy log on that machine' });
         }
       }
 
@@ -937,6 +985,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         // Clients page lists a key that has not been used yet, which the usage
         // table cannot, since it only holds names that spent something.
         res.end(JSON.stringify({ ...extra, ...status, clientKeys: clientKeyNames(config.proxy), caller: callerView(req.tcClient), upstreamPool: upstreamPoolStatus(),
+          // The share at or below which the "outside" read-out leaves a window
+          // out (outside-spend.js). A display setting, so a client key reads it too.
+          outsideSpendHidePercent: outsideSpendHidePercent(config),
           // The dashboard's instance picker. Names and addresses only, never
           // the keys, and only for the operator, who is the one who may use them.
           // `instance` is what the picker calls this machine and what the
@@ -1623,6 +1674,40 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const address = instanceAddress(config);
         console.log(`[TeamClaude] Instance address ${address ? `set to ${safeLine(address, 200)}` : 'cleared; using the guess'} (dashboard)`);
         reply(200, { ok: true, address });
+        return;
+      }
+
+      // Outside-spend cut-off endpoint: the dashboard's Outside spend row on
+      // Settings. Body: {"percent": <0..100>}. Written and reloaded like the
+      // instance name; the status read after it carries the new cut-off, and
+      // the read-outs drop the windows at or below it.
+      if (req.method === 'POST' && req.url === '/teamclaude/outside-spend-hide') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (!hooks.reload) { reply(501, { ok: false, error: 'outside-spend cut-off change not supported' }); return; }
+        try {
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => { setOutsideSpendHidePercent(c, body.percent); });
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Outside-spend cut-off change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'outside-spend cut-off change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after an outside-spend cut-off change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        const percent = outsideSpendHidePercent(config);
+        console.log(`[TeamClaude] Outside spend ${percent > 0 ? `at or below ${percent}% now hidden` : 'now shown at every share'} (dashboard)`);
+        reply(200, { ok: true, outsideSpendHidePercent: percent });
         return;
       }
 
@@ -3990,6 +4075,31 @@ function respondUnrenewed(res, ctx, accountManager) {
   }
 }
 
+/**
+ * Honor upstream cooldown clocks even when a session proxy strips the unified
+ * quota headers. A headerless usage rejection has no clock, so wait one hour.
+ * @param {Headers} headers
+ * @param {number} fallbackSeconds
+ * @returns {number}
+ */
+function accountLimitWait(headers, fallbackSeconds) {
+  const now = Date.now();
+  const retry = headers.get('retry-after');
+  const seconds = retry != null && /^\d+(?:\.\d+)?$/.test(retry.trim()) ? Number(retry) : NaN;
+  const retryAt = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(retry || '');
+  const clocks = [retryAt];
+  for (const name of ['anthropic-ratelimit-reset-requests', 'anthropic-ratelimit-requests-reset',
+    'anthropic-ratelimit-tokens-reset']) {
+    clocks.push(Date.parse(headers.get(name) || ''));
+  }
+  for (const window of ['5h', '7d']) {
+    if (headers.get(`anthropic-ratelimit-unified-${window}-status`) !== 'rejected') continue;
+    clocks.push(Number(headers.get(`anthropic-ratelimit-unified-${window}-reset`)) * 1000);
+  }
+  const future = clocks.filter(at => Number.isFinite(at) && at > now && at <= 8.64e15);
+  return future.length ? Math.max(1, (Math.max(...future) - now) / 1000) : fallbackSeconds;
+}
+
 export async function forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, useSx) {
   const maxRetries = accountManager.accounts.length;
   // This function is exported, so a caller may hand us a ctx built elsewhere.
@@ -4139,11 +4249,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     if (ctx.pinnedIndex != null) {
       ctx.status = 429;
       ctx.account = '(pinned account unavailable)';
+      const pinnedAccount = accountManager.accounts[ctx.pinnedIndex];
+      const resetAt = pinnedAccount?.status === 'throttled'
+        ? computeResetAt(accountManager, [pinnedAccount], ctx.model) : Date.now() + 5000;
+      const reset = new Date(resetAt).toISOString();
       if (!res.headersSent) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '5' });
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(Math.max(1, Math.ceil((resetAt - Date.now()) / 1000))),
+          'anthropic-ratelimit-reset-requests': reset,
+        });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'rate_limit_error', message: 'Pinned account is unavailable (rate-limited, errored, or already tried). Retry shortly.' },
+          error: { type: 'rate_limit_error', message: `Pinned account is unavailable (rate-limited, errored, or already tried). Next account resets at ${reset}.` },
         }));
       }
       return;
@@ -4202,7 +4320,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // windows the retry-after is read from have to be the same accounts, or the
     // two halves of one sentence contradict each other.
     const candidates = candidateAccounts(accountManager, ctx.model, ctx.provider);
-    const retryAfter = computeRetryAfter(accountManager, candidates, ctx.model);
+    const resetAt = computeResetAt(accountManager, candidates, ctx.model);
+    const retryAfter = Math.max(1, Math.ceil((resetAt - Date.now()) / 1000));
 
     // Long-hold mode: hold the HTTP connection and poll until an account
     // recovers or the budget (holdSeconds) runs out. Claude Code waits for
@@ -4230,15 +4349,19 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     accountManager.events?.add({ kind: 'rotation', type: 'exhausted', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: answered 429, retry after ${retryAfter}s` });
+    const enabledCandidates = candidates.filter(a => !a.disabled);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
+      'anthropic-ratelimit-reset-requests': new Date(resetAt).toISOString(),
     });
     res.end(JSON.stringify({
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: exhaustedMessage(candidates, ctx.model, retryAfter),
+        message: enabledCandidates.length > 0 && enabledCandidates.every(a => a.status === 'throttled')
+          ? `All accounts reached usage limits. Next account resets at ${new Date(resetAt).toISOString()}.`
+          : exhaustedMessage(candidates, ctx.model, retryAfter),
       },
     }));
     return;
@@ -4493,24 +4616,21 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const retryAfterHeader = upstreamRes.headers.get('retry-after');
       let retryAfter = parseInt(retryAfterHeader, 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
-      // A 429 that says nothing about the account — no retry-after, no
-      // anthropic-ratelimit-* — is about the REQUEST: a model id upstream
-      // refuses, a shape it will not take. Neither of the account-level
-      // responses below applies to it. Pausing the account made every other
-      // session on it wait out a fabricated 60s for one client's bad model id,
-      // and the inline wait then held that client for the same 60s per attempt;
-      // together they turned one request's problem into a fleet-wide stall
-      // (#288). A throttle, by contrast, always carries the headers.
-      const requestScoped = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
-      // The body is diagnostic for a request-scoped refusal (it names the
-      // reason) and noise otherwise.
+      // A headerless model refusal must not pause otherwise usable accounts
+      // (#288). Usage-limit messages still identify account exhaustion when
+      // a session proxy has removed the upstream quota headers.
+      const headerless = retryAfterHeader == null && Object.keys(rateLimitHeaders).length === 0;
+      // Session proxies can strip the quota headers. Read their error message
+      // before deciding that a headerless 429 is a request/model refusal.
       let refusal = '';
-      if (requestScoped) {
-        const raw = await readErrorBody(upstreamRes.body).catch(() => null);
-        try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
-      } else {
-        await upstreamRes.body?.cancel();
-      }
+      const raw = await readErrorBody(upstreamRes.body).catch(() => null);
+      try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      // A named per-minute/second ceiling is a burst throttle even without
+      // headers; it must not quarantine the whole pool for an hour.
+      const transientLimit = /\b(?:per[ -](?:second|minute)|[rt]pm|rps)\b/i.test(refusal);
+      const usageLimited = /usage[ -]?limit|quota|credits? (?:exhausted|depleted)/i.test(refusal);
+      const accountLimited = !transientLimit && (usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
+      const requestScoped = headerless && !accountLimited && !transientLimit;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
       // status means a quota bucket is spent, so waiting and retrying the SAME
@@ -4538,7 +4658,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
         || codexAccountSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
-      if ((generalRejected || fableRejected || codexFamilyRejected) && retryCount < maxRetries) {
+      if (generalRejected || fableRejected || codexFamilyRejected || accountLimited) {
         // A Fable-only rejection leaves the account fine for other models, so we
         // do NOT throttle it globally — the recorded Fable utilization makes
         // selection skip it for Fable requests only. A general rejection spends a
@@ -4552,7 +4672,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // later request for it pays one refusal here before it rotates.
           console.log(`[TeamClaude] ${safeLine(spentCodexWindows.join(', '), 80)} spent on "${account.name}" — switching account for this request`);
         } else {
-          const hold = Math.min(Math.max(retryAfter, 1), 3600);
+          const hold = accountLimitWait(upstreamRes.headers, accountLimited ? 3600 : 60);
           // Name the spent window when the headers said which: "which one" is
           // the first thing an operator asks of a rejection, and a 5-hour
           // window reads very differently from a weekly one. A model-scoped
@@ -4769,7 +4889,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       console.log(`[TeamClaude] Rate-limit 429 on "${account.name}" — retry-after ${retryAfter}s over inline cap; returning 429 to client (no switch)`);
       ctx.status = 429;
       if (!res.headersSent && !clientGone(res)) {
-        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': String(retryAfter) });
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'retry-after': String(retryAfter),
+          'anthropic-ratelimit-reset-requests': new Date(Date.now() + retryAfter * 1000).toISOString(),
+        });
         res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: `Rate limited; retry in ${retryAfter}s.` } }));
       }
       return;
@@ -5773,6 +5897,17 @@ const UNTIMED_RETRY_AFTER_SECONDS = 60;
  * @returns {number}
  */
 export function computeRetryAfter(accountManager, candidates, model = null) {
+  return Math.max(1, Math.ceil((computeResetAt(accountManager, candidates, model) - Date.now()) / 1000));
+}
+
+/**
+ * Keep the absolute reset and Retry-After derived from the same pool clocks.
+ * @param {import('./account-manager.js').AccountManager} accountManager
+ * @param {Record<string, any>[]} candidates
+ * @param {string|null|undefined} model
+ * @returns {number}
+ */
+function computeResetAt(accountManager, candidates, model) {
   const now = Date.now();
   let soonest = Infinity;
   for (const acct of candidates) {
@@ -5789,7 +5924,5 @@ export function computeRetryAfter(accountManager, candidates, model = null) {
     if (blockedFor <= 0) blockedFor = UNTIMED_RETRY_AFTER_SECONDS * 1000;
     if (blockedFor < soonest) soonest = blockedFor;
   }
-  return soonest === Infinity
-    ? UNTIMED_RETRY_AFTER_SECONDS
-    : Math.max(1, Math.ceil(soonest / 1000));
+  return now + (soonest === Infinity ? UNTIMED_RETRY_AFTER_SECONDS * 1000 : soonest);
 }
