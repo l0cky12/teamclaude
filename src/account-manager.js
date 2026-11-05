@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider, loginCommandFor } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
+import { refreshGrokToken } from './grok-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -592,6 +593,7 @@ export class AccountManager {
    * @param {Function} [opts.refreshFn]
    * @param {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} [opts.refreshCoordinator]  wraps every token refresh (credential-sync.js takes it through a shared lock); the default just refreshes. Resolving null keeps the current token: nothing is written and nothing is announced
    * @param {Function} [opts.codexRefreshFn]
+   * @param {Function} [opts.grokRefreshFn]
    * @param {number} [opts.throttleProbeFloorMs]
    * @param {number} [opts.familyStaleMs]
    * @param {number} [opts.statusStaleMs]
@@ -608,7 +610,7 @@ export class AccountManager {
    * @param {import('./event-log.js').EventLog} [opts.events]  the event log to record into (a fresh one when omitted)
    * @param {UsageHistory} [opts.usageHistory]  the day-by-day usage history to book into (a fresh one when omitted)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events, usageHistory } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, grokRefreshFn = refreshGrokToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events, usageHistory } = {}) {
     // What the dashboard's Logs page reads (event-log.js). One per manager, so
     // each proxy in a process keeps its own; the server and the login flows
     // record into the same one.
@@ -623,9 +625,9 @@ export class AccountManager {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
-    // OAuth token refresh.
-    this._refreshFn = refreshFn;
-    this._codexRefreshFn = codexRefreshFn;
+    // OAuth token refresh. One per provider: each mints tokens at its own
+    // endpoint with its own client id.
+    this._refreshFns = { anthropic: refreshFn, codex: codexRefreshFn, grok: grokRefreshFn };
     this._refreshCoordinator = refreshCoordinator;
     // Kept for accounts added at runtime, which go through the same guard.
     this.listener = listener;
@@ -5802,9 +5804,7 @@ export class AccountManager {
         // known good. A coordinator answer taken from the store is not.
         let minted = false;
         const refresh = async (/** @type {{ budgetMs?: number }} */ opts = {}) => {
-          const tokens = await (providerOf(account) === 'codex'
-            ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
-            : this._refreshFn(sent, undefined, account.routing || null, opts));
+          const tokens = await this._refreshFns[providerOf(account)](sent, undefined, account.routing || null, opts);
           minted = true;
           return tokens;
         };

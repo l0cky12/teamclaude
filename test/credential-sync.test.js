@@ -592,7 +592,7 @@ test('two installs first seeing one account at once: one row, one renewal, the o
   // create meets the key, it reads office's row and is refused its lock.
   let release;
   const gate = new Promise((r) => { release = r; });
-  office.am._refreshFn = async (rt) => { office.refreshed.push(rt); await gate; return { accessToken: 'at-office', refreshToken: 'rt-office', expiresAt: store.now() + 8 * H }; };
+  office.am._refreshFns.anthropic = async (rt) => { office.refreshed.push(rt); await gate; return { accessToken: 'at-office', refreshToken: 'rt-office', expiresAt: store.now() + 8 * H }; };
   const officeDone = office.am.ensureTokenFresh(0, true);
   for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
   assert.ok(store.byKey(syncKeyFor(claude('a'))).Locked, 'office holds the lock');
@@ -636,7 +636,7 @@ test('the renewal gets what is left of the lease, and a lease that ran out is no
   // hand the lock to a third.
   const row = store.byKey(syncKeyFor(claude('a')));
   am.accounts[0]._lastRefreshAt = null;
-  am._refreshFn = async (rt) => {
+  am._refreshFns.anthropic = async (rt) => {
     store.tick(31_000);
     await store.api('POST', `User/Credential/${row.User_Credential__}:lock`, { timeout: 30 }); // office's
     return { accessToken: `${rt}-late-at`, refreshToken: `${rt}-late-rt`, expiresAt: store.now() + 8 * H };
@@ -1046,7 +1046,7 @@ test('two installs renewing one account at once: one renews, the other adopts', 
   // Office renews slowly: its provider call takes 7 seconds of store time.
   let release;
   const gate = new Promise((r) => { release = r; });
-  office.am._refreshFn = async (rt) => { office.refreshed.push(rt); await gate; return { accessToken: 'at-office', refreshToken: 'rt-office', expiresAt: store.now() + 8 * H }; };
+  office.am._refreshFns.anthropic = async (rt) => { office.refreshed.push(rt); await gate; return { accessToken: 'at-office', refreshToken: 'rt-office', expiresAt: store.now() + 8 * H }; };
   const officeDone = office.am.ensureTokenFresh(0, true);
   await new Promise((r) => setImmediate(r)); // office has the lock
   // Home's first wait is where the office finishes: its sleep lets the office's

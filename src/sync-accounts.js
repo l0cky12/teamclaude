@@ -1,5 +1,4 @@
-import { importCredentials } from './oauth.js';
-import { importCodexCredentials } from './codex-auth.js';
+import { credentialFileFor } from './resolve-accounts.js';
 import { sameIdentity } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
@@ -221,9 +220,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         // The file's own format, as resolveAccounts reads it at startup: the
         // Claude reader finds no token in a Codex auth.json, so a Codex login
         // refreshed in its file reached the fleet only on a restart.
-        const creds = providerOf(diskAcct) === 'codex'
-          ? await importCodexCredentials(diskAcct.importFrom)
-          : await importCredentials(diskAcct.importFrom);
+        const creds = await credentialFileFor(diskAcct).read(diskAcct.importFrom);
         // A Codex auth.json carries no expiry; the staleness check below then
         // leaves the file's token to win, as a fresh login there should.
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: 'expiresAt' in creds ? creds.expiresAt : undefined };
