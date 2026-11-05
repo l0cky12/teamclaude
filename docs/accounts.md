@@ -704,7 +704,10 @@ Grok Build's own paths are `/v1/models`, `/v1/responses` and so on, which are
 Anthropic's paths on this listener. So Grok is reached under a `/grok` prefix:
 everything below `/grok/` draws on the Grok accounts, and the prefix is removed
 before the request goes to `https://cli-chat-proxy.grok.com`. A Grok account is
-never offered a Claude or Codex request, and the other way round.
+never offered a Claude or Codex request, and the other way round. API-key
+accounts and third-party backends never serve Grok either, even when pinned
+with `TC_ACCT`: Grok Build speaks xAI's own protocol, which only xAI's proxy
+answers.
 
 In [MITM mode](proxy-modes.md#mitm-proxy-mode-default), `cli-chat-proxy.grok.com`
 is intercepted once the pool has a Grok account, and every request to that host

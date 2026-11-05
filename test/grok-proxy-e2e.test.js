@@ -93,3 +93,63 @@ test('a Grok request never lands on a Claude account, and a Claude request never
     upstream.close();
   }
 });
+
+test('a Grok request is served by a Grok account alone, never by an API key ahead of it', async () => {
+  /** @type {string[]} */
+  const anthropicSeen = [];
+  /** @type {string[]} */
+  const grokSeen = [];
+  let grokSpent = false;
+  const anthropic = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    anthropicSeen.push(`${req.url} ${req.headers['x-api-key']}`);
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: 'Not found' } }));
+  });
+  const grok = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    grokSeen.push(`${req.url} ${req.headers.authorization}`);
+    if (grokSpent) {
+      res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '30' });
+      res.end(JSON.stringify({ code: 429, error: 'You ran out of credits. [WKE=personal-team-blocked:spending-limit]' }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_1', object: 'response', status: 'completed', usage: { input_tokens: 3, output_tokens: 2 } }));
+  });
+  /** @type {Awaited<ReturnType<typeof spawnServer>>|null} */
+  let server = null;
+  try {
+    const listen = (/** @type {import('node:http').Server} */ s) => new Promise((resolve) => s.listen(0, '127.0.0.1', () => resolve(`http://127.0.0.1:${/** @type {import('node:net').AddressInfo} */ (s.address()).port}`)));
+    const anthropicBase = await listen(anthropic);
+    const grokBase = await listen(grok);
+    server = await spawnServer({
+      config: () => ({
+        upstream: anthropicBase, upstreamProxy: false, autoUpdate: false,
+        accounts: [
+          { name: 'key', type: 'apikey', apiKey: 'sk-demo-1', priority: 0 },
+          { name: 'grok', type: 'oauth', provider: 'grok', upstream: grokBase, accessToken: 'at-grok', expiresAt: Date.now() + 24 * 3600_000, userId: 'u', priority: 1 },
+        ],
+      }),
+    });
+    const send = () => fetch(`http://127.0.0.1:${/** @type {any} */ (server).port}/grok/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'grok-build', input: 'hi' }),
+    });
+
+    const served = await send();
+    assert.equal(served.status, 200);
+    await served.arrayBuffer();
+    assert.deepEqual(grokSeen, ['/v1/responses Bearer at-grok']);
+
+    grokSpent = true;
+    const spent = await send();
+    await spent.arrayBuffer();
+    assert.equal(spent.status, 429, 'a spent Grok pool answers 429 rather than another provider\'s reply');
+    assert.deepEqual(grokSeen, ['/v1/responses Bearer at-grok', '/v1/responses Bearer at-grok']);
+    assert.deepEqual(anthropicSeen, [], 'the API key never served a Grok request');
+  } finally {
+    await server?.stop();
+    for (const s of [anthropic, grok]) { s.closeAllConnections(); s.close(); }
+  }
+});

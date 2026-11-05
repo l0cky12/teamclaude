@@ -77,6 +77,9 @@ export const PROVIDERS = {
     // Under MITM the request arrives on xAI's own host with no prefix, and
     // nothing else is served there: the host alone says Grok.
     wholeHost: true,
+    // Grok Build speaks xAI's own protocol to xAI's own proxy, which no API
+    // key or third-party backend can answer, so only Grok accounts serve it.
+    ownAccountsOnly: true,
     loginCommand: 'teamclaude login --grok',
     // Grok states no quota in response headers, so a 429 that means the plan
     // is spent says so only in its body. These are the refusals Grok Build's
@@ -140,12 +143,16 @@ export function isSubscriptionAccount(account) {
  * set itself — how many accounts the request could ever have landed on, and
  * whose windows may speak for when it becomes servable again.
  *
+ * A provider marked `ownAccountsOnly` takes none of the metered capacity
+ * either: its client speaks a protocol only its own accounts' upstream answers.
+ *
  * @param {Record<string, any>|null|undefined} account
  * @param {string} provider
  * @returns {boolean}
  */
 export function canServeProvider(account, provider) {
-  return providerOf(account) === provider || !isSubscriptionAccount(account);
+  if (providerOf(account) === provider) return true;
+  return !isSubscriptionAccount(account) && !(/** @type {Record<string, any>|undefined} */ (PROVIDERS[/** @type {keyof typeof PROVIDERS} */ (provider)]))?.ownAccountsOnly;
 }
 
 // The hosts each provider is reached on, for MITM interception.
