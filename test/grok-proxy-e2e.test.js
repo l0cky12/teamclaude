@@ -153,3 +153,41 @@ test('a Grok request is served by a Grok account alone, never by an API key ahea
     for (const s of [anthropic, grok]) { s.closeAllConnections(); s.close(); }
   }
 });
+
+test('a Grok Build run is tracked by its x-grok-session-id, and an empty one is no session', async () => {
+  const upstream = http.createServer(async (req, res) => {
+    for await (const c of req) void c;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ id: 'resp_1', object: 'response', status: 'completed', usage: { input_tokens: 3, output_tokens: 2 } }));
+  });
+  /** @type {Awaited<ReturnType<typeof spawnServer>>|null} */
+  let server = null;
+  try {
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const xai = `http://127.0.0.1:${/** @type {import('node:net').AddressInfo} */ (upstream.address()).port}`;
+    server = await spawnServer({
+      config: () => ({
+        upstreamProxy: false, autoUpdate: false,
+        accounts: [{ name: 'grok', type: 'oauth', provider: 'grok', upstream: xai, accessToken: 'at-grok', expiresAt: Date.now() + 24 * 3600_000, userId: 'u' }],
+      }),
+    });
+    const proxy = `http://127.0.0.1:${server.port}`;
+    // Grok Build sends the header empty on the first requests of a run, and
+    // the run's id once it has one.
+    for (const sessionHeader of ['', 'grok-run-1']) {
+      const res = await fetch(`${proxy}/grok/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-grok-session-id': sessionHeader },
+        body: JSON.stringify({ model: 'grok-build', input: 'hi' }),
+      });
+      assert.equal(res.status, 200);
+      await res.arrayBuffer();
+    }
+    const status = await (await fetch(`${proxy}/teamclaude/status`)).json();
+    assert.deepEqual(status.sessions.items.map((/** @type {any} */ s) => [s.session, s.requests]), [['grok-run-1', 1]]);
+  } finally {
+    await server?.stop();
+    upstream.closeAllConnections();
+    upstream.close();
+  }
+});

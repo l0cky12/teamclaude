@@ -722,6 +722,10 @@ been checked, so the base URL above is the supported route.
   serving account's, and dropped when it has none, so a request moved to
   another account never carries the first one's identity.
 - Tokens refresh against `auth.x.ai` with Grok Build's own client id.
+- A Grok Build run is tracked by the `x-grok-session-id` header it sends, so
+  [session-aware routing](routing.md#session-aware-routing) and the session
+  readout work as they do for Claude Code. Grok Build sends the header empty
+  until its run has an id, and those first requests count as no session.
 - The body is forwarded untouched, as for Codex.
 
 ### Quota
