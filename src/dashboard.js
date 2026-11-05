@@ -350,6 +350,7 @@ export function recentModelLabels(/** @type {any} */ usage, /** @type {number} *
 
 export function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
+  if (provider === 'grok') return 'Grok';
   if (provider === 'anthropic') return 'Claude';
   return provider || 'Unknown';
 }
@@ -812,6 +813,7 @@ export function accountControlOutcome(res, spec) {
 export function providerTone(group) {
   if (group === 'anthropic') return 'claude';
   if (group === 'codex') return 'codex';
+  if (group === 'grok') return 'grok';
   return 'backend';
 }
 
@@ -821,7 +823,7 @@ export function providerTone(group) {
  * (status `error`) needs one. A key is replaced, not signed in.
  *
  * @param {any} account  one entry of status.accounts
- * @returns {'claude'|'codex'|null}
+ * @returns {'claude'|'codex'|'grok'|null}
  */
 export function needsSignIn(account) {
   var a = account || {};
@@ -829,7 +831,7 @@ export function needsSignIn(account) {
   // Its tokens come from a file (importFrom) on every reload, so a sign-in
   // here would be stored and never used: fileSignInHint says where to go.
   if (a.credentialsFromFile) return null;
-  return a.provider === 'codex' ? 'codex' : 'claude';
+  return a.provider === 'codex' || a.provider === 'grok' ? a.provider : 'claude';
 }
 
 /**
@@ -843,7 +845,7 @@ export function needsSignIn(account) {
 export function fileSignInHint(account) {
   var a = account || {};
   if (a.type !== 'oauth' || a.status !== 'error' || !a.credentialsFromFile) return null;
-  var tool = a.provider === 'codex' ? 'the Codex CLI (codex login)' : 'Claude Code (claude /login)';
+  var tool = a.provider === 'codex' ? 'the Codex CLI (codex login)' : a.provider === 'grok' ? 'Grok Build (grok login)' : 'Claude Code (claude /login)';
   return 'Its sign-in is read from a credentials file. Sign in again in ' + tool + ', then Reload config on the Settings page.';
 }
 
@@ -886,15 +888,25 @@ export function signInRequest(step, body, key) {
  * and ends on a page showing a code to paste. Codex has one link whose
  * redirect names localhost:1455: it finishes by itself on the proxy's machine,
  * and anywhere else lands on an address that does not load, which is the
- * thing to paste.
+ * thing to paste. Grok's is a device sign-in: one link that works anywhere,
+ * a code to check on xAI's page, and nothing to paste.
  *
  * @param {any} start  the reply to 'start'
  * @param {string} hostname  location.hostname
- * @returns {{ href: string, auto: boolean, ask: string, note: string|null }}
+ * @returns {{ href: string, auto: boolean, ask: string, note: string|null, code?: string }}
  */
 export function signInPlan(start, hostname) {
   var s = start || {};
   var local = isLoopbackHost(hostname);
+  if (s.provider === 'grok') {
+    return {
+      href: s.url,
+      auto: true,
+      ask: 'Check that xAI\'s page shows this code, then approve the sign-in. This finishes by itself.',
+      note: s.note || null,
+      code: s.userCode || '',
+    };
+  }
   if (s.provider === 'codex') {
     var auto = local && !!s.listening;
     return {
@@ -933,7 +945,7 @@ export function signInStatusOutcome(res, label) {
     return {
       done: true, kind: 'warn',
       text: 'Signed in' + (r.account ? ' as ' + r.account : '') + ', but that account reads its sign-in from a credentials file, which TeamClaude keeps using. Sign in again in '
-        + (label === 'Codex' ? 'the Codex CLI' : 'Claude Code') + ', then Reload config.',
+        + (label === 'Codex' ? 'the Codex CLI' : label === 'Grok' ? 'Grok Build' : 'Claude Code') + ', then Reload config.',
     };
   }
   if (r.state === 'succeeded') {
@@ -1706,15 +1718,18 @@ export function accountMeters(account, fable, now) {
   var extra = [];
   /** @type {string|null} */
   var text = null;
+  // Codex and Grok plans have no Fable bucket, and a session row only when a
+  // reading states one.
+  var otherPlan = a.provider === 'codex' || a.provider === 'grok';
   if (q.unified5h != null || q.unified7d != null) {
-    if (a.provider !== 'codex') {
+    if (!otherPlan) {
       scopedWeeklyRows(q).forEach(function (r) {
         if (r.family === 'fable') slots[0] = quotaMeter('7-day ' + (fable || 'Fable'), r.utilization, r.resetAt);
         else extra.push(quotaMeter('7-day ' + r.label, r.utilization, r.resetAt));
       });
     }
-    if (a.provider === 'codex' ? q.unified5h != null : showSessionRow(q)) slots[1] = quotaMeter('5-hour limit', q.unified5h, q.unified5hReset);
-    if (showWeeklyRow(q)) slots[2] = quotaMeter('7-day limit', q.unified7d, q.unified7dReset);
+    if (otherPlan ? q.unified5h != null : showSessionRow(q)) slots[1] = quotaMeter('5-hour limit', q.unified5h, q.unified5hReset);
+    if (showWeeklyRow(q)) slots[2] = quotaMeter(q.planPeriod === 'monthly' ? 'Monthly limit' : '7-day limit', q.unified7d, q.unified7dReset);
     // Show usable session capacity: a fresh session cannot bypass an empty
     // weekly bucket. Keep upstream's reading intact for routing and persistence.
     var weekly = [slots[0], slots[2]].filter(function (m) { return exhaustedMeter(m, at); });
@@ -1776,13 +1791,14 @@ export function poolSummary(accounts, slot, fable, now) {
 export function accountGroup(account) {
   var a = account || {};
   if (a.backend) return 'backend:' + a.backend;
-  return a.provider === 'codex' ? 'codex' : 'anthropic';
+  return a.provider === 'codex' || a.provider === 'grok' ? a.provider : 'anthropic';
 }
 
 /** @param {string} group */
 export function groupLabel(group) {
   if (group === 'anthropic') return 'Claude';
   if (group === 'codex') return 'Codex';
+  if (group === 'grok') return 'Grok';
   var host = String(group || '').replace(/^backend:/, '');
   /** @type {Record<string, string>} */
   var known = {
@@ -1801,7 +1817,7 @@ export function providerTabs(accounts) {
   var counts = {};
   list.forEach(function (a) { var g = accountGroup(a); counts[g] = (counts[g] || 0) + 1; });
   /** @param {string} g */
-  var rank = function (g) { return g === 'anthropic' ? 0 : g === 'codex' ? 1 : 2; };
+  var rank = function (g) { return g === 'anthropic' ? 0 : g === 'codex' ? 1 : g === 'grok' ? 2 : 3; };
   var groups = Object.keys(counts).sort(function (x, y) {
     return rank(x) - rank(y) || (x < y ? -1 : x > y ? 1 : 0);
   });
@@ -2097,7 +2113,7 @@ export function insightsSeries(data, split, accounts) {
     for (var i = 0; i < n; i++) t.values[i] += p.values[i] || 0;
     t.total += p.tokens;
   });
-  ['claude', 'codex', 'backend'].forEach(function (tone) {
+  ['claude', 'codex', 'grok', 'backend'].forEach(function (tone) {
     if (!tones[tone]) return;
     var t = tones[tone];
     out.push({ key: t.key, label: t.label, color: t.color, values: t.values, total: t.total });
@@ -2206,12 +2222,13 @@ export function insightsKpis(data, accounts) {
   var range = data ? data.range : '30d';
   var list = accounts || [];
   /** @type {Record<string, number>} */
-  var tally = { claude: 0, codex: 0, backend: 0 };
+  var tally = { claude: 0, codex: 0, grok: 0, backend: 0 };
   list.forEach(function (a) { tally[providerTone(accountGroup(a))]++; });
   /** @type {string[]} */
   var parts = [];
   if (tally.claude) parts.push(tally.claude + ' Claude');
   if (tally.codex) parts.push(tally.codex + ' Codex');
+  if (tally.grok) parts.push(tally.grok + ' Grok');
   if (tally.backend) parts.push(tally.backend + (tally.backend === 1 ? ' backend' : ' backends'));
   var enabled = list.filter(function (a) { return !a.disabled; }).length;
   var cost = data && data.cost;
@@ -2318,12 +2335,12 @@ const PAGE = `<!doctype html>
     --bg: #0d1117; --side: #0a0e13; --panel: #151b23; --panel2: #1c2430; --line: #262f3b; --track: #252e3a;
     --text: #d7dde4; --dim: #8a949f; --accent: #53b1fd; --accent-bg: rgba(83,177,253,.12);
     --ok: #3fb950; --warn: #d29922; --bad: #f85149;
-    --claude: #e0896a; --codex: #2bb88f; --backend: #a58bf0;
+    --claude: #e0896a; --codex: #2bb88f; --grok: #6cb6c9; --backend: #a58bf0;
     /* Insights charts. Separate from the provider colours above, which are
        tuned for text and dots: a filled area needs a darker, validated step of
        the same hue, and a series palette whose neighbours stay apart for
        colour-blind readers. */
-    --ip-claude: #d95926; --ip-codex: #199e70; --ip-backend: #9085e9;
+    --ip-claude: #d95926; --ip-codex: #199e70; --ip-grok: #2c8fa8; --ip-backend: #9085e9;
     --ik-cacheRead: #3987e5; --ik-cacheWrite: #c98500; --ik-input: #d55181; --ik-output: #008300;
     --is1: #3987e5; --is2: #d95926; --is3: #199e70; --is4: #c98500; --is5: #d55181; --is6: #008300; --is7: #9085e9; --is8: #e66767;
     --igrid: #222a35; --iaxis: #343e4b;
@@ -2334,8 +2351,8 @@ const PAGE = `<!doctype html>
       --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
       --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
       --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
-      --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
-      --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-backend: #6250d6;
+      --claude: #b8572f; --codex: #0b7d5f; --grok: #1f6f86; --backend: #7a52cc;
+      --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-grok: #3aa3bd; --ip-backend: #6250d6;
       --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
       --is1: #2a78d6; --is2: #eb6834; --is3: #1baf7a; --is4: #eda100; --is5: #e87ba4; --is6: #008300; --is7: #6250d6; --is8: #e34948;
       --igrid: #eceef1; --iaxis: #c3c8cf;
@@ -2346,8 +2363,8 @@ const PAGE = `<!doctype html>
     --bg: #f6f8fa; --side: #ffffff; --panel: #ffffff; --panel2: #f3f5f8; --line: #d8dee4; --track: #e4e8ee;
     --text: #1f2328; --dim: #59636e; --accent: #0969da; --accent-bg: rgba(9,105,218,.10);
     --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
-    --claude: #b8572f; --codex: #0b7d5f; --backend: #7a52cc;
-    --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-backend: #6250d6;
+    --claude: #b8572f; --codex: #0b7d5f; --grok: #1f6f86; --backend: #7a52cc;
+    --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-grok: #3aa3bd; --ip-backend: #6250d6;
     --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
     --is1: #2a78d6; --is2: #eb6834; --is3: #1baf7a; --is4: #eda100; --is5: #e87ba4; --is6: #008300; --is7: #6250d6; --is8: #e34948;
     --igrid: #eceef1; --iaxis: #c3c8cf;
@@ -2442,17 +2459,21 @@ const PAGE = `<!doctype html>
   .badge.provider { color: var(--text); }
   .badge.provider.anthropic { color: var(--claude); border-color: var(--claude); }
   .badge.provider.codex { color: var(--codex); border-color: var(--codex); }
+  .badge.provider.grok { color: var(--grok); border-color: var(--grok); }
   /* One colour per provider family (providerTone), on its dot, its section
      and its sign-in button, so a Claude login and a ChatGPT one never look alike. */
   .pdot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; background: var(--backend); }
-  .pdot.claude { background: var(--claude); } .pdot.codex { background: var(--codex); }
+  .pdot.claude { background: var(--claude); } .pdot.codex { background: var(--codex); } .pdot.grok { background: var(--grok); }
   .rows.claude, .pcard.claude { border-left: 3px solid var(--claude); }
   .rows.codex, .pcard.codex { border-left: 3px solid var(--codex); }
+  .rows.grok, .pcard.grok { border-left: 3px solid var(--grok); }
   .rows.backend, .pcard.backend { border-left: 3px solid var(--backend); }
   .btn.claude { color: var(--claude); border-color: var(--claude); background: color-mix(in srgb, var(--claude) 12%, transparent); }
   .btn.codex { color: var(--codex); border-color: var(--codex); background: color-mix(in srgb, var(--codex) 12%, transparent); }
-  .btn.claude:hover, .btn.codex:hover { filter: brightness(1.15); }
+  .btn.grok { color: var(--grok); border-color: var(--grok); background: color-mix(in srgb, var(--grok) 12%, transparent); }
+  .btn.claude:hover, .btn.codex:hover, .btn.grok:hover { filter: brightness(1.15); }
   .btn.claude:hover { color: var(--claude); border-color: var(--claude); } .btn.codex:hover { color: var(--codex); border-color: var(--codex); }
+  .btn.grok:hover { color: var(--grok); border-color: var(--grok); }
   .btn.rm { min-width: 112px; }
   .btn.danger { color: var(--bad); border-color: var(--bad); }
   .btn.danger:hover { color: #fff; background: var(--bad); border-color: var(--bad); }
@@ -2466,7 +2487,8 @@ const PAGE = `<!doctype html>
   .phead h2 { margin: 0; display: flex; align-items: center; gap: 8px; }
   .phead .tag { flex: 1 1 200px; }
   .signin { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 0 0 16px; }
-  .signin.claude { border-color: var(--claude); } .signin.codex { border-color: var(--codex); }
+  .signin.claude { border-color: var(--claude); } .signin.codex { border-color: var(--codex); } .signin.grok { border-color: var(--grok); }
+  .signin .code { font: 600 18px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
   .signin .sh { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 10px; }
   .signin .sh .sp { flex: 1; }
   .signin ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 10px; }
@@ -3110,7 +3132,7 @@ ${SHARED_HELPERS}
   // Claude provider's cursor, so a backend group has a current account only
   // when that cursor is on one of its own.
   function currentIn(s, group, members) {
-    var provider = group === 'codex' ? 'codex' : 'anthropic';
+    var provider = group === 'codex' || group === 'grok' ? group : 'anthropic';
     var name = s.currentAccounts ? s.currentAccounts[provider] : s.currentAccount;
     return members.some(function (a) { return a.name === name; }) ? name : null;
   }
@@ -3153,7 +3175,7 @@ ${SHARED_HELPERS}
     head.appendChild(title);
     head.appendChild(el('span', '', members.length + (members.length === 1 ? ' account' : ' accounts')));
     card.appendChild(head);
-    var order = session ? [1] : (group === 'codex' ? [2, 1] : [0, 1, 2]);
+    var order = session ? [1] : (group === 'codex' || group === 'grok' ? [2, 1] : [0, 1, 2]);
     var pools = order.map(function (i) { return poolSummary(members, i, fable); }).filter(function (p) { return p.label; });
     if (!pools.length) {
       if (session) card.appendChild(poolBlock({ label: '5-hour limit', count: 0, segments: [] }, false));
@@ -3180,7 +3202,7 @@ ${SHARED_HELPERS}
     if (resets) card.appendChild(el('div', 'r', 'Resets left: ' + resets.left + ' across ' + resets.accounts + (resets.accounts === 1 ? ' account' : ' accounts')));
     // Drain mode's queue, when the server reports one: the account being spent
     // first and when it resets, so "why this account" reads off the card.
-    var provider = group === 'codex' ? 'codex' : 'anthropic';
+    var provider = group === 'codex' || group === 'grok' ? group : 'anthropic';
     var queue = !session && s.drainQueue && s.drainQueue[provider];
     var head0 = queue && queue.length ? members.filter(function (a) { return a.name === queue[0]; })[0] : null;
     if (head0) {
@@ -3295,6 +3317,7 @@ ${SHARED_HELPERS}
   var GROUP_BLURB = {
     anthropic: 'Claude Pro and Max sign-ins, and Anthropic API keys. Claude Code uses these.',
     codex: 'ChatGPT sign-ins (Plus, Pro, Business). The Codex CLI uses these.',
+    grok: 'xAI sign-ins (SuperGrok, X subscriptions). Grok Build uses these.',
   };
 
   // The heading over one provider's accounts, wherever they are listed.
@@ -3308,7 +3331,7 @@ ${SHARED_HELPERS}
   // The accounts, one section per provider, with the controls that change
   // where rotation may reach each one. A control this key would be refused is
   // not drawn at all; the line at the top of the page says why, once
-  // (callerNotice). Claude and Codex always get a section, empty or not, so
+  // (callerNotice). Claude, Codex and Grok always get a section, empty or not, so
   // the page says where a sign-in will land before there is one.
   function renderAccountsPage(s) {
     var canSignIn = callerCan(s.caller, '/teamclaude/login/start');
@@ -3317,8 +3340,8 @@ ${SHARED_HELPERS}
     var box = document.getElementById('accountGroups');
     box.textContent = '';
     var accounts = s.accounts || [];
-    var groups = ['anthropic', 'codex'].concat(providerTabs(accounts).slice(1).map(function (t) { return t.key; })
-      .filter(function (g) { return g !== 'anthropic' && g !== 'codex'; }));
+    var groups = ['anthropic', 'codex', 'grok'].concat(providerTabs(accounts).slice(1).map(function (t) { return t.key; })
+      .filter(function (g) { return g !== 'anthropic' && g !== 'codex' && g !== 'grok'; }));
     groups.forEach(function (g) {
       var members = accounts.filter(function (a) { return accountGroup(a) === g; });
       var head = el('div', 'phead');
@@ -3432,7 +3455,7 @@ ${SHARED_HELPERS}
     bar.style.display = canSignIn ? '' : 'none';
     if (!canSignIn) return;
     bar.appendChild(el('span', 'lbl', 'Add an account:'));
-    [['claude', 'Sign in to Claude', 'Sign in with a Claude Pro or Max account'], ['codex', 'Sign in to Codex', 'Sign in with a ChatGPT account, for the Codex CLI']].forEach(function (p) {
+    [['claude', 'Sign in to Claude', 'Sign in with a Claude Pro or Max account'], ['codex', 'Sign in to Codex', 'Sign in with a ChatGPT account, for the Codex CLI'], ['grok', 'Sign in to Grok', 'Sign in with an xAI account, for Grok Build']].forEach(function (p) {
       var b = button('btn ' + p[0], p[1], function () { startSignIn(p[0], null); });
       b.title = p[2];
       b.insertBefore(el('span', 'pdot ' + p[0]), b.firstChild);
@@ -4545,7 +4568,7 @@ ${SHARED_HELPERS}
     });
     var provider = document.getElementById('logProvider');
     fillFilter(provider, [], '');
-    [['anthropic', 'Claude'], ['codex', 'Codex']].forEach(function (p) {
+    [['anthropic', 'Claude'], ['codex', 'Codex'], ['grok', 'Grok']].forEach(function (p) {
       var option = el('option', '', p[1]);
       option.value = p[0];
       provider.appendChild(option);
@@ -5422,7 +5445,7 @@ ${SHARED_HELPERS}
   var signInSeq = 0;
   var signInTimer = null;
   var SIGN_IN_POLL_MS = 2000;
-  var SIGN_IN_LABEL = { claude: 'Claude', codex: 'Codex' };
+  var SIGN_IN_LABEL = { claude: 'Claude', codex: 'Codex', grok: 'Grok' };
 
   function pageHost() {
     // A linked instance is another machine whatever its address says: one
@@ -5605,7 +5628,7 @@ ${SHARED_HELPERS}
       var steps = el('ol');
       var one = el('li', '', signIn.who
         ? 'Open the sign-in page and sign in as ' + signIn.who + '.'
-        : 'Open the sign-in page and sign in with the ' + (p === 'codex' ? 'ChatGPT' : 'Claude') + ' account you want to add.');
+        : 'Open the sign-in page and sign in with the ' + ({ codex: 'ChatGPT', grok: 'xAI' }[p] || 'Claude') + ' account you want to add.');
       var line = el('div', 'line');
       var open = el('a', 'btn ' + p, 'Open sign-in page');
       open.href = plan.href;
@@ -5622,17 +5645,22 @@ ${SHARED_HELPERS}
       one.appendChild(line);
       steps.appendChild(one);
       var two = el('li', '', plan.ask);
-      var line2 = el('div', 'line');
-      var paste = el('input');
-      paste.placeholder = p === 'codex' ? 'http://localhost:1455/auth/callback?code=…' : 'Paste the code here';
-      paste.autocomplete = 'off';
-      paste.spellcheck = false;
-      var finish = button('btn primary', 'Finish sign-in', function () { submitSignInCode(paste, finish); });
-      paste.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitSignInCode(paste, finish); });
-      line2.appendChild(paste);
-      line2.appendChild(finish);
-      two.appendChild(line2);
-      if (signIn.pasteError) two.appendChild(el('div', 'st error', signIn.pasteError));
+      if (plan.code != null) {
+        // A device sign-in: the code to check on xAI's page, and no paste.
+        two.appendChild(el('div', 'line code', plan.code));
+      } else {
+        var line2 = el('div', 'line');
+        var paste = el('input');
+        paste.placeholder = p === 'codex' ? 'http://localhost:1455/auth/callback?code=…' : 'Paste the code here';
+        paste.autocomplete = 'off';
+        paste.spellcheck = false;
+        var finish = button('btn primary', 'Finish sign-in', function () { submitSignInCode(paste, finish); });
+        paste.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitSignInCode(paste, finish); });
+        line2.appendChild(paste);
+        line2.appendChild(finish);
+        two.appendChild(line2);
+        if (signIn.pasteError) two.appendChild(el('div', 'st error', signIn.pasteError));
+      }
       steps.appendChild(two);
       box.appendChild(steps);
       if (plan.note) box.appendChild(el('div', 'st warn', plan.note));

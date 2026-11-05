@@ -2696,7 +2696,7 @@ export class TUI {
     const login = this.login;
     if (!login) return { lines, links };
     const prompt = login.prompt;
-    const brand = prompt?.provider === 'codex' ? 'OpenAI' : prompt ? 'Claude' : '';
+    const brand = prompt ? ({ codex: 'OpenAI', grok: 'xAI' })[/** @type {string} */ (prompt.provider)] || 'Claude' : '';
     lines.push(` ${bold(`Sign in "${safeLine(login.account, 60)}"`)}${brand ? dim(` · ${brand}`) : ''}`);
     lines.push('');
     if (!prompt) {
@@ -2726,6 +2726,15 @@ export class TUI {
     // was done on this machine, not as what the person sees: a server whose
     // terminal only looks local (see isRemoteSession) opened it where nobody is.
     const automatic = prompt.listening && !prompt.remote;
+    // A device sign-in finishes when xAI says it was approved; there is
+    // nothing to paste.
+    if (prompt.userCode) {
+      if (automatic) prose('A browser was opened on this machine.');
+      prose('1. Open the link on any device and sign in.');
+      prose(`2. Check the page shows ${prompt.userCode}, then approve it. This finishes by itself.`);
+      if (login.error) prose(`✗ ${login.error}`, red);
+      return { lines, links };
+    }
     if (automatic) prose('A browser was opened on this machine. Approving the sign-in there finishes it by itself.');
     if (prompt.provider === 'claude') {
       if (automatic) prose('Not at this machine? Open the link on your device, sign in, and paste the code the page shows.');
@@ -2836,13 +2845,13 @@ export class TUI {
       const fixed = 20 + typeCell + NAME_MIN + routeCells + tagW + spendW + creditW + switchW + routeW;
       const span = (/** @type {number} */ n, /** @type {number} */ bar) => fixed + 6 * (n - 1) + n * bar;
       const roomFor = (/** @type {number} */ n) => span(n, BAR_MIN) <= W;
-      // No Ses bar once every Codex account here has said it meters no 5h window
+      // No Ses bar once every Codex or Grok account here has said it meters no 5h window
       // (`sessionWindowStated`, the fact a reading leaves behind; not
       // `unified5h` itself, which the expiry sweep nulls every five hours on a
       // row that does have one); a Claude row or an unreported account keeps it,
       // and so does a reading that is still there (showSessionRow).
       const shortBar = cat !== 'unified'
-        || members.some(a => providerOf(a) !== 'codex' || showSessionRow(a.quota) || a.quota.unified7d == null);
+        || members.some(a => providerOf(a) === 'anthropic' || showSessionRow(a.quota) || a.quota.unified7d == null);
       // The family bars are the first thing to go: below the width where they
       // fit even at BAR_MIN they would push the row past the edge, and a row
       // cut mid-bar reads worse than one that simply doesn't draw them (the
@@ -3154,6 +3163,8 @@ export class TUI {
       t2 = q.unified7dReset ?? backendWindows?.weekly?.resetAt ?? null;
       w1 = FIVE_HOUR_MS;
       w2 = SEVEN_DAY_MS;
+      // A Grok plan whose one pool is monthly keeps it in the weekly fields.
+      if (q.planPeriod === 'monthly' && q.unified7d != null) { l2 = 'Mon'; w2 = MONTH_MS; }
       // A plan with a monthly window and no weekly one (the newer Kimi plans)
       // puts the month in the Wk slot rather than leaving it empty.
       if (r2 == null && q.unified7d == null && backendWindows?.monthly != null) {
@@ -3202,7 +3213,7 @@ export class TUI {
     // A list with no five-hour window to draw (see _listLayout) starts the row
     // at the weekly bar.
     const weeklyFirst = !shortBar && category !== 'metered';
-    // A Codex row whose subscription meters no five-hour window draws only the
+    // A Codex or Grok row whose subscription meters no five-hour window draws only the
     // weekly bar even while Claude rows on the same list keep Ses/Wk: a `Ses -`
     // cell there said nothing. Keyed on the fact the reading left behind
     // (`sessionWindowStated`, see _updateCodexQuota), never on `unified5h`
@@ -3214,7 +3225,7 @@ export class TUI {
     // holding the account out of rotation. The weekly bar takes the two cells'
     // width (bar + `  Wk ` + bar) so the row still ends where its neighbours do.
     const weeklyOnly = !weeklyFirst && showBoth && category === 'unified'
-      && providerOf(a) === 'codex' && !showSessionRow(q) && q.unified7d != null;
+      && providerOf(a) !== 'anthropic' && !showSessionRow(q) && q.unified7d != null;
     // The mirror case: a plan with no shared weekly window (a Team seat).
     const sessionOnly = !weeklyFirst && showBoth && category === 'unified' && !showWeeklyRow(q);
     if (weeklyFirst || weeklyOnly) [l1, r1, t1, w1, th1] = [l2, r2, t2, w2, th2];

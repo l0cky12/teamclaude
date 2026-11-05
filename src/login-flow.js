@@ -29,8 +29,10 @@ export const PANEL_LOGIN_TIMEOUT_MS = 5 * 60_000;
  * login panel, which owns the screen and the keyboard while it is open.
  *
  * @typedef {object} LoginPrompt
- * @property {'claude' | 'codex'} provider
+ * @property {'claude' | 'codex' | 'grok'} provider
  * @property {string} url  the link to show and copy; it works from any device
+ * @property {string} [userCode]  a device sign-in's code (Grok), to check against the
+ *   one the page shows; such a sign-in finishes by itself and takes no paste
  * @property {boolean} remote  the terminal looks remote, so no browser was opened here
  * @property {boolean} listening  a loopback listener is waiting for the browser to come back by itself
  * @property {string | null} note  why that listener is not running, when it matters
