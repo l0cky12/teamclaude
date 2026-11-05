@@ -4195,6 +4195,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir, sx, route);
     }
     accountManager.events?.add({ kind: 'rotation', type: 'exhausted', provider: ctx.provider ?? null, reason: 'all_exhausted', message: `All accounts exhausted: answered 429, retry after ${retryAfter}s` });
+    const enabledCandidates = candidates.filter(a => !a.disabled);
     res.writeHead(429, {
       'Content-Type': 'application/json',
       'retry-after': String(retryAfter),
@@ -4204,7 +4205,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: candidates.length > 0 && candidates.every(a => a.status === 'throttled')
+        message: enabledCandidates.length > 0 && enabledCandidates.every(a => a.status === 'throttled')
           ? `All accounts reached usage limits. Next account resets at ${new Date(resetAt).toISOString()}.`
           : exhaustedMessage(candidates, ctx.model, retryAfter),
       },
@@ -4435,9 +4436,12 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       let refusal = '';
       const raw = await readErrorBody(upstreamRes.body).catch(() => null);
       try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      // A named per-minute/second ceiling is a burst throttle even without
+      // headers; it must not quarantine the whole pool for an hour.
+      const transientLimit = /\b(?:per[ -](?:second|minute)|[rt]pm|rps)\b/i.test(refusal);
       const usageLimited = /usage[ -]?limit|quota|credits? (?:exhausted|depleted)/i.test(refusal);
-      const accountLimited = usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal)));
-      const requestScoped = headerless && !accountLimited;
+      const accountLimited = !transientLimit && (usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
+      const requestScoped = headerless && !accountLimited && !transientLimit;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
       // status means a quota bucket is spent, so waiting and retrying the SAME

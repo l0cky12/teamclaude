@@ -99,6 +99,35 @@ test('a headerless 429 without a message defaults to one hour and later requests
   });
 });
 
+for (const message of ['rate limit of 50 requests per minute', 'usage limit of 100 tokens per second', 'rate limit: 50 RPM']) {
+  test(`headerless ${message} uses transient failover without an hour-long cooldown`, async () => {
+    await withFleet((name, _req, res) => {
+      if (name === 'a') return reject(res, {}, message);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true}');
+    }, async ({ am, post, seen }) => {
+      const res = await post();
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), { ok: true });
+      assert.deepEqual(seen, ['a', 'b']);
+      assert.equal(am.accounts[0].status, 'active');
+      assert.equal(am.accounts[0].rateLimitedUntil, null);
+      assert.ok(am.isPaused(0), 'the transient admission pause is still armed');
+      assert.equal(am.accounts[1].status, 'active');
+      assert.equal(res.headers.get(RESET), null);
+    });
+  });
+}
+
+test('disabled accounts do not suppress the standard pool-exhaustion message', async () => {
+  await withFleet((_name, _req, res) => reject(res), async ({ am, post, seen }) => {
+    am.accounts[2].disabled = true;
+    await assertExhausted(await post(), am);
+    assert.deepEqual(seen, ['a', 'b']);
+    assert.equal(am.accounts[2].rateLimitedUntil, null);
+  });
+});
+
 test('global 429 chooses the first account to recover, using the last blocking clock per account', async t => {
   const now = Date.now();
   const resets = { a: now + 900_000, b: now + 600_000, c: now + 1200_000 };
