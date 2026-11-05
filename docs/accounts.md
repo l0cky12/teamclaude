@@ -26,18 +26,19 @@ The server starts with no accounts, so a new install (a fresh Docker container, 
 
 ## Signing in from the dashboard
 
-The [web dashboard](usage.md#status-dashboard-browser)'s **Accounts** page has a **Sign in to Claude** button and a **Sign in to Codex** button. Either one starts the same sign-in as `teamclaude login` (or `login --codex`) inside the running server, and opens a panel:
+The [web dashboard](usage.md#status-dashboard-browser)'s **Accounts** page has a **Sign in to Claude**, a **Sign in to Codex** and a **Sign in to Grok** button. Each one starts the same sign-in as `teamclaude login` (or `login --codex`, `login --grok`) inside the running server, and opens a panel:
 
 1. **Open sign-in page** opens the provider's page in a new tab. The link is also in a box beside the button, to copy to a browser on another device.
 2. Sign in, and approve. Then paste what the browser was left with into the field, and press **Finish sign-in**:
    - Claude: the page shows a code. Paste it.
    - Codex: OpenAI sends the browser to `http://localhost:1455/auth/callback?…`. On any machine but the proxy's, that page does not load. Copy its whole address from the address bar and paste it.
+   - Grok: nothing to paste. The panel shows a code; check xAI's page shows the same one and approve it, and the panel finishes by itself.
 
 When the dashboard is open on the proxy's own machine (at `localhost` or `127.0.0.1`), the sign-in finishes by itself once you approve: the browser reaches the listener on that machine, and there is nothing to paste. The panel says which case you are in. A paste that cannot be used, such as one from another attempt, is refused with the reason, and you can paste again.
 
-The tokens go to the account the browser signed in as, matched by identity exactly as `teamclaude login` does. Signing in as an account TeamClaude already has refreshes its sign-in instead of adding it twice. That is also what **Sign in again** does: it is on the row of a Claude or Codex login that upstream has signed out (`error`), and it opens the same panel. Each sign-in is on the Logs page as `Sign-in started (dashboard)`, then succeeded, failed, cancelled or timed out.
+The tokens go to the account the browser signed in as, matched by identity exactly as `teamclaude login` does. Signing in as an account TeamClaude already has refreshes its sign-in instead of adding it twice. That is also what **Sign in again** does: it is on the row of a Claude, Codex or Grok login that upstream has signed out (`error`), and it opens the same panel. Each sign-in is on the Logs page as `Sign-in started (dashboard)`, then succeeded, failed, cancelled or timed out.
 
-An account that [reads its tokens from a file](#delegating-credentials-to-a-file-importfrom) (`importFrom`) has no **Sign in again**: its file is read again on every reload, so a sign-in stored in the config would never be used. Its row says to sign in again in the tool that owns the file (`claude /login` for Claude Code, `codex login` for the Codex CLI) and then press **Reload config** on the Settings page. A sign-in from the panel that lands on such an account says the same rather than reporting it fixed. `/teamclaude/status` marks these accounts with `credentialsFromFile: true`; it never names the file.
+An account that [reads its tokens from a file](#delegating-credentials-to-a-file-importfrom) (`importFrom`) has no **Sign in again**: its file is read again on every reload, so a sign-in stored in the config would never be used. Its row says to sign in again in the tool that owns the file (`claude /login` for Claude Code, `codex login` for the Codex CLI, `grok login` for Grok Build) and then press **Reload config** on the Settings page. A sign-in from the panel that lands on such an account says the same rather than reporting it fixed. `/teamclaude/status` marks these accounts with `credentialsFromFile: true`; it never names the file.
 
 The server runs one dashboard sign-in at a time. Starting another cancels the first, unless the first already has its code (the browser came back to the listener, or the code was pasted) and is being finished: then the new one is refused until the first is done. **Cancel** gives up and closes the listener; once the code has arrived there is nothing left to cancel, and the account is stored when the exchange ends. The panel waits five minutes. Nothing opens on the server's own screen: the link opens in the browser the dashboard runs in. The buttons are hidden for a page holding a `proxy.clientKeys` key, because signing accounts in is the operator's business. The endpoints behind them are in [Usage](usage.md#account-sign-in-and-removal-endpoints).
 
@@ -654,6 +655,88 @@ just reset. The whole decision — token refresh, credit read and redemption —
 held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
+
+## Grok accounts (experimental)
+
+An xAI subscription (SuperGrok, or Grok through an X subscription) can be pooled
+for [Grok Build](https://github.com/xai-org/grok-build), xAI's coding CLI (`grok`).
+
+```bash
+teamclaude login --grok      # device sign-in, repeat per account
+```
+
+This is the device sign-in `grok login --device-auth` uses. TeamClaude prints a
+page on `accounts.x.ai` and a code. Open the page on any device, check it shows
+the same code, and approve it; the sign-in then finishes by itself. Nothing is
+pasted back, so it works the same over SSH. A browser is opened here unless
+the session looks remote or you pass `--no-browser`. `--name` labels the
+account (it defaults to the email on the login). Signing in again as an xAI
+user TeamClaude already has refreshes that account instead of adding it twice.
+
+The dashboard's **Sign in to Grok** button and the TUI's login panel run the
+same sign-in and show the code beside the link.
+
+To pool the login Grok Build already has, point an account at its credentials
+file instead. It defaults to `~/.grok/auth.json`:
+
+```json
+{ "name": "me@example.com", "type": "oauth", "provider": "grok" }
+```
+
+`importFrom` names another copy of that file. xAI rotates the refresh token on
+every renewal, so a login pooled from Grok Build's file and renewed by
+TeamClaude signs Grok Build out of it, and the other way round, exactly as with
+an imported Codex login. Give the pool its own logins with `teamclaude login
+--grok` when you also use Grok Build directly.
+
+Then point Grok Build at TeamClaude:
+
+```bash
+GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:3456/grok/v1 grok
+```
+
+Grok Build still has to be signed in itself (`grok login`), but its token is
+replaced on every request by the pooled account's.
+
+### How it shares the port
+
+Grok Build's own paths are `/v1/models`, `/v1/responses` and so on, which are
+Anthropic's paths on this listener. So Grok is reached under a `/grok` prefix:
+everything below `/grok/` draws on the Grok accounts, and the prefix is removed
+before the request goes to `https://cli-chat-proxy.grok.com`. A Grok account is
+never offered a Claude or Codex request, and the other way round.
+
+In [MITM mode](proxy-modes.md#mitm-proxy-mode-default), `cli-chat-proxy.grok.com`
+is intercepted once the pool has a Grok account, and every request to that host
+is pooled. Whether Grok Build honours `HTTPS_PROXY` and the proxy's CA has not
+been checked, so the base URL above is the supported route.
+
+### What differs from a Claude account
+
+- The credential is injected as `Authorization: Bearer` with
+  `x-xai-token-auth: xai-grok-cli`. Grok Build also sends who is signed in
+  (`x-userid`, `x-grok-user-id`, `x-email`); those are replaced with the
+  serving account's, and dropped when it has none, so a request moved to
+  another account never carries the first one's identity.
+- Tokens refresh against `auth.x.ai` with Grok Build's own client id.
+- The body is forwarded untouched, as for Codex.
+
+### Quota
+
+A Grok plan has one shared allowance per period, weekly or monthly, and no
+5-hour window. Grok's responses carry no usage headers, so the allowance is
+known only from the [quota probe](quota.md#quota-probe), which reads the same
+billing endpoint Grok Build's usage view does. The reading fills the weekly
+bar (named **Monthly** for a monthly plan), so the switch threshold rotates a
+Grok account before its plan runs out. With the probe off, as it is by default,
+a Grok account's usage is unknown until a request is refused.
+
+A 429 whose body says the plan is spent (`You ran out of credits`, `Plan limit
+reached`) holds that account and moves the request to the next Grok account,
+as a spent Codex window does. Any other 429 is treated as a rate limit: the
+account pauses and the request takes one hop to an idle sibling. These
+messages come from Grok Build's own error handling; TeamClaude has not seen
+one from a live account yet.
 
 ## Claude banked usage-limit resets
 
