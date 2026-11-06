@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   calendarFor, checkoutFromPlist, checkoutFromService, composeUpdateAgentPath, composeUpdateLogPath,
   composeUpdateServicePath, composeUpdateStatus, composeUpdateTimerPath, everyFromPlist, everyFromTimer,
-  formatEvery, formatUsec, installComposeUpdate, parseEvery, randomizedDelay, renderComposeUpdate,
+  formatEvery, installComposeUpdate, parseEvery, parseNextElapse, randomizedDelay, renderComposeUpdate,
   runningInContainer, systemdUnquote, uninstallComposeUpdate, updaterPath, COMPOSE_UPDATE_LABEL,
   COMPOSE_UPDATE_SERVICE, COMPOSE_UPDATE_TIMER,
 } from '../src/compose-update.js';
@@ -57,11 +57,18 @@ test('runningInContainer is the docker or podman marker, not a guess', () => {
   assert.equal(runningInContainer(() => false), false);
 });
 
-test('formatUsec reads a microsecond timestamp and ignores anything else', () => {
-  assert.equal(formatUsec('1700000000000000'), new Date(1700000000000).toISOString());
-  assert.equal(formatUsec('n/a'), null);
-  assert.equal(formatUsec(''), null);
-  assert.equal(formatUsec('5'), null);
+test('parseNextElapse reads the timestamp systemctl show actually prints', () => {
+  // `show --value` prints local time. The zone abbreviation is not parsed.
+  const shown = 'Fri 2026-11-06 00:00:00 CST';
+  assert.equal(parseNextElapse(shown), new Date(2026, 10, 6, 0, 0, 0).toISOString());
+  assert.equal(parseNextElapse(`${shown}\n`), new Date(2026, 10, 6, 0, 0, 0).toISOString());
+  // A bare integer is the D-Bus microsecond property, not what show --value prints.
+  assert.equal(parseNextElapse('1700000000000000'), new Date(1700000000000).toISOString());
+  assert.equal(parseNextElapse('n/a'), null);
+  assert.equal(parseNextElapse(''), null);
+  assert.equal(parseNextElapse('0'), null);
+  assert.equal(parseNextElapse('5'), null);
+  assert.equal(parseNextElapse('2w 31min ago'), null);
 });
 
 /**
@@ -114,7 +121,8 @@ test('install writes a timer that runs redeploy.sh and does not start the onesho
     const timer = await readFile(res.file, 'utf8');
     const script = join(t.checkout, 'scripts', 'redeploy.sh');
     assert.match(service, new RegExp(`ExecStart="${script}"`));
-    assert.match(service, /TimeoutStartSec=30min/);
+    assert.match(service, /TimeoutStartSec=infinity/);
+    assert.doesNotMatch(service, /TimeoutStartSec=30min/);
     assert.match(service, /Type=oneshot/);
     assert.doesNotMatch(service, /\/bin\/sh|RemainAfterExit=yes|--force/);
     assert.match(service, /git pull, docker compose build, and docker compose up -d/);
@@ -151,7 +159,7 @@ test('a 12h interval is a calendar and a 90m interval is monotonic', async () =>
   }
 });
 
-test('paths with spaces or a percent sign are quoted for systemd', async () => {
+test('WorkingDirectory is an unquoted path, and ExecStart stays quoted', async () => {
   const t = await setup();
   try {
     const spaced = join(t.home, 'a b');
@@ -162,7 +170,9 @@ test('paths with spaces or a percent sign are quoted for systemd', async () => {
     const res = await renderComposeUpdate({ ...t.base, root: spaced });
     assert.equal(res.ok, true);
     if (!res.ok) return;
-    assert.match(res.text, /WorkingDirectory="\/.*a b"/);
+    assert.match(res.text, /^WorkingDirectory=\/.*\/a b$/m);
+    assert.doesNotMatch(res.text, /^WorkingDirectory="/m);
+    assert.match(res.text, /^ExecStart="\/.*\/a b\/scripts\/redeploy\.sh"$/m);
     assert.equal(checkoutFromService(res.text), spaced);
 
     const percent = join(t.home, 'a%b');
@@ -173,8 +183,22 @@ test('paths with spaces or a percent sign are quoted for systemd', async () => {
     const again = await renderComposeUpdate({ ...t.base, root: percent });
     assert.equal(again.ok, true);
     if (!again.ok) return;
-    assert.match(again.text, /a%%b/);
+    assert.match(again.text, /^WorkingDirectory=\/.*\/a%%b$/m);
+    assert.match(again.text, /^ExecStart="\/.*\/a%%b\/scripts\/redeploy\.sh"$/m);
     assert.equal(checkoutFromService(again.text), percent);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('a checkout path that would break the unit line is refused', async () => {
+  const t = await setup();
+  try {
+    const res = await renderComposeUpdate({ ...t.base, root: '/tmp/checkout\\', exists: () => true });
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.match(res.error, /backslash/);
+    assert.equal(t.calls.length, 0);
   } finally {
     await t.cleanup();
   }
@@ -285,7 +309,7 @@ test('status reads the installed timer and uninstall removes both units', async 
       ...t.base,
       run: (cmd, args) => {
         if (args.includes('is-active')) return { code: 0, stdout: 'active\n', stderr: '' };
-        if (args.includes('show')) return { code: 0, stdout: '1700000000000000\n', stderr: '' };
+        if (args.includes('show')) return { code: 0, stdout: 'Fri 2026-11-06 00:00:00 CST\n', stderr: '' };
         return { code: 0, stdout: '', stderr: '' };
       },
     });
@@ -293,7 +317,7 @@ test('status reads the installed timer and uninstall removes both units', async 
     assert.equal(status.active, true);
     assert.equal(status.every, '1d');
     assert.equal(status.checkout, t.checkout);
-    assert.equal(status.next, new Date(1700000000000).toISOString());
+    assert.equal(status.next, new Date(2026, 10, 6, 0, 0, 0).toISOString());
     assert.match(status.logs || '', new RegExp(COMPOSE_UPDATE_SERVICE));
 
     t.calls.length = 0;
@@ -309,6 +333,91 @@ test('status reads the installed timer and uninstall removes both units', async 
     const bare = await composeUpdateStatus({ ...t.base, run: () => ({ code: 3, stdout: 'inactive\n', stderr: '' }) });
     assert.equal(bare.installed, false);
     assert.equal(bare.detail, 'not installed');
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('uninstall stops when systemctl cannot reach the user manager', async () => {
+  const t = await setup();
+  try {
+    assert.equal((await installComposeUpdate(t.base)).ok, true);
+    const timer = composeUpdateTimerPath(t.home, t.base.xdgConfig);
+    t.calls.length = 0;
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      run: (cmd, args) => {
+        t.calls.push([cmd, ...args].join(' '));
+        if (args.includes('disable')) return { code: 1, stdout: '', stderr: 'Failed to connect to bus: No such file or directory' };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(gone.ok, false);
+    if (gone.ok) return;
+    assert.match(gone.error, /Failed to connect to bus/);
+    assert.deepEqual(t.calls, [`systemctl --user disable --now ${COMPOSE_UPDATE_TIMER}`]);
+    assert.match(await readFile(timer, 'utf8'), /OnCalendar=daily/);
+
+    t.calls.length = 0;
+    const cleaned = await uninstallComposeUpdate({
+      ...t.base,
+      run: (cmd, args) => {
+        t.calls.push([cmd, ...args].join(' '));
+        if (args.includes('clean')) return { code: 1, stdout: '', stderr: 'Failed to connect to bus: No such file or directory' };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(cleaned.ok, false);
+    if (cleaned.ok) return;
+    assert.match(cleaned.error, /Failed to connect to bus/);
+    assert.deepEqual(t.calls, [
+      `systemctl --user disable --now ${COMPOSE_UPDATE_TIMER}`,
+      `systemctl --user clean ${COMPOSE_UPDATE_TIMER} --what=state`,
+    ]);
+    assert.match(await readFile(timer, 'utf8'), /OnCalendar=daily/);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('uninstall of a timer that is not loaded still removes the unit files', async () => {
+  const t = await setup();
+  try {
+    assert.equal((await installComposeUpdate(t.base)).ok, true);
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      run: (cmd, args) => {
+        t.calls.push([cmd, ...args].join(' '));
+        if (args.includes('disable')) return { code: 1, stdout: '', stderr: `Failed to disable unit: Unit ${COMPOSE_UPDATE_TIMER} does not exist` };
+        if (args.includes('clean')) return { code: 1, stdout: '', stderr: `Failed to add reference to unit ${COMPOSE_UPDATE_TIMER}: Unit ${COMPOSE_UPDATE_TIMER} not found.` };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(gone.ok, true);
+    const after = await readFile(composeUpdateTimerPath(t.home, t.base.xdgConfig), 'utf8').catch((e) => e.code);
+    assert.equal(after, 'ENOENT');
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('a failed daemon-reload is not reported as a finished uninstall', async () => {
+  const t = await setup();
+  try {
+    assert.equal((await installComposeUpdate(t.base)).ok, true);
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      run: (cmd, args) => {
+        t.calls.push([cmd, ...args].join(' '));
+        if (args.includes('daemon-reload')) return { code: 1, stdout: '', stderr: 'Failed to reload: Connection reset by peer' };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(gone.ok, false);
+    if (gone.ok) return;
+    assert.match(gone.error, /Connection reset/);
+    const after = await readFile(composeUpdateTimerPath(t.home, t.base.xdgConfig), 'utf8').catch((e) => e.code);
+    assert.equal(after, 'ENOENT');
   } finally {
     await t.cleanup();
   }
@@ -344,6 +453,81 @@ test('launchd installs one agent that waits out the interval and does not run at
     assert.equal(status.logs, composeUpdateLogPath(t.home));
   } finally {
     await t.cleanup();
+  }
+});
+
+test('uninstall on launchd reports a bootout failure and keeps the plist', async () => {
+  const t = await setup();
+  try {
+    const res = await installComposeUpdate({ ...t.base, kind: 'launchd', platform: 'darwin' });
+    assert.equal(res.ok, true);
+    const file = composeUpdateAgentPath(t.home);
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      kind: 'launchd',
+      platform: 'darwin',
+      run: () => ({ code: 5, stdout: '', stderr: 'Boot-out failed: 5: Input/output error' }),
+    });
+    assert.equal(gone.ok, false);
+    if (gone.ok) return;
+    assert.match(gone.error, /Input\/output error/);
+    assert.match(await readFile(file, 'utf8'), new RegExp(COMPOSE_UPDATE_LABEL));
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('uninstall on launchd removes a plist whose job is not loaded', async () => {
+  const t = await setup();
+  try {
+    const res = await installComposeUpdate({ ...t.base, kind: 'launchd', platform: 'darwin' });
+    assert.equal(res.ok, true);
+    const file = composeUpdateAgentPath(t.home);
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      kind: 'launchd',
+      platform: 'darwin',
+      run: () => ({ code: 3, stdout: '', stderr: 'Boot-out failed: 3: No such process' }),
+    });
+    assert.equal(gone.ok, true);
+    const after = await readFile(file, 'utf8').catch((e) => e.code);
+    assert.equal(after, 'ENOENT');
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('systemd-analyze accepts the unit and rejects a quoted WorkingDirectory', async (t) => {
+  const probe = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' });
+  if (probe.error) {
+    t.skip('systemd-analyze is not installed');
+    return;
+  }
+  const home = await setup();
+  try {
+    const root = join(home.home, 'a b%c');
+    await mkdir(join(root, 'scripts'), { recursive: true });
+    const script = join(root, 'scripts', 'redeploy.sh');
+    await writeFile(script, '#!/bin/sh\nexit 0\n');
+    await chmod(script, 0o755);
+    await writeFile(join(root, 'docker-compose.yml'), 'name: x\n');
+    await writeFile(join(root, '.git'), 'gitdir: x\n');
+    const res = await installComposeUpdate({ ...home.base, root });
+    assert.equal(res.ok, true);
+    const file = composeUpdateServicePath(home.home, home.base.xdgConfig);
+    const text = await readFile(file, 'utf8');
+    assert.match(text, /^WorkingDirectory=.*\/a b%%c$/m);
+    assert.doesNotMatch(text, /^WorkingDirectory="/m);
+    const ok = spawnSync('systemd-analyze', ['verify', file], { encoding: 'utf8' });
+    assert.equal(ok.status, 0, `${ok.stderr}\n${ok.stdout}`);
+    const quoted = text.replace(/^(WorkingDirectory=)(.*)$/m, '$1"$2"');
+    const bad = join(home.home, 'quoted.service');
+    await writeFile(bad, quoted);
+    const fail = spawnSync('systemd-analyze', ['verify', bad], { encoding: 'utf8' });
+    assert.notEqual(fail.status, 0);
+    assert.match(`${fail.stdout}\n${fail.stderr}`, /path is not absolute/);
+  } finally {
+    await home.cleanup();
   }
 });
 

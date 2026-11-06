@@ -209,11 +209,56 @@ export function updaterPath(gitBin, dockerBin) {
 
 /**
  * Specifier expansion still runs inside quotes (`%h` would become the home
- * directory). `%%` is a literal percent.
+ * directory). `%%` is a literal percent. This is the right escaping for
+ * ExecStart= and Environment=, which are command lines and do strip quotes.
  * @param {string} value
  */
 function systemdField(value) {
   return systemdQuote(value.replaceAll('%', '%%'));
+}
+
+/**
+ * WorkingDirectory= is not a command line. systemd-analyze verify keeps a
+ * surrounding quote as part of the path (`path is not absolute: "/home/..."`),
+ * so the value is the rest of the line, spaces included. A backslash is
+ * literal here too: doubling it looks for a different directory. `%` is still
+ * a specifier, so a literal percent is `%%`. Control characters are refused,
+ * as in systemdQuote. A trailing backslash would glue on the next line, and
+ * the parser strips trailing whitespace, so those paths are refused rather
+ * than written wrong.
+ * @param {string} value
+ */
+function systemdPath(value) {
+  const s = String(value);
+  if (/[\x00-\x1f\x7f]/.test(s)) {
+    throw new Error(`Cannot write a systemd unit with a control character in ${JSON.stringify(s)}`);
+  }
+  if (/[ \t\\]$/.test(s)) {
+    throw new Error(`Cannot write a systemd path that ends with whitespace or a backslash: ${JSON.stringify(s)}`);
+  }
+  return s.replaceAll('%', '%%');
+}
+
+/**
+ * disable/bootout of a job that was never loaded is success for uninstall.
+ * Any other failure means the scheduler may still be running it, and deleting
+ * the unit file would hide that.
+ * @param {CommandResult} result
+ */
+function schedulerMissed(result) {
+  if (result.code === 0) return false;
+  const text = `${result.stderr}\n${result.stdout}`;
+  return /does not exist|not found|not-found|No such process|Could not find specified service|service is not loaded/i.test(text);
+}
+
+/**
+ * @param {CommandResult} result
+ * @param {string} fallback
+ * @returns {string | null}
+ */
+function stopFailure(result, fallback) {
+  if (result.code === 0 || schedulerMissed(result)) return null;
+  return result.stderr.trim() || result.stdout.trim() || fallback;
 }
 
 const xmlEscape = (/** @type {string} */ s) => s
@@ -382,9 +427,13 @@ Type=oneshot
 # teamclaude-compose-every=${plan.everyLabel}
 # scripts/redeploy.sh pulls --ff-only, builds while the old container serves,
 # restarts, and puts the previous image back if the new one is not healthy.
-WorkingDirectory=${systemdField(plan.checkout)}
+WorkingDirectory=${systemdPath(plan.checkout)}
 ExecStart=${systemdField(plan.script)}
-TimeoutStartSec=30min
+# No finite start timeout. The manager default is about 90s, and any deadline
+# can SIGTERM the script after the old container is gone and before the
+# rollback finishes. The script has no handler for that, so it has to be
+# allowed to exit on its own.
+TimeoutStartSec=infinity
 ${env.join('\n')}
 `;
 }
@@ -535,19 +584,26 @@ export async function uninstallComposeUpdate(opts = {}) {
   if (c.uid === 0) return { ok: false, error: 'Refusing to change a timer as root. Run it as the user who owns the checkout.' };
   if (c.kind === 'launchd') {
     const file = composeUpdateAgentPath(c.home);
-    c.run('launchctl', ['bootout', `gui/${c.uid ?? 0}/${COMPOSE_UPDATE_LABEL}`]);
+    const out = c.run('launchctl', ['bootout', `gui/${c.uid ?? 0}/${COMPOSE_UPDATE_LABEL}`]);
+    const failed = stopFailure(out, `launchctl bootout exited ${out.code}`);
+    if (failed) return { ok: false, error: failed };
     await rm(file, { force: true });
     c.log(`[TeamClaude] Compose auto-update removed: ${file}`);
     return { ok: true, file };
   }
   const service = composeUpdateServicePath(c.home, c.xdgConfig);
   const timer = composeUpdateTimerPath(c.home, c.xdgConfig);
-  c.run('systemctl', ['--user', 'disable', '--now', COMPOSE_UPDATE_TIMER]);
-  // Drops the Persistent= stamp. Harmless when the timer was never started.
-  c.run('systemctl', ['--user', 'clean', COMPOSE_UPDATE_TIMER, '--what=state']);
+  const disabled = c.run('systemctl', ['--user', 'disable', '--now', COMPOSE_UPDATE_TIMER]);
+  const disableFailed = stopFailure(disabled, `systemctl disable exited ${disabled.code}`);
+  if (disableFailed) return { ok: false, error: disableFailed };
+  // Drops the Persistent= stamp. A timer that was never loaded is not an error.
+  const cleaned = c.run('systemctl', ['--user', 'clean', COMPOSE_UPDATE_TIMER, '--what=state']);
+  const cleanFailed = stopFailure(cleaned, `systemctl clean exited ${cleaned.code}`);
+  if (cleanFailed) return { ok: false, error: cleanFailed };
   await rm(service, { force: true });
   await rm(timer, { force: true });
-  c.run('systemctl', ['--user', 'daemon-reload']);
+  const reloaded = c.run('systemctl', ['--user', 'daemon-reload']);
+  if (reloaded.code !== 0) return { ok: false, error: reloaded.stderr.trim() || reloaded.stdout.trim() || `systemctl daemon-reload exited ${reloaded.code}` };
   c.log(`[TeamClaude] Compose auto-update removed: ${timer}`);
   return { ok: true, file: timer };
 }
@@ -597,16 +653,32 @@ export function everyFromPlist(text) {
 }
 
 /**
- * NextElapseUSecRealtime is microseconds. Anything that is not that is
- * "n/a" or empty, and there is no next run to show.
+ * The next run, as an ISO timestamp.
+ *
+ * `systemctl show --property=NextElapseUSecRealtime --value` prints a local
+ * clock time (`Fri 2026-11-06 00:00:00 CST`), not the microsecond count the
+ * same property has on D-Bus. The clock time is read as local and the
+ * timezone abbreviation is ignored: `CST` is not a unique zone, and this is
+ * the form show prints by default. A bare integer is that microsecond count,
+ * which is what the D-Bus property is and what some builds print instead.
+ * Empty, `0` and `n/a` mean there is no realtime elapse (a monotonic timer
+ * leaves this property unset).
  * @param {string} value
  * @returns {string | null}
  */
-export function formatUsec(value) {
-  if (!/^\d+$/.test(value.trim())) return null;
-  const ms = Number(value.trim()) / 1000;
-  if (!Number.isFinite(ms) || ms < 1_000_000_000_000) return null;
-  return new Date(ms).toISOString();
+export function parseNextElapse(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw || raw === 'n/a' || raw === '0') return null;
+  if (/^\d+$/.test(raw)) {
+    const ms = Number(raw) / 1000;
+    if (!Number.isFinite(ms) || ms < 1_000_000_000_000) return null;
+    return new Date(ms).toISOString();
+  }
+  const m = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(raw);
+  if (!m) return null;
+  const date = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]));
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString();
 }
 
 /**
@@ -664,7 +736,7 @@ export async function composeUpdateStatus(opts = {}) {
     file,
     checkout: serviceText ? checkoutFromService(serviceText) : null,
     every: timerText ? everyFromTimer(timerText) : null,
-    next: formatUsec(next.stdout),
+    next: next.code === 0 ? parseNextElapse(next.stdout) : null,
     logs: `journalctl --user --unit ${COMPOSE_UPDATE_SERVICE}`,
   };
 }
