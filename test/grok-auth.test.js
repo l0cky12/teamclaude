@@ -194,3 +194,44 @@ test('a cancelled device sign-in stops polling', async () => {
     assert.equal(srv.seen.length, 1);
   } finally { await srv.close(); }
 });
+
+/**
+ * An issuer that answers the device request, then stalls the way a dead
+ * connection does: `body` sends the poll's headers and never finishes the
+ * body, `headers` never answers at all, and `start` stalls the device request.
+ * @param {'body'|'headers'|'start'} where
+ */
+async function stallingServer(where) {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      if (req.url === '/d' && where !== 'start') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ device_code: 'd', user_code: 'AB', verification_uri: 'https://accounts.example/device', interval: 1 }));
+      } else if (where === 'body') {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.write('{"error":');
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+  const { port } = /** @type {import('node:net').AddressInfo} */ (server.address());
+  return { url: `http://127.0.0.1:${port}`, close: () => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); } };
+}
+
+for (const where of /** @type {const} */ (['body', 'headers'])) {
+  test(`a device sign-in whose poll stalls (${where}) still ends at its deadline`, async () => {
+    const srv = await stallingServer(where);
+    try {
+      const flow = await startGrokLogin({ deviceEndpoint: `${srv.url}/d`, tokenEndpoint: `${srv.url}/t`, timeoutMs: 200, wait: async () => {} });
+      await assert.rejects(flow.credentials, /expired/);
+    } finally { await srv.close(); }
+  });
+}
+
+test('a device sign-in whose first request stalls ends at its deadline', async () => {
+  const srv = await stallingServer('start');
+  try {
+    await assert.rejects(startGrokLogin({ deviceEndpoint: `${srv.url}/d`, tokenEndpoint: `${srv.url}/t`, timeoutMs: 200, wait: async () => {} }), /did not answer/);
+  } finally { await srv.close(); }
+});

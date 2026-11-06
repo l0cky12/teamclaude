@@ -39,6 +39,9 @@ const DEVICE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 const DEFAULT_INTERVAL_S = 5;
 const SLOW_DOWN_STEP_S = 5;
 const DEFAULT_DEVICE_EXPIRY_S = 600;
+// How long the issuer has to hand out a code, before that code's own expiry
+// takes over as the flow's deadline.
+const START_TIMEOUT_MS = 30_000;
 
 /**
  * @typedef {object} GrokCredentials
@@ -199,37 +202,87 @@ function pageUrl(value) {
  * @returns {Promise<GrokLogin>}
  */
 export async function startGrokLogin({ routing = null, signal = null, timeoutMs = Infinity, deviceEndpoint = DEVICE_ENDPOINT, tokenEndpoint = TOKEN_ENDPOINT, wait = abortableWait } = {}) {
-  const res = await postForm(deviceEndpoint, { client_id: CLIENT_ID, scope: SCOPES }, { routing, signal: signal ?? undefined });
-  if (!res.ok) throw new Error(`xAI refused to start the sign-in (${res.status}): ${safeLine(await res.text(), 200)}`);
-  const body = await res.json();
+  // One controller bounds the whole flow, every request and every body read
+  // included: a connection that goes quiet mid-reply would otherwise hold a
+  // poll (and the panel's sign-in slot) open past the code's own expiry. The
+  // caller's cancel is relayed onto it by hand, as upstream-fetch.js does,
+  // because AbortSignal.any needs Node 20.3 and package.json admits 20.0.
+  const flow = new AbortController();
+  const relay = () => flow.abort(signal?.reason);
+  if (signal?.aborted) relay();
+  else signal?.addEventListener('abort', relay, { once: true });
+  /** @type {NodeJS.Timeout|undefined} */
+  let timer;
+  /** @param {number} ms @param {string} message */
+  const deadlineIn = (ms, message) => {
+    clearTimeout(timer);
+    // Clamped: setTimeout reads a delay past 2^31-1 ms as 1 ms, and expires_in
+    // is the issuer's number.
+    if (Number.isFinite(ms)) timer = setTimeout(() => flow.abort(new Error(message)), Math.min(Math.max(0, ms), 2 ** 31 - 1));
+  };
+  const settle = () => { clearTimeout(timer); signal?.removeEventListener('abort', relay); };
+  /** Settle `promise`, or fail with the flow's abort reason, whichever is first.
+   * @template T @param {Promise<T>} promise @returns {Promise<T>} */
+  const bounded = promise => new Promise((resolve, reject) => {
+    // Settled either way, so a promise that fails after the flow did is still
+    // observed rather than left to end the process as an unhandled rejection.
+    if (flow.signal.aborted) { promise.catch(() => {}); reject(flow.signal.reason); return; }
+    const onAbort = () => reject(flow.signal.reason);
+    flow.signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => flow.signal.removeEventListener('abort', onAbort));
+  });
+  /** POST a form and read its whole reply, both within the flow's deadline.
+   * @param {string} url @param {Record<string, string>} form */
+  const post = async (url, form) => {
+    const res = await bounded(postForm(url, form, { routing, signal: flow.signal }));
+    return { status: res.status, ok: res.ok, text: await bounded(res.text()) };
+  };
+  /** @param {string} text */
+  const parse = text => { try { return JSON.parse(text); } catch { return null; } };
+
+  let body;
+  try {
+    // The code's expiry is not known until the issuer answers, so the first
+    // request has a deadline of its own.
+    deadlineIn(Math.min(timeoutMs, START_TIMEOUT_MS), 'xAI did not answer the sign-in request in time. Try again');
+    const res = await post(deviceEndpoint, { client_id: CLIENT_ID, scope: SCOPES });
+    if (!res.ok) throw new Error(`xAI refused to start the sign-in (${res.status}): ${safeLine(res.text, 200)}`);
+    body = parse(res.text);
+  } catch (err) {
+    settle();
+    throw err;
+  }
   const userCode = typeof body?.user_code === 'string' && /^[A-Z0-9-]{1,32}$/.test(body.user_code) ? body.user_code : null;
   const verificationUri = pageUrl(body?.verification_uri);
   if (!userCode || !verificationUri || typeof body?.device_code !== 'string') {
+    settle();
     throw new Error('xAI answered the sign-in request without a usable code or page');
   }
   const complete = pageUrl(body.verification_uri_complete);
   const url = complete || `${verificationUri}${verificationUri.includes('?') ? '&' : '?'}user_code=${encodeURIComponent(userCode)}`;
 
   const expiresIn = Number(body.expires_in) > 0 ? Number(body.expires_in) : DEFAULT_DEVICE_EXPIRY_S;
-  const deadline = Date.now() + Math.min(expiresIn * 1000, timeoutMs);
+  deadlineIn(Math.min(expiresIn * 1000, timeoutMs), 'The sign-in code expired before it was approved. Start the sign-in again');
   let interval = Number(body.interval) > 0 ? Number(body.interval) : DEFAULT_INTERVAL_S;
 
   const credentials = (async () => {
-    for (;;) {
-      // Waiting first, as RFC 8628 asks: a poll on a code just issued can only
-      // be `authorization_pending`, and polling early earns a `slow_down`.
-      await wait(interval * 1000, signal);
-      if (Date.now() > deadline) throw new Error('The sign-in code expired before it was approved. Start the sign-in again');
-      const poll = await postForm(tokenEndpoint, { grant_type: DEVICE_GRANT, device_code: body.device_code, client_id: CLIENT_ID },
-        { routing, signal: signal ?? undefined });
-      const data = await poll.json().catch(() => null);
-      if (poll.ok) return credentialsFromGrokTokenResponse(data);
-      const error = typeof data?.error === 'string' ? data.error : '';
-      if (error === 'authorization_pending') continue;
-      if (error === 'slow_down') { interval += SLOW_DOWN_STEP_S; continue; }
-      if (error === 'access_denied') throw new Error('The sign-in was refused in the browser');
-      if (error === 'expired_token') throw new Error('The sign-in code expired before it was approved. Start the sign-in again');
-      throw new Error(`xAI refused the sign-in (${poll.status}): ${safeLine(data?.error_description || error || 'no reason given', 200)}`);
+    try {
+      for (;;) {
+        // Waiting first, as RFC 8628 asks: a poll on a code just issued can
+        // only be `authorization_pending`, and polling early earns a `slow_down`.
+        await bounded(Promise.resolve(wait(interval * 1000, flow.signal)));
+        const poll = await post(tokenEndpoint, { grant_type: DEVICE_GRANT, device_code: body.device_code, client_id: CLIENT_ID });
+        const data = parse(poll.text);
+        if (poll.ok) return credentialsFromGrokTokenResponse(data);
+        const error = typeof data?.error === 'string' ? data.error : '';
+        if (error === 'authorization_pending') continue;
+        if (error === 'slow_down') { interval += SLOW_DOWN_STEP_S; continue; }
+        if (error === 'access_denied') throw new Error('The sign-in was refused in the browser');
+        if (error === 'expired_token') throw new Error('The sign-in code expired before it was approved. Start the sign-in again');
+        throw new Error(`xAI refused the sign-in (${poll.status}): ${safeLine(data?.error_description || error || 'no reason given', 200)}`);
+      }
+    } finally {
+      settle();
     }
   })();
   // Awaited by every caller; this only keeps a rejection that lands before
