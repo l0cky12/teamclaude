@@ -40,6 +40,10 @@ test('modelLabel names models the way people say them', () => {
   assert.equal(modelLabel('grok-4-0709'), 'Grok 4');
   assert.equal(modelLabel('grok-4-1-fast-reasoning'), 'Grok 4.1 Fast Reasoning');
   assert.equal(modelLabel('grok-4.1-fast-non-reasoning'), 'Grok 4.1 Fast Non-Reasoning');
+  assert.equal(modelLabel('grok-4.20-reasoning'), 'Grok 4.20 Reasoning');
+  assert.equal(modelLabel('grok-4.20-0309-reasoning'), 'Grok 4.20 Reasoning');
+  assert.equal(modelLabel('grok-4.20-multi-agent-0309'), 'Grok 4.20 Multi Agent');
+  assert.equal(modelLabel('grok-4.20-non-reasoning'), 'Grok 4.20 Non-Reasoning');
   assert.equal(modelLabel('some-other-model'), 'some-other-model');
 });
 

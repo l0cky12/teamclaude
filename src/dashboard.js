@@ -333,12 +333,13 @@ export function modelLabel(/** @type {string} */ id) {
   }
   // xAI writes a version either way, `grok-4.1-fast` or `grok-4-1-fast`, and
   // dates a snapshot with four digits (`grok-4-0709`): the version reads 4.1
-  // both ways and the date is dropped, as for Claude.
+  // both ways and the date is dropped, as for Claude. Only a part of digits
+  // alone is a date: `4.20` is four characters long and a version.
   if (parts[0] === 'grok' && parts.length >= 2) {
     /** @type {string[]} */
     var words = [];
     parts.slice(1).forEach(function (p) {
-      if (isNum(p) && p.length >= 4) return;
+      if (/^\d{4,}$/.test(p)) return;
       var last = words.length - 1;
       if (isNum(p) && last >= 0 && isNum(words[last]) && words[last].indexOf('.') < 0) words[last] += '.' + p;
       else words.push(cap(p));
@@ -1042,9 +1043,15 @@ export function clientKeyOutcome(res, step) {
 }
 
 /**
- * What to paste into a client to use a new key: Claude Code's environment and
- * the Codex CLI's provider block. `origin` is the address this page was opened
- * at, which is the proxy as this browser reaches it.
+ * What to paste into a client to use a new key: Claude Code's environment, the
+ * Codex CLI's provider block and Grok Build's base URL. `origin` is the address
+ * this page was opened at, which is the proxy as this browser reaches it.
+ *
+ * Grok Build gets no key: it sends its own sign-in as the bearer, and its
+ * `extra_headers` setting rides only on some inference calls (checked against
+ * grok 1.0.77: never on /v1/models, /v1/settings or /v1/user), so a key in it
+ * would still leave most of its requests refused. It reaches the proxy from
+ * the proxy's own machine, which needs no key.
  *
  * @param {string} origin
  * @param {string} key
@@ -1058,6 +1065,7 @@ export function clientKeySetup(origin, key) {
     claude: 'export ANTHROPIC_BASE_URL=' + sh(origin) + '\nexport ANTHROPIC_API_KEY=' + sh(key),
     codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = ' + JSON.stringify(origin + '/backend-api/codex') + '\n'
       + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = ' + JSON.stringify(key) + ' }',
+    grok: 'export GROK_CLI_CHAT_PROXY_BASE_URL=' + sh(origin + '/grok/v1'),
   };
 }
 
@@ -2861,7 +2869,7 @@ const PAGE = `<!doctype html>
         </div>
       </div>
       <div id="acctSync" class="card ckeys links" style="display:none">
-        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude and Codex sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
+        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude, Codex and Grok sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
         <div id="syncBody"></div>
         <div id="syncSignIn"></div>
         <p class="hint" id="syncHint"></p>
@@ -3568,7 +3576,7 @@ ${SHARED_HELPERS}
       var d = button('btn', open ? 'Hide details' : 'Show details', function () {
         if (open) hideIssuedKey(); else doClientKey('show', name, d);
       });
-      d.title = 'The key and the setup for Claude Code and the Codex CLI';
+      d.title = 'The key and the setup for Claude Code, the Codex CLI and Grok Build';
       td.appendChild(d);
       var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm revoke' : 'Revoke', function () {
         if (!armed) { ckRevokeArmed[name] = Date.now(); if (lastStatus) render(lastStatus); return; }
@@ -3674,6 +3682,7 @@ ${SHARED_HELPERS}
     snippet(box, 'Key', key, 0);
     snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
     snippet(box, 'Codex CLI: add to ~/.codex/config.toml', setup.codex, 7);
+    snippet(box, 'Grok Build: run in the shell that starts grok. It cannot send this key, so it works only where the proxy asks for none: on the machine the proxy runs on', setup.grok, 1);
     if (isLoopbackHost(pageHost())) {
       box.appendChild(el('div', 'lbl', 'This page is open at ' + origin + '. A client on another machine needs an address of this one it can reach instead.'));
     }
@@ -4118,7 +4127,7 @@ ${SHARED_HELPERS}
     }
     if (syncNote) body.appendChild(el('div', 'st ' + syncNote.kind, syncNote.text));
     hint.textContent = own
-      ? 'Each machine shares the Claude and Codex sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
+      ? 'Each machine shares the Claude, Codex and Grok sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
       : syncView.signedIn
         ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
         : offer ? '' : callbackHint;

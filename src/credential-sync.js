@@ -107,8 +107,13 @@ export const TOMBSTONE_TTL_MS = 7 * 24 * 3600 * 1000;
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
  */
 
-/** The identity fields that travel with a token, in the order they are copied. */
-const IDENTITY_FIELDS = ['accountUuid', 'orgUuid', 'orgName', 'accountId', 'userId', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
+/**
+ * The identity fields that travel with a token, in the order they are copied.
+ * `email` is among them because a Grok request carries it (`x-email`, see
+ * PROVIDERS.grok.scopeHeaders): a Grok account added from a row without it
+ * would send no email where the one it was synced from sends one.
+ */
+const IDENTITY_FIELDS = ['accountUuid', 'orgUuid', 'orgName', 'accountId', 'userId', 'email', 'organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'];
 
 /** A key segment: the characters the store is happy with, and never a slash. */
 function segment(/** @type {unknown} */ v) {
@@ -118,11 +123,16 @@ function segment(/** @type {unknown} */ v) {
 /**
  * Whether an account is one this sync carries: an OAuth login to a provider we
  * refresh ourselves, identified well enough to be matched on another install.
+ * Each provider is matched by the id its own sign-in names the person with:
+ * Claude's account UUID, ChatGPT's account id, xAI's user id (identity.js).
  * @param {Record<string, any>|null|undefined} a
  */
 export function isSyncable(a) {
   if (!a || a.type !== 'oauth' || a.upstream) return false;
-  return providerOf(a) === 'codex' ? !!a.accountId : !!a.accountUuid;
+  const provider = providerOf(a);
+  if (provider === 'codex') return !!a.accountId;
+  if (provider === 'grok') return !!a.userId;
+  return !!a.accountUuid;
 }
 
 /**
@@ -136,6 +146,7 @@ export function syncKeyFor(a) {
   if (!a || !isSyncable(a)) return null;
   const provider = providerOf(a);
   if (provider === 'codex') return `${KEY_PREFIX}codex.${segment(a.accountId)}`;
+  if (provider === 'grok') return `${KEY_PREFIX}grok.${segment(a.userId)}`;
   return `${KEY_PREFIX}anthropic.${segment(a.accountUuid)}.${segment(a.orgUuid || a.orgName || 'org')}`;
 }
 

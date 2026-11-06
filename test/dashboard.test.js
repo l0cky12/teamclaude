@@ -2345,6 +2345,9 @@ test('the setup text points Claude Code and Codex at this proxy with the new key
   assert.match(setup.codex, /^model_provider = "teamclaude"$/m);
   assert.match(setup.codex, /^base_url = "http:\/\/100\.64\.0\.2:3456\/backend-api\/codex"$/m);
   assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "tc-abc" \}$/m);
+  // Grok Build sends no key, only where to find the proxy's Grok mount.
+  assert.equal(setup.grok, 'export GROK_CLI_CHAT_PROXY_BASE_URL=http://100.64.0.2:3456/grok/v1');
+  assert.doesNotMatch(setup.grok, /tc-abc/);
 });
 
 // Show details returns hand-written keys too, so the snippets must survive any key.
