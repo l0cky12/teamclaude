@@ -191,6 +191,10 @@ This fork ([l0cky12/teamclaude](https://github.com/l0cky12/teamclaude)) adds the
 
 - `teamclaude accounts export` and `accounts import`: move your sign-ins to another of your machines in a passphrase-encrypted file ([#19](https://github.com/l0cky12/teamclaude/pull/19)).
 
+**Compose**
+
+- `teamclaude update compose install` schedules `git pull`, `docker compose build`, and `docker compose up -d` for a host checkout ([#42](https://github.com/l0cky12/teamclaude/pull/42)).
+
 **Project**
 
 - CI tests the npm package and the container, publishing waits for CI, and security scans run on every change ([#11](https://github.com/l0cky12/teamclaude/pull/11)).
