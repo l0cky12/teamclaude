@@ -331,6 +331,21 @@ export function modelLabel(/** @type {string} */ id) {
   if (parts[0] === 'gpt' && parts.length >= 2) {
     return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
   }
+  // xAI writes a version either way, `grok-4.1-fast` or `grok-4-1-fast`, and
+  // dates a snapshot with four digits (`grok-4-0709`): the version reads 4.1
+  // both ways and the date is dropped, as for Claude. Only a part of digits
+  // alone is a date: `4.20` is four characters long and a version.
+  if (parts[0] === 'grok' && parts.length >= 2) {
+    /** @type {string[]} */
+    var words = [];
+    parts.slice(1).forEach(function (p) {
+      if (/^\d{4,}$/.test(p)) return;
+      var last = words.length - 1;
+      if (isNum(p) && last >= 0 && isNum(words[last]) && words[last].indexOf('.') < 0) words[last] += '.' + p;
+      else words.push(cap(p));
+    });
+    return 'Grok ' + words.join(' ').replace(/\bNon /g, 'Non-');
+  }
   return s;
 }
 
@@ -1028,14 +1043,23 @@ export function clientKeyOutcome(res, step) {
 }
 
 /**
- * What to paste into a client to use a new key: Claude Code's environment and
- * the Codex CLI's provider block. `origin` is the address this page was opened
- * at, which is the proxy as this browser reaches it.
+ * What to paste into a client to use a new key: Claude Code's environment, the
+ * Codex CLI's provider block and Grok Build's base URL. `origin` is the address
+ * this page was opened at, which is the proxy as this browser reaches it.
+ *
+ * Grok Build gets no key: it sends its own sign-in as the bearer, and its
+ * `extra_headers` setting rides only on some inference calls (checked against
+ * grok 1.0.77: never on /v1/models, /v1/settings or /v1/user), so a key in it
+ * would still leave most of its requests refused. It can only use the loopback
+ * exemption, so its address is not `origin` but the one the proxy reports for
+ * a direct loopback connection (`grokLocal`, server.js grokLocalBase). Null
+ * when the proxy has none (or is too old to say): no Grok line then.
  *
  * @param {string} origin
  * @param {string} key
+ * @param {string|null} [grokLocal]
  */
-export function clientKeySetup(origin, key) {
+export function clientKeySetup(origin, key, grokLocal) {
   // Show details hands back keys written into the file by hand, which may hold
   // `$`, quotes or spaces: single-quote those for the shell, and let JSON's
   // escapes (a subset of TOML's basic-string escapes) quote them for Codex.
@@ -1044,6 +1068,7 @@ export function clientKeySetup(origin, key) {
     claude: 'export ANTHROPIC_BASE_URL=' + sh(origin) + '\nexport ANTHROPIC_API_KEY=' + sh(key),
     codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = ' + JSON.stringify(origin + '/backend-api/codex') + '\n'
       + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = ' + JSON.stringify(key) + ' }',
+    grok: typeof grokLocal === 'string' && grokLocal ? 'export GROK_CLI_CHAT_PROXY_BASE_URL=' + sh(grokLocal) : null,
   };
 }
 
@@ -1744,7 +1769,11 @@ export function accountMeters(account, fable, now) {
     bq.rows.slice(0, 3).forEach(function (r, i) { slots[i] = quotaMeter(r.label, r.utilization, r.resetAt); });
     text = bq.text;
   } else {
-    text = 'quota unknown (no traffic observed yet)';
+    // Grok's replies carry no quota headers, so traffic never fills its bars:
+    // only the zero-spend usage read does, the row's Refresh quota or the
+    // background Quota refresh.
+    text = a.provider === 'grok' ? 'quota unknown: Grok states it only when asked (Refresh quota)'
+      : 'quota unknown (no traffic observed yet)';
   }
   return { slots: slots, extra: extra, text: text };
 }
@@ -2843,7 +2872,7 @@ const PAGE = `<!doctype html>
         </div>
       </div>
       <div id="acctSync" class="card ckeys links" style="display:none">
-        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude and Codex sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
+        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude, Codex and Grok sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
         <div id="syncBody"></div>
         <div id="syncSignIn"></div>
         <p class="hint" id="syncHint"></p>
@@ -3109,9 +3138,9 @@ ${SHARED_HELPERS}
     if (meters.text) { x.appendChild(el('div', 'usage', meters.text)); said++; }
     var q = a.quota || {};
     // Spend on this account that did not come through the proxy (#475).
-    var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent);
+    var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent, q.planPeriod);
     if (outside) { x.appendChild(el('div', 'usage', 'outside: ' + outside)); said++; }
-    var forecast = forecastText(q.forecast, Date.now());
+    var forecast = forecastText(q.forecast, Date.now(), q.planPeriod);
     if (forecast) { x.appendChild(el('div', 'usage', 'forecast: ' + forecast)); said++; }
     if (meters.extra.length) {
       var open = !!expanded['row:' + key];
@@ -3550,7 +3579,7 @@ ${SHARED_HELPERS}
       var d = button('btn', open ? 'Hide details' : 'Show details', function () {
         if (open) hideIssuedKey(); else doClientKey('show', name, d);
       });
-      d.title = 'The key and the setup for Claude Code and the Codex CLI';
+      d.title = 'The key and the setup for Claude Code, the Codex CLI and Grok Build';
       td.appendChild(d);
       var b = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm revoke' : 'Revoke', function () {
         if (!armed) { ckRevokeArmed[name] = Date.now(); if (lastStatus) render(lastStatus); return; }
@@ -3584,7 +3613,7 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = clientKeyOutcome(json, step);
         ckStatus(out.kind, out.text);
-        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true); if (lastStatus) render(lastStatus); return; }
+        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true, json.grokLocal); if (lastStatus) render(lastStatus); return; }
         if (json.ok && step === 'create') {
           document.getElementById('ckName').value = '';
           // The proxy's first key closes a gate this page may have come in
@@ -3592,7 +3621,7 @@ ${SHARED_HELPERS}
           // the key box would cover the panel before the key was copied, so
           // polling waits for Done.
           holdPoll = !!json.firstKey && !localStorage.getItem(KEY);
-          showIssuedKey(json.name, json.key);
+          showIssuedKey(json.name, json.key, false, json.grokLocal);
         }
         // A revoked key's panel would offer setup for a key that no longer works.
         if (json.ok && step === 'revoke' && issuedName === json.name) hideIssuedKey();
@@ -3643,7 +3672,7 @@ ${SHARED_HELPERS}
     box.appendChild(line);
   }
 
-  function showIssuedKey(name, key, existing) {
+  function showIssuedKey(name, key, existing, grokLocal) {
     issuedName = name;
     var box = document.getElementById('ckIssued');
     box.textContent = '';
@@ -3652,10 +3681,17 @@ ${SHARED_HELPERS}
     head.appendChild(el('span', 'hint', existing ? 'Anyone who can see this screen can use the key.' : 'Copy it now, or come back with Show details.'));
     box.appendChild(head);
     var origin = peer ? peerUrl : typeof location !== 'undefined' ? location.origin : '';
-    var setup = clientKeySetup(origin, key);
+    var setup = clientKeySetup(origin, key, grokLocal);
     snippet(box, 'Key', key, 0);
     snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
     snippet(box, 'Codex CLI: add to ~/.codex/config.toml', setup.codex, 7);
+    // Grok Build cannot send the key (clientKeySetup), so it gets the
+    // proxy's own loopback address, or a line saying why it has none.
+    if (setup.grok) {
+      snippet(box, 'Grok Build: run in the shell that starts grok, on the machine the proxy runs on. Grok Build cannot send this key, so it must connect straight to the proxy, which lets that in without one (not through a Docker port mapping or a reverse proxy)', setup.grok, 1);
+    } else if (grokLocal === null) {
+      box.appendChild(el('div', 'lbl', 'Grok Build cannot send this key, and this proxy lets no connection in without one (proxy.trustLoopback is false, or it does not listen on its own machine\u2019s loopback address), so Grok Build cannot use it.'));
+    }
     if (isLoopbackHost(pageHost())) {
       box.appendChild(el('div', 'lbl', 'This page is open at ' + origin + '. A client on another machine needs an address of this one it can reach instead.'));
     }
@@ -4100,7 +4136,7 @@ ${SHARED_HELPERS}
     }
     if (syncNote) body.appendChild(el('div', 'st ' + syncNote.kind, syncNote.text));
     hint.textContent = own
-      ? 'Each machine shares the Claude and Codex sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
+      ? 'Each machine shares the Claude, Codex and Grok sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
       : syncView.signedIn
         ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
         : offer ? '' : callbackHint;

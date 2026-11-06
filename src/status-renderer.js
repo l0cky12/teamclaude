@@ -84,9 +84,9 @@ export function renderStatus(status, { color = process.stdout.isTTY, now = Date.
     if (spend) lines.push(`  ${spend}`);
     const resetCredits = resetCreditLine(account, paint, now);
     if (resetCredits) lines.push(`  ${resetCredits}`);
-    const outside = outsideSpendText(account.quota?.outsideSpend, status.outsideSpendHidePercent);
+    const outside = outsideSpendText(account.quota?.outsideSpend, status.outsideSpendHidePercent, account.quota?.planPeriod);
     if (outside) lines.push(`  ${paint.dim('Outside'.padEnd(8))} ${outside}`);
-    const forecast = forecastText(account.quota?.forecast, now);
+    const forecast = forecastText(account.quota?.forecast, now, account.quota?.planPeriod);
     if (forecast) lines.push(`  ${paint.dim('Forecast'.padEnd(8))} ${forecast}`);
     lines.push(`  ${paint.dim('Usage'.padEnd(8))} ${formatUsage(account.usage, now)}`);
     lines.push(`  ${paint.dim('Probe'.padEnd(8))} ${formatAccountProbe(nameText(account.name), probe, now, paint)}`);
@@ -227,11 +227,15 @@ export function spendLine(account, paint) {
  * Pure and closure-free on purpose: the dashboard serializes it into its page
  * with toString(), so the terminal and the browser say the same thing.
  *
+ * A plan whose shared window is a month (a monthly Grok plan, `planPeriod`)
+ * says "month" for it rather than "week".
+ *
  * @param {Record<string, {share: number|null, state: string, since: string|null}>|null|undefined} outsideSpend
  * @param {number|null} [hidePercent]  status.outsideSpendHidePercent
+ * @param {string|null} [planPeriod]  account.quota.planPeriod
  * @returns {string|null}
  */
-export function outsideSpendText(outsideSpend, hidePercent) {
+export function outsideSpendText(outsideSpend, hidePercent, planPeriod) {
   var o = outsideSpend || {};
   var hide = typeof hidePercent === 'number' && isFinite(hidePercent) && hidePercent >= 0 && hidePercent <= 100 ? hidePercent : 5;
   var keys = Object.keys(o).sort(function (a, b) {
@@ -252,7 +256,7 @@ export function outsideSpendText(outsideSpend, hidePercent) {
       : key === 'unified7dFable' ? 'fable'
       : key === 'unified7dSonnet' ? 'sonnet'
       : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
-    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : planPeriod === 'monthly' ? 'month' : 'week';
     if (v.state === 'measured' && typeof v.share === 'number') {
       return (Math.round(v.share * 1000) / 10).toFixed(1) + '% of the ' + label + ' went elsewhere';
     }
@@ -279,9 +283,10 @@ export function outsideSpendText(outsideSpend, hidePercent) {
  *
  * @param {Record<string, {ratePerHour?: number|null, threshold?: number, reachesThresholdAt?: number|null, resetAt?: number|null}>|null|undefined} forecast
  * @param {number} now  ms epoch
+ * @param {string|null} [planPeriod]  account.quota.planPeriod: "month" for a monthly plan, as outsideSpendText
  * @returns {string|null}
  */
-export function forecastText(forecast, now) {
+export function forecastText(forecast, now, planPeriod) {
   var f = forecast || {};
   /** @param {number} ms */
   var dur = function (ms) {
@@ -310,7 +315,7 @@ export function forecastText(forecast, now) {
       : key === 'unified7dFable' ? 'fable'
       : key === 'unified7dSonnet' ? 'sonnet'
       : key.indexOf('scoped:') === 0 ? key.slice(7) : key;
-    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : 'week';
+    var label = family ? family.charAt(0).toUpperCase() + family.slice(1) + ' week' : planPeriod === 'monthly' ? 'month' : 'week';
     var pct = typeof v.threshold === 'number' ? Math.round(v.threshold * 100) + '%' : 'its threshold';
     var reach = dur(at - now);
     var resetText = reset != null ? dur(reset - now) : null;
@@ -886,7 +891,10 @@ function quotaLines(account, now, paint) {
     lines.push(`${paint.dim(label)} ${bar}${backend.text}`);
   }
 
-  if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray('unknown')}`);
+  // Grok's replies carry no quota headers, so only the usage read fills this
+  // in: say so, rather than leave "unknown" to read as waiting for traffic.
+  const unknown = account.provider === 'grok' ? 'unknown (Grok states it only to the quota probe)' : 'unknown';
+  if (lines.length === 0) lines.push(`${paint.dim('Quota'.padEnd(8))} ${paint.gray(unknown)}`);
   return lines;
 }
 

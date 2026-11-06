@@ -21,6 +21,11 @@ const codex = (name, extra = {}) => ({
   accessToken: `at-${name}-1`, refreshToken: `rt-${name}-1`, expiresAt: T0 + 8 * H, ...extra,
 });
 
+const grok = (name, extra = {}) => ({
+  name, type: 'oauth', provider: 'grok', userId: `user-${name}`, email: `${name}@example.com`,
+  accessToken: `at-${name}-1`, refreshToken: `rt-${name}-1`, expiresAt: T0 + 8 * H, ...extra,
+});
+
 /** The store. `calls` records every API call; `locked` is the lock's state. */
 function makeStore() {
   const rows = new Map(); // id → { User_Credential__, Key, Data, Updated, Locked }
@@ -90,6 +95,7 @@ function setup(entries, { store = makeStore(), signedIn = true, refresh, minted 
       return refresh ? refresh(rt) : { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H };
     },
     codexRefreshFn: async (rt) => { refreshed.push(rt); return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H }; },
+    grokRefreshFn: async (rt) => { refreshed.push(rt); sent.push({ rt, locked: [...store.rows.values()].some((r) => r.Locked) }); return { accessToken: `${rt}-renewed-at`, refreshToken: `${rt}-renewed-rt`, expiresAt: store.now() + 8 * H }; },
   });
   const persisted = [];
   am.onTokenRefresh((idx, tokens) => { persisted.push([am.accounts[idx].name, tokens]); sync.onLocalTokens(idx, tokens); });
@@ -124,6 +130,8 @@ test('only OAuth logins to a provider we refresh are synced, keyed by identity a
   assert.equal(syncKeyFor(claude('a')), `${KEY_PREFIX}anthropic.uuid-a.org-a`);
   assert.equal(syncKeyFor(claude('a', { orgUuid: undefined })), `${KEY_PREFIX}anthropic.uuid-a.Org_a`);
   assert.equal(syncKeyFor(codex('c')), `${KEY_PREFIX}codex.acct-c`);
+  // A Grok login is named by its xAI user id, the identity its sign-in gives.
+  assert.equal(syncKeyFor(grok('g')), `${KEY_PREFIX}grok.user-g`);
   // The same person on two installs: the same key, whatever ids the configs minted.
   assert.equal(syncKeyFor({ ...claude('a'), id: 'id-1' }), syncKeyFor({ ...claude('a'), id: 'id-2' }));
   for (const not of [
@@ -131,6 +139,7 @@ test('only OAuth logins to a provider we refresh are synced, keyed by identity a
     claude('b', { upstream: 'https://gateway.example' }),
     claude('n', { accountUuid: undefined }),
     { ...codex('c'), accountId: undefined },
+    grok('g', { userId: undefined }),
     null, undefined,
   ]) {
     assert.equal(isSyncable(not), false, JSON.stringify(not));
@@ -198,6 +207,29 @@ test('a row with no local account becomes one, with its tokens and identity but 
   assert.equal(am.accounts[1].priority, 0);
   assert.equal(am.accounts[1].disabled, false);
   assert.ok(logs.some((l) => /"b" added from callback.net \(signed in on office\)/.test(l)), logs.join('\n'));
+});
+
+test('a Grok row carries the user id and email, and becomes a Grok account on an install without it', async () => {
+  const store = makeStore();
+  const other = { ...grok('g'), credential: 'at-g-7', refreshToken: 'rt-g-7', expiresAt: T0 + 6 * H };
+  store.put(syncKeyFor(other), encodeBlob(other, tokensOf(other), { now: T0, by: 'office' }));
+  const { sync, am, admitted } = setup([claude('a')], { store });
+  const r = await sync.sync('start');
+  assert.equal(r.added, 1);
+  // The email travels too: Grok sends it beside the token (x-email).
+  assert.deepEqual(admitted, [{ name: 'g', type: 'oauth', provider: 'grok', userId: 'user-g', email: 'g@example.com', accessToken: 'at-g-7', refreshToken: 'rt-g-7', expiresAt: T0 + 6 * H }]);
+  assert.equal(am.accounts[1].provider, 'grok');
+  assert.equal(am.accounts[1].credential, 'at-g-7');
+});
+
+test('a Grok login is stored, and its renewal goes through the row\'s lock like the others', async () => {
+  const { sync, am, store, sent } = setup([grok('g')]);
+  await sync.sync('start');
+  assert.equal(store.blob(`${KEY_PREFIX}grok.user-g`).accessToken, 'at-g-1');
+  await am.ensureTokenFresh(0, true);
+  assert.deepEqual(sent.map((x) => [x.rt, x.locked]), [['rt-g-1', true]], 'renewed once, under the lock');
+  assert.equal(store.blob(`${KEY_PREFIX}grok.user-g`).accessToken, 'rt-g-1-renewed-at');
+  assert.equal(store.byKey(`${KEY_PREFIX}grok.user-g`).Locked, null, 'and unlocked after');
 });
 
 test('the newer token wins each way: the store\'s is adopted, this install\'s is stored', async () => {

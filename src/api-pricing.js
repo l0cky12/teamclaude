@@ -8,6 +8,7 @@
 // USD per million tokens, copied from
 //   https://platform.claude.com/docs/en/about-claude/pricing      (2026-10-29)
 //   https://developers.openai.com/api/docs/pricing                (2026-10-29)
+//   https://docs.x.ai/docs/models                                 (2026-11-05)
 // They change; a model this table does not know is reported as unpriced
 // rather than guessed at.
 //
@@ -16,10 +17,10 @@
 //   - Cache writes are priced at the 5-minute rate. Claude Code also writes
 //     1-hour entries, which cost more, so this can read low.
 //   - Long-prompt surcharges (Claude Haiku 5.5 over 100K tokens, OpenAI's
-//     flagships over 272K) are not applied.
+//     flagships over 272K, xAI's models over 200K) are not applied.
 //   - Fast mode, batch, data-residency and regional multipliers are not applied.
 //
-// Only `anthropic` and `codex` rows are priced. A third-party backend
+// Only `anthropic`, `codex` and `grok` rows are priced. A third-party backend
 // (DeepSeek, z.ai) is already billed by the token at its own rates, which
 // are not Anthropic's even when it serves a Claude-named model.
 
@@ -94,6 +95,23 @@ export const OPENAI_PRICES = {
 };
 
 /**
+ * xAI models by id, standard tier for prompts under 200K tokens. xAI states no
+ * separate price for writing its cache, like OpenAI. Models its page no longer
+ * lists (grok-code-fast-1, grok-4-fast) are left unpriced rather than guessed.
+ * @type {Record<string, Price>}
+ */
+export const GROK_PRICES = {
+  'grok-4.7': { input: 2, cacheRead: 0.5, output: 6 },
+  'grok-4.6': { input: 2, cacheRead: 0.5, output: 6 },
+  'grok-4.5': { input: 2, cacheRead: 0.3, output: 6 },
+  'grok-4.3': { input: 1.25, cacheRead: 0.2, output: 2.5 },
+  'grok-4.20-reasoning': { input: 1.25, cacheRead: 0.2, output: 2.5 },
+  'grok-4.20-non-reasoning': { input: 1.25, cacheRead: 0.2, output: 2.5 },
+  'grok-4.20-multi-agent': { input: 1.25, cacheRead: 0.2, output: 2.5 },
+  'grok-build-0.1': { input: 1, cacheRead: 0.2, output: 2 },
+};
+
+/**
  * A Claude model id as `<family>-<version>`: `claude-opus-4-5-20251101` →
  * `opus-4.5`, `claude-3-5-haiku-20241022` → `haiku-3.5`. Cloud prefixes
  * (`us.anthropic.`), suffixes (`[1m]`, `-v1:0`, `@20250514`) and date stamps
@@ -116,7 +134,7 @@ export function claudeKey(model) {
 /**
  * The price of one model's tokens on one provider, or null when this table
  * has no price for it.
- * @param {string} provider  a history row's provider: `anthropic`, `codex` or `backend:<host>`
+ * @param {string} provider  a history row's provider: `anthropic`, `codex`, `grok` or `backend:<host>`
  * @param {string} model
  * @returns {Price|null}
  */
@@ -137,6 +155,18 @@ export function priceFor(provider, model) {
     // the one it still lists (gpt-5.3-codex at gpt-5.2's rate) shows.
     const base = undated.replace(/-codex(-max)?$/, '');
     return base !== undated ? OPENAI_PRICES[base] ?? null : null;
+  }
+  if (provider === 'grok') {
+    // `-latest` and a dated release (`grok-4.20-0309-reasoning`) are priced as
+    // the model they name, the way xAI's page lists it.
+    const id = model.toLowerCase().trim().replace(/-latest$/, '').replace(/-\d{4}(?=-|$)/, '');
+    if (GROK_PRICES[id]) return GROK_PRICES[id];
+    // A bare name is xAI's alias for its latest stable release (`grok-build`
+    // for `grok-build-0.1`). It is priced only when every listed release it
+    // could stand for costs the same, so an alias is never priced as a guess.
+    const same = Object.keys(GROK_PRICES).filter(k => k.startsWith(`${id}-`)).map(k => GROK_PRICES[k]);
+    const first = same[0];
+    return first && same.every(p => p.input === first.input && p.output === first.output && p.cacheRead === first.cacheRead) ? first : null;
   }
   return null;
 }

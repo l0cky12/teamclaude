@@ -2460,11 +2460,12 @@ async function transferPassphrase({ confirm }) {
   return passphrase;
 }
 
-/** "Claude", "Codex", "API key" or "backend": how an account is counted in a summary. */
+/** "Claude", "Codex", "Grok", "API key" or "backend": how an account is counted in a summary. */
 function transferKind(/** @type {Record<string, any>} */ a) {
   if (a.type === 'apikey') return 'API key';
   if (a.upstream) return 'backend';
-  return providerOf(a) === 'codex' ? 'Codex' : 'Claude';
+  const provider = providerOf(a);
+  return provider === 'codex' ? 'Codex' : provider === 'grok' ? 'Grok' : 'Claude';
 }
 
 /** "12 Claude, 3 Codex" for a list of accounts. */

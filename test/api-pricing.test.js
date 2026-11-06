@@ -2,7 +2,7 @@
 // (api-pricing.js): which model id gets which price, and the arithmetic.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { claudeKey, priceFor, costAt, priceLookup, CLAUDE_PRICES, OPENAI_PRICES } from '../src/api-pricing.js';
+import { claudeKey, priceFor, costAt, priceLookup, CLAUDE_PRICES, OPENAI_PRICES, GROK_PRICES } from '../src/api-pricing.js';
 
 test('Claude ids are priced by family and version, whatever is around them', () => {
   assert.equal(claudeKey('claude-opus-5-5'), 'opus-5.5');
@@ -40,6 +40,20 @@ test('OpenAI ids: exact, dated snapshots, and Codex variants at their base model
   assert.equal(priceFor('codex', 'gpt-5.1-codex-max'), OPENAI_PRICES['gpt-5.1']);
   assert.equal(priceFor('codex', 'gpt-5.1-codex-mini'), null, 'no gpt-5.1-mini to fall back to');
   assert.equal(priceFor('anthropic', 'gpt-5'), null, 'the provider decides which table');
+});
+
+test('Grok ids: exact, `-latest`, and dated releases at the model xAI lists', () => {
+  assert.equal(priceFor('grok', 'grok-4.7'), GROK_PRICES['grok-4.7']);
+  assert.equal(priceFor('grok', 'Grok-Build-0.1'), GROK_PRICES['grok-build-0.1']);
+  assert.equal(priceFor('grok', 'grok-4.7-latest'), GROK_PRICES['grok-4.7']);
+  assert.equal(priceFor('grok', 'grok-4.20-0309-reasoning'), GROK_PRICES['grok-4.20-reasoning']);
+  assert.equal(priceFor('grok', 'grok-4.20-multi-agent-0309'), GROK_PRICES['grok-4.20-multi-agent']);
+  assert.equal(priceFor('grok', 'grok-code-fast-1'), null, 'no longer on xAI\'s page');
+  assert.equal(priceFor('grok', 'grok-build'), GROK_PRICES['grok-build-0.1'], 'an alias for the one release it can mean');
+  assert.equal(priceFor('grok', 'grok-4.20'), GROK_PRICES['grok-4.20-reasoning'], 'releases that all cost the same');
+  assert.equal(priceFor('grok', 'grok-4'), null, 'grok-4.7 is not a release of grok-4');
+  assert.equal(priceFor('codex', 'grok-4.7'), null, 'the provider decides which table');
+  assert.equal(priceFor('grok', 'gpt-5'), null);
 });
 
 test('the cost of a tally: each kind at its own rate, per million', () => {

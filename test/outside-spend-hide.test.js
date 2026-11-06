@@ -216,5 +216,5 @@ test('the page carries the helpers, the Settings row, and passes the cut-off to 
   }
   assert.match(html, /id="ospRow"/);
   assert.match(html, /id="ospVal" type="number" min="0" max="100"/);
-  assert.ok(html.includes('outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent)'));
+  assert.ok(html.includes('outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent, q.planPeriod)'));
 });

@@ -299,6 +299,32 @@ export function isLoopbackAddr(addr) {
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 }
 
+/**
+ * Where a Grok Build on this machine reaches the proxy without a key, for the
+ * dashboard's client-key panel, or null when there is no such address.
+ *
+ * Grok Build cannot present a client key (its `extra_headers` reach only some
+ * of its requests), so it can only use the loopback exemption: a direct
+ * connection from 127.0.0.1 or ::1. That needs the exemption on
+ * (`trustLoopback`) and a listener that answers on loopback: the default
+ * 127.0.0.1, ::1, or a wildcard bind. A proxy bound to one other address
+ * (a LAN or Tailscale IP) answers no loopback connection at all.
+ *
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @param {string|null|undefined} bindHost  the address the listener bound
+ * @param {number} port  the port the request arrived on, which is the listener's
+ * @returns {string|null}
+ */
+export function grokLocalBase(proxyConfig, bindHost, port) {
+  if (proxyConfig?.trustLoopback === false || !(port > 0)) return null;
+  const host = String(bindHost || '127.0.0.1').replace(/^\[|\]$/g, '').toLowerCase();
+  let loopback;
+  if (host === '::1') loopback = '[::1]';
+  else if (['127.0.0.1', 'localhost', '0.0.0.0', '::'].includes(host)) loopback = '127.0.0.1';
+  else return null;
+  return `http://${loopback}:${port}${PROVIDERS.grok.pathPrefix}/v1`;
+}
+
 // Headers a forwarding proxy adds to name the caller it forwards for. Any of
 // them on a loopback-sourced request says the socket's peer is a proxy on this
 // host, not the caller.
@@ -1752,9 +1778,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         // The name only: the key never reaches the log.
         console.log(`[TeamClaude] ${isCreate ? 'Created' : 'Revoked'} client key "${safeLine(result.name, 80)}" (control endpoint)`);
-        // no-store: the create reply carries the key itself.
+        // no-store: the create reply carries the key itself. A new key's
+        // panel also gives Grok Build's local address (grokLocalBase).
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, ...result }));
+        res.end(JSON.stringify({ ok: true, ...result, ...(isCreate ? { grokLocal: grokLocalBase(config.proxy, boundHost(), req.socket.localPort || 0) } : {}) }));
         return;
       }
 
@@ -1774,7 +1801,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return;
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ ok: true, ...result }));
+        res.end(JSON.stringify({ ok: true, ...result, grokLocal: grokLocalBase(config.proxy, boundHost(), req.socket.localPort || 0) }));
         return;
       }
 

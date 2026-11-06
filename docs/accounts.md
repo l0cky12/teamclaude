@@ -178,7 +178,7 @@ The sign-in is a poll-token OAuth2 flow: the URL can be opened on any machine, s
 
 **What callback.net does with the data.** It stores your tokens and nothing else: the rows are the account's identity and its access and refresh tokens, encrypted in transit (TLS) and at rest, readable only with your callback.net login, and never used by the service itself — it holds them so your other installs can read them. The service is provided free of charge, as a convenience for exactly this: syncing your own tokens between your own computers. Use it for that and nothing else; in particular, it is not a place to share accounts with other people, and the pool's per-client keys and routing are the tools for sharing a proxy.
 
-While signed in, every **OAuth** account (Claude and Codex) is kept as one row of your `User/Credential` store on callback.net, encrypted at rest and keyed by the account's identity (provider, account, organization), so each of your installs names the same account the same way. What travels is the identity and the tokens: `priority`, `disabled`, `routing` and the display order stay on each install. API-key accounts and [third-party backends](#third-party-backend-accounts) are not synced — a key does not expire, and a backend credential is not ours to renew.
+While signed in, every **OAuth** account (Claude, Codex and Grok) is kept as one row of your `User/Credential` store on callback.net, encrypted at rest and keyed by the account's identity (provider, account, organization; a Grok login by its xAI user id), so each of your installs names the same account the same way. What travels is the identity (including the account's email, which a Grok request carries) and the tokens: `priority`, `disabled`, `routing` and the display order stay on each install. API-key accounts and [third-party backends](#third-party-backend-accounts) are not synced — a key does not expire, and a backend credential is not ours to renew.
 
 - **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it — but only with a token this install just renewed (below).
 - **Only fresh tokens are stored.** A token is written to the store only when the token endpoint has just minted it: a renewal on this install, or a `login` or `import`. A token read from the config at start, or from disk on a reload, may have died while the proxy was down, and one that served a request may still have been revoked since, so neither is ever stored. An account holding one only reads (it adopts newer tokens and follows tombstones); its next renewal writes the row. That renewal is still made under a lock: with no row yet, it first creates one holding only the account's identity and no token, so that two installs started from the same config renew the account once, not twice.
@@ -772,7 +772,16 @@ billing endpoint Grok Build's usage view does. The reading fills the weekly
 bar (named **Monthly** for a monthly plan; the dashboard's pooled Grok card
 says **Plan allowance** when weekly and monthly plans are pooled together), so
 the switch threshold rotates a Grok account before its plan runs out. With the probe off, as it is by default,
-a Grok account's usage is unknown until a request is refused.
+a Grok account's usage is unknown until a request is refused. Its row on the
+dashboard's Quota page says so, and its **Refresh quota** button reads the
+allowance once, which spends nothing.
+
+Grok accounts appear everywhere Claude and Codex accounts do: their own tab,
+summary card and section on the Quota page, `teamclaude status`, the TUI, and
+the Insights page, where Grok tokens are a provider of their own and are
+priced at xAI's list prices (see [Estimated API cost](usage.md#estimated-api-cost)).
+A monthly plan's outside-spend and forecast lines say "month" rather than
+"week".
 
 A 429 whose body says the plan is spent (`You ran out of credits`, `Plan limit
 reached`) holds that account and moves the request to the next Grok account,

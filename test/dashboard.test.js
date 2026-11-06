@@ -2345,6 +2345,17 @@ test('the setup text points Claude Code and Codex at this proxy with the new key
   assert.match(setup.codex, /^model_provider = "teamclaude"$/m);
   assert.match(setup.codex, /^base_url = "http:\/\/100\.64\.0\.2:3456\/backend-api\/codex"$/m);
   assert.match(setup.codex, /^http_headers = \{ "x-api-key" = "tc-abc" \}$/m);
+  // No local address from the proxy: no Grok line, never the page's origin.
+  assert.equal(setup.grok, null);
+});
+
+test('Grok Build is pointed at the loopback address the proxy reports, never the page\'s, and gets no key', () => {
+  // The page is open over Tailscale; Grok Build can only use the loopback exemption.
+  const setup = clientKeySetup('http://100.64.0.2:3456', 'tc-abc', 'http://127.0.0.1:3456/grok/v1');
+  assert.equal(setup.grok, 'export GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:3456/grok/v1');
+  assert.doesNotMatch(setup.grok, /tc-abc|100\.64/);
+  assert.equal(clientKeySetup('http://127.0.0.1:3456', 'tc-abc', null).grok, null, 'the proxy has no keyless route');
+  assert.equal(clientKeySetup('http://127.0.0.1:3456', 'tc-abc', undefined).grok, null, 'an older proxy says nothing');
 });
 
 // Show details returns hand-written keys too, so the snippets must survive any key.
