@@ -23,6 +23,7 @@ import { sanitizeText, safeLine } from './safe-text.js';
 import { MAX_PROBE_SECONDS, MIN_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 import { hyperlink, clipboardSequence } from './osc.js';
+import { accountLimitReached } from './account-limit.js';
 /** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -2268,6 +2269,12 @@ export class TUI {
         // keep its traffic off this machine's address.
         if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
+        // Before the namesakes below are renamed: a refused add changes nothing.
+        const reached = accountLimitReached(this.config.accounts, entry);
+        if (reached) {
+          this._addLog(`Import refused: ${reached.message}`);
+          return;
+        }
         // New org for this person: disambiguate colliding email names with " (org)".
         if (profile?.accountUuid) {
           const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
@@ -2304,6 +2311,11 @@ export class TUI {
     // One object, not two equal literals: the account has to be built from the
     // entry itself to carry its id, which is what pairs the two afterwards.
     const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
+    const reached = accountLimitReached(this.config.accounts, entry);
+    if (reached) {
+      this._addLog(`API key not added: ${reached.message}`);
+      return;
+    }
     this.config.accounts.push(entry);
     this.am.addAccount(entry);
     // Same window as in _doImport: the account exists here before it does on

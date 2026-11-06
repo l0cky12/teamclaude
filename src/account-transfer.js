@@ -31,6 +31,7 @@ import { findUpsertTarget, updateAccountEntry } from './identity.js';
 import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { providerOf } from './provider.js';
+import { accountLimitReached } from './account-limit.js';
 
 export const BUNDLE_FORMAT = 'teamrouter-accounts';
 export const BUNDLE_VERSION = 1;
@@ -396,6 +397,12 @@ export function mergeImportedAccounts(config, incoming, { force = false } = {}) 
     const hit = findUpsertTarget(sameKind.map(({ a }) => a), acct);
     const idx = hit < 0 ? -1 : sameKind[hit].i;
     if (idx < 0) {
+      // Past the per-kind cap the bundle's account stays out, said per account.
+      const reached = accountLimitReached(config.accounts, acct);
+      if (reached) {
+        skipped.push({ name: acct.name, reason: reached.message });
+        continue;
+      }
       acct.name = freeName(config.accounts, acct);
       acct.source = 'transfer';
       config.accounts.push(acct);

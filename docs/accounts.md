@@ -41,6 +41,21 @@ An account that [reads its tokens from a file](#delegating-credentials-to-a-file
 
 The server runs one dashboard sign-in at a time. Starting another cancels the first, unless the first already has its code (the browser came back to the listener, or the code was pasted) and is being finished: then the new one is refused until the first is done. **Cancel** gives up and closes the listener; once the code has arrived there is nothing left to cancel, and the account is stored when the exchange ends. The panel waits five minutes. Nothing opens on the server's own screen: the link opens in the browser the dashboard runs in. The buttons are hidden for a page holding a `proxy.clientKeys` key, because signing accounts in is the operator's business. The endpoints behind them are in [Usage](usage.md#account-sign-in-and-removal-endpoints).
 
+## How many accounts you can add
+
+TeamClaude holds at most **20 accounts of each kind**. The kinds are counted separately:
+
+- Claude subscriptions (OAuth logins)
+- Codex subscriptions
+- Anthropic API keys
+- each third-party backend, by its upstream host (20 DeepSeek keys and 20 z.ai keys are both allowed)
+
+Disabled accounts count. Once a kind has 20, every way of adding another one refuses it: `teamclaude login`, `login --api`, `login --codex`, `import`, the TUI, the dashboard's sign-in buttons, `teamclaude accounts import`, and accounts arriving through [account sync](#syncing-accounts-across-machines-callbacknet). The refusal says which kind is full, for example `Account limit reached: 20 Claude accounts already (at most 20). Remove one before adding another.` Nothing is written when an add is refused. `login --api` refuses before it asks for the key.
+
+Signing in again to an account you already have is an update, not an add, so it still works at the cap. An `accounts import` adds until the kind is full and lists the rest as skipped. An account that sync could not add is logged once and left in the store.
+
+The cap stops new accounts only. A config that already holds more than 20 of a kind, from before this limit or from a hand edit, keeps all of them.
+
 ## Removing an account
 
 **Remove** on an account's row in the dashboard's **Accounts** page signs that one account out of TeamClaude, and leaves every other account alone. The first click arms it, and the button turns into **Confirm remove** for a few seconds. The second click removes. Removing the last account leaves the server running with none, the same as a [fresh install](#starting-with-no-accounts). A removal waits for a config reload that is under way, so the two never interleave. This does the same as `teamclaude remove <name>`: the account leaves the running fleet at once, and its entry, credentials included, leaves the config file. A conversation pinned to it moves to another account on its next request.

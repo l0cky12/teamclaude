@@ -72,7 +72,7 @@ Some shortcuts:
 - Want plain `claude` to always use the proxy? Run `teamclaude alias --install`.
 - Signing in on a server over SSH? `teamclaude login --token` gives you a link to open on any device and a box to paste the code into.
 
-More on accounts, including API keys and one email in several organisations: [docs/accounts.md](docs/accounts.md).
+You can add up to 20 accounts of each kind (Claude, Codex, API keys, and each third-party backend). More on accounts, including API keys and one email in several organisations: [docs/accounts.md](docs/accounts.md).
 
 ## What it does
 
