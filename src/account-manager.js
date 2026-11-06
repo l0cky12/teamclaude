@@ -6028,6 +6028,38 @@ export class AccountManager {
   }
 
   /**
+   * Put a different login in an account's place. A credentials file another
+   * login was written over (its CLI signed in as someone else) still feeds the
+   * same config row, so the slot keeps its position and its row, but nothing
+   * learned about the login it held carries over: quota windows, session and
+   * route pins, the learners, the rollover reading. The forgetting is
+   * removeAccount's without the renumbering, and without its removal hook: the
+   * old login did not leave the fleet, it only stopped being what this row's
+   * file holds, so it gets no tombstone in the shared store.
+   * @param {number} index
+   * @param {Record<string, any>} acctData  the config entry with the file's credentials
+   */
+  replaceAccount(index, acctData) {
+    if (index < 0 || index >= this.accounts.length) return;
+    this.accounts[index] = makeAccount(acctData, index, this.listener);
+    const forget = (/** @type {number} */ idx) => (idx === index ? null : idx);
+    for (const map of [this.routePins, this.routeCursors, this._drainHolders]) {
+      for (const [key, idx] of [...map.entries()]) if (idx === index) map.delete(key);
+    }
+    this.sessionTracker.remapAccounts(forget);
+    this.burnRateLearner.remapAccounts(forget);
+    this.outsideSpend.remapAccounts(forget);
+    this.concurrencyLearner.remapAccounts(forget);
+    if (this._currentObs) {
+      const held = remapHeld(this._currentObs.unescaped, forget);
+      this._currentObs = this._currentObs.idx !== index
+        ? { ...this._currentObs, unescaped: held }
+        : held ? { ...newObservation(), unescaped: held } : null;
+    }
+    this._rolloverHeldLogAt.clear();
+  }
+
+  /**
    * Remove an account by index.
    */
   removeAccount(index) {

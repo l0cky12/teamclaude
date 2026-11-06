@@ -1,5 +1,5 @@
 import { credentialFileFor } from './resolve-accounts.js';
-import { sameIdentity } from './identity.js';
+import { sameIdentity, distinctAccounts } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -221,6 +221,22 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         // Claude reader finds no token in a Codex auth.json, so a Codex login
         // refreshed in its file reached the fleet only on a restart.
         const creds = await credentialFileFor(diskAcct).read(diskAcct.importFrom);
+        // The file's CLI signed in as someone else since it was last read. Its
+        // token belongs to that login, and so must the identity it is sent with
+        // (Codex scopes it with chatgpt-account-id, Grok with x-userid): the old
+        // login's ids beside the new token are a request upstream refuses or
+        // misattributes. Nor is anything learned about the old login true of
+        // this one, so the slot starts fresh, as a restart would start it.
+        if (creds.accessToken && distinctAccounts(mgr, { ...mgr, ...identityOf(creds) })) {
+          accountManager.replaceAccount(mgrIdx, { ...diskAcct, ...creds });
+          console.log(`[TeamClaude] "${safeLine(mgr.name, 64)}": ${safeLine(diskAcct.importFrom, 120)} now holds a different login; started it fresh`);
+          accountManager.events?.add({ kind: 'signin', type: 'credentials_updated', provider: providerOf(mgr), account: mgr.name, message: 'A different login in its credentials file; started fresh' });
+          continue;
+        }
+        // The same login: ids the running account lacked travel with its token.
+        const ids = /** @type {Record<string, any>} */ (mgr);
+        for (const [field, value] of Object.entries(identityOf(creds))) if (!ids[field]) ids[field] = value;
+        if (creds.email) mgr.email = creds.email;
         // A Codex auth.json carries no expiry; the staleness check below then
         // leaves the file's token to win, as a fresh login there should.
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: 'expiresAt' in creds ? creds.expiresAt : undefined };
@@ -290,4 +306,20 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     dropped++;
   }
   return { added, removed: dropped };
+}
+
+/**
+ * The fields of a credentials file that say whose login it holds, as identity.js
+ * compares them. Only the ones the file states: an absent one means "cannot
+ * tell", never "different".
+ * @param {Record<string, any>} creds
+ * @returns {Record<string, string>}
+ */
+function identityOf(creds) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const field of ['accountId', 'userId', 'accountUuid', 'orgUuid']) {
+    if (typeof creds[field] === 'string' && creds[field]) out[field] = creds[field];
+  }
+  return out;
 }
