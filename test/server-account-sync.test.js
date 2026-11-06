@@ -206,3 +206,49 @@ test('end to end: start, approve at callback.net, the token is saved and a pass 
     }
   }
 });
+
+test('the mode route switches to a local store while a callback.net sign-in is waiting, and keeps no token', async () => {
+  let approve = () => {};
+  const saved = [];
+  let mode = { mode: 'off' };
+  const accountSync = new WebAccountSync({
+    sync: fakeCredentialSync(),
+    login: async (opts) => {
+      const approved = new Promise((resolve) => { approve = resolve; });
+      opts.onUrl('https://oid.jp/LOCAL', { lifetimeSeconds: 900 });
+      await approved;
+      return { access_token: 'at-new', refresh_token: 'rt-new', client_id: 'oaap-x', obtained_at: 1 };
+    },
+    load: async () => saved[0] || null,
+    save: async (token) => { saved.push(token); },
+    mode: () => mode,
+    setMode: async (next) => { mode = next; },
+    canHost: () => true,
+    peerNames: () => ['hub'],
+    probe: async () => ({}),
+    log: () => {},
+  });
+  await withServer(async ({ port }) => {
+    const h = { 'x-api-key': 'tc-local' };
+    const start = await (await post(port, '/teamclaude/account-sync/start', {}, h)).json();
+    assert.equal(start.ok, true, start.error);
+    const before = await (await fetch(`http://127.0.0.1:${port}/teamclaude/account-sync`, { headers: h })).json();
+    assert.equal(before.signIn.state, 'waiting');
+    assert.equal(before.signedIn, false);
+
+    const res = await post(port, '/teamclaude/account-sync/mode', { mode: 'host' }, h);
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    assert.deepEqual(body, { ok: true, mode: 'host', peer: null });
+    assert.doesNotMatch(JSON.stringify(body), /sign-in is in progress/);
+    assert.equal(mode.mode, 'host');
+
+    const after = await (await fetch(`http://127.0.0.1:${port}/teamclaude/account-sync`, { headers: h })).json();
+    assert.equal(after.signIn, null);
+    assert.equal(after.instance.mode, 'host');
+
+    approve();
+    for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(saved, [], 'the approval after the switch is not saved');
+  }, { hooks: { accountSync } });
+});
