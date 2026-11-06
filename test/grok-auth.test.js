@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { importGrokCredentials, refreshGrokToken, startGrokLogin } from '../src/grok-auth.js';
 import { resolveAccounts } from '../src/resolve-accounts.js';
 import { AccountManager } from '../src/account-manager.js';
-import { sameIdentity } from '../src/identity.js';
+import { sameIdentity, distinctAccounts } from '../src/identity.js';
 import { setUpstreamProxy, resolveUpstreamProxy, resetUpstreamProxy } from '../src/upstream-proxy.js';
 
 test.beforeEach(() => setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {})));
@@ -234,4 +234,15 @@ test('a device sign-in whose first request stalls ends at its deadline', async (
   try {
     await assert.rejects(startGrokLogin({ deviceEndpoint: `${srv.url}/d`, tokenEndpoint: `${srv.url}/t`, timeoutMs: 200, wait: async () => {} }), /did not answer/);
   } finally { await srv.close(); }
+});
+
+test('only a Grok login is identified by its user id alone', () => {
+  // A Codex record with no ChatGPT account id falls back to its name, as it did
+  // before Grok: its user id says who signed in, not which plan the token is for.
+  const a = { name: 'same', provider: 'codex', userId: 'u-1' };
+  const b = { name: 'same', provider: 'codex', userId: 'u-2' };
+  assert.equal(sameIdentity(a, b), true);
+  assert.equal(distinctAccounts(a, b), false);
+  const g = { name: 'same', provider: 'grok', userId: 'u-1' };
+  assert.equal(distinctAccounts(g, { ...g, userId: 'u-2' }), true);
 });
