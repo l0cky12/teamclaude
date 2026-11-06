@@ -734,8 +734,9 @@ A Grok plan has one shared allowance per period, weekly or monthly, and no
 5-hour window. Grok's responses carry no usage headers, so the allowance is
 known only from the [quota probe](quota.md#quota-probe), which reads the same
 billing endpoint Grok Build's usage view does. The reading fills the weekly
-bar (named **Monthly** for a monthly plan), so the switch threshold rotates a
-Grok account before its plan runs out. With the probe off, as it is by default,
+bar (named **Monthly** for a monthly plan; the dashboard's pooled Grok card
+says **Plan allowance** when weekly and monthly plans are pooled together), so
+the switch threshold rotates a Grok account before its plan runs out. With the probe off, as it is by default,
 a Grok account's usage is unknown until a request is refused.
 
 A 429 whose body says the plan is spent (`You ran out of credits`, `Plan limit

@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSignIns } from '../src/web-login.js';
-import { signInPlan, signInStatusOutcome, accountGroup, groupLabel, providerTone, providerTabs, accountMeters, needsSignIn, fileSignInHint } from '../src/dashboard.js';
+import { signInPlan, signInStatusOutcome, accountGroup, groupLabel, providerTone, providerTabs, accountMeters, poolSummary, needsSignIn, fileSignInHint } from '../src/dashboard.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
@@ -58,4 +58,15 @@ test('a Grok row draws its plan window, Monthly when the plan is, and no Fable o
 test('a signed-out Grok account is signed in again as Grok, or in Grok Build when its file owns it', () => {
   assert.equal(needsSignIn({ provider: 'grok', type: 'oauth', status: 'error' }), 'grok');
   assert.match(String(fileSignInHint({ provider: 'grok', type: 'oauth', status: 'error', credentialsFromFile: true })), /Grok Build \(grok login\)/);
+});
+
+test('the pooled Grok card names its window the same way whichever account comes first', () => {
+  const reset = Date.now() + 3 * 24 * 3600_000;
+  const weekly = { name: 'w', provider: 'grok', quota: { unified7d: 0.4, unified7dReset: reset, sessionWindowStated: false } };
+  const monthly = { name: 'm', provider: 'grok', quota: { unified7d: 0.7, unified7dReset: reset, sessionWindowStated: false, planPeriod: 'monthly' } };
+  assert.equal(poolSummary([weekly, monthly], 2).label, 'Plan allowance');
+  assert.equal(poolSummary([monthly, weekly], 2).label, 'Plan allowance');
+  // A pool of one kind keeps that kind's own name.
+  assert.equal(poolSummary([monthly, { ...monthly, name: 'm2' }], 2).label, 'Monthly limit');
+  assert.equal(poolSummary([weekly], 2).label, '7-day limit');
 });

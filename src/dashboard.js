@@ -1773,7 +1773,10 @@ export function poolSummary(accounts, slot, fable, now) {
     if (!a || a.disabled) return;
     var m = accountMeters(a, fable, at).slots[slot];
     if (!m) return;
-    out.label = out.label || m.label;
+    // Accounts whose plans run on different periods (a weekly Grok plan
+    // beside a monthly one) share no window name, so the card takes a neutral
+    // one rather than whichever account happens to come first.
+    out.label = out.label == null || out.label === m.label ? m.label : 'Plan allowance';
     if (m.left == null) { out.unknown++; return; }
     out.count++;
     out.left += m.left;
