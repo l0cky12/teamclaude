@@ -1,6 +1,7 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
-import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER, isSubscriptionAccount, canServeProvider, loginCommandFor } from './provider.js';
 import { refreshCodexToken } from './codex-auth.js';
+import { refreshGrokToken } from './grok-auth.js';
 import { parseCodexQuota, parseCodexPlanType, parseCodexActiveLimit } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage, spendCapReached, resolveSwitchThreshold, sanitizeSwitchThreshold, WEEKLY_BUCKET_KEYS } from './model.js';
@@ -198,6 +199,9 @@ const PERSISTED_QUOTA_FIELDS = [
   // Same reason: a Team seat (no shared weekly window) would draw `Wk ?` until
   // its first reading.
   'weeklyWindowStated',
+  // 'monthly' when the plan's one shared window is a month long (Grok), so a
+  // restored row keeps its label until the next reading.
+  'planPeriod',
 ];
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
@@ -225,7 +229,8 @@ const CAPPED_FAMILY_HOLD_MS = 7 * 24 * 3600_000;
  * does not exist.
  *
  * @typedef {object} CodexLearnedQuota
- * @property {string} [planType]  the Codex subscription tier
+ * @property {string} [planType]  the subscription tier (Codex, Grok)
+ * @property {'monthly'|null} [planPeriod]  'monthly' when the plan's shared window is a month, not a week (Grok)
  * @property {{available: number, applicable: number|null, seenAt: number, expiresAt?: number|null, expiries?: Array<number|null>, expiriesAt?: number, expiriesFor?: number|null, grantedAt?: number}} [resetCredits]  free rate-limit reset credits (Codex) or banked usage-limit resets (Claude) held, when that was last seen, and when the soonest one lapses where the provider says
  *   A Codex reading also carries, once the credit rows have been read, `expiries` (when each held credit expires, soonest first, null for none), `expiriesAt` (when they were read), `expiriesFor` (the count they describe, or null once a count change has left them out of step until the next read) and `grantedAt` (when the count last went up).
  * @property {Record<string, {name: string, utilization: number, resetAt: number|null, seenAt: number}>} [codexModelBuckets]  model-scoped weekly buckets, keyed by slug
@@ -592,6 +597,7 @@ export class AccountManager {
    * @param {Function} [opts.refreshFn]
    * @param {(account: Record<string, any>, refresh: () => Promise<any>, info: { force: boolean }) => Promise<any>} [opts.refreshCoordinator]  wraps every token refresh (credential-sync.js takes it through a shared lock); the default just refreshes. Resolving null keeps the current token: nothing is written and nothing is announced
    * @param {Function} [opts.codexRefreshFn]
+   * @param {Function} [opts.grokRefreshFn]
    * @param {number} [opts.throttleProbeFloorMs]
    * @param {number} [opts.familyStaleMs]
    * @param {number} [opts.statusStaleMs]
@@ -608,7 +614,7 @@ export class AccountManager {
    * @param {import('./event-log.js').EventLog} [opts.events]  the event log to record into (a fresh one when omitted)
    * @param {UsageHistory} [opts.usageHistory]  the day-by-day usage history to book into (a fresh one when omitted)
    */
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events, usageHistory } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, grokRefreshFn = refreshGrokToken, refreshCoordinator = (_account, refresh, _info) => refresh(), throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, adaptive, sessionTracker, expiryRouting, affinity, advisorEligibility, listener = null, events, usageHistory } = {}) {
     // What the dashboard's Logs page reads (event-log.js). One per manager, so
     // each proxy in a process keeps its own; the server and the login flows
     // record into the same one.
@@ -623,9 +629,9 @@ export class AccountManager {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
-    // OAuth token refresh.
-    this._refreshFn = refreshFn;
-    this._codexRefreshFn = codexRefreshFn;
+    // OAuth token refresh. One per provider: each mints tokens at its own
+    // endpoint with its own client id.
+    this._refreshFns = { anthropic: refreshFn, codex: codexRefreshFn, grok: grokRefreshFn };
     this._refreshCoordinator = refreshCoordinator;
     // Kept for accounts added at runtime, which go through the same guard.
     this.listener = listener;
@@ -2322,7 +2328,8 @@ export class AccountManager {
    * quite possibly one that cannot. Unclaimed means the session routes that
    * family afresh next request, which is what it did before it had a pin. */
   recordSession(sessionId, accountIndex, model = null) {
-    if (!sessionId) return;
+    // A request picked an account that a reload has since retired (replaceAccount).
+    if (!sessionId || !this.accounts[accountIndex]) return;
     const bucket = this._weeklyBucketFor(model);
     // The pin alone: this runs before the destination's token is refreshed and
     // long before the upstream fetch, so it names where the request is being
@@ -4900,7 +4907,7 @@ export class AccountManager {
     // that stated a window says anything — the catalog fetch carries none — and
     // a weekly window with no 5-hour one beside it is how a subscription that
     // meters no session window reads (see codex-quota.js). The usage probe
-    // records the same fact in applyCodexUsageData.
+    // records the same fact in applyPlanUsageData.
     if (parsed.unified5h != null) account.quota.sessionWindowStated = true;
     else if (parsed.unified7d != null) account.quota.sessionWindowStated = false;
 
@@ -5497,8 +5504,8 @@ export class AccountManager {
     }
   }
 
-  /** Apply a read-only Codex `/wham/usage` reading without counting traffic. */
-  applyCodexUsageData(accountIndex, usage) {
+  /** Apply a read-only plan usage reading (Codex `/wham/usage`, Grok billing) without counting traffic. */
+  applyPlanUsageData(accountIndex, usage) {
     const account = this.accounts[accountIndex];
     if (!account || !usage || usage.error) return;
     // The Codex-learned fields below are written here for the first time, so the
@@ -5540,6 +5547,10 @@ export class AccountManager {
     // is not observed from the null it just became.
     if (fresh5h && q.unified5h != null) this._observeBurnRate(account, ['unified5h']);
     if (usage.planType) q.planType = safeLine(usage.planType, 64);
+    // A Grok plan says whether its one pool is weekly or monthly; the reading
+    // sits in the weekly fields either way, since that is the window rotation
+    // gates on, and this is what tells a renderer to name it Monthly.
+    if (usage.period !== undefined) q.planPeriod = usage.period === 'monthly' ? 'monthly' : null;
     // Stamped, because nothing else refreshes it: a payload that mentions no
     // credits leaves the last reading alone rather than blanking it, so the
     // age is the only thing that says how much the number is worth.
@@ -5802,9 +5813,7 @@ export class AccountManager {
         // known good. A coordinator answer taken from the store is not.
         let minted = false;
         const refresh = async (/** @type {{ budgetMs?: number }} */ opts = {}) => {
-          const tokens = await (providerOf(account) === 'codex'
-            ? this._codexRefreshFn(sent, undefined, account.routing || null, opts)
-            : this._refreshFn(sent, undefined, account.routing || null, opts));
+          const tokens = await this._refreshFns[providerOf(account)](sent, undefined, account.routing || null, opts);
           minted = true;
           return tokens;
         };
@@ -5824,7 +5833,11 @@ export class AccountManager {
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        // By the account's index now, not the one this call was given: a
+        // removal while the refresh was out renumbers it, and a reload that put
+        // another login in its slot retires it to -1 (replaceAccount), whose
+        // tokens must not be persisted onto the row the new login reads.
+        if (account.index >= 0) this._onTokenRefresh?.(account.index, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
@@ -5833,7 +5846,7 @@ export class AccountManager {
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
-        if (isRoutingFailure(err)) this.markRoutingFailed(accountIndex);
+        if (isRoutingFailure(err)) this.markRoutingFailed(account.index);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -5860,7 +5873,8 @@ export class AccountManager {
           }
           this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
-          this._onAccountError?.(account);
+          // A retired login (replaceAccount) has nothing to recover.
+          if (account.index >= 0) this._onAccountError?.(account);
         }
       } finally {
         account._refreshPromise = null;
@@ -5965,7 +5979,7 @@ export class AccountManager {
       code,
       detail,
       since: Date.now(),
-      remedy: providerOf(account) === 'codex' ? 'teamclaude login --codex' : 'teamclaude login',
+      remedy: loginCommandFor(account),
     };
     return account.errorReason;
   }
@@ -6017,6 +6031,43 @@ export class AccountManager {
     const index = this.accounts.length;
     this.accounts.push(makeAccount(acctData, index, this.listener));
     return index;
+  }
+
+  /**
+   * Put a different login in an account's place. A credentials file another
+   * login was written over (its CLI signed in as someone else) still feeds the
+   * same config row, so the slot keeps its position and its row, but nothing
+   * learned about the login it held carries over: quota windows, session and
+   * route pins, the learners, the rollover reading. The forgetting is
+   * removeAccount's without the renumbering, and without its removal hook: the
+   * old login did not leave the fleet, it only stopped being what this row's
+   * file holds, so it gets no tombstone in the shared store.
+   * @param {number} index
+   * @param {Record<string, any>} acctData  the config entry with the file's credentials
+   */
+  replaceAccount(index, acctData) {
+    if (index < 0 || index >= this.accounts.length) return;
+    // Work already under way holds the old object and comes back through its
+    // index: a probe's reading, a response's quota headers, a refresh. Retired
+    // to an index nothing answers to, all of that lands nowhere instead of on
+    // the login that took the slot.
+    this.accounts[index].index = -1;
+    this.accounts[index] = makeAccount(acctData, index, this.listener);
+    const forget = (/** @type {number} */ idx) => (idx === index ? null : idx);
+    for (const map of [this.routePins, this.routeCursors, this._drainHolders]) {
+      for (const [key, idx] of [...map.entries()]) if (idx === index) map.delete(key);
+    }
+    this.sessionTracker.remapAccounts(forget);
+    this.burnRateLearner.remapAccounts(forget);
+    this.outsideSpend.remapAccounts(forget);
+    this.concurrencyLearner.remapAccounts(forget);
+    if (this._currentObs) {
+      const held = remapHeld(this._currentObs.unescaped, forget);
+      this._currentObs = this._currentObs.idx !== index
+        ? { ...this._currentObs, unescaped: held }
+        : held ? { ...newObservation(), unescaped: held } : null;
+    }
+    this._rolloverHeldLogAt.clear();
   }
 
   /**

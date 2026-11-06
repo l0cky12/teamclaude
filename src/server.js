@@ -15,7 +15,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequest
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, upstreamPathFor, rewritesBody, defaultHeadersTimeoutFor, providerForRequest, providerForHost, interceptHostsFor, providerOf, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -2311,7 +2311,7 @@ function hostOfAuthority(authority) {
  * or null when the request is ours to route.
  *
  * MITM terminates every intercepted host on one server, and the request path
- * routes by its PATH alone (providerForPath): `/backend-api/codex/*` is Codex,
+ * routes by its PATH (providerForRequest): `/backend-api/codex/*` is Codex,
  * everything else is Anthropic. That left every other request a Codex client
  * makes on chatgpt.com — codex-cli 0.156's workspace discovery
  * (`/backend-api/wham/accounts/check`), its plugin, MCP and settings calls —
@@ -2336,7 +2336,7 @@ export function clientPassthroughOrigin({ authority, url, config, accounts = [] 
   const provider = providerForHost(host);
   if (!provider || provider === DEFAULT_PROVIDER) return null;
   if (!interceptHostsFor(config?.accounts || []).includes(host)) return null;
-  if (providerForPath(url || '/') === provider) return null;
+  if (providerForRequest(url || '/', host) === provider) return null;
   const sample = accounts.find((a) => providerOf(a) === provider) || null;
   return upstreamFor(sample || { provider }, null);
 }
@@ -2352,13 +2352,15 @@ const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 /** The session id a request carries, or null when the header is absent or
  *  malformed — a malformed one is treated as no session, not rejected.
  *
- *  Claude Code sends `x-claude-code-session-id`, the Codex CLI `session-id`.
- *  Reading only the first left every Codex request untagged, so
- *  `distributeSessions` had nothing to place and a Codex pool stayed on one
- *  account until the switch threshold. The specific header wins when both are
- *  present: `session-id` is generic enough for a proxy in front to set. */
+ *  Claude Code sends `x-claude-code-session-id`, the Codex CLI `session-id`
+ *  and Grok Build `x-grok-session-id` (empty until its run has an id, which
+ *  the shape check reads as no session). Reading only the first left every
+ *  Codex request untagged, so `distributeSessions` had nothing to place and a
+ *  Codex pool stayed on one account until the switch threshold. A specific
+ *  header wins when one is present: `session-id` is generic enough for a proxy
+ *  in front to set. */
 export function clientSessionId(headers) {
-  const raw = headers['x-claude-code-session-id'] ?? headers['session-id'];
+  const raw = headers['x-claude-code-session-id'] ?? headers['x-grok-session-id'] ?? headers['session-id'];
   return typeof raw === 'string' && SESSION_ID_SHAPE.test(raw) ? raw : null;
 }
 
@@ -2644,7 +2646,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // this is, and a Codex Responses body carries `input`/`instructions` and
       // no `messages`, so the walk could only ever come back empty-handed — after
       // reading as far into a multi-megabyte body as its bound allows.
-      const provider = providerForPath(req.url);
+      const provider = providerForRequest(req.url, hostOfAuthority(requestAuthority(req)));
       const { conversation, pinKey, onMessage } = sessionId && provider === DEFAULT_PROVIDER
         ? placeConversation(accountManager, body, sessionId)
         : { conversation: null, pinKey: pinKeyFor(sessionId, null), onMessage: null };
@@ -4146,11 +4148,11 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // A pin bypasses selection entirely, so the provider partition has to be
   // enforced here too — otherwise TC_ACCT aimed at a Claude subscription would
   // serve a Codex request from it, sending an OpenAI-shaped body to
-  // api.anthropic.com with a Claude token. Subscriptions only: an API-key
-  // account is metered capacity with no tie to a caller, so a pin to one stands.
+  // api.anthropic.com with a Claude token. The same predicate selection uses:
+  // an API-key account is metered capacity with no tie to a caller, so a pin
+  // to one stands, except for a provider only its own accounts can serve.
   const pinnedWrongProvider = pinned
-    && isSubscriptionAccount(pinned)
-    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
+    && !canServeProvider(pinned, ctx.provider || DEFAULT_PROVIDER);
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
@@ -4439,7 +4441,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
 
-  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
+  const upstreamUrl = `${upstreamFor(account, upstream)}${upstreamPathFor(req.url || '', ctx.provider)}`;
   const method = req.method;
 
   // An upstream that keeps no thread state would receive only this turn's delta
@@ -4624,12 +4626,22 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       // before deciding that a headerless 429 is a request/model refusal.
       let refusal = '';
       const raw = await readErrorBody(upstreamRes.body).catch(() => null);
-      try { refusal = raw ? String(JSON.parse(raw.toString('utf8'))?.error?.message || '') : ''; } catch { refusal = ''; }
+      const text = raw ? raw.toString('utf8') : '';
+      try {
+        // `error` may be a bare string as well as the usual { message }.
+        const error = JSON.parse(text)?.error;
+        refusal = String((typeof error === 'string' ? error : error?.message) || '');
+      } catch { refusal = ''; }
+      // A provider that states quota in no header (Grok) says its plan is
+      // spent only in the body, and that spends the account like a rejected
+      // unified window does.
+      const planRefusal = /** @type {RegExp|undefined} */ (/** @type {Record<string, any>} */ (PROVIDERS[providerOf(account)]).planRefusal);
+      const planSpent = !!planRefusal && planRefusal.test(text);
       // A named per-minute/second ceiling is a burst throttle even without
       // headers; it must not quarantine the whole pool for an hour.
       const transientLimit = /\b(?:per[ -](?:second|minute)|[rt]pm|rps)\b/i.test(refusal);
       const usageLimited = /usage[ -]?limit|quota|credits? (?:exhausted|depleted)/i.test(refusal);
-      const accountLimited = !transientLimit && (usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
+      const accountLimited = !transientLimit && (planSpent || usageLimited || (headerless && (!refusal || /rate[ -]?limit/i.test(refusal))));
       const requestScoped = headerless && !accountLimited && !transientLimit;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
@@ -4655,7 +4667,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       const codexAccountSpent = spentCodexWindows.some(isAccountWideCodexWindow);
       const generalRejected = rl['anthropic-ratelimit-unified-5h-status'] === 'rejected'
         || rl['anthropic-ratelimit-unified-7d-status'] === 'rejected'
-        || codexAccountSpent;
+        || codexAccountSpent || planSpent;
       const fableRejected = rl['anthropic-ratelimit-unified-7d_oi-status'] === 'rejected' && !generalRejected;
       const codexFamilyRejected = spentCodexWindows.length > 0 && !generalRejected;
       if (generalRejected || fableRejected || codexFamilyRejected || accountLimited) {
@@ -4678,7 +4690,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
           // window reads very differently from a weekly one. A model-scoped
           // label carries upstream's own text, so it goes through safeLine.
           const spent = spentCodexWindows.length
-            ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : '';
+            ? ` (${safeLine(spentCodexWindows.join(', '), 80)} spent)` : planSpent ? ' (plan spent)' : '';
           console.log(`[TeamClaude] Quota rejection (429) on "${account.name}"${spent} — throttling ${hold}s and switching account`);
           accountManager.markRateLimited(account.index, hold);
         }

@@ -922,7 +922,7 @@ export class ResetCreditRedeemer {
     const timeoutMs = this._timeLeft(deadline);
     if (timeoutMs <= 0) return;
     const usage = await this.usageFn(account, { timeoutMs }).catch(() => null);
-    if (usage && !usage.error) this.am.applyCodexUsageData(account.index, usage);
+    if (usage && !usage.error) this.am.applyPlanUsageData(account.index, usage);
   }
 
   /**
@@ -956,6 +956,6 @@ export class ResetCreditRedeemer {
       this.log(`[TeamClaude] Could not re-read Codex quota for "${name}" after the reset — it will be re-learned from traffic`);
       return;
     }
-    this.am.applyCodexUsageData(account.index, usage);
+    this.am.applyPlanUsageData(account.index, usage);
   }
 }

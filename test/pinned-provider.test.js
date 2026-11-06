@@ -75,3 +75,17 @@ test('a pin to an API-key account stands for either caller', async () => {
     ctx.close();
   }
 });
+
+// Grok Build's protocol is answered by xAI's proxy alone, so an API key is no
+// candidate for it, pinned or not.
+test('a Grok request pinned to an API-key account is refused, not served', async () => {
+  const ctx = await proxyWith([{ name: 'shared', type: 'apikey', apiKey: 'k-shared' }]);
+  try {
+    const res = await post(ctx.port, '/tc-acct/shared/grok/v1/responses');
+    await res.text();
+    assert.notEqual(res.status, 200, 'the request must not have been served');
+    assert.deepEqual(ctx.seen, [], 'nothing should have reached upstream');
+  } finally {
+    ctx.close();
+  }
+});

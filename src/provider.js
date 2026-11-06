@@ -48,6 +48,56 @@ export const PROVIDERS = {
     // into a loop of them. Five minutes is the wait that keeps the
     // dead-socket guard useful while leaving a long reasoning turn alone.
     headersTimeoutMs: 300_000,
+    pathPrefix: '/backend-api/codex',
+    loginCommand: 'teamclaude login --codex',
+    // OpenAI scopes a token to one ChatGPT account with this header: the
+    // counterpart of the `account_uuid` the Anthropic path patches into the
+    // body, so no body rewrite is involved.
+    scopeHeaders(/** @type {Record<string, any>} */ headers, /** @type {Record<string, any>} */ account) {
+      if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
+    },
+  },
+  grok: {
+    id: 'grok',
+    label: 'Grok',
+    // Grok Build's inference proxy. The CLI takes its base from
+    // GROK_CLI_CHAT_PROXY_BASE_URL and appends `/models`, `/responses`,
+    // `/settings` and `/billing` to it.
+    upstream: 'https://cli-chat-proxy.grok.com',
+    rewritesBody: false,
+    // Not measured. Grok's models reason before they answer, as Codex's do, so
+    // the same allowance keeps a long turn from being cut as a dead socket.
+    headersTimeoutMs: 300_000,
+    // Every Grok path is under `/v1/`, which is Anthropic's namespace on this
+    // listener, so Grok gets a prefix of its own: the CLI is pointed at
+    // `<proxy>/grok/v1`. The prefix is this proxy's, not xAI's, so it is
+    // removed before the request goes upstream (`mounted`).
+    pathPrefix: '/grok',
+    mounted: true,
+    // Under MITM the request arrives on xAI's own host with no prefix, and
+    // nothing else is served there: the host alone says Grok.
+    wholeHost: true,
+    // Grok Build speaks xAI's own protocol to xAI's own proxy, which no API
+    // key or third-party backend can answer, so only Grok accounts serve it.
+    ownAccountsOnly: true,
+    loginCommand: 'teamclaude login --grok',
+    // Grok states no quota in response headers, so a 429 that means the plan
+    // is spent says so only in its body. These are the refusals Grok Build's
+    // own error handling is tested against (`You ran out of credits.
+    // [WKE=…:spending-limit]`, `Plan limit reached`); a match holds the account
+    // and moves the request on, as a spent Codex window does. Not seen live.
+    planRefusal: /ran out of credits|spending-limit|plan limit|usage limit/i,
+    // Grok Build sends the signed-in user's identity beside the token on every
+    // request. A request served by another account must not carry the first
+    // one's, so these are replaced with the serving account's, and dropped
+    // when it has none to give.
+    scopeHeaders(/** @type {Record<string, any>} */ headers, /** @type {Record<string, any>} */ account) {
+      headers['x-xai-token-auth'] = 'xai-grok-cli';
+      for (const key of ['x-userid', 'x-grok-user-id']) {
+        if (account.userId) headers[key] = account.userId; else delete headers[key];
+      }
+      if (account.email) headers['x-email'] = account.email; else delete headers['x-email'];
+    },
   },
 };
 
@@ -93,12 +143,16 @@ export function isSubscriptionAccount(account) {
  * set itself — how many accounts the request could ever have landed on, and
  * whose windows may speak for when it becomes servable again.
  *
+ * A provider marked `ownAccountsOnly` takes none of the metered capacity
+ * either: its client speaks a protocol only its own accounts' upstream answers.
+ *
  * @param {Record<string, any>|null|undefined} account
  * @param {string} provider
  * @returns {boolean}
  */
 export function canServeProvider(account, provider) {
-  return providerOf(account) === provider || !isSubscriptionAccount(account);
+  if (providerOf(account) === provider) return true;
+  return !isSubscriptionAccount(account) && !(/** @type {Record<string, any>|undefined} */ (PROVIDERS[/** @type {keyof typeof PROVIDERS} */ (provider)]))?.ownAccountsOnly;
 }
 
 // The hosts each provider is reached on, for MITM interception.
@@ -107,7 +161,7 @@ export function canServeProvider(account, provider) {
 // honours HTTPS_PROXY has no base-URL to redirect, so if the proxy will not
 // intercept the provider's host, that provider is simply unreachable through
 // it. Codex is exactly that case.
-const PROVIDER_HOSTS = { 'api.anthropic.com': 'anthropic', 'chatgpt.com': 'codex' };
+const PROVIDER_HOSTS = { 'api.anthropic.com': 'anthropic', 'chatgpt.com': 'codex', 'cli-chat-proxy.grok.com': 'grok' };
 
 // Hosts adjacent to a provider that must NOT be intercepted.
 //
@@ -153,22 +207,27 @@ export function isKnownProvider(id) {
   return Object.hasOwn(PROVIDERS, id);
 }
 
-// Request paths that belong to Codex rather than Anthropic.
+// Request paths that belong to a provider other than Anthropic, from each
+// entry's `pathPrefix`.
 //
 // The Codex CLI appends `/responses` and `/models` to whatever `base_url` it is
 // given, so pointing it at `<proxy>/backend-api/codex` makes it emit exactly
 // the paths the ChatGPT backend already expects. That keeps this a pure
 // passthrough — the proxy forwards the path verbatim and never rewrites it —
 // and it keeps the Codex namespace clearly separated from Anthropic's `/v1/*`.
-const CODEX_PATHS = ['/backend-api/codex'];
+// Grok's own paths are `/v1/*`, so its prefix is a mount (see PROVIDERS.grok).
+const PATH_PREFIXES = Object.values(PROVIDERS).flatMap(p => ('pathPrefix' in p ? [[p.pathPrefix, p.id]] : []));
 
 /**
  * Which provider should serve a request path.
  *
- * This is what lets one port serve both CLIs: Claude Code posts to
- * `/v1/messages` and Codex to `/backend-api/codex/responses`, so the path alone
- * says which pool of accounts is eligible. No second listener, no
- * client-supplied hint that could disagree with the body.
+ * This is what lets one port serve every CLI: Claude Code posts to
+ * `/v1/messages`, Codex to `/backend-api/codex/responses` and Grok Build to
+ * `/grok/v1/responses`, so the path alone says which pool of accounts is
+ * eligible. No second listener, no client-supplied hint that could disagree
+ * with the body.
+ * @param {unknown} url
+ * @returns {keyof typeof PROVIDERS}
  */
 export function providerForPath(url) {
   // Read on the classification path, never rewritten: the request goes out with
@@ -179,9 +238,45 @@ export function providerForPath(url) {
   // `new URL()` folds to a Codex path before sending it — does not classify as
   // Codex at all, so it draws the wrong pool's credential.
   const path = classificationPath(url);
-  return CODEX_PATHS.some(p => path === p || path.startsWith(`${p}/`))
-    ? 'codex'
-    : DEFAULT_PROVIDER;
+  const hit = PATH_PREFIXES.find(([prefix]) => path === prefix || path.startsWith(`${prefix}/`));
+  return hit ? /** @type {keyof typeof PROVIDERS} */ (hit[1]) : DEFAULT_PROVIDER;
+}
+
+/**
+ * Which provider should serve a request, from its path and, under MITM, the
+ * host the client addressed. A provider that owns its whole host (`wholeHost`)
+ * is named by the host alone, since its requests arrive there without the
+ * mount the base-URL mode adds. On the base listener the host is this proxy's
+ * own and names nothing, so the path decides.
+ * @param {unknown} url
+ * @param {string|null|undefined} host
+ * @returns {keyof typeof PROVIDERS}
+ */
+export function providerForRequest(url, host) {
+  const byPath = providerForPath(url);
+  if (byPath !== DEFAULT_PROVIDER) return byPath;
+  const byHost = providerForHost(host);
+  return byHost && /** @type {Record<string, any>} */ (PROVIDERS[byHost]).wholeHost ? byHost : byPath;
+}
+
+/**
+ * The path a request is sent upstream on: as it arrived, less the provider's
+ * mount when it has one.
+ *
+ * Only the literal mount is removed. A spelling of it that classified as the
+ * provider only once decoded (`/%67rok/v1/…`, `/grok%2fv1/…`) goes to that
+ * provider's host as sent, where it is a 404: the credential attached is that
+ * provider's either way, so nothing reaches a party it was not issued for. A
+ * backslash after the mount is kept, since `new URL()` folds it to a slash.
+ * @param {string} url
+ * @param {string|null|undefined} provider  the request's classification
+ */
+export function upstreamPathFor(url, provider) {
+  const entry = /** @type {Record<string, any>|undefined} */ (provider ? PROVIDERS[/** @type {keyof typeof PROVIDERS} */ (provider)] : undefined);
+  if (!entry?.mounted || !url.startsWith(entry.pathPrefix)) return url;
+  const rest = url.slice(entry.pathPrefix.length);
+  if (rest === '' || rest[0] === '?') return `/${rest}`;
+  return rest[0] === '/' || rest[0] === '\\' ? rest : url;
 }
 
 /**
@@ -190,25 +285,28 @@ export function providerForPath(url) {
  * Mutates `headers` in place, mirroring how the forward path already builds
  * them. Returns nothing: the caller owns the object.
  *
- * - Anthropic OAuth and Codex both use `Authorization: Bearer`.
+ * - Anthropic OAuth, Codex and Grok use `Authorization: Bearer`.
  * - Anthropic API keys use `x-api-key`.
- * - Codex additionally needs `ChatGPT-Account-Id`, which is how OpenAI scopes
- *   a token to one ChatGPT account. It is the direct counterpart of the
- *   `account_uuid` that the Anthropic path patches into the request body —
- *   a header here, so no body rewrite is involved.
+ * - A provider that scopes the token with headers of its own (Codex's
+ *   ChatGPT-Account-Id, Grok's user id) sets them in its `scopeHeaders`.
  */
 export function applyAuthHeaders(headers, account) {
   const provider = providerOf(account);
-  if (provider === 'codex') {
-    headers['authorization'] = `Bearer ${account.credential}`;
-    if (account.accountId) headers['chatgpt-account-id'] = account.accountId;
-    return;
-  }
-  if (account.type === 'oauth') {
+  if (account.type === 'oauth' || provider !== DEFAULT_PROVIDER) {
     headers['authorization'] = `Bearer ${account.credential}`;
   } else {
     headers['x-api-key'] = account.credential;
   }
+  /** @type {Record<string, any>} */ (PROVIDERS[provider]).scopeHeaders?.(headers, account);
+}
+
+/**
+ * The command that signs an account of this provider in again.
+ * @param {Record<string, any>|null|undefined} account
+ * @returns {string}
+ */
+export function loginCommandFor(account) {
+  return /** @type {Record<string, any>} */ (PROVIDERS[providerOf(account)]).loginCommand || 'teamclaude login';
 }
 
 /**

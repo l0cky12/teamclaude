@@ -228,8 +228,8 @@ test('a reading inside the settle time after a request is never the start of an 
 
 test('a Codex usage probe feeds the weekly window too', () => {
   const am = new AccountManager([oauth('a')], 0.98);
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.2, resetAt: RESET } });
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.25, resetAt: RESET } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.2, resetAt: RESET } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.25, resetAt: RESET } });
   assert.equal(weekly(am).state, 'measured');
   assert.ok(Math.abs(weekly(am).share - 0.05) < 1e-9);
 });

@@ -46,11 +46,11 @@ test('creditDetailsDue reads the rows for a new count or old dates, and never fo
 
 test('a usage read whose count went up records when, and logs the grant once', () => {
   const am = new AccountManager([codex('a')], 0.98);
-  am.applyCodexUsageData(0, usage(1));
+  am.applyPlanUsageData(0, usage(1));
   assert.equal(am.accounts[0].quota.resetCredits.grantedAt, undefined, 'a first reading is not a grant');
   assert.equal(eventsOf(am, 'credit_granted').length, 0);
 
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   const grantedAt = am.accounts[0].quota.resetCredits.grantedAt;
   assert.ok(Number.isFinite(grantedAt));
   const [event] = eventsOf(am, 'credit_granted');
@@ -58,7 +58,7 @@ test('a usage read whose count went up records when, and logs the grant once', (
   assert.equal(event.account, 'a');
   assert.match(event.message, /2 left/);
 
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   assert.equal(eventsOf(am, 'credit_granted').length, 1, 'an unchanged count is not another grant');
   assert.equal(am.accounts[0].quota.resetCredits.grantedAt, grantedAt, 'and keeps the grant time');
 });
@@ -68,18 +68,18 @@ test('a usage read carries the dates over while the count holds, and drops their
   const am = new AccountManager([codex('a')], 0.98);
   /** @param {any} q */
   const shown = q => codexResetExpiry({ name: 'a', provider: 'codex', quota: q });
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   // A credit this plan cannot spend expires first; a redemption skips it and
   // spends the supported one, so the count alone cannot say which one went.
   am.applyResetCreditDetails(0, [{ ...row(now + DAY), supportedByPlan: false }, row(now + 2 * DAY)]);
   assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + DAY, now + 2 * DAY]);
 
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   assert.deepEqual(am.accounts[0].quota.resetCredits.expiries, [now + DAY, now + 2 * DAY]);
   assert.equal(creditDetailsDue(am.accounts[0].quota.resetCredits), false);
   assert.equal(shown(am.accounts[0].quota), now + DAY);
 
-  am.applyCodexUsageData(0, usage(1));
+  am.applyPlanUsageData(0, usage(1));
   const q = am.accounts[0].quota.resetCredits;
   assert.equal(q.expiriesFor, null);
   assert.equal(creditDetailsDue(q), true, 'the rows are read again');
@@ -94,12 +94,12 @@ test('rows that disagree with the count are not shown, and the next count change
   const am = new AccountManager([codex('a')], 0.98);
   /** @param {any} q */
   const shown = q => codexResetExpiry({ name: 'a', provider: 'codex', quota: q });
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   // Rows read after one of the two was spent, before a usage read caught up.
   am.applyResetCreditDetails(0, [row(now + 5 * DAY)]);
   assert.equal(shown(am.accounts[0].quota), null, 'one row against a count of two');
 
-  am.applyCodexUsageData(0, usage(1));
+  am.applyPlanUsageData(0, usage(1));
   assert.equal(creditDetailsDue(am.accounts[0].quota.resetCredits), true);
   am.applyResetCreditDetails(0, [row(now + 5 * DAY)]);
   assert.equal(shown(am.accounts[0].quota), now + 5 * DAY);
@@ -108,12 +108,12 @@ test('rows that disagree with the count are not shown, and the next count change
 test('dates left out of step by a grant stay untrusted when the count falls back', () => {
   const now = Date.now();
   const am = new AccountManager([codex('a')], 0.98);
-  am.applyCodexUsageData(0, usage(1));
+  am.applyPlanUsageData(0, usage(1));
   am.applyResetCreditDetails(0, [row(now + DAY)]);
   // A grant whose date was never read, then the OLD credit redeemed: the count
   // is back to 1, but the date on hand is the spent credit's.
-  am.applyCodexUsageData(0, usage(2));
-  am.applyCodexUsageData(0, usage(1));
+  am.applyPlanUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(1));
   const q = am.accounts[0].quota.resetCredits;
   assert.equal(q.expiriesFor, null);
   assert.equal(creditDetailsDue(q), true, 'the rows must be read again');
@@ -126,7 +126,7 @@ test('dates left out of step by a grant stay untrusted when the count falls back
 test('a credit expiring within the window is logged once, a later one not at all', () => {
   const now = Date.now();
   const am = new AccountManager([codex('a')], 0.98);
-  am.applyCodexUsageData(0, usage(2));
+  am.applyPlanUsageData(0, usage(2));
   const soon = now + CREDIT_EXPIRY_WINDOW_MS - HOUR;
   am.applyResetCreditDetails(0, [row(soon), row(now + CREDIT_EXPIRY_WINDOW_MS + DAY)]);
   am.applyResetCreditDetails(0, [row(soon), row(now + CREDIT_EXPIRY_WINDOW_MS + DAY)]);

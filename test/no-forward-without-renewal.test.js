@@ -73,7 +73,7 @@ test('with another account to serve, the request fails over to it without touchi
 
 test('control: a renewal that works is used, and the request is served with the new token', async () => {
   const f = await fleet([expired('a')], async (_account, refresh) => refresh());
-  f.am._refreshFn = async () => ({ accessToken: 'live-a2', refreshToken: 'rt-a2', expiresAt: Date.now() + 8 * H });
+  f.am._refreshFns.anthropic = async () => ({ accessToken: 'live-a2', refreshToken: 'rt-a2', expiresAt: Date.now() + 8 * H });
   try {
     const r = await f.send();
     assert.equal(r.status, 200);

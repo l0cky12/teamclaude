@@ -9,7 +9,7 @@
 
 TeamRouter is a local proxy that pools your own AI coding accounts and moves between them before any one of them hits its limit.
 
-You point [Claude Code](https://claude.com/product/claude-code) or the [Codex CLI](https://github.com/openai/codex) at it, and it handles the rest. It holds your Claude Max, ChatGPT/Codex, API-key and third-party backend (DeepSeek, z.ai/GLM, NanoGPT) accounts. When the account in use gets close to its 5-hour or weekly limit, the next request goes to another one. Your sessions keep running instead of stopping on a rate-limit error.
+You point [Claude Code](https://claude.com/product/claude-code), the [Codex CLI](https://github.com/openai/codex) or Grok Build at it, and it handles the rest. It holds your Claude Max, ChatGPT/Codex, xAI/Grok, API-key and third-party backend (DeepSeek, z.ai/GLM, NanoGPT) accounts. When the account in use gets close to its 5-hour or weekly limit, the next request goes to another one. Your sessions keep running instead of stopping on a rate-limit error.
 
 You control it from a terminal UI, the command line, or a web dashboard that works from any machine on your network.
 
@@ -23,7 +23,7 @@ New in this fork: a redesigned web dashboard, sign-in from the browser, client k
 
 **One person, with their own accounts.** The "team" is your agents: if you run ten or fifty coding sessions at once, one subscription isn't enough, and switching accounts by hand every time one fills up gets old fast. TeamRouter does that switching for you.
 
-It is not for sharing accounts between people, it is not a hosted service, and it only drives each provider's own client (Claude Code on Claude accounts, the Codex CLI on Codex accounts). See [Scope](#scope).
+It is not for sharing accounts between people, it is not a hosted service, and it only drives each provider's own client (Claude Code on Claude accounts, the Codex CLI on Codex accounts, Grok Build on Grok accounts). See [Scope](#scope).
 
 ## Install
 
@@ -56,6 +56,7 @@ A git checkout never updates itself. Use `git pull` to update it.
 ```bash
 teamclaude login           # sign in to a Claude account in your browser; repeat for each account
 teamclaude login --codex   # sign in to a ChatGPT/Codex account
+teamclaude login --grok    # sign in to an xAI account, for Grok Build
 teamclaude server          # start the proxy (shows the terminal UI)
 ```
 
@@ -137,6 +138,7 @@ Light and dark themes follow your system, and the layout fits a phone. Full tour
 ### Works with more than Claude
 
 - **Codex (ChatGPT) accounts** are pooled next to Claude accounts on the same port, with their own quota and rotation.
+- **Grok (xAI) accounts** are pooled for Grok Build the same way, under `/grok/v1` on the same port (`GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:3456/grok/v1 grok`).
 - **Third-party backends** (DeepSeek, z.ai/GLM, NanoGPT, or any Anthropic-compatible API) can act as a low-priority fallback for when your Claude accounts run out.
 - **Free resets get used.** With `autoRedeemResets` on (off by default), banked Claude usage-limit resets and Codex rate-limit reset credits can be spent automatically when no account has room left. A Codex credit that expires within three days is also spent on an account whose weekly limit is used up, rather than being lost.
 
@@ -233,7 +235,7 @@ Step by step: [docs/routing.md](docs/routing.md#request-lifecycle).
 
 | Page | What's in it |
 | --- | --- |
-| [Accounts](docs/accounts.md) | Signing in from the CLI or dashboard, API keys, several organisations, Codex accounts, third-party backends, export/import, account sync (your own machines or callback.net), per-account proxies, signing in over SSH |
+| [Accounts](docs/accounts.md) | Signing in from the CLI or dashboard, API keys, several organisations, Codex accounts, Grok accounts, third-party backends, export/import, account sync (your own machines or callback.net), per-account proxies, signing in over SSH |
 | [Usage](docs/usage.md) | The server and terminal UI, running Claude Code, the web dashboard, linked instances, the MCP endpoint, every command, logging, Docker |
 | [VS Code](docs/vscode.md) | The Claude Code extension for VS Code through the proxy: settings, a check, updates |
 | [Routing](docs/routing.md) | How accounts are chosen, the distribution modes, model routes, pinning, the prompt cache |
@@ -265,7 +267,7 @@ The only official sources are [github.com/KarpelesLab/teamclaude](https://github
 TeamRouter is a local proxy that holds your own sign-ins and drives each provider's own CLI, for one person's work. That holds for every provider it supports:
 
 - **One person, their own accounts.** Not account sharing, not a hosted service, not resale.
-- **The provider's own client.** Claude Code on Claude accounts, the Codex CLI on Codex accounts. Other tools can't use subscription sign-ins through it.
+- **The provider's own client.** Claude Code on Claude accounts, the Codex CLI on Codex accounts, Grok Build on Grok accounts. Other tools can't use subscription sign-ins through it.
 - **A third-party backend is just another account:** a key you were given, used under that company's terms.
 
 How this fits each provider's terms, including the common question about holding several subscriptions, is in [docs/compliance.md](docs/compliance.md). It isn't legal advice. Changes outside this scope aren't merged; see [CONTRIBUTING.md](CONTRIBUTING.md).

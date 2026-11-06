@@ -857,7 +857,7 @@ function quotaLines(account, now, paint) {
       lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
     }
     if (showWeeklyRow(quota)) {
-      lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+      lines.push(formatQuotaLine(quota.planPeriod === 'monthly' ? 'Monthly' : 'Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
     }
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));

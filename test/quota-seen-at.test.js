@@ -132,19 +132,19 @@ test('a Codex usage read stamps only the shared windows it stated', (t) => {
   const am = new AccountManager([codex('c')], 0.98);
   const q = am.accounts[0].quota;
 
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.5, resetAt: start + DAY } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.5, resetAt: start + DAY } });
   assert.equal(q.unified7dSeenAt, start);
   assert.equal(q.unified5hSeenAt, null);
 
   t.mock.timers.tick(60_000);
-  am.applyCodexUsageData(0, { error: 'HTTP 401' });
-  am.applyCodexUsageData(0, {});
-  am.applyCodexUsageData(0, { resetCredits: { available: 1, applicable: 1 } });
-  am.applyCodexUsageData(0, { modelBuckets: [{ slug: 'bengalfox', name: 'GPT-5.6-Sol', utilization: 0.1, resetAt: null }] });
+  am.applyPlanUsageData(0, { error: 'HTTP 401' });
+  am.applyPlanUsageData(0, {});
+  am.applyPlanUsageData(0, { resetCredits: { available: 1, applicable: 1 } });
+  am.applyPlanUsageData(0, { modelBuckets: [{ slug: 'bengalfox', name: 'GPT-5.6-Sol', utilization: 0.1, resetAt: null }] });
   assert.equal(q.unified7dSeenAt, start);
   assert.equal(q.unified5hSeenAt, null);
 
-  am.applyCodexUsageData(0, { fiveHour: { utilization: 0.1, resetAt: start + HOUR } });
+  am.applyPlanUsageData(0, { fiveHour: { utilization: 0.1, resetAt: start + HOUR } });
   assert.equal(q.unified5hSeenAt, start + 60_000);
   assert.equal(q.unified7dSeenAt, start);
 });

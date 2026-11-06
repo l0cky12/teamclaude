@@ -11,13 +11,13 @@ It is a **self-hosted local proxy**. You run it on your own machine, it holds *y
 Two things it has never been for, on any provider:
 
 - **Sharing accounts between people.** Not a pool for a group, a family or a company, and not something to resell access through. If several people need the tool, each uses their own subscription, or the organization buys the plan or API access made for that. Features such as `proxy.clientKeys`, a non-loopback `proxy.host` and the callback.net token sync exist so that *your* machines and agents can reach *your* proxy; none of them is a way to hand the pool to someone else.
-- **Driving a subscription from another harness.** Claude accounts serve Claude Code; Codex accounts serve the Codex CLI. The proxy is not a bridge that lets a different client spend a subscription login.
+- **Driving a subscription from another harness.** Claude accounts serve Claude Code; Codex accounts serve the Codex CLI; Grok accounts serve Grok Build. The proxy is not a bridge that lets a different client spend a subscription login.
 
 ## The same stance for every provider
 
-TeamClaude started with Claude accounts and now also pools ChatGPT/Codex subscriptions and third-party backends. The scope above does not change with the provider:
+TeamClaude started with Claude accounts and now also pools ChatGPT/Codex and xAI/Grok subscriptions and third-party backends. The scope above does not change with the provider:
 
-- **Subscription accounts (Claude, ChatGPT/Codex):** your own subscriptions, used through the provider's own CLI, by you.
+- **Subscription accounts (Claude, ChatGPT/Codex, xAI/Grok):** your own subscriptions, used through the provider's own CLI, by you.
 - **API keys:** keys issued to you, billed to you.
 - **Third-party backends (DeepSeek, z.ai, Kimi and the like):** an account like any other — a key you were issued, used under that vendor's terms. Being a fallback does not make it exempt.
 

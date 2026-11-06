@@ -384,3 +384,27 @@ test('login panel: a closing marker with no opening one keeps what came before i
   assert.equal(tui.login.buf, 'abc#state');
   assert.equal(tui.login.pasting, false);
 });
+
+test('login panel: a device sign-in (Grok) takes no typing and offers no submit', () => {
+  const flow = fakeFlow({ provider: 'grok', url: 'https://accounts.example/device?user_code=WDJB-MJHT', userCode: 'WDJB-MJHT', submit: () => { flow.submits.push('called'); return false; } });
+  const tui = makeTUI({ loginAccount: flow.loginAccount });
+  tui.running = true;
+  captureStdout(() => openPanel(tui));
+  assert.equal(tui.mode, 'login');
+
+  // A stray key or Enter must not close the panel while the flow still polls.
+  tui._onData('abc');
+  tui._key('enter');
+  assert.equal(tui.mode, 'login', 'the panel closed on a device sign-in');
+  assert.deepEqual(flow.submits, []);
+  assert.equal(tui.login.buf, '');
+
+  const painted = stripAnsi(withoutLinks(frame(tui, { columns: 100, rows: 30 })));
+  assert.match(painted, /Check the page shows WDJB-MJHT/);
+  assert.doesNotMatch(painted, /Enter submit/);
+  assert.match(painted, /Esc cancel/);
+
+  tui._key('esc');
+  assert.equal(tui.mode, 'normal');
+  assert.ok(flow.signal.aborted);
+});
