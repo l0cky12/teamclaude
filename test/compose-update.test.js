@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   calendarFor, checkoutFromPlist, checkoutFromService, composeUpdateAgentPath, composeUpdateLogPath,
   composeUpdateServicePath, composeUpdateStatus, composeUpdateTimerPath, everyFromPlist, everyFromTimer,
-  formatEvery, installComposeUpdate, parseEvery, parseNextElapse, randomizedDelay, renderComposeUpdate,
+  composeInterpolations, envAssignments, formatEvery, installComposeUpdate, parseEvery, parseNextElapse, randomizedDelay, renderComposeUpdate,
   runningInContainer, systemdUnquote, uninstallComposeUpdate, updaterPath, COMPOSE_UPDATE_LABEL,
   COMPOSE_UPDATE_SERVICE, COMPOSE_UPDATE_TIMER,
 } from '../src/compose-update.js';
@@ -55,6 +55,33 @@ test('runningInContainer is the docker or podman marker, not a guess', () => {
   assert.equal(runningInContainer((p) => p === '/.dockerenv'), true);
   assert.equal(runningInContainer((p) => p === '/run/.containerenv'), true);
   assert.equal(runningInContainer(() => false), false);
+});
+
+test('composeInterpolations keeps required variables and defaults apart', () => {
+  const items = composeInterpolations([
+    'image: ${IMAGE:-teamclaude}',
+    'port: "${TAILSCALE_IP:?set it}"',
+    'other: ${OPTIONAL}',
+    'bare: $BARE',
+    'literal: $$HOME',
+    'alt: ${SET:+yes}',
+  ].join('\n'));
+  const byName = Object.fromEntries(items.map((item) => [item.name, item.required]));
+  assert.equal(byName.IMAGE, false);
+  assert.equal(byName.TAILSCALE_IP, true);
+  assert.equal(byName.OPTIONAL, false);
+  assert.equal(byName.BARE, false);
+  assert.equal(byName.SET, false);
+  assert.equal(byName.HOME, undefined);
+});
+
+test('envAssignments accepts KEY=VALUE and rejects a bare word', () => {
+  const ok = envAssignments(['DOCKER_HOST=tcp://example:2375', 'TAILSCALE_IP=100.64.0.1']);
+  assert.equal(ok.ok, true);
+  if (!ok.ok) return;
+  assert.deepEqual(ok.values, { DOCKER_HOST: 'tcp://example:2375', TAILSCALE_IP: '100.64.0.1' });
+  const bad = envAssignments(['DOCKER_HOST']);
+  assert.equal(bad.ok, false);
 });
 
 test('parseNextElapse reads the timestamp systemctl show actually prints', () => {
@@ -440,6 +467,7 @@ test('launchd installs one agent that waits out the interval and does not run at
     assert.equal(everyFromPlist(plist), '1d');
     assert.match(plist, /<string>\/usr\/bin:\/usr\/local\/bin:\/bin<\/string>/);
     assert.deepEqual(t.calls, [
+      `launchctl print gui/1000/${COMPOSE_UPDATE_LABEL}`,
       `launchctl bootout gui/1000/${COMPOSE_UPDATE_LABEL}`,
       `launchctl bootstrap gui/1000 ${file}`,
     ]);
@@ -451,6 +479,107 @@ test('launchd installs one agent that waits out the interval and does not run at
     });
     assert.equal(status.active, true);
     assert.equal(status.logs, composeUpdateLogPath(t.home));
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('a running redeploy is not unloaded by install or uninstall', async () => {
+  const t = await setup();
+  try {
+    const running = (/** @type {string} */ cmd, /** @type {string[]} */ args) => {
+      t.calls.push([cmd, ...args].join(' '));
+      if (args[0] === 'print') return { code: 0, stdout: 'state = running\npid = 4242\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const res = await installComposeUpdate({ ...t.base, kind: 'launchd', platform: 'darwin', run: running });
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.match(res.error, /still running/);
+    assert.deepEqual(t.calls, [`launchctl print gui/1000/${COMPOSE_UPDATE_LABEL}`]);
+    const file = composeUpdateAgentPath(t.home);
+    assert.equal(await readFile(file, 'utf8').catch((e) => e.code), 'ENOENT');
+
+    t.calls.length = 0;
+    const idle = await installComposeUpdate({
+      ...t.base,
+      kind: 'launchd',
+      platform: 'darwin',
+      run: (cmd, args) => {
+        t.calls.push([cmd, ...args].join(' '));
+        if (args[0] === 'print') return { code: 0, stdout: 'state = waiting\n', stderr: '' };
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+    assert.equal(idle.ok, true);
+    // Waiting is not a running redeploy, so the plist is written and loaded.
+    assert.match(await readFile(file, 'utf8'), new RegExp(COMPOSE_UPDATE_LABEL));
+
+    t.calls.length = 0;
+    const gone = await uninstallComposeUpdate({
+      ...t.base,
+      kind: 'launchd',
+      platform: 'darwin',
+      run: running,
+    });
+    assert.equal(gone.ok, false);
+    if (gone.ok) return;
+    assert.match(gone.error, /still running/);
+    assert.deepEqual(t.calls, [`launchctl print gui/1000/${COMPOSE_UPDATE_LABEL}`]);
+    assert.match(await readFile(file, 'utf8'), new RegExp(COMPOSE_UPDATE_LABEL));
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test('the timer keeps the Docker target and a required compose variable', async () => {
+  const t = await setup();
+  try {
+    await writeFile(join(t.checkout, 'docker-compose.yml'), 'name: teamclaude\nports:\n  - "${TAILSCALE_IP:?set it}:3466:3456"\n');
+    const missing = await renderComposeUpdate(t.base);
+    assert.equal(missing.ok, false);
+    if (missing.ok) return;
+    assert.match(missing.error, /TAILSCALE_IP/);
+    assert.match(missing.error, /--env/);
+    assert.equal(t.calls.length, 0);
+
+    const env = {
+      DOCKER_HOST: 'tcp://example:2375',
+      COMPOSE_PROJECT_NAME: 'preview',
+      TAILSCALE_IP: '100.64.0.1',
+      AWS_SECRET_ACCESS_KEY: 'do-not-copy',
+      IMAGE: 'custom:latest',
+    };
+    await writeFile(join(t.checkout, 'docker-compose.yml'), 'name: teamclaude\nimage: ${IMAGE:-teamclaude}\nports:\n  - "${TAILSCALE_IP:?set it}:3466:3456"\n');
+    const res = await renderComposeUpdate({ ...t.base, env });
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.match(res.text, /DOCKER_HOST=tcp:\/\/example:2375/);
+    assert.match(res.text, /COMPOSE_PROJECT_NAME=preview/);
+    assert.match(res.text, /TAILSCALE_IP=100\.64\.0\.1/);
+    assert.match(res.text, /IMAGE=custom:latest/);
+    assert.doesNotMatch(res.text, /do-not-copy/);
+    assert.doesNotMatch(res.text, /AWS_SECRET_ACCESS_KEY/);
+
+    const plist = await renderComposeUpdate({ ...t.base, env, kind: 'launchd', platform: 'darwin' });
+    assert.equal(plist.ok, true);
+    if (!plist.ok) return;
+    assert.match(plist.text, /<key>DOCKER_HOST<\/key>\s*<string>tcp:\/\/example:2375<\/string>/);
+    assert.match(plist.text, /<key>TAILSCALE_IP<\/key>\s*<string>100\.64\.0\.1<\/string>/);
+    assert.doesNotMatch(plist.text, /do-not-copy/);
+
+    await mkdir(join(t.checkout, 'docker'), { recursive: true });
+    await writeFile(join(t.checkout, 'docker', 'preview.yml'), 'ports:\n  - "${TAILSCALE_IP:?set it}:3466:3456"\n');
+    await writeFile(join(t.checkout, 'docker', '.env'), 'TAILSCALE_IP=100.64.0.2\n');
+    await writeFile(join(t.checkout, '.env'), 'TAILSCALE_IP=100.64.0.9\n');
+    const fromFile = await renderComposeUpdate({
+      ...t.base,
+      env: { COMPOSE_FILE: 'docker/preview.yml' },
+    });
+    assert.equal(fromFile.ok, true);
+    if (!fromFile.ok) return;
+    assert.doesNotMatch(fromFile.text, /TAILSCALE_IP=/);
+    assert.match(fromFile.text, /COMPOSE_FILE=docker\/preview.yml/);
   } finally {
     await t.cleanup();
   }
@@ -510,14 +639,25 @@ test('systemd-analyze accepts the unit and rejects a quoted WorkingDirectory', a
     const script = join(root, 'scripts', 'redeploy.sh');
     await writeFile(script, '#!/bin/sh\nexit 0\n');
     await chmod(script, 0o755);
-    await writeFile(join(root, 'docker-compose.yml'), 'name: x\n');
+    await writeFile(join(root, 'docker-compose.yml'), 'ports:\n  - "${TAILSCALE_IP:?set it}:3466:3456"\n');
     await writeFile(join(root, '.git'), 'gitdir: x\n');
-    const res = await installComposeUpdate({ ...home.base, root });
+    const res = await installComposeUpdate({
+      ...home.base,
+      root,
+      env: {
+        DOCKER_HOST: 'tcp://example:2375',
+        COMPOSE_PROJECT_NAME: 'a b',
+        TAILSCALE_IP: '100.64.0.1',
+      },
+    });
     assert.equal(res.ok, true);
     const file = composeUpdateServicePath(home.home, home.base.xdgConfig);
     const text = await readFile(file, 'utf8');
     assert.match(text, /^WorkingDirectory=.*\/a b%%c$/m);
     assert.doesNotMatch(text, /^WorkingDirectory="/m);
+    assert.match(text, /Environment="DOCKER_HOST=tcp:\/\/example:2375"/);
+    assert.match(text, /Environment="COMPOSE_PROJECT_NAME=a b"/);
+    assert.match(text, /Environment="TAILSCALE_IP=100\.64\.0\.1"/);
     const ok = spawnSync('systemd-analyze', ['verify', file], { encoding: 'utf8' });
     assert.equal(ok.status, 0, `${ok.stderr}\n${ok.stdout}`);
     const quoted = text.replace(/^(WorkingDirectory=)(.*)$/m, '$1"$2"');
@@ -594,4 +734,14 @@ test('help mentions the compose timer', async () => {
   assert.equal(r.code, 0);
   assert.match(r.stdout, /update compose/);
   assert.match(r.stdout, /git pull, docker compose build, docker compose up -d/);
+  assert.match(r.stdout, /--env KEY=VALUE/);
+});
+
+test('update compose --env rejects a missing or bare value', async () => {
+  const missing = await runCli(['update', 'compose', 'print', '--env']);
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /--env needs KEY=VALUE/);
+  const bare = await runCli(['update', 'compose', 'print', '--env', 'TAILSCALE_IP']);
+  assert.equal(bare.code, 1);
+  assert.match(bare.stderr, /not KEY=VALUE/);
 });

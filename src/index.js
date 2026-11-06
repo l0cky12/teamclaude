@@ -51,7 +51,7 @@ import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
-import { COMPOSE_UPDATE_USAGE, installComposeUpdate, uninstallComposeUpdate, composeUpdateStatus, renderComposeUpdate } from './compose-update.js';
+import { COMPOSE_UPDATE_USAGE, envAssignments, installComposeUpdate, uninstallComposeUpdate, composeUpdateStatus, renderComposeUpdate } from './compose-update.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './account-routing.js';
@@ -2848,8 +2848,27 @@ async function composeUpdateCommand() {
     console.error('teamclaude update compose: --every needs a value, for example 12h or 1d');
     process.exit(1);
   }
+  const envItems = [];
+  if (sub === 'install' || sub === 'print') {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== '--env') continue;
+      const value = args[i + 1];
+      if (!value || value.startsWith('-')) {
+        console.error('teamclaude update compose: --env needs KEY=VALUE');
+        process.exit(1);
+      }
+      envItems.push(value);
+      i++;
+    }
+  }
+  const assigned = envAssignments(envItems);
+  if (assigned.ok === false) {
+    console.error(`teamclaude update compose: ${assigned.error}`);
+    process.exit(1);
+  }
+  const env = { ...process.env, ...assigned.values };
   if (sub === 'install') {
-    const res = await installComposeUpdate({ every: everyFlag || '1d' });
+    const res = await installComposeUpdate({ every: everyFlag || '1d', env });
     if (res.ok === false) {
       console.error(`teamclaude update compose install failed: ${res.error}`);
       process.exit(1);
@@ -2865,7 +2884,7 @@ async function composeUpdateCommand() {
     return;
   }
   if (sub === 'print') {
-    const res = renderComposeUpdate({ every: everyFlag || '1d' });
+    const res = renderComposeUpdate({ every: everyFlag || '1d', env });
     if (res.ok === false) {
       console.error(`teamclaude update compose print failed: ${res.error}`);
       process.exit(1);
@@ -3399,7 +3418,8 @@ Commands:
   update              Check npm for a newer teamclaude and install it
   update compose      Schedule an update of a docker compose checkout:
                       git pull, docker compose build, docker compose up -d
-                      (install | uninstall | status | print; --every 1d).
+                      (install | uninstall | status | print; --every 1d;
+                      --env KEY=VALUE for a compose variable the timer must keep).
                       Off until you install it. Run on the host, in the
                       checkout, not inside the container.
   version             Print the installed version

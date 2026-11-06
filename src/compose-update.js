@@ -11,9 +11,13 @@
 //
 // Nothing is scheduled until `teamclaude update compose install`. The npm
 // auto-update stays what it is: a global install, never a git checkout.
+// The unit keeps the Docker and Compose settings captured at install. A
+// user timer does not see the shell, and launchd bootout is refused while
+// a redeploy is still running: that signal would kill the script with no
+// chance to finish putting the previous image back.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
@@ -29,12 +33,18 @@ const MIN_SECONDS = 15 * 60;
 const MAX_SECONDS = 30 * 24 * 60 * 60;
 const COMPOSE_NAMES = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
 
-export const COMPOSE_UPDATE_USAGE = `Usage: teamclaude update compose <install|uninstall|status|print> [--every 1d]
+export const COMPOSE_UPDATE_USAGE = `Usage: teamclaude update compose <install|uninstall|status|print> [--every 1d] [--env KEY=VALUE]
 
 Installs a per-user timer that runs scripts/redeploy.sh in this checkout:
 git pull, docker compose build, docker compose up -d. The running proxy stays
 up during the build, and an unhealthy new container is rolled back. Nothing
 runs until you install it. The interval is 15m to 30d; the default is 1d.
+
+The timer does not see your shell. Docker and Compose settings that choose
+the daemon or the project are copied in when they are set at install, and a
+variable the compose file requires (for example TAILSCALE_IP) must be set
+then too. Pass --env KEY=VALUE, or export it in the shell you install from.
+A project .env file is left for Compose to read.
 
 Run this on the host, from the git checkout docker compose builds. The copy
 inside the container cannot see that checkout or the Docker socket, and the
@@ -261,6 +271,142 @@ function stopFailure(result, fallback) {
   return result.stderr.trim() || result.stdout.trim() || fallback;
 }
 
+// A running redeploy has a pid. An idle timer is only waiting for the
+// interval, and bootout of that one does not interrupt a container swap.
+const REDEPLOY_BUSY = 'A compose update is still running. Wait for it to finish, then try again. Unloading it now would stop the script after the old container may already be gone.';
+
+/**
+ * @param {string} stdout
+ */
+function launchdIsRunning(stdout) {
+  return /\bpid = [1-9]\d*\b/.test(stdout) || /\bstate = running\b/.test(stdout);
+}
+
+/**
+ * @param {ComposeContext} c
+ * @returns {string | null}
+ */
+function launchdBusyError(c) {
+  const printed = c.run('launchctl', ['print', `gui/${c.uid ?? 0}/${COMPOSE_UPDATE_LABEL}`]);
+  if (printed.code === 0 && launchdIsRunning(printed.stdout)) return REDEPLOY_BUSY;
+  return null;
+}
+
+// Copied into the unit when set. These choose which daemon, context, or
+// project `docker compose` talks to. The timer would otherwise use the
+// user manager's empty environment and hit a different Docker.
+const TARGETING_ENV = [
+  'DOCKER_HOST',
+  'DOCKER_CONTEXT',
+  'DOCKER_CONFIG',
+  'DOCKER_CERT_PATH',
+  'DOCKER_TLS_VERIFY',
+  'COMPOSE_PROJECT_NAME',
+  'COMPOSE_PROFILES',
+  'COMPOSE_PROJECT_DIRECTORY',
+  'COMPOSE_PATH_SEPARATOR',
+  'COMPOSE_ENV_FILES',
+  'TEAMCLAUDE_REDEPLOY_TIMEOUT',
+];
+
+const RESERVED_ENV = new Set(['PATH', 'COMPOSE_FILE', 'TEAMCLAUDE_SERVICE', 'TEAMROUTER_SERVICE']);
+
+/**
+ * `--env KEY=VALUE` assignments. The value may itself contain `=`.
+ * @param {string[]} items
+ * @returns {{ ok: true, values: Record<string, string> } | { ok: false, error: string }}
+ */
+export function envAssignments(items) {
+  /** @type {Record<string, string>} */
+  const values = {};
+  for (const item of items) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(item);
+    if (!m) return { ok: false, error: `--env ${JSON.stringify(item)} is not KEY=VALUE` };
+    values[m[1]] = m[2];
+  }
+  return { ok: true, values };
+}
+
+/**
+ * Variables a compose file interpolates, in the order they appear.
+ * `${NAME:?message}` and `${NAME?message}` are required: Compose refuses
+ * to start without them. A default (`${NAME:-value}`) is not required.
+ * A bare `${NAME}` becomes empty when unset, which is Compose's own rule,
+ * so it is not required either; a value that is set is still kept.
+ * `$$` is a literal dollar.
+ * @param {string} text
+ * @returns {{ name: string, required: boolean }[]}
+ */
+export function composeInterpolations(text) {
+  /** @type {Map<string, boolean>} */
+  const found = new Map();
+  const note = (/** @type {string} */ name, /** @type {boolean} */ required) => {
+    const prev = found.get(name);
+    if (prev === undefined) found.set(name, required);
+    else if (required) found.set(name, true);
+  };
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '$') continue;
+    if (text[i + 1] === '$') { i += 1; continue; }
+    if (text[i + 1] === '{') {
+      const end = text.indexOf('}', i + 2);
+      if (end < 0) continue;
+      const body = text.slice(i + 2, end);
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)(.*)$/.exec(body);
+      i = end;
+      if (!m) continue;
+      const op = m[2];
+      const hasDefault = op.startsWith(':-') || op.startsWith('-') || op.startsWith(':+') || op.startsWith('+');
+      const required = !hasDefault && (op.startsWith(':?') || op.startsWith('?'));
+      note(m[1], required);
+      continue;
+    }
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(text.slice(i + 1));
+    if (!m) continue;
+    note(m[1], false);
+    i += m[1].length;
+  }
+  return [...found.entries()].map(([name, required]) => ({ name, required }));
+}
+
+/**
+ * KEY=VALUE lines from a Compose env file. Quotes around the value are
+ * removed; nothing in the value is executed.
+ * @param {string} text
+ * @returns {Map<string, string>}
+ */
+function envFileValues(text) {
+  /** @type {Map<string, string>} */
+  const out = new Map();
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const body = trimmed.startsWith('export ') ? trimmed.slice(7).trim() : trimmed;
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(body);
+    if (!m) continue;
+    let value = m[2];
+    if ((value.startsWith('"') && value.endsWith('"') && value.length >= 2)
+      || (value.startsWith("'") && value.endsWith("'") && value.length >= 2)) {
+      value = value.slice(1, -1);
+    }
+    out.set(m[1], value);
+  }
+  return out;
+}
+
+/**
+ * @param {string} path
+ * @returns {Map<string, string>}
+ */
+function readEnvFile(path) {
+  try {
+    return envFileValues(readFileSync(path, 'utf8'));
+  } catch (err) {
+    if (err && /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT') return new Map();
+    throw err;
+  }
+}
+
 const xmlEscape = (/** @type {string} */ s) => s
   .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
@@ -317,6 +463,7 @@ export function composeUpdateLogPath(home) {
  * @property {string} pathEnv
  * @property {string | null} composeFileEnv
  * @property {string | null} serviceName
+ * @property {[string, string][]} deploymentEnv
  */
 
 /**
@@ -347,6 +494,8 @@ function inspect(c) {
   const dockerBin = c.lookup('docker');
   if (!dockerBin) return { ok: false, error: 'docker was not found on PATH. The timer cannot build without it.' };
   const named = envVar('SERVICE', c.env);
+  const deployed = deploymentEnvironment(c, compose.files ?? []);
+  if (deployed.ok === false) return { ok: false, error: deployed.error };
   return {
     ok: true,
     seconds,
@@ -356,26 +505,135 @@ function inspect(c) {
     pathEnv: updaterPath(gitBin, dockerBin),
     composeFileEnv: compose.env ?? null,
     serviceName: named ? named : null,
+    deploymentEnv: deployed.pairs,
   };
 }
 
 /**
  * @param {ComposeContext} c
- * @returns {{ env: string | null, error?: undefined } | { env?: undefined, error: string }}
+ * @returns {{ env: string | null, files: string[], error?: undefined } | { env?: undefined, files?: undefined, error: string }}
  */
 function composeFile(c) {
   const raw = c.env.COMPOSE_FILE;
   if (raw) {
-    const first = c.platform === 'win32' ? raw : raw.split(':')[0];
-    if (!first) return { error: 'COMPOSE_FILE is empty.' };
-    const path = isAbsolute(first) ? first : join(c.root, first);
-    if (!c.exists(path)) return { error: `COMPOSE_FILE names ${path}, which does not exist.` };
-    return { env: raw };
+    const parts = c.platform === 'win32' ? [raw] : raw.split(':');
+    /** @type {string[]} */
+    const files = [];
+    for (const part of parts) {
+      if (!part) return { error: 'COMPOSE_FILE is empty.' };
+      const path = isAbsolute(part) ? part : join(c.root, part);
+      // Only the first file has to exist. Compose accepts a later path that
+      // is absent on this machine, and the raw value is what the timer runs.
+      if (!files.length && !c.exists(path)) return { error: `COMPOSE_FILE names ${path}, which does not exist.` };
+      if (c.exists(path)) files.push(path);
+    }
+    if (!files.length) return { error: 'COMPOSE_FILE is empty.' };
+    return { env: raw, files };
   }
   for (const name of COMPOSE_NAMES) {
-    if (c.exists(join(c.root, name))) return { env: null };
+    const path = join(c.root, name);
+    if (!c.exists(path)) continue;
+    const files = [path];
+    const override = path.replace(/(\.ya?ml)$/, '.override$1');
+    if (override !== path && c.exists(override)) files.push(override);
+    return { env: null, files };
   }
   return { error: `No compose file in ${c.root} (looked for ${COMPOSE_NAMES.join(', ')}). Set COMPOSE_FILE if it lives elsewhere.` };
+}
+
+/**
+ * The project directory Compose uses: the first compose file's directory,
+ * or the checkout when the default filename is discovered there. An explicit
+ * COMPOSE_PROJECT_DIRECTORY wins, the same way the compose CLI does.
+ * @param {ComposeContext} c
+ * @param {string[]} files
+ */
+function projectDirectory(c, files) {
+  const named = c.env.COMPOSE_PROJECT_DIRECTORY;
+  if (named) return isAbsolute(named) ? named : join(c.root, named);
+  if (c.env.COMPOSE_FILE && files[0]) return dirname(files[0]);
+  return c.root;
+}
+
+/**
+ * Values Compose will see from `.env` and COMPOSE_ENV_FILES. The shell is
+ * not included; the caller already has that.
+ * @param {ComposeContext} c
+ * @param {string[]} files
+ * @returns {Map<string, string>}
+ */
+function composeFileEnvironment(c, files) {
+  const dir = projectDirectory(c, files);
+  /** @type {Map<string, string>} */
+  const merged = new Map();
+  const paths = [join(dir, '.env')];
+  const listed = c.env.COMPOSE_ENV_FILES;
+  if (listed) {
+    const parts = c.platform === 'win32' ? [listed] : listed.split(':');
+    for (const part of parts) {
+      if (!part) continue;
+      paths.push(isAbsolute(part) ? part : join(dir, part));
+    }
+  }
+  for (const path of paths) {
+    for (const [key, value] of readEnvFile(path)) merged.set(key, value);
+  }
+  return merged;
+}
+
+/**
+ * Environment written into the unit, beyond PATH, COMPOSE_FILE, and the
+ * service name. Targeting variables are copied when the install environment
+ * set them. Interpolation variables are copied the same way, and a required
+ * one that is in neither the environment nor the project env file is an error.
+ * @param {ComposeContext} c
+ * @param {string[]} files
+ * @returns {{ ok: true, pairs: [string, string][] } | { ok: false, error: string }}
+ */
+function deploymentEnvironment(c, files) {
+  /** @type {Map<string, string>} */
+  const pairs = new Map();
+  /** @type {string[]} */
+  const missing = [];
+  let fileEnv = new Map();
+  try {
+    fileEnv = composeFileEnvironment(c, files);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  for (const file of files) {
+    let text = '';
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch (err) {
+      if (err && /** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT') continue;
+      return { ok: false, error: `Could not read ${file}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    for (const item of composeInterpolations(text)) {
+      if (RESERVED_ENV.has(item.name)) continue;
+      const fromShell = c.env[item.name];
+      if (typeof fromShell === 'string' && fromShell !== '') {
+        pairs.set(item.name, fromShell);
+        continue;
+      }
+      const fromFile = fileEnv.get(item.name);
+      if (typeof fromFile === 'string' && fromFile !== '') continue;
+      if (item.required) missing.push(item.name);
+    }
+  }
+  if (missing.length) {
+    const names = [...new Set(missing)];
+    return {
+      ok: false,
+      error: `The compose file requires ${names.join(', ')}. The timer does not see your shell. Export it before installing, or pass --env ${names[0]}=... A value in the project .env file counts, and is left there for Compose to read.`,
+    };
+  }
+  for (const key of TARGETING_ENV) {
+    if (RESERVED_ENV.has(key) || pairs.has(key)) continue;
+    const value = c.env[key];
+    if (typeof value === 'string' && value !== '') pairs.set(key, value);
+  }
+  return { ok: true, pairs: [...pairs.entries()] };
 }
 
 /**
@@ -409,11 +667,22 @@ function renderUnits(c, plan) {
   }
 }
 
+/**
+ * @param {ComposePlan} plan
+ * @returns {string[]}
+ */
+function environmentAssignments(plan) {
+  /** @type {string[]} */
+  const assignments = [`PATH=${plan.pathEnv}`];
+  if (plan.composeFileEnv) assignments.push(`COMPOSE_FILE=${plan.composeFileEnv}`);
+  if (plan.serviceName) assignments.push(`TEAMCLAUDE_SERVICE=${plan.serviceName}`);
+  for (const [key, value] of plan.deploymentEnv) assignments.push(`${key}=${value}`);
+  return assignments;
+}
+
 /** @param {ComposePlan} plan */
 function renderSystemdService(plan) {
-  const env = [`Environment=${systemdField(`PATH=${plan.pathEnv}`)}`];
-  if (plan.composeFileEnv) env.push(`Environment=${systemdField(`COMPOSE_FILE=${plan.composeFileEnv}`)}`);
-  if (plan.serviceName) env.push(`Environment=${systemdField(`TEAMCLAUDE_SERVICE=${plan.serviceName}`)}`);
+  const env = environmentAssignments(plan).map((assignment) => `Environment=${systemdField(assignment)}`);
   // ExecStart is the script and nothing else. A shell here would be a place
   // for the checkout path or a service name to be parsed as code. The script
   // is the pull, the build and the restart.
@@ -470,9 +739,12 @@ WantedBy=timers.target
  * @param {string} logFile
  */
 function renderPlist(plan, logFile) {
-  const env = [`    <key>PATH</key>\n    <string>${xmlEscape(plan.pathEnv)}</string>`];
-  if (plan.composeFileEnv) env.push(`    <key>COMPOSE_FILE</key>\n    <string>${xmlEscape(plan.composeFileEnv)}</string>`);
-  if (plan.serviceName) env.push(`    <key>TEAMCLAUDE_SERVICE</key>\n    <string>${xmlEscape(plan.serviceName)}</string>`);
+  const env = environmentAssignments(plan).map((assignment) => {
+    const eq = assignment.indexOf('=');
+    const key = assignment.slice(0, eq);
+    const value = assignment.slice(eq + 1);
+    return `    <key>${xmlEscape(key)}</key>\n    <string>${xmlEscape(value)}</string>`;
+  });
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -540,25 +812,37 @@ export async function installComposeUpdate(opts = {}) {
   const units = renderUnits(c, plan);
   if (units.ok === false) return { ok: false, error: units.error };
 
+  // Before the plist is replaced. bootout of a running job kills redeploy.sh,
+  // and the script cannot finish a rollback after that.
+  if (c.kind === 'launchd') {
+    const busy = launchdBusyError(c);
+    if (busy) return { ok: false, error: busy };
+  }
+
   await mkdir(dirname(units.servicePath), { recursive: true });
   await writeFile(units.servicePath, units.serviceText, { mode: 0o644 });
   if (units.timerPath && units.timerText) await writeFile(units.timerPath, units.timerText, { mode: 0o644 });
 
+  const captured = plan.deploymentEnv.map(([key]) => key);
   if (c.kind === 'launchd') {
     if (units.logFile) await mkdir(dirname(units.logFile), { recursive: true });
     const domain = `gui/${c.uid ?? 0}`;
     // bootstrap fails when the label is already loaded. Unload first, the
     // same way the proxy service does, so a reinstall replaces the plist.
+    // The running check above is what keeps this from killing a redeploy.
     c.run('launchctl', ['bootout', `${domain}/${COMPOSE_UPDATE_LABEL}`]);
     const boot = c.run('launchctl', ['bootstrap', domain, units.servicePath]);
     if (boot.code !== 0) return { ok: false, error: boot.stderr.trim() || `launchctl bootstrap exited ${boot.code}` };
     c.log(`[TeamClaude] Compose auto-update installed: ${units.servicePath}`);
     c.log(`[TeamClaude] Every ${plan.everyLabel}: git pull, docker compose build, docker compose up -d (${plan.script}).`);
     c.log(`[TeamClaude] Checkout: ${plan.checkout}`);
+    if (captured.length) c.log(`[TeamClaude] Deployment environment: ${captured.join(', ')}`);
     c.log(`[TeamClaude] Logs: ${units.logFile}`);
     return { ok: true, file: units.servicePath, checkout: plan.checkout, every: plan.everyLabel };
   }
 
+  // A oneshot that has already started keeps running across daemon-reload.
+  // Stopping the service would signal it mid-rollback, so this path never does.
   const reloaded = c.run('systemctl', ['--user', 'daemon-reload']);
   if (reloaded.code !== 0) return { ok: false, error: reloaded.stderr.trim() || `systemctl daemon-reload exited ${reloaded.code}` };
   // --now starts the timer, not the oneshot. The oneshot runs when the
@@ -568,6 +852,7 @@ export async function installComposeUpdate(opts = {}) {
   c.log(`[TeamClaude] Compose auto-update installed: ${units.timerPath}`);
   c.log(`[TeamClaude] Every ${plan.everyLabel}: git pull, docker compose build, docker compose up -d (${plan.script}).`);
   c.log(`[TeamClaude] Checkout: ${plan.checkout}`);
+  if (captured.length) c.log(`[TeamClaude] Deployment environment: ${captured.join(', ')}`);
   c.log(`[TeamClaude] Logs: journalctl --user --unit ${COMPOSE_UPDATE_SERVICE}`);
   c.log('[TeamClaude] To keep the timer with no session open: loginctl enable-linger $USER');
   return { ok: true, file: units.timerPath || units.servicePath, checkout: plan.checkout, every: plan.everyLabel };
@@ -584,6 +869,8 @@ export async function uninstallComposeUpdate(opts = {}) {
   if (c.uid === 0) return { ok: false, error: 'Refusing to change a timer as root. Run it as the user who owns the checkout.' };
   if (c.kind === 'launchd') {
     const file = composeUpdateAgentPath(c.home);
+    const busy = launchdBusyError(c);
+    if (busy) return { ok: false, error: busy };
     const out = c.run('launchctl', ['bootout', `gui/${c.uid ?? 0}/${COMPOSE_UPDATE_LABEL}`]);
     const failed = stopFailure(out, `launchctl bootout exited ${out.code}`);
     if (failed) return { ok: false, error: failed };
@@ -593,6 +880,8 @@ export async function uninstallComposeUpdate(opts = {}) {
   }
   const service = composeUpdateServicePath(c.home, c.xdgConfig);
   const timer = composeUpdateTimerPath(c.home, c.xdgConfig);
+  // disable --now of the timer leaves a oneshot that has already started.
+  // `systemctl stop` on the service would kill it mid-rollback, so that is not done.
   const disabled = c.run('systemctl', ['--user', 'disable', '--now', COMPOSE_UPDATE_TIMER]);
   const disableFailed = stopFailure(disabled, `systemctl disable exited ${disabled.code}`);
   if (disableFailed) return { ok: false, error: disableFailed };
