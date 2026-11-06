@@ -136,6 +136,23 @@ export function isSyncable(a) {
 }
 
 /**
+ * Why an OAuth account this sync would carry cannot be, or null when it can
+ * (or is not one it would carry at all: an API key, a backend). A login
+ * whose identity is missing — a Grok login read from a Grok Build file that
+ * names no user, say — cannot be matched on another machine, so it stays
+ * here; the pass says so once rather than skipping it without a word.
+ * @param {Record<string, any>|null|undefined} a
+ * @returns {string|null}
+ */
+export function unsyncableReason(a) {
+  if (!a || a.type !== 'oauth' || a.upstream || isSyncable(a)) return null;
+  const provider = providerOf(a);
+  if (provider === 'codex') return 'it has no ChatGPT account id; sign in again with teamclaude login --codex';
+  if (provider === 'grok') return 'it has no xAI user id; sign in again with teamclaude login --grok (or the dashboard\'s Sign in to Grok)';
+  return 'it has no Claude account id; sign in again with teamclaude login';
+}
+
+/**
  * The store key for an account, or null when it is not syncable. Built from the
  * identity, never the per-install config id, so every install of one person
  * names one account the same way.
@@ -373,6 +390,10 @@ export class CredentialSync {
     this._timer = null;
     this.lastSyncAt = null;
     this.lastError = null;
+    /** OAuth accounts the last pass could not share, and why. @type {{ name: string, provider: string, reason: string }[]} */
+    this.notShared = [];
+    /** The names already logged as not shared, so a pass every few minutes says it once. @type {Set<string>} */
+    this._notSharedLogged = new Set();
   }
 
   /** What status reports. */
@@ -385,7 +406,7 @@ export class CredentialSync {
       else rows++;
       if (needsSignIn(r.blob)) signInNeeded++;
     }
-    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows, tombstones, signInNeeded };
+    return { lastSyncAt: this.lastSyncAt, lastError: this.lastError, rows, tombstones, signInNeeded, notShared: this.notShared.map(n => ({ ...n })) };
   }
 
   /** Run a pass now and every SYNC_INTERVAL_MS from then on. */
@@ -491,7 +512,7 @@ export class CredentialSync {
   /** @param {string} reason */
   async _sync(reason) {
     const result = { signedIn: false, adopted: 0, pushed: 0, created: 0, added: 0, evicted: 0, expired: 0, emptied: 0, rows: 0 };
-    if (!await this.isSignedIn()) { this.rows.clear(); return result; }
+    if (!await this.isSignedIn()) { this.rows.clear(); this.notShared = []; return result; }
     result.signedIn = true;
     try {
       this.rows = await this._list();
@@ -506,9 +527,21 @@ export class CredentialSync {
       }
       result.rows = this.rows.size;
 
+      /** @type {{ name: string, provider: string, reason: string }[]} */
+      const notShared = [];
       for (const account of [...this.am.accounts]) {
         const key = syncKeyFor(account);
-        if (!key) continue;
+        if (!key) {
+          const why = unsyncableReason(account);
+          if (why) {
+            notShared.push({ name: safeLine(account.name, 64), provider: providerOf(account), reason: why });
+            if (!this._notSharedLogged.has(account.name)) {
+              this._notSharedLogged.add(account.name);
+              this.log(`[TeamClaude] Account "${safeLine(account.name, 64)}" is not shared through ${this.where()}: ${why}`);
+            }
+          }
+          continue;
+        }
         const row = this._rowFor(account);
         const broken = isInError(account);
         if (!row) {
@@ -567,6 +600,7 @@ export class CredentialSync {
         result.added++;
         this.log(`[TeamClaude] Account "${safeLine(entry.name, 64)}" added from ${this.where()} (signed in on ${safeLine(row.blob.by, 48)})`);
       }
+      this.notShared = notShared;
       this.lastSyncAt = this.now();
       this.lastError = null;
       if (result.adopted || result.pushed || result.created || result.added || result.evicted || result.expired || result.emptied) {

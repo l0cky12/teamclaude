@@ -115,7 +115,7 @@ function card({ signedIn = false, mode = { mode: 'off' }, peers = ['hub'], canHo
 test('the card switches the store, and refuses what would leave an install on two stores or none it can reach', async () => {
   const c = card();
   assert.deepEqual(await c.sync.changeMode({ mode: 'host' }), { mode: 'host', peer: null });
-  assert.deepEqual((await c.sync.view()).instance, { mode: 'host', peer: null, peers: ['hub'], canHost: true, supported: true });
+  assert.deepEqual((await c.sync.view()).instance, { mode: 'host', peer: null, members: null, self: '', cluster: null, peers: ['hub'], canHost: true, supported: true });
   // Sync now works against a store of your own, signed in to nothing.
   await c.sync.syncNow();
   assert.deepEqual(c.passes, ['dashboard']);
@@ -139,7 +139,32 @@ test('the card switches the store, and refuses what would leave an install on tw
   await refused({}, { mode: 'follow', peer: 'elsewhere' }, /choose one of the linked instances/);
   await refused({ probe: async () => { throw new Error('hub does not keep the accounts; turn that on there first'); } },
     { mode: 'follow', peer: 'hub' }, /could not use the account store on hub: hub does not keep the accounts/);
-  await refused({}, { mode: 'everywhere' }, /must be host, follow or off/);
+  await refused({}, { mode: 'everywhere' }, /must be host, follow, cluster or off/);
+});
+
+test('the card puts a machine on a master and backups only with a list every member of it can use', async () => {
+  const named = (opts = {}) => {
+    const c = card({ peers: ['hub', 'desk'], ...opts });
+    c.sync._selfName = () => 'server';
+    return c;
+  };
+  const c = named();
+  assert.deepEqual(await c.sync.changeMode({ mode: 'cluster', members: ['server', ' hub ', 'desk'] }), { mode: 'cluster', peer: null, members: ['server', 'hub', 'desk'] });
+  assert.deepEqual(c.set, [{ mode: 'cluster', members: ['server', 'hub', 'desk'] }]);
+  // A plain follower, not in the list itself, needs no proxy key.
+  const f = named({ canHost: false });
+  assert.deepEqual((await f.sync.changeMode({ mode: 'cluster', members: ['hub', 'desk'] })).members, ['hub', 'desk']);
+
+  const refused = async (opts, members, re) => {
+    const x = named(opts);
+    await assert.rejects(x.sync.changeMode({ mode: 'cluster', members }), (err) => err instanceof AccountSyncError && re.test(err.message));
+    assert.deepEqual(x.set, [], 'nothing saved');
+  };
+  await refused({}, ['server'], /two or more machines/);
+  await refused({}, ['server', 'server'], /two or more machines/);
+  await refused({}, ['server', 'attic'], /attic is not a linked instance of this machine; link it under that name first \(this machine is called server\)/);
+  await refused({ canHost: false }, ['server', 'hub'], /no proxy key/);
+  await refused({ signedIn: true }, ['server', 'hub'], /signed in to callback.net; sign out first/);
 });
 
 test('the store answers only a caller holding this machine\'s proxy key, never a keyless one', async () => {

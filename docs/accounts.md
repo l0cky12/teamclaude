@@ -180,6 +180,8 @@ The sign-in is a poll-token OAuth2 flow: the URL can be opened on any machine, s
 
 While signed in, every **OAuth** account (Claude, Codex and Grok) is kept as one row of your `User/Credential` store on callback.net, encrypted at rest and keyed by the account's identity (provider, account, organization; a Grok login by its xAI user id), so each of your installs names the same account the same way. What travels is the identity (including the account's email, which a Grok request carries) and the tokens: `priority`, `disabled`, `routing` and the display order stay on each install. API-key accounts and [third-party backends](#third-party-backend-accounts) are not synced — a key does not expire, and a backend credential is not ours to renew.
 
+An OAuth login is shared only when it names its account: a Claude account UUID, a ChatGPT account id, or an xAI user id. A login without one, such as a Grok login read from a Grok Build file that names no user, cannot be matched on another machine, so it stays where it is. The log says so once, and the **Account sync** card names the account and how to fix it (sign in again from TeamClaude). `status --json` lists such accounts under `callbackSync.notShared`. Every machine has to run a version that syncs Grok as well. An older one neither stores its own Grok logins nor adds the ones the others share.
+
 - **A pass** runs when the server starts, on every reload (`callback login`, `login`, `import` and `callback sync` all trigger one) and once a day. A row with no local account becomes one, so signing in on a new machine brings every account over. A row whose token is newer than the local one — the later `expiresAt`, which a renewal always pushes forward — replaces it. A local account newer than its row updates the row, and one with no row creates it — but only with a token this install just renewed (below).
 - **Only fresh tokens are stored.** A token is written to the store only when the token endpoint has just minted it: a renewal on this install, or a `login` or `import`. A token read from the config at start, or from disk on a reload, may have died while the proxy was down, and one that served a request may still have been revoked since, so neither is ever stored. An account holding one only reads (it adopts newer tokens and follows tombstones); its next renewal writes the row. That renewal is still made under a lock: with no row yet, it first creates one holding only the account's identity and no token, so that two installs started from the same config renew the account once, not twice.
 - **A token refresh** goes through the row's advisory lock, so one install renews and the rest adopt. A refresh rotates the token family, and two installs renewing one account at once would each invalidate the other's copy — which is exactly the "sign in again everywhere" this exists to end. With the lock taken, the row is read first (the lock answers with it): if it holds a token other than this install's, another install renewed or signed in since, and that token is adopted whatever its expiry; the provider is not called. The one exception is a row this install wrote itself with an older token than it holds now, a renewal of its own that never reached the store, which is renewed over rather than taken back. Refused, another install is renewing: a token that is still good (the refresh runs five minutes ahead of expiry) is simply kept, the renewal arrives through the store, and the next request asks again. A token that has already expired, or that upstream just rejected, waits instead, re-reading every 5 seconds for 30 seconds, adopts what the holder stores, and otherwise tries the lock again; a lock that nobody releases times out after 30 seconds. A store that cannot be reached never stops a refresh: the account is renewed without it and stored on the next pass.
@@ -226,13 +228,63 @@ The card then shows which machine keeps the accounts, how many accounts the stor
 - **A pass runs every 5 minutes**, as well as at start, on reload and at **Sync now**. It is a read on your own network.
 - **The store is a file** next to the config of the machine that keeps it: `<config>.sync-store.json`, mode `0600`. It holds the same tokens the config does, so treat it like the config. A follower reads and writes it through `POST /teamclaude/sync-store` on that machine. That route answers only a request carrying that machine's `proxy.apiKey`: a [client key](configuration.md) is refused, and so is a request without a key, even from the same machine, and a machine without a proxy key keeps its store closed. It answers only on the machine that keeps the store, and is never forwarded through another instance. A server and a CLI command on that machine share the file under a lock; a write never goes ahead without it, so a busy store makes a renewal wait rather than run unlocked. The tokens cross your network on the link's address, so use an address on a network you trust, such as Tailscale or your LAN, or HTTPS through a reverse proxy.
 - **Rows from before count as seeds.** When a machine starts keeping the store, and each time it starts up while keeping it, every row already in the file is marked as a seed. The other machines may have renewed without it in the meantime, so an old row can't replace a newer token.
-- **When the machine that keeps the store is down**, the followers keep serving with the tokens they have. A token that is still good is kept. One that has expired waits until the store answers again rather than being renewed without the lock, because renewing without it could sign the other machines out. If that machine is gone for good, turn the sync off on the others, or make one of them keep a new store.
+- **When the machine that keeps the store is down**, the followers keep serving with the tokens they have. A token that is still good is kept. One that has expired waits until the store answers again rather than being renewed without the lock, because renewing without it could sign the other machines out. If that machine is gone for good, turn the sync off on the others, or make one of them keep a new store. To have another machine take over by itself, use a [master and backups](#master-and-backups-failover) instead.
 
 **Before you turn it off.** Once two machines share an account, each holds a copy of the same login. A machine where sync is off renews its copy on its own, which signs the others out of that account. So keep it on wherever a shared account is used, or remove that account from every machine but one before you turn it off. Turning it off doesn't delete the store file: `<config>.sync-store.json` still holds the tokens it had, so delete it yourself if that machine will no longer keep the store.
 
 **Who can read the store.** On the machine that keeps it, the shared `proxy.apiKey` now reads every shared login. Give your Claude Code and Codex clients [client keys](configuration.md) instead of that key. A client key is refused by the store. While own-machine sync is on, `teamclaude callback login` is refused, so a machine never syncs with two stores.
 
 `teamclaude status --json` reports the pass under `callbackSync` for both kinds of store.
+
+## Master and backups (failover)
+
+With one machine keeping the store, the others carry on when it goes down, but no sign-in that runs out can be renewed until it comes back. A master with backups removes that wait. Every member keeps the store: the master answers it, and each backup holds a copy of the master's that it keeps up to date. When the master stops answering, the next member in line takes over with that copy, and every machine moves to it on its own.
+
+**Set it up.** Link the machines first (**Settings**, **Linked instances**), give each one a proxy key (`proxy.apiKey`), and give each an **Instance name** (Settings) that the others use for it too. In Docker, the default name is the container id, so set one. Then on each machine, in **Account sync**, enter the machines by name, the master first, and click **Use master and backups**:
+
+```
+server, hermes, desk
+```
+
+Enter the same list, in the same order, on every machine. To do it from one page, pick each machine in the Instance picker in turn. In the config it is:
+
+```json
+"accountSync": { "mode": "cluster", "members": ["server", "hermes", "desk"] }
+```
+
+A machine that runs this setting but is not in the list (a laptop, say) is a plain follower: it uses whichever member is master and keeps no copy.
+
+**How the master is elected.** There is no vote. Every machine checks every member every 10 seconds, over the same link and key the dashboard uses (`POST /teamclaude/sync-cluster`), and works out the master on its own by walking the list from the top:
+
+1. If it reaches its own name, it is the master: every member above it is down.
+2. A member that answered is the master.
+3. A member it has not heard from yet means there is no master for now. It waits rather than guess.
+4. A member that has missed 3 checks in a row (30 seconds) is down, and the walk moves on to the next name. One exception: if another member answered this machine and reached that member at its own last check, the fault is only between those two machines. Then there is no master from here, and nothing takes over.
+
+Every machine walks the same list, so they all reach the same answer. Taking over is then a handshake, so two machines that both think it is their turn never both answer. That happens, for example, when the master restarts just as its backup gives up on it:
+
+1. The machine says it is a **candidate**. Every check of it says so from then on.
+2. It checks every member again, there and then. It backs off if a member above it answers, or if any member says it is a candidate or the master. If two candidates see each other, both back off. The walk then makes the lower one a backup, and the higher one tries again at its next check.
+3. It merges the copies of the store held by every member that answered, row by row. For the same account, the later token wins. A copy that another copy already contains brings nothing, so it can't restore an account deleted since. Deleted rows are also remembered for a month, so a copy from the other side of a split can't restore them either. A row locked in any copy stays locked. It then starts a new *term*, numbered above every term it has seen, and marks every row as a seed, as when a machine starts keeping the store (see above). A newer token on any machine still wins over the merged copy. A row that was locked for a renewal on the old master stays locked for a full lease (30 seconds), so that renewal can store its token first.
+
+A master steps down when any of these happens:
+
+- A member above it in the list is up.
+- A member it reaches runs a different list, or its own list changes.
+- Another member says it is a candidate or the master.
+- A member holds writes its own copy lacks.
+
+Stepping down first clears the store's *write fence*, while this machine still says it is master. From that moment, this server also takes no store call of its own. If the fence can't be cleared because the store file is busy, the step-down stays pending. The machine keeps saying it is master, so nobody takes over yet, and it tries again at each check. The store file names the machine it is answered by. Every store call checks that name inside the file lock, whether it comes from this server, from a CLI command on this machine, or from another machine. So once the fence is cleared, a renewal still running on the old master can no longer write. The copy the next master takes is then final.
+
+Each copy remembers which terms it has taken in, and how far into each. A backup replaces its copy with the master's only when the master's copy already contains it. A copy holding writes the master lacks, such as the other side of a network split, is kept. The master steps down for it and merges it in at a new term.
+
+So when `server` goes down, `hermes` takes over after 30 seconds and `desk` follows it. When `server` comes back, `hermes` steps down, `server` takes over the copy `hermes` kept (with everything renewed meanwhile), and `hermes` and `desk` follow `server` again.
+
+While there is no master, the machines behave as they do when a single store machine is down. A token that is still good is used. One that has run out waits rather than being renewed without the lock. The card shows why there is no master: a member it has not heard from yet, a member it cannot place among its linked instances, a member on an older version, or a member that runs with a different list. A member list that differs between machines never lets any of them take over, so fix the list rather than waiting.
+
+**What it cannot protect against.** If the network splits so that neither side reaches any member of the other, each side elects its own master. Both may then renew the same sign-in, which signs one side out of that account. When the split heals, both masters step down. The member higher in the list merges both sides' copies, and the next renewal or sign-in sets things right. With only two members there is no third to notice a split, so use three where you can. Up to 10 seconds of writes made just before a master dies may not have reached a backup's copy. A token renewed in that window is not lost, since the machine that renewed it stores it again at its next sync. A removal made in that window may have to be made again.
+
+**The card.** It names the master and this machine's place. It lists every member as up, down or not heard from yet, and says when there is no master and why. The **Account sync** column of the Linked instances table says which machine is the master. **Turn off** stops sharing on that machine only.
 
 ## Moving accounts to a new machine (export / import)
 

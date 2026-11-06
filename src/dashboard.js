@@ -1307,13 +1307,35 @@ export function accountSyncUser(view) {
 
 /**
  * The store of your own instances a view names: 'host' (the instance keeps
- * it), 'follow' (it uses a linked one's), or '' when neither.
+ * it), 'follow' (it uses a linked one's), 'cluster' (a master and backups
+ * keep it), or '' when none.
  *
  * @param {any} view  GET /teamclaude/account-sync
  */
 export function accountSyncOwnMode(view) {
   var m = view && view.instance && view.instance.mode;
-  return m === 'host' || m === 'follow' ? m : '';
+  return m === 'host' || m === 'follow' || m === 'cluster' ? m : '';
+}
+
+/**
+ * The members of a master and backups, in order, as the instance shown sees
+ * them: one line each, for the card.
+ *
+ * @param {any} view  GET /teamclaude/account-sync
+ * @returns {{ name: string, kind: string, text: string }[]}
+ */
+export function accountSyncMembers(view) {
+  var cl = view && view.instance && view.instance.cluster;
+  if (!cl || !Array.isArray(cl.memberStates)) return [];
+  return cl.memberStates.map(function (/** @type {any} */ m, /** @type {number} */ i) {
+    var where = m.self ? ' (this machine)' : '';
+    var place = i === 0 ? 'first in line' : 'backup ' + i;
+    if (m.state === 'down') return { name: m.name, kind: 'error', text: m.name + where + ': down, ' + place };
+    if (m.state === 'unplaced') return { name: m.name, kind: 'error', text: m.name + ': not a linked instance of this machine' };
+    if (m.state === 'unknown') return { name: m.name, kind: '', text: m.name + where + ': not heard from yet, ' + place };
+    if (m.name === cl.master) return { name: m.name, kind: 'ok', text: m.name + where + ': master' };
+    return { name: m.name, kind: '', text: m.name + where + ': up, ' + place };
+  });
 }
 
 /**
@@ -1328,6 +1350,12 @@ export function accountSyncLine(view, where) {
   var on;
   if (own === 'host') {
     on = 'On: ' + where + ' keeps the accounts for your other machines.';
+  } else if (own === 'cluster') {
+    var cl = view.instance.cluster || {};
+    if (!cl.master) return { kind: 'warn', text: 'On, with a master and backups, but there is no master right now' + (cl.reason ? ': ' + cl.reason : '') + '. Sign-ins that run out wait until there is one.' };
+    var self = cl.master === view.instance.self;
+    on = 'On: ' + (self ? where + ' is the master' : cl.master + ' is the master')
+      + (self ? '.' : cl.role === 'follower' ? ', and ' + where + ' follows it.' : ', and ' + where + ' keeps a copy to take over with.');
   } else if (own === 'follow') {
     var linked = Array.isArray(view.instance.peers) ? view.instance.peers : [];
     if (linked.indexOf(view.instance.peer) < 0) return { kind: 'error', text: 'On, but ' + where + ' follows ' + view.instance.peer + ', which is no longer a linked instance: nothing is synced, and a sign-in that runs out is not renewed. Link it again, or turn this off.' };
@@ -1364,6 +1392,12 @@ export function peerSyncCell(view, httpStatus, own) {
   var mode = accountSyncOwnMode(view);
   if (mode === 'host') return { kind: 'ok', text: 'keeps the accounts', setUp: false };
   if (mode === 'follow') return { kind: 'ok', text: 'follows ' + view.instance.peer, setUp: false };
+  if (mode === 'cluster') {
+    var cl = view.instance.cluster || {};
+    if (!cl.master) return { kind: 'warn', text: 'master and backups: no master right now', setUp: false };
+    var role = cl.role === 'master' ? 'the master' : cl.role === 'backup' ? 'a backup' : 'follows ' + cl.master;
+    return { kind: 'ok', text: 'master and backups: ' + role + (cl.role === 'backup' ? ' (master: ' + cl.master + ')' : ''), setUp: false };
+  }
   // Off there. A callback.net sign-in is offered only while this machine
   // syncs that way too: beside a store of your own it would be a second one.
   if (!view.signedIn) return { kind: '', text: 'off', setUp: !accountSyncOwnMode(own) };
@@ -1433,6 +1467,7 @@ export function accountSyncOutcome(res, step, where) {
   if (step === 'mode') {
     if (res.mode === 'host') return { kind: 'ok', text: 'On: ' + where + ' keeps the accounts. On each of your other machines, choose Follow ' + (where === 'this machine' ? 'it' : where) + ' here.' };
     if (res.mode === 'follow') return { kind: 'ok', text: 'On: ' + where + ' follows ' + res.peer + '. The accounts arrive with the first sync, in a moment.' };
+    if (res.mode === 'cluster') return { kind: 'ok', text: 'On: master and backups ' + (res.members || []).join(', ') + '. Set the same list, in the same order, on each of them. The first one up is the master.' };
     return { kind: 'ok', text: 'Off. The accounts stay where they are.' };
   }
   if (step === 'sign-out') {
@@ -2321,7 +2356,7 @@ const SHARED_HELPERS = [
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
-  accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
+  accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
   fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fleetMissingText,
 ].map(fn => fn.toString()).join('\n\n');
 
@@ -2565,6 +2600,10 @@ const PAGE = `<!doctype html>
   /* The store of your own instances, under the callback.net controls. */
   .links .ownsync { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
   .links .ownsync .hint { margin: 4px 0 0; }
+  .links .ownsync .cluster { margin-top: 12px; }
+  .links .ownsync .cluster input { flex: 1 1 220px; min-width: 0; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .links ul.members { list-style: none; margin: 8px 0 0; padding: 0; font-size: 12px; }
+  .links ul.members li { padding: 2px 0; }
   .links .ownsync select { flex: 0 1 220px; min-width: 0; font: inherit; font-size: 12px; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
   .links .own { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
   .badge.meta { color: var(--dim); }
@@ -4104,6 +4143,14 @@ ${SHARED_HELPERS}
     var on = syncView.signedIn || !!own;
     if (on && sum.lastSyncAt) row.appendChild(el('span', 'when', 'Last synced ' + fmtAgo(sum.lastSyncAt) + '.'));
     body.appendChild(row);
+    var members = accountSyncMembers(syncView);
+    if (members.length) {
+      var list = el('ul', 'members');
+      members.forEach(function (m) { list.appendChild(el('li', 'st ' + m.kind, m.text)); });
+      body.appendChild(list);
+    }
+    var notShared = Array.isArray(sum.notShared) ? sum.notShared : [];
+    notShared.forEach(function (n) { body.appendChild(el('p', 'st warn', '"' + n.name + '" is not shared: ' + n.reason)); });
     var acts = el('div', 'row acts');
     if (syncView.ok && !on) {
       if (!syncSigningIn()) acts.appendChild(button('btn primary', 'Turn on account sync', function () { startSyncSignIn(''); }));
@@ -4135,7 +4182,9 @@ ${SHARED_HELPERS}
       body.appendChild(ownSyncBox(syncView.instance));
     }
     if (syncNote) body.appendChild(el('div', 'st ' + syncNote.kind, syncNote.text));
-    hint.textContent = own
+    hint.textContent = own === 'cluster'
+      ? 'Each machine shares the Claude, Codex and Grok sign-ins it has and adds the ones the others share. The first member in the list that is up is the master; the backups keep a copy of its store, and the next one up takes over when the master has not answered for 30 seconds. API-key and backend accounts are not shared.'
+      : own
       ? 'Each machine shares the Claude, Codex and Grok sign-ins it has and adds the ones the others share, every few minutes or at once with Sync now. A follower reaches ' + (own === 'host' ? syncWhere('') : syncView.instance.peer) + ' over its link, with the key it already holds. API-key and backend accounts are not shared.'
       : syncView.signedIn
         ? 'An account reaches callback.net when a machine signs it in or next renews it. A machine where that account needs a sign-in takes the working one at its next sync, which Sync now runs at once. API-key and backend accounts are not shared.'
@@ -4165,6 +4214,31 @@ ${SHARED_HELPERS}
       follow.title = syncWhere('') + ' uses the sign-ins the chosen machine keeps';
       acts.appendChild(follow);
     }
+    box.appendChild(acts);
+    if (peers.length) box.appendChild(clusterSyncBox(inst));
+    return box;
+  }
+
+  // A master and backups (sync-cluster.js): the same ordered list on every
+  // machine. Offered with this machine first and its linked instances after,
+  // which the operator reorders by editing the line.
+  function clusterSyncBox(inst) {
+    var box = el('div', 'cluster');
+    box.appendChild(el('div', 'sub2', 'Or a master with backups'));
+    box.appendChild(el('p', 'hint', 'List the machines by name, the master first, then the backups in the order they take over. Set the same list on every machine. If the master does not answer for 30 seconds, the next one up takes over with the copy it kept.'));
+    var acts = el('div', 'row acts');
+    var list = el('input');
+    list.type = 'text';
+    list.setAttribute('aria-label', 'Machines, master first');
+    var names = [inst.self].concat(Array.isArray(inst.peers) ? inst.peers : []).filter(function (n) { return !!n; });
+    list.value = names.join(', ');
+    acts.appendChild(list);
+    var use = button('btn', syncBusy === 'mode' ? 'Turning on…' : 'Use master and backups', function () {
+      doSync('mode', { mode: 'cluster', members: list.value.split(',').map(function (n) { return n.trim(); }).filter(function (n) { return !!n; }) });
+    });
+    use.disabled = !!syncBusy;
+    use.title = 'The first machine in the list is the master; the others keep a copy and take over in that order';
+    acts.appendChild(use);
     box.appendChild(acts);
     return box;
   }

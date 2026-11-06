@@ -96,7 +96,7 @@
     }
   ],
   "accountSync": {
-    "mode": "follow",
-    "peer": "server"
+    "mode": "cluster",
+    "members": ["server", "hermes"]
   }
 }

@@ -506,6 +506,9 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // The store this machine keeps for your other ones holds every shared
   // account's tokens: only a proxy key, the one a linked instance holds, reads it.
   ['/teamclaude/sync-store', 'a client key cannot read the account store'],
+  // The master and backups check one another here, and a backup copies the
+  // whole store through it.
+  ['/teamclaude/sync-cluster', 'a client key cannot read the account store'],
 ]);
 
 /**
@@ -983,6 +986,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           return reply(401, { ok: false, error: shared ? 'the account store answers only to this machine\'s proxy key' : 'this machine has no proxy key (proxy.apiKey), so its account store is closed' });
         }
         const store = hooks.syncStore?.() || null;
+        // With a master and backups, a member that is not the master right
+        // now refuses the same way: a caller that still takes it for the
+        // master holds its renewal back until it finds the one that is.
         if (!store) return reply(404, { ok: false, token: 'error_not_host', error: 'this instance does not keep the accounts for your other machines' });
         const body = await readControlJson(req, res);
         if (!body) return;
@@ -996,6 +1002,38 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
             return reply(code, { ok: false, token: err.token, error: err.message });
           }
           console.error(`[TeamClaude] Account store call failed: ${safeLine(String(/** @type {Error} */ (err)?.message || err), 160)}`);
+          return reply(500, { ok: false, error: 'the account store failed; see the proxy log on that machine' });
+        }
+      }
+
+      // The master and backups of the account store (accountSync.mode
+      // "cluster", sync-cluster.js): {"op":"status"} is the check every
+      // member makes of every other, {"op":"snapshot"} hands over this
+      // machine's copy of the store. Like the store itself, only to this
+      // machine's proxy key, and never through the relay (peers.js).
+      if (req.method === 'POST' && req.url === '/teamclaude/sync-cluster') {
+        const reply = (/** @type {number} */ code, /** @type {Record<string, any>} */ payload) => {
+          res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(payload));
+        };
+        const shared = config.proxy?.apiKey;
+        if (!shared || !safeKeyEqual(req.headers['x-api-key'], shared)) {
+          return reply(401, { ok: false, error: shared ? 'the account store answers only to this machine\'s proxy key' : 'this machine has no proxy key (proxy.apiKey), so its account store is closed' });
+        }
+        const cluster = hooks.syncCluster;
+        if (!cluster) return reply(404, { ok: false, error: 'this server has no master and backups' });
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        try {
+          if (body.op === 'status') return reply(200, { ok: true, ...cluster.status() });
+          if (body.op === 'snapshot') {
+            const store = await cluster.snapshot();
+            if (!store) return reply(404, { ok: false, error: 'this machine is not one of the master and backups' });
+            return reply(200, { ok: true, store });
+          }
+          return reply(400, { ok: false, error: '"op" must be status or snapshot' });
+        } catch (err) {
+          console.error(`[TeamClaude] Account store check failed: ${safeLine(String(/** @type {Error} */ (err)?.message || err), 160)}`);
           return reply(500, { ok: false, error: 'the account store failed; see the proxy log on that machine' });
         }
       }
