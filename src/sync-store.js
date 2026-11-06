@@ -28,8 +28,21 @@
 // how current it is with two counters: `rev`, raised by every write, and
 // `term`, raised each time a member takes over as master. A copy is newer
 // than another when its term is higher, or its term is the same and its rev
-// higher, so a member that comes back after a failover can tell that the
-// copy kept meanwhile is the one to take.
+// higher. `owner` names the member that started the term: two members that
+// each took over on their own side of a split can reach the same counters
+// with different contents, and the owner tells those copies apart.
+// `lineage` lists the earlier terms a copy took in (each with the rev it had
+// reached), so a member can tell whether another's copy is already part of
+// its own (contains) or holds writes it lacks, which have to be merged in
+// rather than copied over.
+//
+// `leader` is the write fence. It names the member answering as master, and
+// only while it does: a takeover sets it, a step-down clears it, and a copy
+// taken from another member never carries it. With a master and backups,
+// every call of the store's API — from this server, from a CLI command on
+// this machine, or from another machine — checks it under the file lock, so
+// a renewal still under way when the master steps down cannot write to a
+// store the next master has already copied.
 
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
@@ -74,9 +87,110 @@ export function getSyncStorePath(configPath = getConfigPath()) {
 
 /**
  * @typedef {{ id: string, key: string, data: string, updated: number, lockedAt: number|null, lease?: string|null }} StoreRow
- * @typedef {{ v: number, term: number, rev: number, rows: StoreRow[] }} StoreFile
- * @typedef {{ term: number, rev: number }} StorePosition
+ * @typedef {{ term: number, owner: string|null, rev: number }} TermMark
+ * @typedef {{ v: number, term: number, rev: number, owner: string|null, leader: string|null, lineage: TermMark[], rows: StoreRow[] }} StoreFile
+ * @typedef {{ term: number, rev: number, owner?: string|null, lineage?: TermMark[] }} StorePosition
  */
+
+/** How many earlier terms a copy remembers. */
+const MAX_LINEAGE = 64;
+
+/**
+ * Whether copy `a` already holds everything copy `b` does: `b` is `a` itself
+ * or an earlier version of it (same term and owner, no later rev), or a term
+ * `a` took in at or past the rev `b` had reached. An empty store is part of
+ * every copy.
+ * @param {StorePosition} a
+ * @param {StorePosition} b
+ */
+export function contains(a, b) {
+  if (b.term === 0 && b.rev === 0) return true;
+  const same = (/** @type {{ term: number, owner?: string|null }} */ m) => m.term === b.term && (m.owner ?? null) === (b.owner ?? null);
+  if (same(a) && a.rev >= b.rev) return true;
+  return (a.lineage || []).some(m => same(m) && m.rev >= b.rev);
+}
+
+/**
+ * The lineage of a copy made from `positions` (this one first), plus the
+ * positions themselves: each term once, at the highest rev seen.
+ * @param {StorePosition[]} positions
+ * @returns {TermMark[]}
+ */
+function joinLineage(positions) {
+  /** @type {Map<string, TermMark>} */
+  const marks = new Map();
+  const add = (/** @type {TermMark} */ m) => {
+    if (m.term === 0 && m.rev === 0) return;
+    const k = `${m.term}\u0000${m.owner ?? ''}`;
+    const held = marks.get(k);
+    if (!held || m.rev > held.rev) marks.set(k, { term: m.term, owner: m.owner ?? null, rev: m.rev });
+  };
+  for (const p of positions) {
+    for (const m of p.lineage || []) add(m);
+    add({ term: p.term, owner: p.owner ?? null, rev: p.rev });
+  }
+  return [...marks.values()].sort((x, y) => y.term - x.term || y.rev - x.rev).slice(0, MAX_LINEAGE);
+}
+
+/** A lineage from a file or a reply. @param {unknown} v @returns {TermMark[]} */
+export function lineageOf(v) {
+  if (!Array.isArray(v)) return [];
+  /** @type {TermMark[]} */
+  const out = [];
+  for (const m of v.slice(0, MAX_LINEAGE)) {
+    if (!m || typeof m !== 'object') continue;
+    const term = counter(m.term);
+    const rev = counter(m.rev);
+    out.push({ term, rev, owner: typeof m.owner === 'string' && m.owner ? m.owner.slice(0, 64) : null });
+  }
+  return out;
+}
+
+/**
+ * Whether two positions name the same version of the store: the same
+ * counters, in a term the same member started.
+ * @param {StorePosition} a
+ * @param {StorePosition} b
+ */
+export function samePosition(a, b) {
+  return a.term === b.term && a.rev === b.rev && (a.owner ?? null) === (b.owner ?? null);
+}
+
+/** The expiry a row's token carries, or null when it holds none. @param {StoreRow} row */
+function tokenExpiry(row) {
+  try {
+    const b = JSON.parse(row.data);
+    return b && typeof b === 'object' && b._deleted == null && Number.isFinite(b.expiresAt) && typeof b.refreshToken === 'string' && b.refreshToken ? b.expiresAt : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Several copies of the store made one, row by row, keyed by the row's key:
+ * a row only one copy holds is kept, and of two rows for the same account
+ * the one with the later token expiry wins (a renewal always pushes it
+ * forward), else the one written later. What a stale copy brings back is
+ * harmless: a takeover marks every row as a seed, and a seed never replaces
+ * a newer token any machine holds.
+ * @param {StoreRow[][]} copies  the first is this machine's own
+ * @returns {StoreRow[]}
+ */
+export function mergeRows(copies) {
+  /** @type {Map<string, StoreRow>} */
+  const byKey = new Map();
+  for (const rows of copies) {
+    for (const row of rows) {
+      const held = byKey.get(row.key);
+      if (!held) { byKey.set(row.key, { ...row }); continue; }
+      const a = tokenExpiry(held);
+      const b = tokenExpiry(row);
+      const wins = a != null && b != null ? b > a : row.updated > held.updated;
+      if (wins) byKey.set(row.key, { ...row });
+    }
+  }
+  return [...byKey.values()].slice(0, MAX_ROWS);
+}
 
 /**
  * Whether position `a` is newer than `b`: a later term, or the same term
@@ -119,23 +233,42 @@ function parseStore(text) {
     if (!r || typeof r.id !== 'string' || typeof r.key !== 'string' || typeof r.data !== 'string') continue;
     rows.push({ id: r.id, key: r.key, data: r.data, updated: Number(r.updated) || 0, lockedAt: Number.isFinite(r.lockedAt) ? r.lockedAt : null, lease: typeof r.lease === 'string' ? r.lease : null });
   }
-  return { v: STORE_VERSION, term: counter(doc.term), rev: counter(doc.rev), rows };
+  return { v: STORE_VERSION, term: counter(doc.term), rev: counter(doc.rev), owner: nameOf(doc.owner), leader: nameOf(doc.leader), lineage: lineageOf(doc.lineage), rows };
+}
+
+/** A member name from a file, or null. @param {unknown} v */
+function nameOf(v) {
+  return typeof v === 'string' && v ? v.slice(0, 64) : null;
 }
 
 /**
  * The store at `path`. `call` takes what callbackCall takes, so it can stand
  * in for it as the sync's `api`.
  *
- * @param {{ path?: string, now?: () => number }} [opts]
+ * `leaderName` turns on the write fence (see the top of this file): when it
+ * names this machine, every call is refused unless the file says this
+ * machine leads it. Null (the default, and a store kept by one machine) is
+ * no fence.
+ *
+ * @param {{ path?: string, now?: () => number, leaderName?: () => (string | null | Promise<string | null>) }} [opts]
  */
-export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = {}) {
+export function createSyncStore({ path = getSyncStorePath(), now = Date.now, leaderName = () => null } = {}) {
+  /**
+   * Refuse when the fence is on and the file does not name this machine.
+   * @param {StoreFile} store
+   * @param {string|null} want
+   */
+  function fence(store, want) {
+    if (want != null && store.leader !== want) throw new SyncStoreError('error_not_host', 'this machine is not the master of the account store right now');
+  }
+
   /** @returns {Promise<StoreFile>} */
   async function load() {
     let text;
     try {
       text = await readFile(path, 'utf8');
     } catch (/** @type {any} */ err) {
-      if (err?.code === 'ENOENT') return { v: STORE_VERSION, term: 0, rev: 0, rows: [] };
+      if (err?.code === 'ENOENT') return { v: STORE_VERSION, term: 0, rev: 0, owner: null, leader: null, lineage: [], rows: [] };
       throw err;
     }
     return parseStore(text);
@@ -188,6 +321,11 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
    * @returns {Promise<any>}
    */
   async function call(method, route, params = null, opts = {}) {
+    const want = await leaderName();
+    // Every change goes through here, so the fence is checked under the lock.
+    /** @type {typeof update} */
+    const write = (fn) => update((store) => { fence(store, want); return fn(store); });
+    const read = async () => { const store = await load(); fence(store, want); return store; };
     const m = PATH_RE.exec(String(route || ''));
     if (!m) throw new SyncStoreError('error_bad_request', 'unknown route');
     const [, id, action] = m;
@@ -197,7 +335,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     if (id == null && method === 'GET') {
       const size = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(Number(p.results_per_page)) || MAX_PAGE_SIZE));
       const page = Math.max(1, Math.floor(Number(p.page_no)) || 1);
-      const { rows } = await load();
+      const { rows } = await read();
       const data = rows.slice((page - 1) * size, page * size).map(view);
       const pageMax = Math.max(1, Math.ceil(rows.length / size));
       return opts.envelope ? { data, paging: { page_no: page, page_max: pageMax, count: rows.length } } : data;
@@ -207,7 +345,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
       const key = p.Key;
       if (typeof key !== 'string' || !key || key.length > MAX_KEY_LENGTH) throw new SyncStoreError('error_bad_request', '"Key" must be a short string');
       const data = checkData(p.Data);
-      return update((store) => {
+      return write((store) => {
         if (store.rows.some(r => r.key === key)) throw new SyncStoreError('error_key_exists', 'a credential with that key exists');
         if (store.rows.length >= MAX_ROWS) throw new SyncStoreError('error_store_full', 'the account store is full');
         const row = { id: 'ucr-' + randomBytes(9).toString('hex'), key, data, updated: now(), lockedAt: null };
@@ -221,7 +359,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     if (action === 'lock' && method === 'POST') {
       const asked = Number(p.timeout);
       const timeoutS = Number.isFinite(asked) ? Math.min(MAX_LOCK_S, Math.max(MIN_LOCK_S, asked)) : DEFAULT_LOCK_S;
-      return update((store) => {
+      return write((store) => {
         const row = find(store, id);
         // Handed over once it is older than the lease this taker names, the
         // rule the sync is written for (credential-sync.js LOCK_TIMEOUT_S).
@@ -236,7 +374,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
       });
     }
     if (action === 'unlock' && method === 'POST') {
-      return update((store) => {
+      return write((store) => {
         const row = find(store, id);
         if (row.lockedAt == null || (row.lease && p.Lease !== row.lease)) return { result: view(row), changed: false };
         row.lockedAt = null;
@@ -246,10 +384,10 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     }
     if (action) throw new SyncStoreError('error_bad_request', 'unknown route');
 
-    if (method === 'GET') return view(find(await load(), id));
+    if (method === 'GET') return view(find(await read(), id));
     if (method === 'PATCH') {
       const data = checkData(p.Data);
-      return update((store) => {
+      return write((store) => {
         const row = find(store, id);
         row.data = data;
         row.updated = now();
@@ -257,7 +395,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
       });
     }
     if (method === 'DELETE') {
-      return update((store) => {
+      return write((store) => {
         find(store, id);
         store.rows = store.rows.filter(r => r.id !== id);
         return { result: { ok: true }, changed: true };
@@ -292,8 +430,8 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
 
   /** How current this copy is. @returns {Promise<StorePosition>} */
   async function position() {
-    const { term, rev } = await load();
-    return { term, rev };
+    const { term, rev, owner, lineage } = await load();
+    return { term, rev, owner, lineage };
   }
 
   /**
@@ -309,32 +447,59 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     return update((store) => {
       store.term = copy.term;
       store.rev = copy.rev;
+      store.owner = copy.owner;
+      store.lineage = copy.lineage;
+      // A copy is never led from here: only a takeover sets the fence.
+      store.leader = null;
       store.rows = copy.rows;
-      return { result: { term: copy.term, rev: copy.rev }, changed: true, positioned: true };
+      return { result: { term: copy.term, rev: copy.rev, owner: copy.owner, lineage: copy.lineage }, changed: true, positioned: true };
     });
   }
 
   /**
-   * Start answering as the master, at `term`. Every row becomes a seed, as
-   * when a machine starts keeping the store: the copy may predate renewals
-   * made on the old master. A lock the copy holds is stamped as taken now,
-   * so a renewal that was under way on the old master keeps its row for a
-   * full lease and stores its token before anyone else renews that account.
-   * @param {number} term
+   * Stop leading: clear the fence, so no call made through this file goes
+   * ahead from here on. The rows stay as they are, for the next master to
+   * take.
    * @returns {Promise<StorePosition>}
    */
-  async function promote(term) {
+  async function resign() {
     return update((store) => {
-      store.term = counter(term);
-      store.rev += 1;
-      markSeeds(store);
-      const at = now();
-      for (const row of store.rows) if (row.lockedAt != null) row.lockedAt = at;
-      return { result: { term: store.term, rev: store.rev }, changed: true, positioned: true };
+      const changed = store.leader != null;
+      store.leader = null;
+      return { result: { term: store.term, rev: store.rev, owner: store.owner, lineage: store.lineage }, changed, positioned: true };
     });
   }
 
-  return { path, call, reseed, snapshot, position, replaceWith, promote };
+  /**
+   * Start answering as the master `name`, at `term`, with the rows of the
+   * other members' copies merged in (mergeRows). Every row becomes a seed, as
+   * when a machine starts keeping the store: a copy may predate renewals
+   * made on the old master. A lock a copy holds is stamped as taken now, so
+   * a renewal that was under way on the old master keeps its row for a full
+   * lease and stores its token before anyone else renews that account.
+   * @param {number} term
+   * @param {string} name
+   * @param {unknown[]} [copies]  other members' snapshots
+   * @returns {Promise<StorePosition>}
+   */
+  async function promote(term, name, copies = []) {
+    const others = copies.map(c => parseStore(JSON.stringify(c ?? null)));
+    return update((store) => {
+      store.rows = mergeRows([store.rows, ...others.map(o => o.rows)]);
+      // Every copy taken in, this one included, is part of the new term.
+      store.lineage = joinLineage([store, ...others]);
+      store.term = counter(term);
+      store.rev += 1;
+      store.owner = name;
+      store.leader = name;
+      markSeeds(store);
+      const at = now();
+      for (const row of store.rows) if (row.lockedAt != null) row.lockedAt = at;
+      return { result: { term: store.term, rev: store.rev, owner: store.owner, lineage: store.lineage }, changed: true, positioned: true };
+    });
+  }
+
+  return { path, call, reseed, snapshot, position, replaceWith, promote, resign };
 }
 
 /**

@@ -23,13 +23,27 @@
 //   only this machine cannot see it, and nobody is the master from here.
 //
 // Every machine runs the same walk over the same list, so they agree on the
-// master without a vote. Before a member starts answering as master it also
-// waits for any other member that still says it is master to step down (a
-// member steps down as soon as it sees a member above it up), takes the
-// newest copy any member holds (sync-store.js positions), and raises the
-// term. So a master that comes back takes over the copy the backup kept
-// while it was gone, and two members never answer as master at the same
-// time while they can see each other.
+// master without a vote. Taking over is then a handshake, so that two
+// members who both think it is their turn (a master restarting just as its
+// backup gives up on it) never both answer:
+//
+// 1. The member says it is a CANDIDATE: from now on every check of it
+//    answers so.
+// 2. It checks every member again, then and there. It backs off if one
+//    above it in the list answers, or if any member answers that it is a
+//    candidate or the master. Two candidates that check each other both
+//    back off; the walk then makes the lower one a backup, and the higher
+//    one goes again next round.
+// 3. It merges every copy the members that answer hold (sync-store.js
+//    mergeRows), starts a new term above every term it has seen, and only
+//    then answers as master.
+//
+// A master steps down as soon as a member above it is up, or a member it
+// reaches runs another list, or says it is a candidate or master itself, or
+// holds a copy from a term this one did not start. Stepping down clears the
+// store's write fence (sync-store.js) BEFORE this machine stops saying it is
+// master, so the copy the next master takes is final: a renewal still under
+// way here can no longer write to it.
 //
 // What this cannot rule out is a network split where neither side sees any
 // member of the other: each side then elects its own master, and both may
@@ -41,7 +55,7 @@
 // as when a single store machine is down (instance-sync.js).
 
 import { configuredPeers, instanceName, peerRequest } from './peers.js';
-import { isNewerPosition } from './sync-store.js';
+import { contains, lineageOf, samePosition } from './sync-store.js';
 import { safeLine } from './safe-text.js';
 
 /** How often each member is checked. */
@@ -59,7 +73,7 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /**
  * @typedef {import('./peers.js').Peer} Peer
  * @typedef {import('./sync-store.js').StorePosition} StorePosition
- * @typedef {'master' | 'backup' | 'follower' | 'off'} ClusterRole
+ * @typedef {'master' | 'candidate' | 'backup' | 'follower' | 'off'} ClusterRole
  * @typedef {'up' | 'down' | 'unknown' | 'unplaced'} MemberState
  * @typedef {object} MemberView
  * @property {MemberState} state  up: answered the last check; down: missed DOWN_AFTER_MISSES in a row;
@@ -161,7 +175,13 @@ function positionOf(p) {
   if (!p || typeof p !== 'object') return null;
   const term = Number(p.term);
   const rev = Number(p.rev);
-  return Number.isSafeInteger(term) && Number.isSafeInteger(rev) && term >= 0 && rev >= 0 ? { term, rev } : null;
+  const owner = typeof p.owner === 'string' ? p.owner.slice(0, 64) : null;
+  return Number.isSafeInteger(term) && Number.isSafeInteger(rev) && term >= 0 && rev >= 0 ? { term, rev, owner, lineage: lineageOf(p.lineage) } : null;
+}
+
+/** A role from a reply, or null. @param {unknown} r @returns {ClusterRole|null} */
+function roleOf(r) {
+  return r === 'master' || r === 'candidate' || r === 'backup' || r === 'follower' ? r : null;
 }
 
 /** A list of names from a reply. @param {unknown} v @returns {string[]} */
@@ -173,7 +193,7 @@ export class ClusterMonitor {
   /**
    * @param {object} opts
    * @param {() => Record<string, any>} opts.getConfig  the running config
-   * @param {{ snapshot: () => Promise<any>, position: () => Promise<StorePosition>, replaceWith: (snap: unknown) => Promise<StorePosition>, promote: (term: number) => Promise<StorePosition> }} opts.store  this machine's store (sync-store.js)
+   * @param {{ snapshot: () => Promise<any>, position: () => Promise<StorePosition>, replaceWith: (snap: unknown) => Promise<StorePosition>, promote: (term: number, name: string, copies?: unknown[]) => Promise<StorePosition>, resign: () => Promise<StorePosition> }} opts.store  this machine's store (sync-store.js)
    * @param {() => void} [opts.onChange]  the master changed, or this machine's role did: the sync has to move to it
    * @param {typeof peerRequest} [opts.request]
    * @param {(line: string) => void} [opts.log]
@@ -197,7 +217,7 @@ export class ClusterMonitor {
     /** @type {Election} */
     this.election = { master: null, reason: null };
     /** @type {StorePosition} */
-    this.position = { term: 0, rev: 0 };
+    this.position = { term: 0, rev: 0, owner: null, lineage: [] };
     /** @type {string|null} why the last round could not do what it set out to */
     this.lastError = null;
     /** @type {number|null} */
@@ -208,6 +228,8 @@ export class ClusterMonitor {
     this._timer = null;
     /** @type {Promise<void>|null} */
     this._round = null;
+    /** Stepping down: the fence is being cleared, and no new store call is taken. */
+    this._resigning = false;
   }
 
   /** Check every CLUSTER_CHECK_MS, and once now. Does nothing while the setting is not a cluster. */
@@ -234,7 +256,7 @@ export class ClusterMonitor {
 
   /** Whether this machine answers the store's API now. */
   isMaster() {
-    return this.role === 'master' && !!this.setting();
+    return this.role === 'master' && !this._resigning && !!this.setting();
   }
 
   /**
@@ -262,7 +284,8 @@ export class ClusterMonitor {
   async _tick() {
     const setting = this.setting();
     if (!setting) {
-      if (this.role !== 'off') this._setRole('off', 'the account store is no longer kept by a master and backups');
+      if (this.role === 'master') await this._resign('the account store is no longer kept by a master and backups', 'off');
+      else if (this.role !== 'off') this._setRole('off', null);
       this.views.clear();
       this._for = '';
       this.election = { master: null, reason: null };
@@ -272,7 +295,9 @@ export class ClusterMonitor {
     const key = JSON.stringify([self, members]);
     if (key !== this._for) {
       // Another list, or another name for this machine: what was heard about
-      // the old one says nothing about the new.
+      // the old one says nothing about the new, and a master elected under
+      // the old one is not elected under this one.
+      if (this.role === 'master') await this._resign('the member list changed', 'backup');
       this.views.clear();
       this._for = key;
     }
@@ -289,7 +314,7 @@ export class ClusterMonitor {
       await this._lead(members, self);
     } else {
       const role = members.includes(self) ? 'backup' : 'follower';
-      if (this.role === 'master') this._setRole(role, election.master ? `${election.master} is up again` : election.reason || 'no member is up');
+      if (this.role === 'master') await this._resign(election.master ? `${election.master} is up again` : election.reason || 'no member is up', role);
       else if (this.role !== role) this._setRole(role, null);
       if (role === 'backup' && election.master) await this._follow(election.master);
     }
@@ -328,7 +353,7 @@ export class ClusterMonitor {
       if (a) {
         this.views.set(name, {
           state: 'up', misses: 0, cluster: a.cluster !== false, peer: peer.name,
-          role: a.role === 'master' || a.role === 'backup' || a.role === 'follower' ? a.role : null,
+          role: roleOf(a.role),
           sees: namesOf(a.sees), members: a.members ? namesOf(a.members) : null, position: positionOf(a.position),
         });
         continue;
@@ -344,60 +369,113 @@ export class ClusterMonitor {
   }
 
   /**
-   * This machine is first in line. Take over once it is safe: no other
-   * member still says it is master, every member that answers runs the same
-   * list, and the newest copy any of them holds is here.
+   * This machine is first in line. A sitting master checks it still may be;
+   * any other member takes over once it is safe (the handshake at the top).
    * @param {string[]} members
    * @param {string} self
    */
   async _lead(members, self) {
     const up = members.filter(n => n !== self && this.views.get(n)?.state === 'up');
+    const conflict = this._conflict(members, up);
     if (this.role === 'master') {
-      // A member holding a newer copy than the master's was master on the
-      // other side of a split. Its copy is taken over in a new term, as on
-      // any takeover; until then this machine stops answering.
-      const ahead = up.find(n => {
-        const p = this.views.get(n)?.position;
-        return !!p && isNewerPosition(p, this.position);
-      });
-      if (!ahead) return;
-      this._setRole('backup', `${ahead} holds a newer copy`);
+      if (conflict) await this._resign(conflict, 'backup');
+      else return;
     }
-    const differs = up.find(n => {
-      const m = this.views.get(n)?.members;
-      return !!m && JSON.stringify(m) !== JSON.stringify(members);
-    });
-    if (differs) {
-      this._hold(`${differs} runs with another member list; set the same list, in the same order, on every machine`);
+    if (conflict) {
+      this._hold(conflict);
       return;
     }
-    const sitting = up.find(n => this.views.get(n)?.role === 'master');
-    if (sitting) {
-      // It steps down when it sees this machine; its copy is taken after.
-      this._hold(`waiting for ${sitting} to hand over`);
+    // 1. Say so first, then 2. look again: whoever checks this machine from
+    // here on sees a candidate.
+    this._setRole('candidate', null);
+    const fresh = await this._confirm(members, self);
+    if (fresh.reason) {
+      this._hold(fresh.reason);
       return;
     }
+    // 3. Every copy the members that answered hold, merged, in a new term.
     try {
-      let newest = this.position;
-      let from = null;
-      for (const n of up) {
-        const p = this.views.get(n)?.position;
-        if (p && isNewerPosition(p, newest)) { newest = p; from = n; }
-      }
-      if (from) {
-        const peerName = this.views.get(from)?.peer;
-        const peer = configuredPeers(this.getConfig()).find(p => p.name === peerName);
-        if (!peer) throw new Error(`${from} is no longer a linked instance`);
-        this.position = await this.store.replaceWith(await fetchSnapshot(peer, { request: this.request }));
-        this.log(`[TeamClaude] Account store: took the newer copy ${safeLine(from, 64)} kept`);
-      }
+      const copies = [];
+      for (const peer of fresh.peers) copies.push(await fetchSnapshot(peer, { request: this.request }));
       let term = this.position.term;
-      for (const n of up) term = Math.max(term, this.views.get(n)?.position?.term ?? 0);
-      this.position = await this.store.promote(term + 1);
+      for (const p of fresh.positions) term = Math.max(term, p.term);
+      for (const c of copies) term = Math.max(term, Number(c?.term) || 0);
+      this.position = await this.store.promote(term + 1, self, copies);
+      if (this.role !== 'candidate') return; // stopped meanwhile
       this._setRole('master', null);
     } catch (/** @type {any} */ err) {
       this._hold(`could not take over: ${safeLine(err?.message || String(err), 160)}`);
     }
+  }
+
+  /**
+   * Why this machine may not lead right now, from this round's checks: a
+   * member that runs another list, one that says it is master or candidate,
+   * or — for a sitting master — one holding a copy from a term it did not
+   * start or a later one.
+   * @param {string[]} members
+   * @param {string[]} up
+   * @returns {string|null}
+   */
+  _conflict(members, up) {
+    for (const n of up) {
+      const v = this.views.get(n);
+      if (v?.members && JSON.stringify(v.members) !== JSON.stringify(members)) {
+        return `${n} runs with another member list; set the same list, in the same order, on every machine`;
+      }
+    }
+    for (const n of up) {
+      const role = this.views.get(n)?.role;
+      // It steps down (or backs off) when it sees this machine, which is
+      // above it; its copy is merged in after.
+      if (role === 'master' || role === 'candidate') return `waiting for ${n} to hand over`;
+    }
+    if (this.role === 'master') {
+      // A copy this one does not contain holds writes made elsewhere (the
+      // other side of a split): it is merged in, in a new term.
+      for (const n of up) {
+        const p = this.views.get(n)?.position;
+        if (p && !contains(this.position, p)) return `${n} holds writes this copy lacks`;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Step 2 of the handshake: every member asked again, now. Refused when a
+   * member above this one answers, or any member answers that it is a
+   * candidate or master, or runs another list. Otherwise the members that
+   * answered, to merge their copies.
+   * @param {string[]} members
+   * @param {string} self
+   * @returns {Promise<{ reason: string|null, peers: Peer[], positions: StorePosition[] }>}
+   */
+  async _confirm(members, self) {
+    const peers = configuredPeers(this.getConfig());
+    const others = members.filter(n => n !== self);
+    const linked = others.map(n => ({ name: n, peer: peers.find(p => p.name === this.views.get(n)?.peer) || null }));
+    const answers = await Promise.all(linked.map(m => (m.peer ? askMember(m.peer, { request: this.request }) : Promise.resolve(null))));
+    /** @type {Peer[]} */
+    const reached = [];
+    /** @type {StorePosition[]} */
+    const positions = [];
+    const rank = members.indexOf(self);
+    for (let i = 0; i < linked.length; i++) {
+      const a = answers[i];
+      const { name, peer } = linked[i];
+      if (!a || !peer) continue;
+      if (a.cluster === false) return { reason: `${name} runs a version without master and backups; update it`, peers: [], positions: [] };
+      if (members.indexOf(name) < rank) return { reason: `${name} is up again`, peers: [], positions: [] };
+      const role = roleOf(a.role);
+      if (role === 'master' || role === 'candidate') return { reason: `waiting for ${name} to hand over`, peers: [], positions: [] };
+      if (a.members && JSON.stringify(namesOf(a.members)) !== JSON.stringify(members)) {
+        return { reason: `${name} runs with another member list; set the same list, in the same order, on every machine`, peers: [], positions: [] };
+      }
+      reached.push(peer);
+      const p = positionOf(a.position);
+      if (p) positions.push(p);
+    }
+    return { reason: null, peers: reached, positions };
   }
 
   /**
@@ -406,11 +484,18 @@ export class ClusterMonitor {
    */
   async _follow(master) {
     const v = this.views.get(master);
-    // Only from a master answering as one, and only forward: a member first
-    // in line that has not taken over yet holds an older copy, and the one
-    // here is what it is about to take.
+    // Only from a master answering as one: a member first in line that has
+    // not taken over yet holds an older copy, and the one here is among those
+    // it is about to merge. A master took every copy in when it took over,
+    // so whatever it holds now is the one to keep.
     if (!v || v.state !== 'up' || v.role !== 'master' || !v.position || !v.peer) return;
-    if (!isNewerPosition(v.position, this.position)) return;
+    if (samePosition(v.position, this.position)) return;
+    // A copy here that the master's does not contain holds writes it lacks:
+    // kept, for the master to merge in (it steps down for it, _conflict).
+    if (!contains(v.position, this.position)) {
+      this.lastError = `this copy holds writes ${safeLine(master, 64)} lacks; it merges them in at its next round`;
+      return;
+    }
     const peer = configuredPeers(this.getConfig()).find(p => p.name === v.peer);
     if (!peer) return;
     try {
@@ -418,6 +503,28 @@ export class ClusterMonitor {
     } catch (/** @type {any} */ err) {
       this.lastError = `could not copy the account store from ${safeLine(master, 64)}: ${safeLine(err?.message || String(err), 160)}`;
     }
+  }
+
+  /**
+   * Stop answering as master. The fence is cleared first, while checks of
+   * this machine still say master, so nobody takes its copy before the last
+   * write here has landed or been refused. Until then isMaster() is already
+   * false: this server takes no new store call.
+   * @param {string} why
+   * @param {ClusterRole} next
+   */
+  async _resign(why, next) {
+    this._resigning = true;
+    try {
+      this.position = await this.store.resign();
+    } catch (/** @type {any} */ err) {
+      // The fence could not be cleared: say master no longer anyway (no new
+      // call is taken), and try again at the next step-down.
+      this.lastError = `could not clear the account store's write fence: ${safeLine(err?.message || String(err), 160)}`;
+    } finally {
+      this._resigning = false;
+    }
+    this._setRole(next, why);
   }
 
   /** First in line, not taking over yet: nobody is master from here. @param {string} why */

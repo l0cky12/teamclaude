@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSyncStore, isNewerPosition, SyncStoreError } from '../src/sync-store.js';
+import { contains, createSyncStore, isNewerPosition, mergeRows, samePosition, SyncStoreError } from '../src/sync-store.js';
 import { ClusterMonitor, elect, parseMembers, DOWN_AFTER_MISSES } from '../src/sync-cluster.js';
 import { accountSyncMode, createSyncTransport, storeTarget } from '../src/instance-sync.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -68,24 +68,27 @@ test('the store counts its writes, hands over a copy, and starts a term as maste
   try {
     const one = createSyncStore({ path: join(dir, 'one.json'), now: () => clock });
     const two = createSyncStore({ path: join(dir, 'two.json'), now: () => clock });
-    assert.deepEqual(await one.position(), { term: 0, rev: 0 });
+    assert.deepEqual(await one.position(), { term: 0, rev: 0, owner: null, lineage: [] });
 
     const blob = JSON.stringify({ v: 1, provider: 'grok', name: 'g', userId: 'u1', accessToken: 'at', refreshToken: 'rt', expiresAt: T0 + 3600_000 });
     const row = await one.call('POST', 'User/Credential', { Key: 'teamrouter.grok.u1', Data: blob });
     const id = row.User_Credential__;
     await one.call('POST', `User/Credential/${id}:lock`, { timeout: 30 });
-    assert.deepEqual(await one.position(), { term: 0, rev: 2 }, 'a create and a lock are two writes');
+    assert.deepEqual(await one.position(), { term: 0, rev: 2, owner: null, lineage: [] }, 'a create and a lock are two writes');
 
     // The copy keeps the position it was taken at.
     const snap = await one.snapshot();
-    assert.deepEqual(await two.replaceWith(snap), { term: 0, rev: 2 });
-    assert.deepEqual(await two.position(), { term: 0, rev: 2 });
+    assert.deepEqual(await two.replaceWith(snap), { term: 0, rev: 2, owner: null, lineage: [] });
+    assert.deepEqual(await two.position(), { term: 0, rev: 2, owner: null, lineage: [] });
     assert.equal((await two.call('GET', `User/Credential/${id}`)).Data, blob);
 
     // Taking over: a new term, every token row a seed, and a lock the copy
     // held stamped as taken now, so it holds a full lease from here.
     clock += 600_000;
-    assert.deepEqual(await two.promote(1), { term: 1, rev: 3 });
+    // The copy it started from is part of the new term's lineage.
+    assert.deepEqual(await two.promote(1, 'two'), { term: 1, rev: 3, owner: 'two', lineage: [{ term: 0, owner: null, rev: 2 }] });
+    assert.equal(contains(await two.position(), await one.position()), true);
+    assert.equal(contains(await one.position(), await two.position()), false);
     const after = JSON.parse(await readFile(join(dir, 'two.json'), 'utf8'));
     assert.equal(JSON.parse(after.rows[0].data).seeded, true);
     assert.equal(after.rows[0].lockedAt, clock);
@@ -104,6 +107,52 @@ test('the store counts its writes, hands over a copy, and starts a term as maste
   }
 });
 
+test('the store answers only while the file names this machine as its leader', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const store = createSyncStore({ path: join(dir, 'a.json'), now: () => T0, leaderName: () => 'a' });
+    const refused = (e) => e instanceof SyncStoreError && e.token === 'error_not_host';
+    const post = (key) => store.call('POST', 'User/Credential', { Key: key, Data: '{}' });
+    // Never led: every call is refused, reads too.
+    await assert.rejects(post('teamrouter.x'), refused);
+    await assert.rejects(store.call('GET', 'User/Credential'), refused);
+    // Led from a takeover.
+    await store.promote(1, 'a');
+    await post('teamrouter.x');
+    // Stepped down: refused again, and the rows stay for the next master.
+    await store.resign();
+    await assert.rejects(post('teamrouter.y'), refused);
+    assert.deepEqual((await store.snapshot()).rows.map(r => r.key), ['teamrouter.x']);
+    // A copy taken from another member never leads.
+    await store.promote(2, 'a');
+    await store.replaceWith({ v: 1, term: 3, rev: 1, owner: 'b', leader: 'a', rows: [] });
+    await assert.rejects(post('teamrouter.z'), refused);
+    // Another name in the file is not this machine.
+    const other = createSyncStore({ path: join(dir, 'a.json'), now: () => T0, leaderName: () => 'b' });
+    await store.promote(4, 'a');
+    await assert.rejects(other.call('GET', 'User/Credential'), refused);
+    // No fence: a store one machine keeps alone answers whatever the file says.
+    await createSyncStore({ path: join(dir, 'a.json'), now: () => T0 }).call('GET', 'User/Credential');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('copies merged at a takeover keep every account, the later token winning', () => {
+  const tok = (exp) => JSON.stringify({ v: 1, accessToken: 'a', refreshToken: 'r', expiresAt: exp });
+  const row = (key, data, updated) => ({ id: 'id-' + key + updated, key, data, updated, lockedAt: null, lease: null });
+  const merged = mergeRows([
+    [row('k1', tok(100), 5), row('k2', tok(100), 5)],
+    [row('k1', tok(200), 1), row('k3', tok(50), 1)],
+    [row('k2', JSON.stringify({ _deleted: 'x' }), 9)],
+  ]);
+  const byKey = Object.fromEntries(merged.map(r => [r.key, r]));
+  assert.deepEqual(Object.keys(byKey).sort(), ['k1', 'k2', 'k3']);
+  assert.equal(JSON.parse(byKey.k1.data).expiresAt, 200, 'the later expiry, whatever was written last');
+  assert.ok(JSON.parse(byKey.k2.data)._deleted, 'a token against a tombstone: the later write');
+  assert.equal(samePosition({ term: 2, rev: 3, owner: 'a' }, { term: 2, rev: 3, owner: 'b' }), false);
+});
+
 // ---- Three members over a simulated network ---------------------------------
 
 /**
@@ -113,6 +162,8 @@ test('the store counts its writes, hands over a copy, and starts a term as maste
 async function cluster(dir, names, { members = names, lists = {} } = {}) {
   let clock = T0;
   const cut = new Set();
+  /** Runs before each request is delivered, as (from, to, op). */
+  let hook = async (_from, _to, _op) => {};
   /** @type {Record<string, { monitor: ClusterMonitor, store: ReturnType<typeof createSyncStore>, config: any, logs: string[], changes: number }>} */
   const m = {};
   for (const name of names) {
@@ -122,27 +173,34 @@ async function cluster(dir, names, { members = names, lists = {} } = {}) {
       accountSync: { mode: 'cluster', members: lists[name] || members },
       peers: names.filter(n => n !== name).map(n => ({ name: n, url: `http://${n}.test`, apiKey: `tc-${n}` })),
     };
-    const store = createSyncStore({ path: join(dir, `${name}.json`), now: () => clock });
+    const store = createSyncStore({ path: join(dir, `${name}.json`), now: () => clock, leaderName: () => name });
     const logs = [];
     const node = { store, config, logs, changes: 0, monitor: /** @type {any} */ (null) };
     // A request reaches the member the link's address names, unless the link is cut.
     const request = async (peer, rest, opts) => {
       const to = new URL(peer.url).hostname.replace(/\.test$/, '');
+      const body = JSON.parse(opts.body.toString());
+      await hook(name, to, body.op);
       if (cut.has(`${name}>${to}`) || !m[to]) throw new Error('connect ECONNREFUSED');
       assert.equal(rest, 'sync-cluster');
       assert.equal(peer.apiKey, `tc-${to}`, 'each link carries that machine\'s key');
-      const body = JSON.parse(opts.body.toString());
       const target = m[to].monitor;
       const payload = body.op === 'status' ? { ok: true, ...target.status() } : { ok: true, store: await target.snapshot() };
       return { status: 200, body: Buffer.from(JSON.stringify(payload)) };
     };
     node.monitor = new ClusterMonitor({ getConfig: () => config, store, request, log: (l) => logs.push(l), now: () => clock, onChange: () => { node.changes++; } });
+    node.restart = () => {
+      // A process that died without stepping down: its file still names it.
+      node.monitor = new ClusterMonitor({ getConfig: () => config, store, request, log: (l) => logs.push(l), now: () => clock, onChange: () => { node.changes++; } });
+    };
     m[name] = node;
   }
   const round = async (who = names) => { for (const n of who) await m[n].monitor.tick(); };
   const roles = () => Object.fromEntries(names.map(n => [n, m[n].monitor.role]));
   const masters = () => Object.fromEntries(names.map(n => [n, m[n].monitor.election.master]));
-  return { m, cut, round, roles, masters, tick: (ms) => { clock += ms; } };
+  // Whoever answers as master, among the members that can reach each other.
+  const answering = () => names.filter(n => m[n].monitor.isMaster());
+  return { m, cut, round, roles, masters, answering, onRequest: (fn) => { hook = fn; }, tick: (ms) => { clock += ms; } };
 }
 
 /** A row on whichever store answers as master, the way a follower's sync writes one. */
@@ -269,25 +327,172 @@ test('the master comes back: the acting master steps down, and it takes over the
   }
 });
 
-test('after a split, a master that finds a newer copy elsewhere takes it over in a new term', async () => {
+test('after a split, both masters step down and the one first in line merges both copies', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
   try {
     const c = await cluster(dir, ['server', 'desk']);
     await c.round();
-    // Two members, cut apart both ways: each side elects itself.
+    // Two members, cut apart both ways: each side elects itself, and both
+    // reach the same term and rev with different rows.
     c.cut.add('desk>server').add('server>desk');
     for (let i = 0; i < DOWN_AFTER_MISSES; i++) await c.round();
     assert.deepEqual(c.roles(), { server: 'master', desk: 'master' });
-    await write(c.m.desk.store, 'split');
-    // Healed: desk steps down on seeing server; server finds desk's copy is newer.
+    await write(c.m.server.store, 'only-server');
+    await write(c.m.desk.store, 'only-desk');
+
+    // Healed. Each sees the other answering as master and steps down.
     c.cut.clear();
+    await c.round();
+    assert.ok(c.answering().length <= 1, JSON.stringify(c.roles()));
+    for (let i = 0; i < 4; i++) await c.round();
+    assert.deepEqual(c.roles(), { server: 'master', desk: 'backup' });
+    assert.deepEqual(await keys(c.m.server.store), ['teamrouter.anthropic.only-desk.org', 'teamrouter.anthropic.only-server.org']);
+    assert.ok(samePosition(await c.m.desk.store.position(), await c.m.server.store.position()), 'desk holds the merged copy');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a copy with the master\'s counters but from a term another member started is merged in, not ignored', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    const master = await c.m.server.store.position();
+    // desk holds a copy at the master's very term and rev, started by desk,
+    // with an account the master's copy lacks.
+    const extra = { id: 'ucr-x', key: 'teamrouter.anthropic.desk-only.org', data: JSON.stringify({ v: 1, accessToken: 'a', refreshToken: 'r', expiresAt: T0 }), updated: T0, lockedAt: null };
+    await c.m.desk.store.replaceWith({ v: 1, term: master.term, rev: master.rev, owner: 'desk', rows: [extra] });
+    const theirs = await c.m.desk.store.position();
+    assert.deepEqual([theirs.term, theirs.rev], [master.term, master.rev], 'equal counters');
+    assert.equal(samePosition(theirs, master), false, 'but not the same copy');
+    for (let i = 0; i < 3; i++) await c.round();
+    assert.deepEqual(c.roles(), { server: 'master', desk: 'backup' });
+    assert.deepEqual(await keys(c.m.server.store), ['teamrouter.anthropic.desk-only.org']);
+    assert.ok((await c.m.server.store.position()).term > master.term);
+    assert.ok(samePosition(await c.m.desk.store.position(), await c.m.server.store.position()));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a master that restarts as its backup gives up on it: the backup backs off at its fresh check', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 1; i < DOWN_AFTER_MISSES; i++) await c.round(['desk']);
+    // In desk's third round, its check of server fails; server is back
+    // (restarted) by the time desk checks again as a candidate.
+    c.m.server.restart();
+    let asked = 0;
+    c.onRequest(async (from, to) => {
+      if (from === 'desk' && to === 'server' && ++asked === 2) c.cut.clear();
+    });
     await c.round(['desk']);
     assert.equal(c.m.desk.monitor.role, 'backup');
-    await c.round(['server']);
-    await c.round(['server']);
+    assert.match(c.m.desk.monitor.election.reason, /server is up again/);
+    assert.deepEqual(c.answering(), []);
+    await c.round(['server', 'desk']);
+    assert.deepEqual(c.answering(), ['server']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a master that restarts while its backup is taking over waits for the candidate, and never both answer', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    await write(c.m.server.store, 'one');
+    await c.round();
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 1; i < DOWN_AFTER_MISSES; i++) await c.round(['desk']);
+    // desk passes its fresh check (server still down) and is merging. Right
+    // then server restarts, the network is back, and server runs a round.
+    c.m.server.restart();
+    const promote = c.m.desk.store.promote;
+    let seen = null;
+    c.m.desk.store.promote = async (...args) => {
+      c.cut.clear();
+      await c.m.server.monitor.tick();
+      seen = c.m.server.monitor.role;
+      return promote(...args);
+    };
+    await c.round(['desk']);
+    c.m.desk.store.promote = promote;
+    assert.equal(seen, 'backup', 'server saw a candidate and did not take over');
+    assert.match(c.m.server.monitor.election.reason, /waiting for desk to hand over/);
+    assert.deepEqual(c.answering(), ['desk']);
+    // From here, rounds in any order: desk steps down for server, which
+    // takes over with desk's copy; never two at once.
+    for (const order of [['desk', 'server'], ['server', 'desk'], ['desk', 'server'], ['server', 'desk']]) {
+      for (const n of order) {
+        await c.round([n]);
+        assert.ok(c.answering().length <= 1, JSON.stringify(c.roles()));
+      }
+    }
+    assert.deepEqual(c.answering(), ['server']);
+    assert.deepEqual(await keys(c.m.server.store), ['teamrouter.anthropic.one.org']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a renewal under way when the master steps down cannot write to the copy the next master takes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 0; i < DOWN_AFTER_MISSES; i++) await c.round(['desk']);
+    assert.equal(c.m.desk.monitor.isMaster(), true);
+    // desk's own sync is pinned to its local store, as a renewal would be.
+    const transport = createSyncTransport({ getConfig: () => c.m.desk.config, store: c.m.desk.store, cluster: c.m.desk.monitor });
+    transport.pin(c.m.desk.config);
+    const row = await transport.api('POST', 'User/Credential', { Key: 'teamrouter.anthropic.renewing.org', Data: '{}' });
+    await transport.api('POST', `User/Credential/${row.User_Credential__}:lock`, { timeout: 30 });
+    // server is back; desk steps down. The renewal's PATCH arrives after.
+    c.cut.clear();
+    await c.round(['desk']);
+    assert.equal(c.m.desk.monitor.isMaster(), false);
+    await assert.rejects(transport.api('PATCH', `User/Credential/${row.User_Credential__}`, { Data: '{"late":true}' }), (e) => e.token === 'error_not_host');
+    await assert.rejects(transport.api('POST', 'User/Credential', { Key: 'teamrouter.x', Data: '{}' }), (e) => e.token === 'error_not_host');
+    // server, master all along on its side, steps down for desk's newer
+    // term, then takes over with desk's copy merged in.
+    for (let i = 0; i < 3; i++) await c.round(['server', 'desk']);
+    assert.deepEqual(c.answering(), ['server']);
+    const taken = (await c.m.server.store.snapshot()).rows.find(r => r.key === 'teamrouter.anthropic.renewing.org');
+    assert.equal(taken.data, '{}', 'the late write never reached the copy');
+    assert.equal(taken.lockedAt, T0, 'and its lock holds a full lease on the new master');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a sitting master steps down when a member\'s list, or its own, changes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
     assert.equal(c.m.server.monitor.role, 'master');
-    assert.deepEqual(await keys(c.m.server.store), ['teamrouter.anthropic.split.org']);
-    assert.ok(c.m.server.logs.some(l => /stops answering as master \(desk holds a newer copy\)/.test(l)));
+    c.m.desk.config.accountSync.members = ['server', 'desk', 'attic'];
+    await c.round(['desk', 'server']);
+    assert.equal(c.m.server.monitor.role, 'backup');
+    assert.match(c.m.server.monitor.election.reason, /desk runs with another member list/);
+    assert.ok(c.m.server.logs.some(l => /stops answering as master/.test(l)));
+
+    // Lists level again: server takes over again. Then its own list changes.
+    c.m.desk.config.accountSync.members = ['server', 'desk'];
+    await c.round(['desk', 'server']);
+    assert.equal(c.m.server.monitor.role, 'master');
+    c.m.server.config.accountSync.members = ['server', 'desk', 'attic'];
+    c.m.server.config.peers.push({ name: 'attic', url: 'http://attic.test', apiKey: 'tc-attic' });
+    await c.round(['server']);
+    assert.notEqual(c.m.server.monitor.role, 'master');
+    assert.ok(c.m.server.logs.some(l => /stops answering as master \(the member list changed\)/.test(l)));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

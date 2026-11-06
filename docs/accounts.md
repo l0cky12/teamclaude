@@ -261,17 +261,28 @@ A machine that runs this setting but is not in the list (a laptop, say) is a pla
 3. A member it has not heard from yet means there is no master for now. It waits rather than guess.
 4. A member that has missed 3 checks in a row (30 seconds) is down, and the walk moves on to the next name. One exception: if another member answered this machine and reached that member at its own last check, the fault is only between those two machines. Then there is no master from here, and nothing takes over.
 
-Every machine walks the same list, so they all reach the same answer. A machine that has just been elected also waits before it starts answering as master:
+Every machine walks the same list, so they all reach the same answer. Taking over is then a handshake, so two machines that both think it is their turn never both answer. That happens, for example, when the master restarts just as its backup gives up on it:
 
-- If another member still says it is master (the old one, back again), the new one waits for it to step down. A member steps down as soon as it sees a member above it in the list.
-- It takes the newest copy of the store any member holds. Each copy carries a *term*, raised at each takeover, and a revision count, raised by each write. A higher term is newer; within one term, a higher count is.
-- It starts a new term and marks every row as a seed, as when a machine starts keeping the store (see above). A newer token on any machine then wins over the copy. A row that was locked for a renewal on the old master stays locked for a full lease (30 seconds), so that renewal can store its token first.
+1. The machine says it is a **candidate**. Every check of it says so from then on.
+2. It checks every member again, there and then. It backs off if a member above it answers, or if any member says it is a candidate or the master. If two candidates see each other, both back off. The walk then makes the lower one a backup, and the higher one tries again at its next check.
+3. It merges the copies of the store held by every member that answered, row by row. For the same account, the later token wins. It then starts a new *term*, numbered above every term it has seen, and marks every row as a seed, as when a machine starts keeping the store (see above). A newer token on any machine still wins over the merged copy. A row that was locked for a renewal on the old master stays locked for a full lease (30 seconds), so that renewal can store its token first.
+
+A master steps down when any of these happens:
+
+- A member above it in the list is up.
+- A member it reaches runs a different list, or its own list changes.
+- Another member says it is a candidate or the master.
+- A member holds writes its own copy lacks.
+
+Stepping down first clears the store's *write fence*, while this machine still says it is master. The store file names the machine it is answered by. Every store call checks that name inside the file lock, whether it comes from this server, from a CLI command on this machine, or from another machine. So once the fence is cleared, a renewal still running on the old master can no longer write. The copy the next master takes is then final.
+
+Each copy remembers which terms it has taken in, and how far into each. A backup replaces its copy with the master's only when the master's copy already contains it. A copy holding writes the master lacks, such as the other side of a network split, is kept. The master steps down for it and merges it in at a new term.
 
 So when `server` goes down, `hermes` takes over after 30 seconds and `desk` follows it. When `server` comes back, `hermes` steps down, `server` takes over the copy `hermes` kept (with everything renewed meanwhile), and `hermes` and `desk` follow `server` again.
 
 While there is no master, the machines behave as they do when a single store machine is down. A token that is still good is used. One that has run out waits rather than being renewed without the lock. The card shows why there is no master: a member it has not heard from yet, a member it cannot place among its linked instances, a member on an older version, or a member that runs with a different list. A member list that differs between machines never lets any of them take over, so fix the list rather than waiting.
 
-**What it cannot protect against.** If the network splits so that neither side reaches any member of the other, each side elects its own master, and both may renew the same sign-in, which signs one side out of that account. When the split heals, the member higher in the list stays master, takes the newer copy, and the next renewal or sign-in sets things right. With only two members there is no third to notice a split, so use three where you can. Up to 10 seconds of writes made just before a master dies may not have reached a backup's copy. A token renewed in that window is not lost, since the machine that renewed it stores it again at its next sync. A removal made in that window may have to be made again.
+**What it cannot protect against.** If the network splits so that neither side reaches any member of the other, each side elects its own master. Both may then renew the same sign-in, which signs one side out of that account. When the split heals, both masters step down. The member higher in the list merges both sides' copies, and the next renewal or sign-in sets things right. With only two members there is no third to notice a split, so use three where you can. Up to 10 seconds of writes made just before a master dies may not have reached a backup's copy. A token renewed in that window is not lost, since the machine that renewed it stores it again at its next sync. A removal made in that window may have to be made again.
 
 **The card.** It names the master and this machine's place. It lists every member as up, down or not heard from yet, and says when there is no master and why. The **Account sync** column of the Linked instances table says which machine is the master. **Turn off** stops sharing on that machine only.
 

@@ -82,7 +82,15 @@ let activeCredentialSync = null;
  * share with the running server.
  */
 function cliSyncOptions() {
-  const transport = createSyncTransport({ getConfig: async () => (await loadConfig()) || {}, store: createSyncStore() });
+  // With a master and backups, the file is written to only while it names
+  // this machine as its leader (sync-store.js): a command here never writes
+  // to a store this machine has stopped answering for.
+  const disk = async () => (await loadConfig()) || {};
+  const leaderName = async () => {
+    const c = await disk();
+    return accountSyncMode(c).mode === 'cluster' ? instanceName(c) : null;
+  };
+  const transport = createSyncTransport({ getConfig: disk, store: createSyncStore({ leaderName }) });
   return {
     api: transport.api,
     isSignedIn: transport.isSignedIn,
@@ -512,7 +520,7 @@ async function serverCommand() {
   // one the running election names: this machine's own while it is the
   // master, the master's otherwise. A change of master moves the sync the
   // way a change of setting does, once the operations under way are done.
-  const syncStore = createSyncStore();
+  const syncStore = createSyncStore({ leaderName: () => (accountSyncMode(config).mode === 'cluster' ? instanceName(config) : null) });
   const syncCluster = new ClusterMonitor({
     getConfig: () => config,
     store: syncStore,
@@ -1267,8 +1275,10 @@ async function serverCommand() {
   }
   credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
   // The checks the master and backups make of one another; nothing is sent
-  // unless accountSync is a cluster.
-  syncCluster.start();
+  // unless accountSync is a cluster. Only once this server listens: a member
+  // that says it is a candidate has to be one the others can see saying so.
+  if (server.listening) syncCluster.start();
+  else server.once('listening', () => syncCluster.start());
 
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
