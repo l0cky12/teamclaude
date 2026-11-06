@@ -36,6 +36,10 @@ test('modelLabel names models the way people say them', () => {
   assert.equal(modelLabel('claude-haiku-4-5-20251001'), 'Haiku 4.5');
   assert.equal(modelLabel('gpt-6.1-sol'), 'GPT 6.1 Sol');
   assert.equal(modelLabel('gpt-6.0-astra'), 'GPT 6.0 Astra');
+  assert.equal(modelLabel('grok-code-fast-1'), 'Grok Code Fast 1');
+  assert.equal(modelLabel('grok-4-0709'), 'Grok 4');
+  assert.equal(modelLabel('grok-4-1-fast-reasoning'), 'Grok 4.1 Fast Reasoning');
+  assert.equal(modelLabel('grok-4.1-fast-non-reasoning'), 'Grok 4.1 Fast Non-Reasoning');
   assert.equal(modelLabel('some-other-model'), 'some-other-model');
 });
 

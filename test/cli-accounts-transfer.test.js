@@ -92,6 +92,16 @@ test('export then import moves every account to a fresh machine', async () => {
   assert.match(again.stdout, /0 added, 0 updated, 2 skipped/);
 });
 
+test('export counts a Grok login as Grok, not Claude', async () => {
+  const source = await writeConfig([
+    ...SOURCE_ACCOUNTS,
+    { id: 'src-3', name: 'demo-c@example.com', type: 'oauth', provider: 'grok', userId: 'user-c', accessToken: 'gk-at', refreshToken: 'gk-rt', expiresAt: LATER },
+  ]);
+  const out = await runCli(source.path, ['accounts', 'export', join(source.dir, 'accounts.tcx')], PASS);
+  assert.equal(out.code, 0, out.stderr);
+  assert.match(out.stdout, /Exported 3 accounts \(1 Claude, 1 Codex, 1 Grok\)/);
+});
+
 test('import with the wrong passphrase changes nothing', async () => {
   const source = await writeConfig(SOURCE_ACCOUNTS);
   const target = await writeConfig([]);

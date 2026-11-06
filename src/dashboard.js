@@ -331,6 +331,20 @@ export function modelLabel(/** @type {string} */ id) {
   if (parts[0] === 'gpt' && parts.length >= 2) {
     return 'GPT ' + parts[1] + (parts.length > 2 ? ' ' + parts.slice(2).map(cap).join(' ') : '');
   }
+  // xAI writes a version either way, `grok-4.1-fast` or `grok-4-1-fast`, and
+  // dates a snapshot with four digits (`grok-4-0709`): the version reads 4.1
+  // both ways and the date is dropped, as for Claude.
+  if (parts[0] === 'grok' && parts.length >= 2) {
+    /** @type {string[]} */
+    var words = [];
+    parts.slice(1).forEach(function (p) {
+      if (isNum(p) && p.length >= 4) return;
+      var last = words.length - 1;
+      if (isNum(p) && last >= 0 && isNum(words[last]) && words[last].indexOf('.') < 0) words[last] += '.' + p;
+      else words.push(cap(p));
+    });
+    return 'Grok ' + words.join(' ').replace(/\bNon /g, 'Non-');
+  }
   return s;
 }
 
@@ -1744,7 +1758,11 @@ export function accountMeters(account, fable, now) {
     bq.rows.slice(0, 3).forEach(function (r, i) { slots[i] = quotaMeter(r.label, r.utilization, r.resetAt); });
     text = bq.text;
   } else {
-    text = 'quota unknown (no traffic observed yet)';
+    // Grok's replies carry no quota headers, so traffic never fills its bars:
+    // only the zero-spend usage read does, the row's Refresh quota or the
+    // background Quota refresh.
+    text = a.provider === 'grok' ? 'quota unknown: Grok states it only when asked (Refresh quota)'
+      : 'quota unknown (no traffic observed yet)';
   }
   return { slots: slots, extra: extra, text: text };
 }
@@ -3109,9 +3127,9 @@ ${SHARED_HELPERS}
     if (meters.text) { x.appendChild(el('div', 'usage', meters.text)); said++; }
     var q = a.quota || {};
     // Spend on this account that did not come through the proxy (#475).
-    var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent);
+    var outside = outsideSpendText(q.outsideSpend, s.outsideSpendHidePercent, q.planPeriod);
     if (outside) { x.appendChild(el('div', 'usage', 'outside: ' + outside)); said++; }
-    var forecast = forecastText(q.forecast, Date.now());
+    var forecast = forecastText(q.forecast, Date.now(), q.planPeriod);
     if (forecast) { x.appendChild(el('div', 'usage', 'forecast: ' + forecast)); said++; }
     if (meters.extra.length) {
       var open = !!expanded['row:' + key];

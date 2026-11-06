@@ -772,7 +772,16 @@ billing endpoint Grok Build's usage view does. The reading fills the weekly
 bar (named **Monthly** for a monthly plan; the dashboard's pooled Grok card
 says **Plan allowance** when weekly and monthly plans are pooled together), so
 the switch threshold rotates a Grok account before its plan runs out. With the probe off, as it is by default,
-a Grok account's usage is unknown until a request is refused.
+a Grok account's usage is unknown until a request is refused. Its row on the
+dashboard's Quota page says so, and its **Refresh quota** button reads the
+allowance once, which spends nothing.
+
+Grok accounts appear everywhere Claude and Codex accounts do: their own tab,
+summary card and section on the Quota page, `teamclaude status`, the TUI, and
+the Insights page, where Grok tokens are a provider of their own and are
+priced at xAI's list prices (see [Estimated API cost](usage.md#estimated-api-cost)).
+A monthly plan's outside-spend and forecast lines say "month" rather than
+"week".
 
 A 429 whose body says the plan is spent (`You ran out of credits`, `Plan limit
 reached`) holds that account and moves the request to the next Grok account,
