@@ -2328,7 +2328,8 @@ export class AccountManager {
    * quite possibly one that cannot. Unclaimed means the session routes that
    * family afresh next request, which is what it did before it had a pin. */
   recordSession(sessionId, accountIndex, model = null) {
-    if (!sessionId) return;
+    // A request picked an account that a reload has since retired (replaceAccount).
+    if (!sessionId || !this.accounts[accountIndex]) return;
     const bucket = this._weeklyBucketFor(model);
     // The pin alone: this runs before the destination's token is refreshed and
     // long before the upstream fetch, so it names where the request is being
@@ -5832,7 +5833,11 @@ export class AccountManager {
         // Set before the listener runs: it is what lets the sync store them.
         account._minted = minted;
         console.log(`[TeamClaude] Token refreshed for account "${safeLine(account.name, 64)}"`);
-        this._onTokenRefresh?.(accountIndex, newTokens);
+        // By the account's index now, not the one this call was given: a
+        // removal while the refresh was out renumbers it, and a reload that put
+        // another login in its slot retires it to -1 (replaceAccount), whose
+        // tokens must not be persisted onto the row the new login reads.
+        if (account.index >= 0) this._onTokenRefresh?.(account.index, newTokens);
       } catch (/** @type {any} */ err) {
         console.error(`[TeamClaude] Token refresh failed for "${safeLine(account.name, 64)}": ${err.message}`);
         // Why, until a refresh succeeds: what the client is told when this
@@ -5841,7 +5846,7 @@ export class AccountManager {
         // The refresh never reached the token endpoint: the account's own
         // routing proxy is down. The forward that follows would fail the same
         // way, so hold the account out of rotation now rather than after it.
-        if (isRoutingFailure(err)) this.markRoutingFailed(accountIndex);
+        if (isRoutingFailure(err)) this.markRoutingFailed(account.index);
         // Reserve 'error' (which drops the account from rotation until re-login)
         // for a GENUINE auth rejection: the refresh token itself is no longer
         // valid — revoked, or invalidated by an account/plan migration. A
@@ -5868,7 +5873,8 @@ export class AccountManager {
           }
           this._needsLogin(account, 'refresh_rejected', `upstream rejected its refresh token (${err.status})`);
           console.error(`[TeamClaude] Account "${safeLine(account.name, 64)}" needs re-login (refresh token rejected) — run: teamclaude login`);
-          this._onAccountError?.(account);
+          // A retired login (replaceAccount) has nothing to recover.
+          if (account.index >= 0) this._onAccountError?.(account);
         }
       } finally {
         account._refreshPromise = null;
@@ -6041,6 +6047,11 @@ export class AccountManager {
    */
   replaceAccount(index, acctData) {
     if (index < 0 || index >= this.accounts.length) return;
+    // Work already under way holds the old object and comes back through its
+    // index: a probe's reading, a response's quota headers, a refresh. Retired
+    // to an index nothing answers to, all of that lands nowhere instead of on
+    // the login that took the slot.
+    this.accounts[index].index = -1;
     this.accounts[index] = makeAccount(acctData, index, this.listener);
     const forget = (/** @type {number} */ idx) => (idx === index ? null : idx);
     for (const map of [this.routePins, this.routeCursors, this._drainHolders]) {

@@ -13,6 +13,8 @@ import { syncAccountsFromDisk } from '../src/sync-accounts.js';
 import { resolveAccounts } from '../src/resolve-accounts.js';
 import { ensureAccountIds } from '../src/account-id.js';
 import { applyAuthHeaders } from '../src/provider.js';
+import { Prober } from '../src/prober.js';
+import { normalizeGrokBilling } from '../src/grok-usage.js';
 
 const GROK_KEY = 'https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828';
 
@@ -96,6 +98,85 @@ test('a Codex file now holding another ChatGPT account scopes the new token to i
     assert.equal(headers.authorization, 'Bearer tok-b');
     assert.equal(headers['chatgpt-account-id'], 'acct-b');
     assert.notEqual(after.quota.unified7d, 0.9);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a swapped login stays in place across later reloads when the config row still names the old one', async () => {
+  // A row written by a sign-in carries the login's ids, and nothing rewrites
+  // them when the file changes hands, so pairing must not hang on them.
+  const { dir, file, disk, memConfig, am } = await fleet({ name: 'grok', type: 'oauth', provider: 'grok', userId: 'user-a' }, grokFile('user-a', 'tok-a'));
+  try {
+    await writeFile(file, grokFile('user-b', 'tok-b'));
+    for (let i = 0; i < 3; i++) await syncAccountsFromDisk(disk, memConfig, am);
+    assert.equal(am.accounts.length, 1);
+    assert.equal(memConfig.accounts.length, 1);
+    assert.equal(am.accounts[0].credential, 'tok-b');
+    assert.equal(am.accounts[0].userId, 'user-b');
+    assert.equal(am.accounts[0].id, disk.accounts[0].id);
+    assert.equal(memConfig.accounts[0].userId, 'user-b', 'the running config still names the old login');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a probe of the previous login that answers after the swap is not read as the new login\'s', async () => {
+  const { dir, file, disk, memConfig, am } = await fleet({ name: 'grok', type: 'oauth', provider: 'grok' }, grokFile('user-a', 'tok-a'));
+  try {
+    /** @type {(value: any) => void} */
+    let answer = () => {};
+    /** @type {() => void} */
+    let asked = () => {};
+    const probing = new Promise(resolve => { asked = () => resolve(undefined); });
+    const prober = new Prober(am, {
+      log: () => {},
+      grokProbeFn: () => { asked(); return new Promise(resolve => { answer = resolve; }); },
+    });
+    const probe = prober.probeOne(am.accounts[0]);
+    await probing;
+
+    await writeFile(file, grokFile('user-b', 'tok-b'));
+    await syncAccountsFromDisk(disk, memConfig, am);
+    answer(normalizeGrokBilling({ config: { creditUsagePercent: 100, currentPeriod: { type: 'USAGE_PERIOD_TYPE_WEEKLY', end: new Date(Date.now() + 86_400_000).toISOString() } } }));
+    await probe;
+
+    assert.equal(am.accounts[0].userId, 'user-b');
+    assert.notEqual(am.accounts[0].quota.unified7d, 1, 'the old login\'s reading landed on the new login');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a refresh of the previous login that finishes after the swap is not persisted for the new login', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-login-swap-'));
+  const file = join(dir, 'auth.json');
+  try {
+    await writeFile(file, grokFile('user-a', 'tok-a'));
+    const disk = { accounts: [{ name: 'grok', type: 'oauth', provider: 'grok', importFrom: file }] };
+    ensureAccountIds(disk.accounts);
+    const memConfig = { accounts: disk.accounts.map(a => ({ ...a })) };
+    /** @type {(tokens: any) => void} */
+    let finish = () => {};
+    /** @type {() => void} */
+    let started = () => {};
+    const refreshStarted = new Promise(resolve => { started = () => resolve(undefined); });
+    const am = new AccountManager(await resolveAccounts(disk), 0.98, {
+      grokRefreshFn: () => { started(); return new Promise(resolve => { finish = resolve; }); },
+    });
+    /** @type {number[]} */
+    const persisted = [];
+    am.onTokenRefresh((/** @type {number} */ idx) => { persisted.push(idx); });
+    const refreshing = am.ensureTokenFresh(0, true);
+    await refreshStarted;
+
+    await writeFile(file, grokFile('user-b', 'tok-b'));
+    await syncAccountsFromDisk(disk, memConfig, am);
+    finish({ accessToken: 'tok-a-renewed', refreshToken: 'r-a-renewed', expiresAt: Date.now() + 3600_000 });
+    await refreshing;
+
+    assert.equal(am.accounts[0].credential, 'tok-b');
+    assert.deepEqual(persisted, [], 'the old login\'s renewed tokens were persisted onto the new login\'s row');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

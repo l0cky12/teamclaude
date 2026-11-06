@@ -24,6 +24,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // first one with that accountUuid.
   const claimed = new Set();
   const claim = (/** @type {Record<string, any>} */ diskAcct) => {
+    const byId = fileBackedById(accountManager.accounts, claimed, diskAcct);
+    if (byId >= 0) {
+      claimed.add(byId);
+      return byId;
+    }
     for (let i = 0; i < accountManager.accounts.length; i++) {
       if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
         claimed.add(i);
@@ -40,6 +45,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // pairs an unorged entry with whichever same-uuid disk entry comes first.
   const cfgClaimed = new Set();
   const claimConfig = (/** @type {Record<string, any>} */ diskAcct) => {
+    const byId = fileBackedById(memConfig.accounts, cfgClaimed, diskAcct);
+    if (byId >= 0) {
+      cfgClaimed.add(byId);
+      return memConfig.accounts[byId];
+    }
     for (let i = 0; i < memConfig.accounts.length; i++) {
       if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
@@ -229,6 +239,14 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         // this one, so the slot starts fresh, as a restart would start it.
         if (creds.accessToken && distinctAccounts(mgr, { ...mgr, ...identityOf(creds) })) {
           accountManager.replaceAccount(mgrIdx, { ...diskAcct, ...creds });
+          // The running config row may name the old login (a sign-in wrote its
+          // ids there); left so, the next save would put them back on disk.
+          if (cfgAcct) {
+            for (const field of [...IDENTITY_FIELDS, 'email']) {
+              if (!(field in cfgAcct)) continue;
+              if (creds[field]) cfgAcct[field] = creds[field]; else delete cfgAcct[field];
+            }
+          }
           console.log(`[TeamClaude] "${safeLine(mgr.name, 64)}": ${safeLine(diskAcct.importFrom, 120)} now holds a different login; started it fresh`);
           accountManager.events?.add({ kind: 'signin', type: 'credentials_updated', provider: providerOf(mgr), account: mgr.name, message: 'A different login in its credentials file; started fresh' });
           continue;
@@ -308,6 +326,9 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   return { added, removed: dropped };
 }
 
+// The fields of a credentials file that say whose login it holds.
+const IDENTITY_FIELDS = ['accountId', 'userId', 'accountUuid', 'orgUuid'];
+
 /**
  * The fields of a credentials file that say whose login it holds, as identity.js
  * compares them. Only the ones the file states: an absent one means "cannot
@@ -318,8 +339,25 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
 function identityOf(creds) {
   /** @type {Record<string, string>} */
   const out = {};
-  for (const field of ['accountId', 'userId', 'accountUuid', 'orgUuid']) {
+  for (const field of IDENTITY_FIELDS) {
     if (typeof creds[field] === 'string' && creds[field]) out[field] = creds[field];
   }
   return out;
+}
+
+/**
+ * The unclaimed entry in `list` that a file-backed disk row pairs with by its
+ * config id, or -1. Such a row's login is whatever its file holds now, so the
+ * ids it carries (written by the sign-in that created it) can name a login the
+ * file no longer has. Pairing by those would orphan the account the reload
+ * itself put in its place on the previous pass. The id is the row's own,
+ * stable through any change of login. Rows that hold their own tokens still
+ * pair by identity, as before.
+ * @param {Array<Record<string, any>>} list
+ * @param {Set<number>} taken
+ * @param {Record<string, any>} diskAcct
+ */
+function fileBackedById(list, taken, diskAcct) {
+  if (!diskAcct.importFrom || !diskAcct.id) return -1;
+  return list.findIndex((a, i) => !taken.has(i) && a.id === diskAcct.id && providerOf(a) === providerOf(diskAcct));
 }
