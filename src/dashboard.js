@@ -1050,13 +1050,16 @@ export function clientKeyOutcome(res, step) {
  * Grok Build gets no key: it sends its own sign-in as the bearer, and its
  * `extra_headers` setting rides only on some inference calls (checked against
  * grok 1.0.77: never on /v1/models, /v1/settings or /v1/user), so a key in it
- * would still leave most of its requests refused. It reaches the proxy from
- * the proxy's own machine, which needs no key.
+ * would still leave most of its requests refused. It can only use the loopback
+ * exemption, so its address is not `origin` but the one the proxy reports for
+ * a direct loopback connection (`grokLocal`, server.js grokLocalBase). Null
+ * when the proxy has none (or is too old to say): no Grok line then.
  *
  * @param {string} origin
  * @param {string} key
+ * @param {string|null} [grokLocal]
  */
-export function clientKeySetup(origin, key) {
+export function clientKeySetup(origin, key, grokLocal) {
   // Show details hands back keys written into the file by hand, which may hold
   // `$`, quotes or spaces: single-quote those for the shell, and let JSON's
   // escapes (a subset of TOML's basic-string escapes) quote them for Codex.
@@ -1065,7 +1068,7 @@ export function clientKeySetup(origin, key) {
     claude: 'export ANTHROPIC_BASE_URL=' + sh(origin) + '\nexport ANTHROPIC_API_KEY=' + sh(key),
     codex: 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = ' + JSON.stringify(origin + '/backend-api/codex') + '\n'
       + 'wire_api = "responses"\nhttp_headers = { "x-api-key" = ' + JSON.stringify(key) + ' }',
-    grok: 'export GROK_CLI_CHAT_PROXY_BASE_URL=' + sh(origin + '/grok/v1'),
+    grok: typeof grokLocal === 'string' && grokLocal ? 'export GROK_CLI_CHAT_PROXY_BASE_URL=' + sh(grokLocal) : null,
   };
 }
 
@@ -3610,7 +3613,7 @@ ${SHARED_HELPERS}
         if (!json) return;
         var out = clientKeyOutcome(json, step);
         ckStatus(out.kind, out.text);
-        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true); if (lastStatus) render(lastStatus); return; }
+        if (json.ok && step === 'show') { showIssuedKey(json.name, json.key, true, json.grokLocal); if (lastStatus) render(lastStatus); return; }
         if (json.ok && step === 'create') {
           document.getElementById('ckName').value = '';
           // The proxy's first key closes a gate this page may have come in
@@ -3618,7 +3621,7 @@ ${SHARED_HELPERS}
           // the key box would cover the panel before the key was copied, so
           // polling waits for Done.
           holdPoll = !!json.firstKey && !localStorage.getItem(KEY);
-          showIssuedKey(json.name, json.key);
+          showIssuedKey(json.name, json.key, false, json.grokLocal);
         }
         // A revoked key's panel would offer setup for a key that no longer works.
         if (json.ok && step === 'revoke' && issuedName === json.name) hideIssuedKey();
@@ -3669,7 +3672,7 @@ ${SHARED_HELPERS}
     box.appendChild(line);
   }
 
-  function showIssuedKey(name, key, existing) {
+  function showIssuedKey(name, key, existing, grokLocal) {
     issuedName = name;
     var box = document.getElementById('ckIssued');
     box.textContent = '';
@@ -3678,11 +3681,17 @@ ${SHARED_HELPERS}
     head.appendChild(el('span', 'hint', existing ? 'Anyone who can see this screen can use the key.' : 'Copy it now, or come back with Show details.'));
     box.appendChild(head);
     var origin = peer ? peerUrl : typeof location !== 'undefined' ? location.origin : '';
-    var setup = clientKeySetup(origin, key);
+    var setup = clientKeySetup(origin, key, grokLocal);
     snippet(box, 'Key', key, 0);
     snippet(box, 'Claude Code: run in the shell that starts claude', setup.claude, 2);
     snippet(box, 'Codex CLI: add to ~/.codex/config.toml', setup.codex, 7);
-    snippet(box, 'Grok Build: run in the shell that starts grok. It cannot send this key, so it works only where the proxy asks for none: on the machine the proxy runs on', setup.grok, 1);
+    // Grok Build cannot send the key (clientKeySetup), so it gets the
+    // proxy's own loopback address, or a line saying why it has none.
+    if (setup.grok) {
+      snippet(box, 'Grok Build: run in the shell that starts grok, on the machine the proxy runs on. Grok Build cannot send this key, so it must connect straight to the proxy, which lets that in without one (not through a Docker port mapping or a reverse proxy)', setup.grok, 1);
+    } else if (grokLocal === null) {
+      box.appendChild(el('div', 'lbl', 'Grok Build cannot send this key, and this proxy lets no connection in without one (proxy.trustLoopback is false, or it does not listen on its own machine\u2019s loopback address), so Grok Build cannot use it.'));
+    }
     if (isLoopbackHost(pageHost())) {
       box.appendChild(el('div', 'lbl', 'This page is open at ' + origin + '. A client on another machine needs an address of this one it can reach instead.'));
     }

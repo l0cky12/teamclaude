@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer } from '../src/server.js';
+import { createProxyServer, grokLocalBase } from '../src/server.js';
 
 // POST /teamclaude/client-keys/create and /revoke are what the dashboard's
 // Client keys card sends. Like /threshold they write the config file under its
@@ -73,6 +73,8 @@ test('create stores a new key under the name, reloads, and answers with the key 
     assert.equal(body.name, 'laptop');
     assert.equal(body.firstKey, false);
     assert.match(body.key, /^tc-/);
+    // Grok Build cannot send the key: the panel gets the keyless loopback address.
+    assert.equal(body.grokLocal, `http://127.0.0.1:${port}/grok/v1`);
     assert.deepEqual(await readKeys(path), [{ name: 'laptop', key: body.key }]);
     assert.equal(reloads.count, 1, 'the running server is told to pick it up');
   });
@@ -188,7 +190,7 @@ test('show answers with the key under the name, uncached, and writes nothing', a
     const res = await send(port, 'show', { name: 'laptop' });
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('cache-control'), 'no-store', 'the reply carries a key');
-    assert.deepEqual(await res.json(), { ok: true, name: 'laptop', key: 'lap-key' });
+    assert.deepEqual(await res.json(), { ok: true, name: 'laptop', key: 'lap-key', grokLocal: `http://127.0.0.1:${port}/grok/v1` });
     assert.equal(reloads.count, 0);
 
     const missing = await send(port, 'show', { name: 'gone' });
@@ -201,4 +203,24 @@ test('show answers with the key under the name, uncached, and writes nothing', a
     assert.ok(!(await crossSite.text()).includes('lap-key'));
     assert.deepEqual(await readKeys(path), [{ name: 'ci', key: 'ci-key' }, { name: 'laptop', key: 'lap-key' }]);
   }, { proxy: { apiKey: 'tc-test', clientKeys: [{ name: 'ci', key: 'ci-key' }, { name: 'laptop', key: 'lap-key' }] } });
+});
+
+test('with the loopback exemption off, the panel is told Grok Build has no keyless address', async () => {
+  await withServer(async ({ port }) => {
+    const res = await send(port, 'show', { name: 'laptop' }, { 'x-api-key': 'tc-test' });
+    assert.equal((await res.json()).grokLocal, null);
+  }, { proxy: { apiKey: 'tc-test', trustLoopback: false, clientKeys: [{ name: 'laptop', key: 'lap-key' }] } });
+});
+
+test('Grok Build\'s keyless address is the loopback one the listener answers on, or none', () => {
+  assert.equal(grokLocalBase({}, undefined, 3456), 'http://127.0.0.1:3456/grok/v1', 'the default bind');
+  assert.equal(grokLocalBase({}, '0.0.0.0', 3456), 'http://127.0.0.1:3456/grok/v1', 'a wildcard answers on loopback too');
+  assert.equal(grokLocalBase({}, '::', 3456), 'http://127.0.0.1:3456/grok/v1');
+  assert.equal(grokLocalBase({}, 'localhost', 3456), 'http://127.0.0.1:3456/grok/v1');
+  assert.equal(grokLocalBase({}, '::1', 3456), 'http://[::1]:3456/grok/v1');
+  assert.equal(grokLocalBase({}, '[::1]', 3456), 'http://[::1]:3456/grok/v1');
+  assert.equal(grokLocalBase({}, '100.64.0.2', 3456), null, 'bound to one other address: no loopback listener');
+  assert.equal(grokLocalBase({}, '192.168.1.5', 3456), null);
+  assert.equal(grokLocalBase({ trustLoopback: false }, '127.0.0.1', 3456), null, 'the exemption is off');
+  assert.equal(grokLocalBase({}, '127.0.0.1', 0), null);
 });

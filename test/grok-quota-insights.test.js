@@ -85,3 +85,34 @@ test('a monthly plan\'s outside-spend and forecast lines say month, a weekly one
   assert.match(String(forecastText(forecast, now, 'monthly')), /^month reaches 98% in ~5h/);
   assert.match(String(forecastText(forecast, now)), /^week reaches 98% in ~5h/);
 });
+
+test('the Grok address the client-key panel gives works without a key while a key is required, and only directly', async t => {
+  // A stand-in for xAI's proxy: it answers the model list Grok Build reads
+  // first, which carries no client key whatever Grok Build is configured with.
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ path: req.url }));
+  });
+  const upstreamPort = await listen(upstream);
+  const am = new AccountManager([{
+    name: 'grok-a', type: 'oauth', provider: 'grok', upstream: `http://127.0.0.1:${upstreamPort}`,
+    accessToken: 'at-a', expiresAt: Date.now() + 24 * 3600_000, userId: 'user-a',
+  }], 0.98);
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'tc-shared', clientKeys: [{ name: 'laptop', key: 'tc-laptop' }] } });
+  const port = await listen(proxy);
+  t.after(() => { proxy.closeAllConnections(); proxy.close(); upstream.closeAllConnections(); upstream.close(); });
+
+  const shown = await (await fetch(`http://127.0.0.1:${port}/teamclaude/client-keys/show`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': 'tc-shared' }, body: JSON.stringify({ name: 'laptop' }),
+  })).json();
+  assert.equal(shown.grokLocal, `http://127.0.0.1:${port}/grok/v1`);
+
+  // No key, as Grok Build sends it: let in, and served by the Grok account.
+  const direct = await fetch(`${shown.grokLocal}/models`, { headers: { authorization: 'Bearer grok-own-token' } });
+  assert.equal(direct.status, 200);
+  assert.deepEqual(await direct.json(), { path: '/v1/models' });
+  // The same request through a forwarding proxy is not exempt: the panel says
+  // Grok Build has to connect straight to the proxy.
+  const forwarded = await fetch(`${shown.grokLocal}/models`, { headers: { authorization: 'Bearer grok-own-token', 'x-forwarded-for': '203.0.113.9' } });
+  assert.equal(forwarded.status, 401);
+});
