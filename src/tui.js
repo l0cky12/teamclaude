@@ -23,6 +23,7 @@ import { sanitizeText, safeLine } from './safe-text.js';
 import { MAX_PROBE_SECONDS, MIN_PROBE_SECONDS, ROUTE_COLORS } from './config-ops.js';
 import { isLocalUpstream } from './provider.js';
 import { hyperlink, clipboardSequence } from './osc.js';
+import { admitUnderCap } from './account-limit.js';
 /** @typedef {import('./login-flow.js').LoginPrompt} LoginPrompt */
 
 // ── ANSI helpers ─────────────────────────────────────────────
@@ -740,6 +741,11 @@ export class TUI {
   constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null,
     // Cast so the destructured binding is the callback type, not `null`: index.js passes a function here.
     loginAccount = /** @type {LoginAccount | null} */ (null),
+    // Adds a new account under the per-kind cap against a fresh read of the
+    // config file (account-limit.js admitUnderCap); index.js passes the
+    // server's. Without one (no server behind this TUI) the check runs on the
+    // lists held here.
+    admitAccount = /** @type {((entry: Record<string, any>, opts?: { pickName?: ((taken: Set<string>) => string) | null }) => Promise<{ added: boolean, idx: number | null, reason: string | null }>) | null} */ (null),
     activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -772,6 +778,7 @@ export class TUI {
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
     /** @type {LoginAccount | null} */
     this.loginAccount = loginAccount; // (re-)login for a chosen account (may be null)
+    this.admitAccount = admitAccount;
     this._env = env;
     this.activityLogPath = activityLogPath;
     this._readCredentials = readCredentials;
@@ -2273,23 +2280,23 @@ export class TUI {
         if (prev.routing) this._addLog(`Note: "${safeLine(prev.name, 64)}" has its own proxy, and this import's profile lookup did not go through it`);
       } else {
         // New org for this person: disambiguate colliding email names with " (org)".
-        if (profile?.accountUuid) {
-          const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
-          const collisions = this.config.accounts.filter(
-            a => a.accountUuid === entry.accountUuid && !sameIdentity(a, entry)
-          );
-          if (collisions.length > 0) {
-            for (const c of collisions) {
-              if (!c.name.includes(' (')) c.name = `${c.name} (${orgLbl(c)})`;
-            }
-            entry.name = `${name} (${orgLbl(entry)})`;
-          }
-        }
+        // The namesakes are renamed only once the add is accepted, so a
+        // refused one changes nothing.
+        const orgLbl = a => a.orgName || (a.orgUuid ? a.orgUuid.slice(0, 8) : 'org');
+        const collisions = profile?.accountUuid
+          ? this.config.accounts.filter(a => a.accountUuid === entry.accountUuid && !sameIdentity(a, entry))
+          : [];
+        if (collisions.length > 0) entry.name = `${name} (${orgLbl(entry)})`;
         // One object into both lists, so the account is built carrying its
         // entry's id and the two pair from the moment they exist.
-        entry.id = mintAccountId();
-        this.config.accounts.push(entry);
-        this.am.addAccount(entry);
+        const { added, reason } = await this._admit(entry);
+        if (!added) {
+          this._addLog(`Import refused: ${reason || `"${entry.name}" is already in the pool`}`);
+          return;
+        }
+        for (const c of collisions) {
+          if (!c.name.includes(' (')) c.name = `${c.name} (${orgLbl(c)})`;
+        }
         // Recorded until the save below lands: a reload that reads the file
         // first would find a running account with no row and drop it.
         markAccountAdded(this.config, entry.id);
@@ -2302,19 +2309,45 @@ export class TUI {
     }
   }
 
+  /**
+   * Add a new account to the config and the running pool, under the per-kind
+   * cap (account-limit.js). With a server behind the TUI the check and the
+   * write run against a fresh read of the file; without one, against the
+   * lists held here, and the caller's save writes it.
+   * @param {Record<string, any>} entry
+   * @param {{ pickName?: ((taken: Set<string>) => string) | null }} [opts]
+   * @returns {Promise<{ added: boolean, idx: number | null, reason: string | null }>}
+   */
+  _admit(entry, { pickName = null } = {}) {
+    if (this.admitAccount) return this.admitAccount(entry, { pickName });
+    return admitUnderCap({
+      entry, config: this.config, accountManager: this.am, pickName,
+      update: async (fn) => fn({ accounts: [...this.config.accounts] }),
+    });
+  }
+
   async _doAddKey(apiKey) {
-    const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    const name = `api-${n}`;
     // One object, not two equal literals: the account has to be built from the
     // entry itself to carry its id, which is what pairs the two afterwards.
-    const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
-    this.config.accounts.push(entry);
-    this.am.addAccount(entry);
+    const entry = { id: mintAccountId(), name: '', type: 'apikey', apiKey };
+    // api-N after the keys there are, stepping past a name still taken: after a
+    // removal the count lands on one that is, and an API key's identity is its
+    // name, so the new key would read as that account and never be added.
+    const pickName = (/** @type {Set<string>} */ taken) => {
+      let n = [...taken].filter(t => t.startsWith('api-')).length + 1;
+      while (taken.has(`api-${n}`)) n++;
+      return `api-${n}`;
+    };
+    const { added, reason } = await this._admit(entry, { pickName });
+    if (!added) {
+      this._addLog(`API key not added: ${reason || 'that key is already in the pool'}`);
+      return;
+    }
     // Same window as in _doImport: the account exists here before it does on
     // disk, and a reload in between must not read the file as a removal.
     markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
-    this._addLog(`Added API key account "${name}"`);
+    this._addLog(`Added API key account "${entry.name}"`);
   }
 
   async _doRemove(idx) {

@@ -65,6 +65,7 @@ import { WebAccountSync } from './web-account-sync.js';
 import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel, INSTANCE_SYNC_INTERVAL_MS } from './instance-sync.js';
 import { createSyncStore } from './sync-store.js';
 import { configuredPeers } from './peers.js';
+import { accountLimitReached, assertAccountLimit, admitUnderCap, AccountLimitError } from './account-limit.js';
 import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
@@ -454,14 +455,25 @@ async function serverCommand() {
   // callback.net credential store (credential-sync.js). Same three lists the
   // refresh persistence below keeps in step for an account found on disk —
   // config, manager, disk — and the same guard against an entry already there.
-  const admitAccount = (/** @type {Record<string, any>} */ entry) => {
-    if (config.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry)) || accountManager.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) return null;
-    config.accounts.push(entry);
-    ensureAccountIds(config.accounts);
-    const idx = accountManager.addAccount(entry);
-    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
-      if (!diskConfig.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) diskConfig.accounts.push(entry);
-    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from ${credentialSync.where()}: ${err.message}`));
+  /** @type {Set<string>} */
+  const limitRefusalsLogged = new Set();
+  /**
+   * A new account into config, disk and manager, under the per-kind cap
+   * (account-limit.js), checked and written against a fresh read of the file
+   * so a running process's stale count cannot let a twenty-first in. The TUI's
+   * adds take this too.
+   * @param {Record<string, any>} entry
+   * @param {{ pickName?: ((taken: Set<string>) => string) | null }} [opts]
+   */
+  const admitNewAccount = (entry, { pickName = null } = {}) => admitUnderCap({ entry, config, accountManager, update: atomicConfigUpdate, pickName });
+  const admitAccount = async (/** @type {Record<string, any>} */ entry) => {
+    const { idx, reason } = await admitNewAccount(entry);
+    // Past the cap the store's account stays out. Said once per account:
+    // every sync pass would otherwise say it again.
+    if (reason && !limitRefusalsLogged.has(entry.name)) {
+      limitRefusalsLogged.add(entry.name);
+      console.error(`[TeamClaude] Not adding "${safeLine(entry.name, 64)}" from ${credentialSync.where()}: ${reason}`);
+    }
     return idx;
   };
 
@@ -867,6 +879,7 @@ async function serverCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
+      admitAccount: admitNewAccount,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).
@@ -1456,7 +1469,24 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  await upsertProviderLogin('codex', argValue('--name'), creds, routing, store);
+  await exitOnAccountLimit(() => upsertProviderLogin('codex', argValue('--name'), creds, routing, store));
+}
+
+/**
+ * Run an add, and turn a refusal at the account cap into a message and a
+ * failed exit: what a CLI command does with it.
+ * @template T
+ * @param {() => Promise<T>} add
+ * @returns {Promise<T>}
+ */
+async function exitOnAccountLimit(add) {
+  try {
+    return await add();
+  } catch (err) {
+    if (!(err instanceof AccountLimitError)) throw err;
+    console.error(err.message);
+    process.exit(1);
+  }
 }
 
 /**
@@ -1480,7 +1510,7 @@ async function loginGrokCommand() {
     console.error('  then add: { "name": "...", "type": "oauth", "provider": "grok" }');
     process.exit(1);
   }
-  await upsertProviderLogin('grok', argValue('--name'), creds, routing, store);
+  await exitOnAccountLimit(() => upsertProviderLogin('grok', argValue('--name'), creds, routing, store));
 }
 
 /**
@@ -1548,6 +1578,7 @@ async function upsertProviderLogin(provider, requestedName, creds, routing = nul
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      assertAccountLimit(config.accounts, account);
       config.accounts.push(account);
       outcome = { action: 'added', name: account.name };
       console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
@@ -1623,6 +1654,13 @@ async function loginApiCommand() {
   // The flag alone: an API key is always a NEW entry, so there is no stored
   // routing for it to borrow (and `none` is what it gets without the flag).
   const { routing } = routingFlag();
+  // A key is always a new row, so the cap can refuse it before the prompt; the
+  // save checks again on its fresh read.
+  const early = accountLimitReached(loaded.accounts, { type: 'apikey' });
+  if (early) {
+    console.error(early.message);
+    process.exit(1);
+  }
   refuseSelfRouting(routing, loaded);
   await requireWorkingRouting(routing, upstreamFor({ type: 'apikey' }, loaded.upstream));
 
@@ -1644,10 +1682,16 @@ async function loginApiCommand() {
       const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
       name = `api-${n}`;
     }
-    disk.accounts.push({
+    const entry = {
       name, type: 'apikey', apiKey: apiKey.trim(), priority,
       ...(routing ? { routing: routingToUrl(routing) } : {}),
-    });
+    };
+    assertAccountLimit(disk.accounts, entry);
+    disk.accounts.push(entry);
+  }).catch((err) => {
+    if (!(err instanceof AccountLimitError)) throw err;
+    console.error(err.message);
+    process.exit(1);
   });
   console.log(`Added API key account "${name}" at priority ${priority}${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
   if (priority === APIKEY_DEFAULT_PRIORITY) {
@@ -3609,6 +3653,8 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       console.log(`Updated account "${prev.name}"`);
       if (!storeRouting) noteUnusedRouting(prev, routing);
     } else {
+      // Before the namesakes below are renamed: a refused add changes nothing.
+      assertAccountLimit(config.accounts, account);
       // New org for this person: if another entry shares the accountUuid, the bare
       // email name would collide — disambiguate both with " (org)".
       if (!userNamed && account.accountUuid) {
@@ -3627,6 +3673,11 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       console.log(`Added account "${account.name}"`);
     }
     signedIn = config.accounts[idx >= 0 ? idx : config.accounts.length - 1];
+  }).catch((err) => {
+    // A CLI login says it and exits; the TUI and dashboard show the message.
+    if (!fatal || !(err instanceof AccountLimitError)) throw err;
+    console.error(err.message);
+    process.exit(1);
   });
   console.log(`Saved to ${getConfigPath()}`);
   // Before the server is told: its reload pass would otherwise read a tombstone
