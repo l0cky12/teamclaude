@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
+import { CredentialSync, refreshOutsideProxy, syncKeyFor, isSyncable, unsyncableReason, encodeBlob, decodeBlob, entryFromBlob, needsSignIn, tombstoneOf, tombstone, KEY_PREFIX, TOMBSTONE_TTL_MS } from '../src/credential-sync.js';
 
 // Credential sync through callback.net: every signed-in install keeps its OAuth
 // account tokens in the user's credential store and follows it. The store here
@@ -232,6 +232,20 @@ test('a Grok login is stored, and its renewal goes through the row\'s lock like 
   assert.equal(store.byKey(`${KEY_PREFIX}grok.user-g`).Locked, null, 'and unlocked after');
 });
 
+test('a login the sync cannot match on another install is named once, with what to do, instead of skipped in silence', async () => {
+  // A Grok login read from a Grok Build file that names no user, say.
+  const { sync, logs, store } = setup([grok('g', { userId: undefined }), claude('a'), { name: 'k', type: 'apikey', apiKey: 'sk-demo-1' }]);
+  await sync.sync('start');
+  assert.deepEqual(sync.summary().notShared, [{ name: 'g', provider: 'grok', reason: unsyncableReason({ type: 'oauth', provider: 'grok' }) }]);
+  assert.match(sync.summary().notShared[0].reason, /no xAI user id; sign in again with teamclaude login --grok/);
+  // An API key is not a login the sync carries: nothing to say about it.
+  assert.equal(unsyncableReason({ name: 'k', type: 'apikey', apiKey: 'sk-demo-1' }), null);
+  assert.equal(unsyncableReason(grok('g')), null);
+  assert.equal(store.blob(`${KEY_PREFIX}anthropic.uuid-a.org-a`).accessToken, 'at-a-1', 'the others are stored as before');
+  await sync.sync('again');
+  assert.equal(logs.filter((l) => /"g" is not shared/.test(l)).length, 1, 'said once, not at every pass');
+});
+
 test('the newer token wins each way: the store\'s is adopted, this install\'s is stored', async () => {
   const store = makeStore();
   const a = claude('a');
@@ -314,7 +328,7 @@ test('an account removed here leaves a tombstone, and the other installs remove 
   await office.settled();
   assert.equal(JSON.parse(store.byKey(syncKeyFor(claude('b'))).Data)._deleted, new Date(store.now()).toISOString());
   assert.equal(store.calls.filter((c) => c.method === 'PATCH' && c.params.Data.includes('_deleted')).length, 1);
-  assert.deepEqual(office.sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 1, signInNeeded: 0 });
+  assert.deepEqual(office.sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 1, signInNeeded: 0, notShared: [] });
 });
 
 test('a refresh never brings a removed account back; a sign-in does', async () => {
@@ -1101,5 +1115,5 @@ test('the daily pass is scheduled and stopped', async () => {
   assert.ok(sync._timer, 'armed');
   sync.stop();
   assert.equal(sync._timer, null);
-  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 0, signInNeeded: 0 });
+  assert.deepEqual(sync.summary(), { lastSyncAt: store.now(), lastError: null, rows: 1, tombstones: 0, signInNeeded: 0, notShared: [] });
 });

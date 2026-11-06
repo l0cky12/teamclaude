@@ -65,7 +65,8 @@ import { CredentialSync, refreshOutsideProxy, SYNC_INTERVAL_MS } from './credent
 import { WebAccountSync } from './web-account-sync.js';
 import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel, INSTANCE_SYNC_INTERVAL_MS } from './instance-sync.js';
 import { createSyncStore } from './sync-store.js';
-import { configuredPeers } from './peers.js';
+import { ClusterMonitor } from './sync-cluster.js';
+import { configuredPeers, instanceName } from './peers.js';
 import { accountLimitReached, assertAccountLimit, admitUnderCap, AccountLimitError } from './account-limit.js';
 import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
@@ -506,8 +507,22 @@ async function serverCommand() {
   // the config) or a linked one (`follow`). Read off the running config on
   // every call, so the dashboard's switch and a reload apply at once. A pass
   // then also runs every few minutes, and stores the accounts the store lacks.
+  //
+  // With a master and backups (`cluster`, sync-cluster.js) the store is the
+  // one the running election names: this machine's own while it is the
+  // master, the master's otherwise. A change of master moves the sync the
+  // way a change of setting does, once the operations under way are done.
   const syncStore = createSyncStore();
-  const syncTransport = createSyncTransport({ getConfig: () => config, store: syncStore });
+  const syncCluster = new ClusterMonitor({
+    getConfig: () => config,
+    store: syncStore,
+    // For tests that run a failover end to end without waiting 30 seconds.
+    checkMs: Number(envVar('SYNC_CLUSTER_CHECK_MS')) || undefined,
+    onChange: () => {
+      if (syncTransport.differs(config)) credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
+    },
+  });
+  const syncTransport = createSyncTransport({ getConfig: () => config, store: syncStore, cluster: syncCluster });
   syncTransport.pin(config);
   // Pointing the sync at the store the config names now. A machine that
   // starts keeping the store (again, or at launch) first marks what the file
@@ -646,6 +661,8 @@ async function serverCommand() {
     config.peers = diskConfig.peers;
     if (syncTransport.differs(config)) credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
     else credentialSync.sync('reload').catch(() => {});
+    // A new member list is checked at once rather than at the next round.
+    syncCluster.tick().catch(() => {});
     // Pick up client-key edits (proxy.clientKeys is read live by both auth
     // gates through the shared config object, so refreshing it here is all a
     // key add/rotate/revoke needs — no restart).
@@ -1017,6 +1034,8 @@ async function serverCommand() {
   hooks.accountSync = new WebAccountSync({
     sync: credentialSync,
     mode: () => accountSyncMode(config),
+    cluster: () => syncCluster.status(),
+    selfName: () => instanceName(config),
     peerNames: () => configuredPeers(config).map(p => p.name),
     canHost: () => !!config.proxy?.apiKey,
     probe: (name) => {
@@ -1033,6 +1052,7 @@ async function serverCommand() {
       else config.accountSync = next;
       console.log(`[TeamClaude] Account sync ${next.mode === 'off' ? 'through your own instances is off' : `now goes through ${storeLabel(next)}`} (dashboard)`);
       credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
+      syncCluster.tick().catch(() => {});
     },
   });
   // POST /teamclaude/sync-store: the store, while this machine keeps it. Read
@@ -1040,7 +1060,16 @@ async function serverCommand() {
   // follower renewing at that moment keeps its new token, and the row's lock
   // runs out on its own lease (30 s). Turning the store off ends sharing
   // anyway (docs/accounts.md), so nothing waits for that.
-  hooks.syncStore = () => (accountSyncMode(config).mode === 'host' ? syncStore : null);
+  //
+  // With a master and backups, only while the election makes this machine
+  // the master: a member that is a backup refuses, and a caller that still
+  // takes it for the master waits until it finds the one that is.
+  hooks.syncStore = () => {
+    const m = accountSyncMode(config).mode;
+    return m === 'host' || (m === 'cluster' && syncCluster.isMaster()) ? syncStore : null;
+  };
+  // POST /teamclaude/sync-cluster: the checks the members make of one another.
+  hooks.syncCluster = syncCluster;
 
   // The dashboard's Remove (POST /teamclaude/remove).
   hooks.removeAccount = createAccountRemover({
@@ -1229,7 +1258,17 @@ async function serverCommand() {
   if (accountSyncMode(config).mode === 'host' && !config.proxy?.apiKey) {
     console.error('[TeamClaude] accountSync.mode is "host" but there is no proxy.apiKey: the account store stays closed to your other machines until one is set');
   }
+  const startMode = accountSyncMode(config);
+  if (startMode.mode === 'cluster' && startMode.members.includes(instanceName(config)) && !config.proxy?.apiKey) {
+    console.error('[TeamClaude] This machine is one of the account store\'s master and backups but has no proxy.apiKey: the others cannot check it or reach its store until one is set');
+  }
+  if (startMode.mode === 'cluster' && !startMode.members.includes(instanceName(config))) {
+    console.log(`[TeamClaude] This machine (${instanceName(config)}) is not in accountSync.members, so it only follows the master. Set its instance name to the one in the list to make it a backup.`);
+  }
   credentialSync.switchStore(syncIntervalFor(config), repin).catch(() => {});
+  // The checks the master and backups make of one another; nothing is sent
+  // unless accountSync is a cluster.
+  syncCluster.start();
 
   // Background self-update for a backgrounded (headless) server. Skipped under
   // the TUI, where npm's install output would corrupt the display — interactive
@@ -1255,6 +1294,7 @@ async function serverCommand() {
     prober?.stop();
     warmer?.stop();
     credentialSync.stop();
+    syncCluster.stop();
     eventLoopMonitor.stop();
     if (quotaSaveInterval) clearInterval(quotaSaveInterval);
     await persistQuotaState();

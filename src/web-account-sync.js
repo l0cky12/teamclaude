@@ -30,6 +30,7 @@ import { randomBytes } from 'node:crypto';
 import { loginCallback, loadCallbackToken, saveCallbackTokenIn, callbackSessionEpoch, callbackWhoami, logoutCallback } from './callback-auth.js';
 import { safeLine } from './safe-text.js';
 import { storeLabel } from './instance-sync.js';
+import { parseMembers } from './sync-cluster.js';
 
 // The user's name and email are read from callback.net for the card. A page
 // that cannot get them quickly still shows the rest.
@@ -120,10 +121,14 @@ export class WebAccountSync {
    * @param {() => string[]} [opts.peerNames]  the linked instances this machine lists
    * @param {() => boolean} [opts.canHost]  whether other machines can reach this one (it has a proxy key)
    * @param {(peer: string) => Promise<unknown>} [opts.probe]  one read of a linked instance's store
+   * @param {() => Record<string, any> | null} [opts.cluster]  the master and backups as this machine sees them (sync-cluster.js)
+   * @param {() => string} [opts.selfName]  what this machine is called (peers.js instanceName)
    */
-  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackTokenIn, epoch = callbackSessionEpoch, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l), mode = () => ({ mode: 'off' }), setMode = null, peerNames = () => [], canHost = () => false, probe = () => Promise.reject(new Error('not supported')) }) {
+  constructor({ sync, login = loginCallback, load = loadCallbackToken, save = saveCallbackTokenIn, epoch = callbackSessionEpoch, whoami = callbackWhoami, logout = logoutCallback, fetchImpl = fetch, log = (l) => console.log(l), mode = () => ({ mode: 'off' }), setMode = null, peerNames = () => [], canHost = () => false, probe = () => Promise.reject(new Error('not supported')), cluster = () => null, selfName = () => '' }) {
     this._sync = sync;
     this._mode = mode;
+    this._cluster = cluster;
+    this._selfName = selfName;
     this._setMode = setMode;
     this._peerNames = peerNames;
     this._canHost = canHost;
@@ -154,7 +159,9 @@ export class WebAccountSync {
    * the last pass found, and the dashboard sign-in in progress, if any.
    * `instance` is the store of your own instances: off, kept here (host) or
    * followed on a linked instance, with what the card offers to switch to.
-   * @returns {Promise<{ signedIn: boolean, user: SyncUser | null, userError: string | null, sync: Record<string, any>, signIn: { id: string, state: SyncSignInState } | null, instance: { mode: SyncMode['mode'], peer: string | null, peers: string[], canHost: boolean, supported: boolean } }>}
+   * With a master and backups, `members` is the list and `cluster` what the
+   * running election says about it.
+   * @returns {Promise<{ signedIn: boolean, user: SyncUser | null, userError: string | null, sync: Record<string, any>, signIn: { id: string, state: SyncSignInState } | null, instance: { mode: SyncMode['mode'], peer: string | null, members: string[] | null, self: string, cluster: Record<string, any> | null, peers: string[], canHost: boolean, supported: boolean } }>}
    */
   async view() {
     const token = await this._load().catch(() => null);
@@ -188,6 +195,9 @@ export class WebAccountSync {
       instance: {
         mode: m.mode,
         peer: m.mode === 'follow' ? m.peer : null,
+        members: m.mode === 'cluster' ? m.members : null,
+        self: this._selfName(),
+        cluster: m.mode === 'cluster' ? this._cluster() : null,
         peers: this._peerNames(),
         canHost: this._canHost(),
         supported: !!this._setMode,
@@ -213,8 +223,14 @@ export class WebAccountSync {
    * the switch is checked cannot save a token. One already approved
    * (`finishing`) is past cancelling: its token is being saved, and the
    * switch is refused until that has landed and been signed out.
-   * @param {{ mode?: unknown, peer?: unknown }} body
-   * @returns {Promise<{ mode: SyncMode['mode'], peer: string | null }>}
+   *
+   * `cluster` {members} puts this machine on a master and backups
+   * (sync-cluster.js): the list, in order of succession, has to be the same
+   * on every machine, so the page sets it on each. A member other than this
+   * machine has to be a linked instance, listed under that name; this
+   * machine is in the list by its own name, and needs a proxy key then.
+   * @param {{ mode?: unknown, peer?: unknown, members?: unknown }} body
+   * @returns {Promise<{ mode: SyncMode['mode'], peer: string | null, members?: string[] }>}
    */
   async changeMode(body) {
     if (!this._setMode) throw new AccountSyncError('this server cannot switch account sync from the dashboard');
@@ -223,12 +239,21 @@ export class WebAccountSync {
     let next;
     if (want === 'off') {
       next = { mode: 'off' };
-    } else if (want === 'host' || want === 'follow') {
+    } else if (want === 'host' || want === 'follow' || want === 'cluster') {
       // Refusals that need no I/O come first, so a waiting sign-in is left
       // alone when this machine cannot take the store anyway.
       if (want === 'host') {
         if (!this._canHost()) throw new AccountSyncError('this machine has no proxy key (proxy.apiKey), so your other machines could not reach its store; set one first');
         next = { mode: 'host' };
+      } else if (want === 'cluster') {
+        const members = parseMembers(body?.members);
+        if (!members) throw new AccountSyncError('list two or more machines, each once, by name, the master first');
+        const self = this._selfName();
+        const linked = this._peerNames();
+        const missing = members.find(n => n !== self && !linked.includes(n));
+        if (missing) throw new AccountSyncError(`${safeLine(missing, 64)} is not a linked instance of this machine; link it under that name first (this machine is called ${safeLine(self, 64)})`);
+        if (members.includes(self) && !this._canHost()) throw new AccountSyncError('this machine has no proxy key (proxy.apiKey), so the others could not check it or reach its store; set one first');
+        next = { mode: 'cluster', members };
       } else {
         const peer = typeof body?.peer === 'string' ? body.peer.trim() : '';
         if (!peer || !this._peerNames().includes(peer)) throw new AccountSyncError('choose one of the linked instances of this machine');
@@ -252,10 +277,10 @@ export class WebAccountSync {
         }
       }
     } else {
-      throw new AccountSyncError('"mode" must be host, follow or off');
+      throw new AccountSyncError('"mode" must be host, follow, cluster or off');
     }
     await this._setMode(next);
-    return { mode: next.mode, peer: next.mode === 'follow' ? next.peer : null };
+    return { mode: next.mode, peer: next.mode === 'follow' ? next.peer : null, ...(next.mode === 'cluster' ? { members: next.members } : {}) };
   }
 
   /**

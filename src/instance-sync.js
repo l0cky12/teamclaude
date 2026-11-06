@@ -8,6 +8,9 @@
 //
 //   "accountSync": { "mode": "host" }                    this instance keeps it (sync-store.js)
 //   "accountSync": { "mode": "follow", "peer": "desk" }   the linked instance "desk" keeps it
+//   "accountSync": { "mode": "cluster", "members": ["server", "desk"] }
+//                                  a master and backups keep it (sync-cluster.js):
+//                                  the first member that is up is the master
 //
 // A follower reaches the host through the linked-instance channel (peers.js):
 // the address and proxy key it lists for that instance under `peers`, and the
@@ -17,9 +20,10 @@
 // from the dashboard applies to the running sync at once. Set, it wins over a
 // callback.net session: an install syncs with one store, never two.
 
-import { configuredPeers, peerRequest } from './peers.js';
+import { configuredPeers, instanceName, peerRequest } from './peers.js';
 import { callbackCall, loadCallbackToken } from './callback-auth.js';
 import { safeLine } from './safe-text.js';
+import { parseMembers, askMember } from './sync-cluster.js';
 
 /** One store call to a host; a renewal is waiting on it, so not long. */
 const STORE_CALL_TIMEOUT_MS = 15_000;
@@ -27,8 +31,10 @@ const STORE_CALL_TIMEOUT_MS = 15_000;
 export const INSTANCE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * @typedef {{ mode: 'off' } | { mode: 'host' } | { mode: 'follow', peer: string }} SyncMode
+ * @typedef {{ mode: 'off' } | { mode: 'host' } | { mode: 'follow', peer: string } | { mode: 'cluster', members: string[] }} SyncMode
  * @typedef {(method: string, path: string, params?: Record<string, any>|null, opts?: any) => Promise<any>} Api
+ * @typedef {{ isMaster: () => boolean, masterPeer: () => import('./peers.js').Peer | null, election: { master: string|null, reason: string|null } }} ClusterView
+ *   the running election (sync-cluster.js ClusterMonitor)
  */
 
 /**
@@ -41,6 +47,10 @@ export function accountSyncMode(config) {
   const s = config?.accountSync;
   if (s?.mode === 'host') return { mode: 'host' };
   if (s?.mode === 'follow' && typeof s.peer === 'string' && s.peer.trim()) return { mode: 'follow', peer: s.peer.trim() };
+  if (s?.mode === 'cluster') {
+    const members = parseMembers(s.members);
+    if (members) return { mode: 'cluster', members };
+  }
   return { mode: 'off' };
 }
 
@@ -51,6 +61,7 @@ export function accountSyncMode(config) {
 export function storeLabel(m) {
   if (m.mode === 'host') return 'the account store on this machine';
   if (m.mode === 'follow') return `the account store on ${safeLine(m.peer, 64)}`;
+  if (m.mode === 'cluster') return 'the account store of your master and backups';
   return 'callback.net';
 }
 
@@ -87,14 +98,52 @@ export function peerStoreApi(peer, { request = peerRequest } = {}) {
 
 /**
  * The store a config names, with the peer entry a follower reaches it
- * through: what an operation is pinned to.
+ * through: what an operation is pinned to. With a master and backups it is
+ * the master the election names now: this machine's own store when it is
+ * the master (`local`), the master's otherwise, and none while there is no
+ * master (`master` null).
  * @param {Record<string, any>} config
- * @returns {{ mode: SyncMode, peer: import('./peers.js').Peer | null }}
+ * @param {ClusterView|null} [cluster]
+ * @returns {{ mode: SyncMode, peer: import('./peers.js').Peer | null, local?: boolean, master?: string | null }}
  */
-export function storeTarget(config) {
+export function storeTarget(config, cluster = null) {
   const mode = accountSyncMode(config);
+  if (mode.mode === 'cluster') {
+    if (cluster?.isMaster()) return { mode, peer: null, local: true, master: instanceName(config) };
+    const peer = cluster?.masterPeer() || null;
+    return { mode, peer, local: false, master: peer ? cluster?.election.master ?? null : null };
+  }
   const peer = mode.mode === 'follow' ? configuredPeers(config).find(p => p.name === mode.peer) || null : null;
   return { mode, peer };
+}
+
+/**
+ * The master of a cluster as a one-shot command finds it, with no election
+ * of its own running: the first member, in order, that answers that it is
+ * the master. This machine is asked through its own proxy (loopback, its own
+ * key), since the running server is the one that knows. Null when none says so.
+ * @param {Record<string, any>} config
+ * @param {{ request?: typeof peerRequest }} [opts]
+ * @returns {Promise<{ local: boolean, peer: import('./peers.js').Peer | null, master: string } | null>}
+ */
+export async function findClusterMaster(config, { request = peerRequest } = {}) {
+  const mode = accountSyncMode(config);
+  if (mode.mode !== 'cluster') return null;
+  const self = instanceName(config);
+  const peers = configuredPeers(config);
+  const key = config.proxy?.apiKey;
+  const port = Number(config.proxy?.port) || 3456;
+  for (const name of mode.members) {
+    if (name === self) {
+      if (!key) continue;
+      const own = { name: self, url: `http://127.0.0.1:${port}`, apiKey: key };
+      if ((await askMember(own, { request }))?.role === 'master') return { local: true, peer: null, master: self };
+      continue;
+    }
+    const peer = peers.find(p => p.name === name);
+    if (peer && (await askMember(peer, { request }))?.role === 'master') return { local: false, peer, master: name };
+  }
+  return null;
 }
 
 /**
@@ -114,26 +163,42 @@ export function storeTarget(config) {
  * @param {Api} [opts.callback]
  * @param {() => Promise<boolean>} [opts.callbackSignedIn]
  * @param {typeof peerRequest} [opts.request]
+ * @param {ClusterView|null} [opts.cluster]  the running election, with a master and backups
  */
-export function createSyncTransport({ getConfig, store, callback = callbackCall, callbackSignedIn = async () => !!(await loadCallbackToken()), request = peerRequest }) {
+export function createSyncTransport({ getConfig, store, callback = callbackCall, callbackSignedIn = async () => !!(await loadCallbackToken()), request = peerRequest, cluster = null }) {
   /** @type {ReturnType<typeof storeTarget> | null} */
   let pinned = null;
-  const target = async () => (pinned ??= storeTarget(await getConfig()));
+  // A one-shot command has no election running: it asks the members who is
+  // master, once, when it pins.
+  const oneShot = async (/** @type {Record<string, any>} */ config) => {
+    const t = storeTarget(config, cluster);
+    if (t.mode.mode !== 'cluster' || cluster) return t;
+    const found = await findClusterMaster(config, { request }).catch(() => null);
+    return found ? { mode: t.mode, peer: found.peer, local: found.local, master: found.master } : t;
+  };
+  const target = async () => (pinned ??= await oneShot(await getConfig()));
   return {
     /** Point every later call at the store `config` names. @param {Record<string, any>} config */
     pin(config) {
-      pinned = storeTarget(config);
+      pinned = storeTarget(config, cluster);
     },
     /** Whether `config` names another store than the one pinned. @param {Record<string, any>} config */
     differs(config) {
-      return JSON.stringify(storeTarget(config)) !== JSON.stringify(pinned);
+      return JSON.stringify(storeTarget(config, cluster)) !== JSON.stringify(pinned);
     },
     /** @type {Api} */
     async api(method, path, params = null, opts = {}) {
-      const { mode, peer } = await target();
-      if (mode.mode === 'host') return store.call(method, path, params, opts);
+      const t = await target();
+      const { mode, peer } = t;
+      if (mode.mode === 'host' || (mode.mode === 'cluster' && t.local)) return store.call(method, path, params, opts);
       if (mode.mode === 'follow') {
         if (!peer) throw new Error(`no linked instance named ${safeLine(mode.peer, 64)} (accountSync.peer)`);
+        return peerStoreApi(peer, { request })(method, path, params, opts);
+      }
+      if (mode.mode === 'cluster') {
+        // No master: the same as a store that cannot be reached, so a
+        // renewal waits rather than going ahead unlocked.
+        if (!peer) throw new Error('no account store master is reachable');
         return peerStoreApi(peer, { request })(method, path, params, opts);
       }
       return callback(method, path, params, opts);
@@ -146,6 +211,10 @@ export function createSyncTransport({ getConfig, store, callback = callbackCall,
       return mode.mode !== 'off' || callbackSignedIn();
     },
     where() {
+      if (pinned?.mode.mode === 'cluster') {
+        if (pinned.local) return 'the account store on this machine (master)';
+        return pinned.master ? `the account store on ${safeLine(pinned.master, 64)} (master)` : 'the account store (no master reachable)';
+      }
       return storeLabel(pinned?.mode ?? { mode: 'off' });
     },
     /** The mode pinned, 'off' before the first pin. */

@@ -21,6 +21,15 @@
 //
 // A file that does not parse is never written over: a lost store would cost
 // every machine its sign-ins, so the operator decides what to do with it.
+//
+// With a master and backups (`accountSync.mode: "cluster"`, sync-cluster.js)
+// every member keeps such a file: the master answers the store's API, and
+// each backup holds a copy of the master's to take over with. The file says
+// how current it is with two counters: `rev`, raised by every write, and
+// `term`, raised each time a member takes over as master. A copy is newer
+// than another when its term is higher, or its term is the same and its rev
+// higher, so a member that comes back after a failover can tell that the
+// copy kept meanwhile is the one to take.
 
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
@@ -65,8 +74,25 @@ export function getSyncStorePath(configPath = getConfigPath()) {
 
 /**
  * @typedef {{ id: string, key: string, data: string, updated: number, lockedAt: number|null, lease?: string|null }} StoreRow
- * @typedef {{ v: number, rows: StoreRow[] }} StoreFile
+ * @typedef {{ v: number, term: number, rev: number, rows: StoreRow[] }} StoreFile
+ * @typedef {{ term: number, rev: number }} StorePosition
  */
+
+/**
+ * Whether position `a` is newer than `b`: a later term, or the same term
+ * and a later rev.
+ * @param {StorePosition} a
+ * @param {StorePosition} b
+ */
+export function isNewerPosition(a, b) {
+  return a.term > b.term || (a.term === b.term && a.rev > b.rev);
+}
+
+/** A count from a file or a reply: a whole number, 0 when it is not one. */
+function counter(/** @type {unknown} */ v) {
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
 
 /**
  * A row as callback.net's User/Credential answers it, which is what the sync reads.
@@ -93,7 +119,7 @@ function parseStore(text) {
     if (!r || typeof r.id !== 'string' || typeof r.key !== 'string' || typeof r.data !== 'string') continue;
     rows.push({ id: r.id, key: r.key, data: r.data, updated: Number(r.updated) || 0, lockedAt: Number.isFinite(r.lockedAt) ? r.lockedAt : null, lease: typeof r.lease === 'string' ? r.lease : null });
   }
-  return { v: STORE_VERSION, rows };
+  return { v: STORE_VERSION, term: counter(doc.term), rev: counter(doc.rev), rows };
 }
 
 /**
@@ -109,7 +135,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
     try {
       text = await readFile(path, 'utf8');
     } catch (/** @type {any} */ err) {
-      if (err?.code === 'ENOENT') return { v: STORE_VERSION, rows: [] };
+      if (err?.code === 'ENOENT') return { v: STORE_VERSION, term: 0, rev: 0, rows: [] };
       throw err;
     }
     return parseStore(text);
@@ -117,16 +143,21 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
 
   /**
    * Change the store under its lock. `fn` returns what the call answers and
-   * whether anything changed; nothing is written when nothing did.
+   * whether anything changed; nothing is written when nothing did. A write
+   * raises `rev`, unless `fn` set the position itself (a copy taken from
+   * the master keeps the master's).
    * @template T
-   * @param {(store: StoreFile) => { result: T, changed: boolean }} fn
+   * @param {(store: StoreFile) => { result: T, changed: boolean, positioned?: boolean }} fn
    * @returns {Promise<T>}
    */
   function update(fn) {
     return withConfigLock(path, async () => {
       const store = await load();
-      const { result, changed } = fn(store);
-      if (changed) await writeJsonAtomic(path, store);
+      const { result, changed, positioned = false } = fn(store);
+      if (changed) {
+        if (!positioned) store.rev += 1;
+        await writeJsonAtomic(path, store);
+      }
       return result;
     }, { strict: true }).catch((/** @type {any} */ err) => {
       if (err?.code === 'LOCK_BUSY') throw new SyncStoreError('error_store_busy', 'the account store is busy; try again');
@@ -244,18 +275,82 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now } = 
    */
   async function reseed() {
     return update((store) => {
-      let n = 0;
-      for (const row of store.rows) {
-        let blob;
-        try { blob = JSON.parse(row.data); } catch { continue; }
-        if (!blob || typeof blob !== 'object' || blob._deleted != null || typeof blob.refreshToken !== 'string' || blob.seeded) continue;
-        blob.seeded = true;
-        row.data = JSON.stringify(blob);
-        n++;
-      }
+      const n = markSeeds(store);
       return { result: n, changed: n > 0 };
     });
   }
 
-  return { path, call, reseed };
+  /**
+   * The whole file, for a backup to keep a copy of (sync-cluster.js). Read
+   * without the lock: every write replaces the file in one rename, so a read
+   * sees one version or the other.
+   * @returns {Promise<StoreFile>}
+   */
+  function snapshot() {
+    return load();
+  }
+
+  /** How current this copy is. @returns {Promise<StorePosition>} */
+  async function position() {
+    const { term, rev } = await load();
+    return { term, rev };
+  }
+
+  /**
+   * Make this file a copy of another member's (its `snapshot`), position
+   * included. What it is given is checked like a file read from disk, and an
+   * unreadable file here is still never written over.
+   * @param {unknown} snap
+   * @returns {Promise<StorePosition>}  the position now held
+   */
+  async function replaceWith(snap) {
+    const copy = parseStore(JSON.stringify(snap ?? null));
+    if (copy.rows.length > MAX_ROWS) throw new SyncStoreError('error_store_full', 'the copy holds more rows than a store may');
+    return update((store) => {
+      store.term = copy.term;
+      store.rev = copy.rev;
+      store.rows = copy.rows;
+      return { result: { term: copy.term, rev: copy.rev }, changed: true, positioned: true };
+    });
+  }
+
+  /**
+   * Start answering as the master, at `term`. Every row becomes a seed, as
+   * when a machine starts keeping the store: the copy may predate renewals
+   * made on the old master. A lock the copy holds is stamped as taken now,
+   * so a renewal that was under way on the old master keeps its row for a
+   * full lease and stores its token before anyone else renews that account.
+   * @param {number} term
+   * @returns {Promise<StorePosition>}
+   */
+  async function promote(term) {
+    return update((store) => {
+      store.term = counter(term);
+      store.rev += 1;
+      markSeeds(store);
+      const at = now();
+      for (const row of store.rows) if (row.lockedAt != null) row.lockedAt = at;
+      return { result: { term: store.term, rev: store.rev }, changed: true, positioned: true };
+    });
+  }
+
+  return { path, call, reseed, snapshot, position, replaceWith, promote };
+}
+
+/**
+ * Mark every token row of `store` as a seed, in place.
+ * @param {StoreFile} store
+ * @returns {number} how many rows were marked
+ */
+function markSeeds(store) {
+  let n = 0;
+  for (const row of store.rows) {
+    let blob;
+    try { blob = JSON.parse(row.data); } catch { continue; }
+    if (!blob || typeof blob !== 'object' || blob._deleted != null || typeof blob.refreshToken !== 'string' || blob.seeded) continue;
+    blob.seeded = true;
+    row.data = JSON.stringify(blob);
+    n++;
+  }
+  return n;
 }

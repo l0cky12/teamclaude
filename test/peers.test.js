@@ -52,7 +52,7 @@ test('parsePeerUrl keeps the relay inside the control plane', () => {
   assert.deepEqual(parsePeerUrl('/teamclaude/peers/server/status'), { name: 'server', rest: 'status' });
   assert.deepEqual(parsePeerUrl('/teamclaude/peers/my%20box/logs?after=3'), { name: 'my box', rest: 'logs?after=3' });
   assert.deepEqual(parsePeerUrl('/teamclaude/peers/s/login/start'), { name: 's', rest: 'login/start' });
-  for (const rest of ['', 'dashboard', 'mcp', 'peers/other/status', '../../v1/messages', '%2e%2e/v1/messages', 'Status', 'a//b']) {
+  for (const rest of ['', 'dashboard', 'mcp', 'peers/other/status', 'sync-store', 'sync-cluster', '../../v1/messages', '%2e%2e/v1/messages', 'Status', 'a//b']) {
     assert.equal(parsePeerUrl('/teamclaude/peers/s/' + rest)?.rest, null, rest);
   }
   assert.equal(parsePeerUrl('/teamclaude/peers'), null);

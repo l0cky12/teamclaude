@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { accountSyncOwnMode, accountSyncLine, peerSyncCell, accountSyncOutcome, accountSyncRequest } from '../src/dashboard.js';
+import { accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncOutcome, accountSyncRequest } from '../src/dashboard.js';
 
 // The Account sync card's words for a store one of your own instances keeps
 // (instance-sync.js): what the card and a Linked instances row say about a
@@ -49,4 +49,38 @@ test('what the switch answers', () => {
   assert.deepEqual(accountSyncOutcome({ ok: true, mode: 'off', peer: null }, 'mode', 'this machine'), { kind: 'ok', text: 'Off. The accounts stay where they are.' });
   assert.deepEqual(accountSyncOutcome({ ok: false, error: 'this machine is signed in to callback.net; sign out first, so it syncs with one store only' }, 'mode', 'this machine'),
     { kind: 'error', text: 'could not change account sync: this machine is signed in to callback.net; sign out first, so it syncs with one store only' });
+});
+
+// A master and backups (sync-cluster.js): the card names the master and this
+// machine's place, lists each member, and says when there is no master.
+test('the card and a Linked instances row for a master and backups', () => {
+  const cluster = (cl, self = 'desk') => view({ mode: 'cluster', members: ['server', 'desk', 'laptop'], self, cluster: cl });
+  const states = [
+    { name: 'server', self: false, state: 'up', role: 'master' },
+    { name: 'desk', self: true, state: 'up', role: 'backup' },
+    { name: 'laptop', self: false, state: 'down', role: null },
+  ];
+  const backup = cluster({ role: 'backup', master: 'server', memberStates: states });
+  assert.equal(accountSyncOwnMode(backup), 'cluster');
+  assert.deepEqual(accountSyncLine(backup, 'this machine'), { kind: 'ok', text: 'On: server is the master, and this machine keeps a copy to take over with. 3 accounts in the store.' });
+  assert.deepEqual(accountSyncMembers(backup).map(m => [m.kind, m.text]), [
+    ['ok', 'server: master'],
+    ['', 'desk (this machine): up, backup 1'],
+    ['error', 'laptop: down, backup 2'],
+  ]);
+  assert.deepEqual(accountSyncLine(cluster({ role: 'master', master: 'server', memberStates: [] }, 'server'), 'this machine'),
+    { kind: 'ok', text: 'On: this machine is the master. 3 accounts in the store.' });
+  assert.deepEqual(accountSyncLine(cluster({ role: 'follower', master: 'server', memberStates: [] }, 'pi'), 'pi'),
+    { kind: 'ok', text: 'On: server is the master, and pi follows it. 3 accounts in the store.' });
+  assert.deepEqual(accountSyncLine(cluster({ role: 'backup', master: null, reason: 'waiting to hear from server', memberStates: [] }), 'this machine'),
+    { kind: 'warn', text: 'On, with a master and backups, but there is no master right now: waiting to hear from server. Sign-ins that run out wait until there is one.' });
+
+  assert.deepEqual(peerSyncCell(backup, 200, view({ mode: 'off' })), { kind: 'ok', text: 'master and backups: a backup (master: server)', setUp: false });
+  assert.deepEqual(peerSyncCell(cluster({ role: 'master', master: 'server' }, 'server'), 200, view({ mode: 'off' })), { kind: 'ok', text: 'master and backups: the master', setUp: false });
+  assert.deepEqual(peerSyncCell(cluster({ role: 'backup', master: null }), 200, view({ mode: 'off' })), { kind: 'warn', text: 'master and backups: no master right now', setUp: false });
+
+  assert.deepEqual(accountSyncOutcome({ ok: true, mode: 'cluster', peer: null, members: ['server', 'desk'] }, 'mode', 'this machine'),
+    { kind: 'ok', text: 'On: master and backups server, desk. Set the same list, in the same order, on each of them. The first one up is the master.' });
+  // An older server, or another mode: no member lines.
+  assert.deepEqual(accountSyncMembers(view({ mode: 'host' })), []);
 });
