@@ -173,9 +173,12 @@ async function cluster(dir, names, { members = names, lists = {} } = {}) {
       accountSync: { mode: 'cluster', members: lists[name] || members },
       peers: names.filter(n => n !== name).map(n => ({ name: n, url: `http://${n}.test`, apiKey: `tc-${n}` })),
     };
-    const store = createSyncStore({ path: join(dir, `${name}.json`), now: () => clock, leaderName: () => name });
     const logs = [];
-    const node = { store, config, logs, changes: 0, monitor: /** @type {any} */ (null) };
+    const node = { store: /** @type {any} */ (null), config, logs, changes: 0, monitor: /** @type {any} */ (null) };
+    // Fenced as index.js fences the server's own store: only while the
+    // election makes this member master, and only while the file names it.
+    const store = createSyncStore({ path: join(dir, `${name}.json`), now: () => clock, leaderName: () => (node.monitor?.isMaster() ? name : '') });
+    node.store = store;
     // A request reaches the member the link's address names, unless the link is cut.
     const request = async (peer, rest, opts) => {
       const to = new URL(peer.url).hostname.replace(/\.test$/, '');
@@ -581,5 +584,138 @@ test('the check route answers only this machine\'s proxy key, and hands a copy o
   } finally {
     server.closeAllConnections?.();
     server.close();
+  }
+});
+
+// ---- Round-2 cases: locks, failed step-downs, deletions, long absences ------
+
+test('a lock any copy holds survives the merge, even when the other copy\'s token wins the tie', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  let clock = T0;
+  try {
+    const server = createSyncStore({ path: join(dir, 'server.json'), now: () => clock });
+    const desk = createSyncStore({ path: join(dir, 'desk.json'), now: () => clock });
+    const data = JSON.stringify({ v: 1, accessToken: 'a', refreshToken: 'r', expiresAt: T0 + 3600_000 });
+    const row = await server.call('POST', 'User/Credential', { Key: 'teamrouter.anthropic.both.org', Data: data });
+    await desk.replaceWith(await server.snapshot());
+    // Only desk's copy is locked: a renewal under way there. Same token, so
+    // the expiries tie and server's (own) row is the one kept.
+    await desk.call('POST', `User/Credential/${row.User_Credential__}:lock`, { timeout: 30 });
+    clock += 1000;
+    await server.promote(5, 'server', [await desk.snapshot()]);
+    const merged = (await server.snapshot()).rows[0];
+    assert.equal(merged.lockedAt, clock, 'locked, and for a full lease from the takeover');
+    await assert.rejects(server.call('POST', `User/Credential/${row.User_Credential__}:lock`, { timeout: 30 }), (e) => e.token === 'error_credential_locked');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a step-down whose write fence cannot be cleared stays pending: still master to the others, and nothing writes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 0; i < DOWN_AFTER_MISSES; i++) await c.round(['desk']);
+    assert.equal(c.m.desk.monitor.isMaster(), true);
+    const transport = createSyncTransport({ getConfig: () => c.m.desk.config, store: c.m.desk.store, cluster: c.m.desk.monitor });
+    transport.pin(c.m.desk.config);
+    const row = await transport.api('POST', 'User/Credential', { Key: 'teamrouter.anthropic.pending.org', Data: '{}' });
+
+    // server is back; desk's file is busy when it tries to step down.
+    const resign = c.m.desk.store.resign;
+    let busy = true;
+    c.m.desk.store.resign = async () => {
+      if (busy) throw new SyncStoreError('error_store_busy', 'the account store is busy; try again');
+      return resign();
+    };
+    c.cut.clear();
+    await c.round(['desk']);
+    assert.equal(c.m.desk.monitor.status().role, 'master', 'the others still see a master, so none takes over');
+    assert.equal(c.m.desk.monitor.isMaster(), false, 'but it takes no store call');
+    assert.match(c.m.desk.monitor.status().error, /write fence could not be cleared yet/);
+    await assert.rejects(transport.api('PATCH', `User/Credential/${row.User_Credential__}`, { Data: '{"late":true}' }), (e) => e.token === 'error_not_host');
+    await c.round(['server']);
+    assert.notEqual(c.m.server.monitor.role, 'master');
+    assert.match(c.m.server.monitor.election.reason, /waiting for desk to hand over/);
+
+    // The file is free again: the next round steps down, and server takes over.
+    busy = false;
+    for (let i = 0; i < 3; i++) await c.round(['desk', 'server']);
+    c.m.desk.store.resign = resign;
+    assert.deepEqual(c.answering(), ['server']);
+    const taken = (await c.m.server.store.snapshot()).rows.find(r => r.key === 'teamrouter.anthropic.pending.org');
+    assert.equal(taken.data, '{}', 'the late write never landed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('an account deleted while a member was away is not brought back by that member\'s copy', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['server', 'desk']);
+    await c.round();
+    const gone = await write(c.m.server.store, 'removed');
+    await c.round();
+    // server goes away; desk takes over and deletes the row (as the sync
+    // deletes an expired tombstone).
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 0; i < DOWN_AFTER_MISSES; i++) await c.round(['desk']);
+    assert.equal(c.m.desk.monitor.isMaster(), true);
+    const row = (await c.m.desk.store.snapshot()).rows.find(r => r.key === gone.Key);
+    c.tick(1000);
+    await c.m.desk.store.call('DELETE', `User/Credential/${row.id}`);
+    // Back again: server's copy is an ancestor of desk's and brings nothing.
+    c.cut.clear();
+    for (let i = 0; i < 4; i++) await c.round(['desk', 'server']);
+    assert.deepEqual(c.answering(), ['server']);
+    assert.deepEqual(await keys(c.m.server.store), []);
+
+    // A copy that is NOT an ancestor (the other side of a split, with a
+    // write of its own) still does not bring the deleted row back.
+    c.cut.add('desk>server').add('server>desk');
+    for (let i = 0; i < DOWN_AFTER_MISSES; i++) await c.round();
+    await write(c.m.server.store, 'kept');
+    const again = await write(c.m.desk.store, 'gone-again');
+    await c.m.server.store.replaceWith({ ...(await c.m.server.store.snapshot()) });
+    c.tick(1000);
+    await c.m.desk.store.call('DELETE', `User/Credential/${again.User_Credential__}`);
+    // server's side never saw gone-again at all; it is desk's own row that
+    // was deleted, and server's split-side write is kept.
+    c.cut.clear();
+    for (let i = 0; i < 6; i++) await c.round(['desk', 'server']);
+    assert.deepEqual(c.answering(), ['server']);
+    assert.deepEqual(await keys(c.m.server.store), ['teamrouter.anthropic.kept.org']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a member back from more than 64 terms behind is merged once, and the cluster then settles', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-sync-cluster-'));
+  try {
+    const c = await cluster(dir, ['desk', 'server']);
+    // server holds an old copy of its own, from term 1, with a row of its own.
+    await c.m.server.store.promote(1, 'server');
+    const extra = await c.m.server.store.snapshot();
+    extra.rows.push({ id: 'ucr-old', key: 'teamrouter.anthropic.old.org', data: JSON.stringify({ v: 1, accessToken: 'a', refreshToken: 'r', expiresAt: T0 }), updated: T0, lockedAt: null });
+    await c.m.server.store.replaceWith(extra);
+    // desk has been master for 70 terms since.
+    for (let t = 2; t <= 71; t++) await c.m.desk.store.promote(t, 'desk');
+    await c.m.desk.store.resign();
+    const seen = [];
+    for (let i = 0; i < 8; i++) {
+      await c.round(['desk', 'server']);
+      seen.push(`${c.roles().desk}/${c.roles().server}/${(await c.m.desk.store.position()).term}`);
+    }
+    // The last rounds change nothing: same roles, same term.
+    assert.equal(new Set(seen.slice(-4)).size, 1, seen.join(' '));
+    assert.deepEqual(c.answering(), ['desk']);
+    assert.ok(samePosition(await c.m.server.store.position(), await c.m.desk.store.position()), 'server took the merged copy');
+    assert.deepEqual(await keys(c.m.desk.store), ['teamrouter.anthropic.old.org']);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
   }
 });

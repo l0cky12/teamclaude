@@ -42,7 +42,15 @@
 // every call of the store's API — from this server, from a CLI command on
 // this machine, or from another machine — checks it under the file lock, so
 // a renewal still under way when the master steps down cannot write to a
-// store the next master has already copied.
+// store the next master has already copied. The server also refuses its own
+// calls the moment its election stops making it master (index.js), before
+// the file is even touched.
+//
+// A takeover merges the copies the members hold. A copy another one already
+// contains brings nothing (it would only bring back what was deleted since),
+// a lock any copy holds is kept, and `deleted` remembers the rows deleted
+// for a month, so a copy from the other side of a split cannot bring them
+// back either.
 
 import { readFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
@@ -88,12 +96,20 @@ export function getSyncStorePath(configPath = getConfigPath()) {
 /**
  * @typedef {{ id: string, key: string, data: string, updated: number, lockedAt: number|null, lease?: string|null }} StoreRow
  * @typedef {{ term: number, owner: string|null, rev: number }} TermMark
- * @typedef {{ v: number, term: number, rev: number, owner: string|null, leader: string|null, lineage: TermMark[], rows: StoreRow[] }} StoreFile
+ * @typedef {{ key: string, at: number }} DeletedMark
+ * @typedef {{ v: number, term: number, rev: number, owner: string|null, leader: string|null, lineage: TermMark[], deleted: DeletedMark[], rows: StoreRow[] }} StoreFile
  * @typedef {{ term: number, rev: number, owner?: string|null, lineage?: TermMark[] }} StorePosition
  */
 
-/** How many earlier terms a copy remembers. */
+/** How many earlier terms a copy remembers, beyond the copies a takeover merged. */
 const MAX_LINEAGE = 64;
+/**
+ * Rows deleted are remembered this long, and at most this many, so a copy
+ * that still holds one does not bring it back at a merge. Longer than the
+ * week a tombstone is kept before it is deleted (credential-sync.js).
+ */
+const DELETED_TTL_MS = 30 * 24 * 3600 * 1000;
+const MAX_DELETED = 1000;
 
 /**
  * Whether copy `a` already holds everything copy `b` does: `b` is `a` itself
@@ -119,9 +135,10 @@ export function contains(a, b) {
 function joinLineage(positions) {
   /** @type {Map<string, TermMark>} */
   const marks = new Map();
+  const keyOf = (/** @type {{ term: number, owner?: string|null }} */ m) => `${m.term}\u0000${m.owner ?? ''}`;
   const add = (/** @type {TermMark} */ m) => {
     if (m.term === 0 && m.rev === 0) return;
-    const k = `${m.term}\u0000${m.owner ?? ''}`;
+    const k = keyOf(m);
     const held = marks.get(k);
     if (!held || m.rev > held.rev) marks.set(k, { term: m.term, owner: m.owner ?? null, rev: m.rev });
   };
@@ -129,7 +146,18 @@ function joinLineage(positions) {
     for (const m of p.lineage || []) add(m);
     add({ term: p.term, owner: p.owner ?? null, rev: p.rev });
   }
-  return [...marks.values()].sort((x, y) => y.term - x.term || y.rev - x.rev).slice(0, MAX_LINEAGE);
+  // The copies merged now are always kept, however old their term: a
+  // member that returned from far behind has to find its copy contained,
+  // or the next round would merge it all over again. The rest are the
+  // latest terms, up to MAX_LINEAGE.
+  const inputs = new Set(positions.filter(p => !(p.term === 0 && p.rev === 0)).map(keyOf));
+  const all = [...marks.values()].sort((x, y) => y.term - x.term || y.rev - x.rev);
+  const kept = all.filter(m => inputs.has(keyOf(m)));
+  for (const m of all) {
+    if (kept.length >= MAX_LINEAGE + inputs.size) break;
+    if (!inputs.has(keyOf(m))) kept.push(m);
+  }
+  return kept.sort((x, y) => y.term - x.term || y.rev - x.rev);
 }
 
 /** A lineage from a file or a reply. @param {unknown} v @returns {TermMark[]} */
@@ -137,7 +165,8 @@ export function lineageOf(v) {
   if (!Array.isArray(v)) return [];
   /** @type {TermMark[]} */
   const out = [];
-  for (const m of v.slice(0, MAX_LINEAGE)) {
+  // Room for the merged copies of a full list of members (sync-cluster.js MAX_MEMBERS).
+  for (const m of v.slice(0, MAX_LINEAGE + 16)) {
     if (!m || typeof m !== 'object') continue;
     const term = counter(m.term);
     const rev = counter(m.rev);
@@ -173,14 +202,27 @@ function tokenExpiry(row) {
  * forward), else the one written later. What a stale copy brings back is
  * harmless: a takeover marks every row as a seed, and a seed never replaces
  * a newer token any machine holds.
+ *
+ * The lock is merged apart from the token: a row any copy holds locked stays
+ * locked (the latest lock and its lease), whichever copy's token wins, so a
+ * renewal under way on the copy that lost is still waited for. A row a copy
+ * deleted (`deleted`, see DELETE) after it was last written is not brought
+ * back by a copy that still holds it.
  * @param {StoreRow[][]} copies  the first is this machine's own
+ * @param {DeletedMark[]} [deleted]
  * @returns {StoreRow[]}
  */
-export function mergeRows(copies) {
+export function mergeRows(copies, deleted = []) {
   /** @type {Map<string, StoreRow>} */
   const byKey = new Map();
+  /** @type {Map<string, StoreRow>} the latest lock seen per key */
+  const locks = new Map();
   for (const rows of copies) {
     for (const row of rows) {
+      if (row.lockedAt != null) {
+        const l = locks.get(row.key);
+        if (!l || /** @type {number} */ (row.lockedAt) > /** @type {number} */ (l.lockedAt)) locks.set(row.key, row);
+      }
       const held = byKey.get(row.key);
       if (!held) { byKey.set(row.key, { ...row }); continue; }
       const a = tokenExpiry(held);
@@ -189,7 +231,46 @@ export function mergeRows(copies) {
       if (wins) byKey.set(row.key, { ...row });
     }
   }
-  return [...byKey.values()].slice(0, MAX_ROWS);
+  /** @type {Map<string, number>} */
+  const gone = new Map();
+  for (const d of deleted) gone.set(d.key, Math.max(gone.get(d.key) ?? 0, d.at));
+  /** @type {StoreRow[]} */
+  const out = [];
+  for (const row of byKey.values()) {
+    const at = gone.get(row.key);
+    if (at != null && row.updated <= at) continue;
+    const l = locks.get(row.key);
+    if (l) { row.lockedAt = l.lockedAt; row.lease = l.lease ?? null; }
+    out.push(row);
+  }
+  return out.slice(0, MAX_ROWS);
+}
+
+/**
+ * The copies a takeover merges, without those another copy already
+ * contains: an ancestor holds nothing its descendant lacks, and merging its
+ * rows would bring back what the descendant deleted. Of copies at the same
+ * position, the first is kept.
+ * @template {StorePosition} T
+ * @param {T[]} copies
+ * @returns {T[]}
+ */
+export function newestCopies(copies) {
+  return copies.filter((c, i) => !copies.some((d, j) => j !== i && contains(d, c) && (!contains(c, d) || j < i)));
+}
+
+/**
+ * The deletion marks of several copies, each key once at its latest
+ * deletion, the old ones dropped.
+ * @param {DeletedMark[][]} lists
+ * @param {number} now
+ * @returns {DeletedMark[]}
+ */
+function joinDeleted(lists, now) {
+  /** @type {Map<string, number>} */
+  const at = new Map();
+  for (const list of lists) for (const d of list) if (now - d.at < DELETED_TTL_MS) at.set(d.key, Math.max(at.get(d.key) ?? 0, d.at));
+  return [...at].map(([key, t]) => ({ key, at: t })).sort((x, y) => y.at - x.at).slice(0, MAX_DELETED);
 }
 
 /**
@@ -233,7 +314,12 @@ function parseStore(text) {
     if (!r || typeof r.id !== 'string' || typeof r.key !== 'string' || typeof r.data !== 'string') continue;
     rows.push({ id: r.id, key: r.key, data: r.data, updated: Number(r.updated) || 0, lockedAt: Number.isFinite(r.lockedAt) ? r.lockedAt : null, lease: typeof r.lease === 'string' ? r.lease : null });
   }
-  return { v: STORE_VERSION, term: counter(doc.term), rev: counter(doc.rev), owner: nameOf(doc.owner), leader: nameOf(doc.leader), lineage: lineageOf(doc.lineage), rows };
+  /** @type {DeletedMark[]} */
+  const deleted = [];
+  for (const d of Array.isArray(doc.deleted) ? doc.deleted.slice(0, MAX_DELETED) : []) {
+    if (d && typeof d.key === 'string' && Number.isFinite(d.at)) deleted.push({ key: d.key, at: d.at });
+  }
+  return { v: STORE_VERSION, term: counter(doc.term), rev: counter(doc.rev), owner: nameOf(doc.owner), leader: nameOf(doc.leader), lineage: lineageOf(doc.lineage), deleted, rows };
 }
 
 /** A member name from a file, or null. @param {unknown} v */
@@ -268,7 +354,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now, lea
     try {
       text = await readFile(path, 'utf8');
     } catch (/** @type {any} */ err) {
-      if (err?.code === 'ENOENT') return { v: STORE_VERSION, term: 0, rev: 0, owner: null, leader: null, lineage: [], rows: [] };
+      if (err?.code === 'ENOENT') return { v: STORE_VERSION, term: 0, rev: 0, owner: null, leader: null, lineage: [], deleted: [], rows: [] };
       throw err;
     }
     return parseStore(text);
@@ -396,8 +482,11 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now, lea
     }
     if (method === 'DELETE') {
       return write((store) => {
-        find(store, id);
+        const row = find(store, id);
         store.rows = store.rows.filter(r => r.id !== id);
+        // Remembered, so a copy that still holds the row (a member that was
+        // away) does not bring it back at the next takeover (mergeRows).
+        store.deleted = joinDeleted([[{ key: row.key, at: now() }], store.deleted], now());
         return { result: { ok: true }, changed: true };
       });
     }
@@ -449,6 +538,7 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now, lea
       store.rev = copy.rev;
       store.owner = copy.owner;
       store.lineage = copy.lineage;
+      store.deleted = copy.deleted;
       // A copy is never led from here: only a takeover sets the fence.
       store.leader = null;
       store.rows = copy.rows;
@@ -485,9 +575,15 @@ export function createSyncStore({ path = getSyncStorePath(), now = Date.now, lea
   async function promote(term, name, copies = []) {
     const others = copies.map(c => parseStore(JSON.stringify(c ?? null)));
     return update((store) => {
-      store.rows = mergeRows([store.rows, ...others.map(o => o.rows)]);
+      const all = [store, ...others];
+      // Only the copies no other copy contains bring rows (newestCopies),
+      // judged on the positions as they were, before this store's changes.
+      const newest = newestCopies(all.map(c => ({ ...c })));
+      const deleted = joinDeleted(all.map(c => c.deleted), now());
       // Every copy taken in, this one included, is part of the new term.
-      store.lineage = joinLineage([store, ...others]);
+      store.lineage = joinLineage(all);
+      store.rows = mergeRows(newest.map(c => c.rows), deleted);
+      store.deleted = deleted;
       store.term = counter(term);
       store.rev += 1;
       store.owner = name;

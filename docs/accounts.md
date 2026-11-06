@@ -265,7 +265,7 @@ Every machine walks the same list, so they all reach the same answer. Taking ove
 
 1. The machine says it is a **candidate**. Every check of it says so from then on.
 2. It checks every member again, there and then. It backs off if a member above it answers, or if any member says it is a candidate or the master. If two candidates see each other, both back off. The walk then makes the lower one a backup, and the higher one tries again at its next check.
-3. It merges the copies of the store held by every member that answered, row by row. For the same account, the later token wins. It then starts a new *term*, numbered above every term it has seen, and marks every row as a seed, as when a machine starts keeping the store (see above). A newer token on any machine still wins over the merged copy. A row that was locked for a renewal on the old master stays locked for a full lease (30 seconds), so that renewal can store its token first.
+3. It merges the copies of the store held by every member that answered, row by row. For the same account, the later token wins. A copy that another copy already contains brings nothing, so it can't restore an account deleted since. Deleted rows are also remembered for a month, so a copy from the other side of a split can't restore them either. A row locked in any copy stays locked. It then starts a new *term*, numbered above every term it has seen, and marks every row as a seed, as when a machine starts keeping the store (see above). A newer token on any machine still wins over the merged copy. A row that was locked for a renewal on the old master stays locked for a full lease (30 seconds), so that renewal can store its token first.
 
 A master steps down when any of these happens:
 
@@ -274,7 +274,7 @@ A master steps down when any of these happens:
 - Another member says it is a candidate or the master.
 - A member holds writes its own copy lacks.
 
-Stepping down first clears the store's *write fence*, while this machine still says it is master. The store file names the machine it is answered by. Every store call checks that name inside the file lock, whether it comes from this server, from a CLI command on this machine, or from another machine. So once the fence is cleared, a renewal still running on the old master can no longer write. The copy the next master takes is then final.
+Stepping down first clears the store's *write fence*, while this machine still says it is master. From that moment, this server also takes no store call of its own. If the fence can't be cleared because the store file is busy, the step-down stays pending. The machine keeps saying it is master, so nobody takes over yet, and it tries again at each check. The store file names the machine it is answered by. Every store call checks that name inside the file lock, whether it comes from this server, from a CLI command on this machine, or from another machine. So once the fence is cleared, a renewal still running on the old master can no longer write. The copy the next master takes is then final.
 
 Each copy remembers which terms it has taken in, and how far into each. A backup replaces its copy with the master's only when the master's copy already contains it. A copy holding writes the master lacks, such as the other side of a network split, is kept. The master steps down for it and merges it in at a new term.
 

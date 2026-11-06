@@ -520,7 +520,13 @@ async function serverCommand() {
   // one the running election names: this machine's own while it is the
   // master, the master's otherwise. A change of master moves the sync the
   // way a change of setting does, once the operations under way are done.
-  const syncStore = createSyncStore({ leaderName: () => (accountSyncMode(config).mode === 'cluster' ? instanceName(config) : null) });
+  // With a master and backups, a call here goes ahead only while the
+  // election says this machine is master AND the file names it (sync-store.js):
+  // the first stops this server's own renewals the moment it steps down,
+  // the second a CLI command's. '' is a name no file holds: refused.
+  const syncStore = createSyncStore({
+    leaderName: () => (accountSyncMode(config).mode !== 'cluster' ? null : syncCluster.isMaster() ? instanceName(config) : ''),
+  });
   const syncCluster = new ClusterMonitor({
     getConfig: () => config,
     store: syncStore,

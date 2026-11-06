@@ -230,6 +230,8 @@ export class ClusterMonitor {
     this._round = null;
     /** Stepping down: the fence is being cleared, and no new store call is taken. */
     this._resigning = false;
+    /** A step-down whose fence is still to be cleared. @type {{ why: string, next: ClusterRole } | null} */
+    this._pendingResign = null;
   }
 
   /** Check every CLUSTER_CHECK_MS, and once now. Does nothing while the setting is not a cluster. */
@@ -282,9 +284,15 @@ export class ClusterMonitor {
   }
 
   async _tick() {
+    // A step-down whose fence could not be cleared comes first, and until it
+    // goes through nothing else does: this machine still says master.
+    if (this._pendingResign) {
+      const p = this._pendingResign;
+      if (!(await this._resign(p.why, p.next))) return;
+    }
     const setting = this.setting();
     if (!setting) {
-      if (this.role === 'master') await this._resign('the account store is no longer kept by a master and backups', 'off');
+      if (this.role === 'master' && !(await this._resign('the account store is no longer kept by a master and backups', 'off'))) return;
       else if (this.role !== 'off') this._setRole('off', null);
       this.views.clear();
       this._for = '';
@@ -297,7 +305,7 @@ export class ClusterMonitor {
       // Another list, or another name for this machine: what was heard about
       // the old one says nothing about the new, and a master elected under
       // the old one is not elected under this one.
-      if (this.role === 'master') await this._resign('the member list changed', 'backup');
+      if (this.role === 'master' && !(await this._resign('the member list changed', 'backup'))) return;
       this.views.clear();
       this._for = key;
     }
@@ -314,8 +322,10 @@ export class ClusterMonitor {
       await this._lead(members, self);
     } else {
       const role = members.includes(self) ? 'backup' : 'follower';
-      if (this.role === 'master') await this._resign(election.master ? `${election.master} is up again` : election.reason || 'no member is up', role);
-      else if (this.role !== role) this._setRole(role, null);
+      if (this.role === 'master') {
+        // Pending until the fence is cleared: nothing else this round.
+        if (!(await this._resign(election.master ? `${election.master} is up again` : election.reason || 'no member is up', role))) return;
+      } else if (this.role !== role) this._setRole(role, null);
       if (role === 'backup' && election.master) await this._follow(election.master);
     }
     if (before !== this.election.master) {
@@ -378,8 +388,8 @@ export class ClusterMonitor {
     const up = members.filter(n => n !== self && this.views.get(n)?.state === 'up');
     const conflict = this._conflict(members, up);
     if (this.role === 'master') {
-      if (conflict) await this._resign(conflict, 'backup');
-      else return;
+      if (!conflict) return;
+      if (!(await this._resign(conflict, 'backup'))) return;
     }
     if (conflict) {
       this._hold(conflict);
@@ -509,22 +519,28 @@ export class ClusterMonitor {
    * Stop answering as master. The fence is cleared first, while checks of
    * this machine still say master, so nobody takes its copy before the last
    * write here has landed or been refused. Until then isMaster() is already
-   * false: this server takes no new store call.
+   * false: this server takes no new store call, its own included.
+   *
+   * When the fence cannot be cleared (the file is busy, say), the step-down
+   * stays pending: checks keep saying master, so no member takes over from
+   * a copy that could still change, and every round tries again first.
    * @param {string} why
    * @param {ClusterRole} next
+   * @returns {Promise<boolean>}  whether this machine has stepped down
    */
   async _resign(why, next) {
     this._resigning = true;
     try {
       this.position = await this.store.resign();
     } catch (/** @type {any} */ err) {
-      // The fence could not be cleared: say master no longer anyway (no new
-      // call is taken), and try again at the next step-down.
-      this.lastError = `could not clear the account store's write fence: ${safeLine(err?.message || String(err), 160)}`;
-    } finally {
-      this._resigning = false;
+      this._pendingResign = { why, next };
+      this.lastError = `stepping down as master, but the account store's write fence could not be cleared yet: ${safeLine(err?.message || String(err), 160)}`;
+      return false;
     }
+    this._pendingResign = null;
+    this._resigning = false;
     this._setRole(next, why);
+    return true;
   }
 
   /** First in line, not taking over yet: nobody is master from here. @param {string} why */
