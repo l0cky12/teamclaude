@@ -68,6 +68,31 @@ It runs from any directory. It finds the checkout it lives in. What it does:
 
 The proxy stays up during the build, and a failed update rolls back, so an agent that uses the proxy can run the script itself. The service is `teamclaude` by default. Set `TEAMCLAUDE_SERVICE` to use another one, and `COMPOSE_FILE` if your compose file is not in the checkout root. A shell alias makes it one word: `alias tc-update=~/path/to/teamclaude/scripts/redeploy.sh`.
 
+#### Updating a compose deployment on a schedule
+
+To run that script on a schedule, on the host, in the checkout that has your `docker-compose.yml`:
+
+```bash
+node src/index.js update compose install            # every day
+node src/index.js update compose install --every 12h
+node src/index.js update compose status
+node src/index.js update compose uninstall
+```
+
+`teamclaude update compose install` is the same command when this checkout is the `teamclaude` on your PATH. It installs a per-user timer (systemd on Linux, a LaunchAgent on macOS). It does not start a second proxy. The timer runs `scripts/redeploy.sh`:
+
+1. `git pull --ff-only` of the branch that is checked out. A failed pull stops there, and the running proxy is left as it is.
+2. `docker compose build`, while the old container keeps serving. When that container is already running this commit, the script stops before the build and does not restart anything.
+3. `docker compose up -d`. The proxy is down only for the container swap. If the new container does not become healthy, the previous image is put back.
+
+Nothing runs until you install the timer. Intervals are `15m` to `30d`; the default is `1d`. `print` writes the unit to the terminal and changes nothing. `"autoUpdate": false` does not remove the timer; `uninstall` does.
+
+Run it on the host. The container has no copy of the checkout and no Docker socket, and auto-update is disabled in the image, so the command refuses to install from inside the container. Install it on a branch you are willing to have built on its own: the timer fast-forwards whatever is checked out.
+
+On Linux the units are `teamclaude-compose-update.service` and `.timer` under `~/.config/systemd/user/`. Logs: `journalctl --user --unit teamclaude-compose-update.service`. A missed day runs at the next login, which includes installing the timer after today's slot has passed. That run pulls, and it rebuilds only when the container is not already on the checked-out commit. The timer stops when your last login session ends, unless lingering is on (`loginctl enable-linger $USER`). On macOS the LaunchAgent waits one interval after install before the first run, and logs to `~/Library/Logs/teamclaude-compose-update.log`.
+
+Git has to be able to pull without asking. The timer runs as your user and has no terminal, so a credential helper or an ssh key that does not prompt is what makes the pull succeed. A pull that waits for a password fails, and the running proxy is left as it is.
+
 #### Previewing a branch
 
 `docker/docker-compose.preview.yml` builds a second proxy from a checkout and runs it beside the one you use, for trying a branch's dashboard from another machine on your [Tailscale](https://tailscale.com) network. Every `docker compose` command for it needs `TAILSCALE_IP`, so export it once:
@@ -311,6 +336,7 @@ teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude callback login    # Sign in to callback.net: keep OAuth tokens in step across your installs
 teamclaude callback status   # (also: sync, logout) — see docs/accounts.md
 teamclaude update            # Check npm for a newer teamclaude and install it
+teamclaude update compose install  # Schedule git pull, docker compose build, docker compose up -d
 teamclaude version           # Print the installed version
 teamclaude help              # Show all commands
 ```
@@ -531,11 +557,11 @@ It speaks both the stateless 2026-07-28 revision of the protocol and the handsha
 
 ## Auto-update
 
-When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never touched — update that with `git pull`. Run `teamclaude update` to update on demand.
+When TeamClaude is installed globally via npm, it self-updates in the background: it checks the npm registry at most once a day, and when a newer version is published it runs `npm install -g @karpeleslab/teamclaude@latest` and applies it on the next launch. The check runs after a `teamclaude run` session ends and when a headless server starts. In a headless server the install runs as a background child process, so the proxy keeps serving requests while npm works (a synchronous install used to stall it for the duration). A git checkout is never updated by npm. Update it with `git pull`, or, when that checkout is what `docker compose` builds, with [`teamclaude update compose install`](#updating-a-compose-deployment-on-a-schedule). Run `teamclaude update` to update an npm install on demand.
 
 Only an npm global install is updated in place. Any other copy gets a notice when a newer version is out. A pnpm global install is recognized: the notice names `pnpm add -g @karpeleslab/teamclaude@latest`, and `teamclaude update` prints that command instead of running npm, which would install a second copy and leave the one on your PATH as it was. Update a copy that another tool installed, such as Yarn or Bun, with that tool as well.
 
-Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config.
+Disable it with `TEAMCLAUDE_DISABLE_AUTOUPDATE=1` or `"autoUpdate": false` in the config. Neither one schedules or cancels the compose timer above. The published container image leaves this check off and does not include npm; upgrade that image by pulling a new tag, or build it from a checkout and use the timer.
 
 ## Request logging
 

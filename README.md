@@ -47,7 +47,7 @@ A git checkout never updates itself. Use `git pull` to update it.
 
 **Other ways to run it:**
 
-- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container). If you build it with `docker compose` from a checkout, `scripts/redeploy.sh` pulls, rebuilds and restarts it in one command, and rolls back if the new build is unhealthy. See [Updating a compose deployment](docs/usage.md#updating-a-compose-deployment-in-one-command).
+- **Docker:** `ghcr.io/karpeleslab/teamclaude`. See [Running in a container](docs/usage.md#running-in-a-container). If you build it with `docker compose` from a checkout, `scripts/redeploy.sh` pulls, rebuilds and restarts it in one command, and rolls back if the new build is unhealthy. `teamclaude update compose install`, run on the host from that checkout, does the same on a schedule. See [Updating a compose deployment](docs/usage.md#updating-a-compose-deployment-in-one-command).
 - **Nix:** a flake with NixOS and Home Manager modules. See [nix/README.md](nix/README.md).
 - **As a background service:** `teamclaude service install` starts the proxy at login and restarts it if it stops (systemd on Linux, a LaunchAgent on macOS).
 
@@ -159,7 +159,7 @@ Turn on the MCP endpoint (`"proxy": { "mcp": "read" }`) and Claude Code can chec
 
 The optional features that make extra calls or use quota are off until you turn them on: quota probing, keep-warm requests, extra usage, spending resets, holding requests, MCP and session titles.
 
-Two things do run on their own. Sign-ins are refreshed before they expire. An npm install also checks for a new version at most once a day and installs it; turn that off with `"autoUpdate": false` or `TEAMCLAUDE_DISABLE_AUTOUPDATE=1`.
+Two things do run on their own. Sign-ins are refreshed before they expire. An npm install also checks for a new version at most once a day and installs it; turn that off with `"autoUpdate": false` or `TEAMCLAUDE_DISABLE_AUTOUPDATE=1`. A docker compose checkout is not updated by that check. From the checkout, on the host, `teamclaude update compose install` schedules `scripts/redeploy.sh` (`git pull`, `docker compose build`, `docker compose up -d`).
 
 ## What's new in this fork
 
