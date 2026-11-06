@@ -1767,7 +1767,7 @@ export class TUI {
       login.error = null;
     } else if (!login.buf && k === 'c') {
       if (this._copyLoginUrl(login)) login.notice = 'Sent again.';
-    } else if (k.length === 1 && fieldText(k)) {
+    } else if (k.length === 1 && fieldText(k) && !login.prompt?.userCode) {
       login.buf += k;
       login.error = null;
     }
@@ -1780,6 +1780,10 @@ export class TUI {
    * @param {LoginPanel} login
    */
   _submitLogin(login) {
+    // A device sign-in (Grok) has nothing to paste: it finishes when the code
+    // is approved on xAI's page. Whatever reached the field is dropped rather
+    // than submitted, which would close the panel while the flow still polls.
+    if (login.prompt?.userCode) { login.buf = ''; return; }
     if (!login.prompt || !login.buf.trim()) return;
     try {
       // false means nothing was left to settle (the browser got there first),
@@ -3773,6 +3777,8 @@ export class TUI {
         // is only offered then.
         const login = this.login;
         const panelKeys = login?.prompt && !login.buf ? `  ${bold('c')} copy link` : '';
+        // A device sign-in takes no paste (see _submitLogin).
+        if (login?.prompt?.userCode) return ` ${bold('Esc')} cancel${panelKeys}`;
         return ` ${bold('Enter')} submit  ${bold('Esc')} cancel${panelKeys}`;
       }
       default:
