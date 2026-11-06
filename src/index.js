@@ -52,6 +52,7 @@ import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
+import { COMPOSE_UPDATE_USAGE, envAssignments, installComposeUpdate, uninstallComposeUpdate, composeUpdateStatus, renderComposeUpdate } from './compose-update.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
 import { parseRoutingUrl, routingToUrl, describeRouting, checkRouting } from './account-routing.js';
@@ -2922,6 +2923,76 @@ async function distributeCommand() {
 
 // ── update ──────────────────────────────────────────────────
 
+// The compose timer is a host unit. It is not the npm self-update, and it
+// is refused inside the container, which cannot see the checkout or Docker.
+async function composeUpdateCommand() {
+  const sub = args[2] || 'status';
+  if (sub.startsWith('-') || !['install', 'uninstall', 'status', 'print'].includes(sub)) {
+    console.error(COMPOSE_UPDATE_USAGE);
+    process.exit(1);
+  }
+  const everyFlag = argValue('--every');
+  if ((sub === 'install' || sub === 'print') && args.includes('--every') && !everyFlag) {
+    console.error('teamclaude update compose: --every needs a value, for example 12h or 1d');
+    process.exit(1);
+  }
+  const envItems = [];
+  if (sub === 'install' || sub === 'print') {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] !== '--env') continue;
+      const value = args[i + 1];
+      if (!value || value.startsWith('-')) {
+        console.error('teamclaude update compose: --env needs KEY=VALUE');
+        process.exit(1);
+      }
+      envItems.push(value);
+      i++;
+    }
+  }
+  const assigned = envAssignments(envItems);
+  if (assigned.ok === false) {
+    console.error(`teamclaude update compose: ${assigned.error}`);
+    process.exit(1);
+  }
+  const env = { ...process.env, ...assigned.values };
+  if (sub === 'install') {
+    const res = await installComposeUpdate({ every: everyFlag || '1d', env });
+    if (res.ok === false) {
+      console.error(`teamclaude update compose install failed: ${res.error}`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'uninstall') {
+    const res = await uninstallComposeUpdate();
+    if (res.ok === false) {
+      console.error(`teamclaude update compose uninstall failed: ${res.error}`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (sub === 'print') {
+    const res = renderComposeUpdate({ every: everyFlag || '1d', env });
+    if (res.ok === false) {
+      console.error(`teamclaude update compose print failed: ${res.error}`);
+      process.exit(1);
+    }
+    process.stdout.write(res.text);
+    return;
+  }
+  const s = await composeUpdateStatus();
+  if (!s.supported || s.refused) {
+    console.error(`teamclaude update compose: ${s.detail}`);
+    process.exit(1);
+  }
+  console.log(`Timer:    ${s.installed ? s.file : 'not installed'}`);
+  console.log(`State:    ${s.active ? 'active' : s.detail}`);
+  if (s.checkout) console.log(`Checkout: ${s.checkout}`);
+  if (s.every) console.log(`Every:    ${s.every}`);
+  if (s.next) console.log(`Next:     ${s.next}`);
+  if (s.logs) console.log(`Logs:     ${s.logs}`);
+}
+
 // ── callback.net ────────────────────────────────────────────
 
 /** `Name <email>`, whichever parts the profile has. */
@@ -3044,12 +3115,18 @@ async function callbackCommand() {
 }
 
 async function updateCommand() {
+  if (args[1] === 'compose') {
+    await composeUpdateCommand();
+    return;
+  }
   const cur = currentVersion();
   console.log(`Current version: ${cur || 'unknown'}`);
 
   const kind = await installKind();
   if (kind === 'git') {
-    console.log('This is a git checkout — update it with `git pull`, not npm.');
+    console.log('This is a git checkout — npm will not update it.');
+    console.log('A docker compose checkout updates on a schedule with: teamclaude update compose install');
+    console.log('That runs scripts/redeploy.sh: git pull, docker compose build, docker compose up -d.');
     return;
   }
   // `npm install -g` would put a second copy in npm's global directory and
@@ -3429,6 +3506,12 @@ Commands:
   callback sync       Reconcile the running server with the store now
   callback logout     Revoke that session and forget it
   update              Check npm for a newer teamclaude and install it
+  update compose      Schedule an update of a docker compose checkout:
+                      git pull, docker compose build, docker compose up -d
+                      (install | uninstall | status | print; --every 1d;
+                      --env KEY=VALUE for a compose variable the timer must keep).
+                      Off until you install it. Run on the host, in the
+                      checkout, not inside the container.
   version             Print the installed version
   help                Show this help
 
@@ -3528,7 +3611,10 @@ them) pins those. Held requests wait up to holdSeconds (default 120), then get a
 
 A global npm install self-updates in the background (checked once/day, applied
 on the next launch). Disable with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or
-"autoUpdate": false in the config.
+"autoUpdate": false in the config. A git checkout is not updated that way.
+From the checkout docker compose builds, on the host: teamclaude update
+compose install schedules scripts/redeploy.sh (git pull, docker compose
+build, docker compose up -d).
 
 Config: ${getConfigPath()} (a ~/.config/teamrouter.json is used when it exists)
 Crash log: ${getCrashLogPath()} (server; written when the process dies unexpectedly)
