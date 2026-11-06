@@ -196,44 +196,62 @@ test('a cancelled device sign-in stops polling', async () => {
 });
 
 /**
- * An issuer that answers the device request, then stalls the way a dead
- * connection does: `body` sends the poll's headers and never finishes the
- * body, `headers` never answers at all, and `start` stalls the device request.
- * @param {'body'|'headers'|'start'} where
+ * A fetch for a device sign-in that stalls at one phase and says when it got
+ * there: `start` never answers the device request, `headers` never answers the
+ * poll, and `body` answers the poll's headers and then never finishes its body.
+ * The deadline is a timer the test fires itself, once the stall is reached, so
+ * nothing here waits on the clock.
+ * @param {'start'|'headers'|'body'} where
  */
-async function stallingServer(where) {
-  const server = http.createServer((req, res) => {
-    req.resume();
-    req.on('end', () => {
-      if (req.url === '/d' && where !== 'start') {
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ device_code: 'd', user_code: 'AB', verification_uri: 'https://accounts.example/device', interval: 1 }));
-      } else if (where === 'body') {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.write('{"error":');
-      }
-    });
+function stallingIssuer(where) {
+  /** @type {() => void} */
+  let reached = () => {};
+  const stalled = new Promise(resolve => { reached = () => resolve(undefined); });
+  /** @type {Array<{ fn: () => void, ms: number, cleared: boolean }>} */
+  const armed = [];
+  const timers = {
+    set: (/** @type {() => void} */ fn, /** @type {number} */ ms) => { const t = { fn, ms, cleared: false }; armed.push(t); return t; },
+    clear: (/** @type {any} */ t) => { if (t) t.cleared = true; },
+  };
+  const never = () => new Promise(() => {});
+  const fetchImpl = /** @type {any} */ (async (/** @type {string} */ url) => {
+    if (url.endsWith('/d')) {
+      if (where === 'start') { reached(); return never(); }
+      return { status: 200, ok: true, text: async () => JSON.stringify({ device_code: 'd', user_code: 'AB', verification_uri: 'https://accounts.example/device' }) };
+    }
+    if (where === 'headers') { reached(); return never(); }
+    // Headers in, and the body read is where it stops.
+    return { status: 400, ok: false, text: () => { reached(); return never(); } };
   });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(undefined)));
-  const { port } = /** @type {import('node:net').AddressInfo} */ (server.address());
-  return { url: `http://127.0.0.1:${port}`, close: () => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); } };
+  /** Fire the deadline armed last, as if its time had come. */
+  const expire = () => {
+    const live = armed.filter(t => !t.cleared);
+    assert.ok(live.length > 0, 'no deadline was armed');
+    live[live.length - 1].fn();
+  };
+  return { fetchImpl, timers, stalled, armed, expire };
 }
 
 for (const where of /** @type {const} */ (['body', 'headers'])) {
-  test(`a device sign-in whose poll stalls (${where}) still ends at its deadline`, async () => {
-    const srv = await stallingServer(where);
-    try {
-      const flow = await startGrokLogin({ deviceEndpoint: `${srv.url}/d`, tokenEndpoint: `${srv.url}/t`, timeoutMs: 200, wait: async () => {} });
-      await assert.rejects(flow.credentials, /expired/);
-    } finally { await srv.close(); }
+  test(`a device sign-in whose poll stalls (${where}) still ends at the code's expiry`, async () => {
+    const issuer = stallingIssuer(where);
+    const flow = await startGrokLogin({ deviceEndpoint: 'https://issuer.example/d', tokenEndpoint: 'https://issuer.example/t', wait: async () => {}, fetchImpl: issuer.fetchImpl, timers: issuer.timers });
+    await issuer.stalled;
+    // The poll runs under the code's own expiry (600 s when the issuer names none).
+    assert.equal(issuer.armed.filter(t => !t.cleared).at(-1)?.ms, 600_000);
+    issuer.expire();
+    await assert.rejects(flow.credentials, /expired/);
+    assert.ok(issuer.armed.every(t => t.cleared), 'a deadline was left armed');
   });
 }
 
-test('a device sign-in whose first request stalls ends at its deadline', async () => {
-  const srv = await stallingServer('start');
-  try {
-    await assert.rejects(startGrokLogin({ deviceEndpoint: `${srv.url}/d`, tokenEndpoint: `${srv.url}/t`, timeoutMs: 200, wait: async () => {} }), /did not answer/);
-  } finally { await srv.close(); }
+test('a device sign-in whose first request stalls ends at the start deadline', async () => {
+  const issuer = stallingIssuer('start');
+  const started = startGrokLogin({ deviceEndpoint: 'https://issuer.example/d', tokenEndpoint: 'https://issuer.example/t', wait: async () => {}, fetchImpl: issuer.fetchImpl, timers: issuer.timers });
+  await issuer.stalled;
+  assert.equal(issuer.armed.at(-1)?.ms, 30_000);
+  issuer.expire();
+  await assert.rejects(started, /did not answer/);
 });
 
 test('only a Grok login is identified by its user id alone', () => {

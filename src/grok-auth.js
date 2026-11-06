@@ -199,9 +199,11 @@ function pageUrl(value) {
  * @param {string} [opts.deviceEndpoint]
  * @param {string} [opts.tokenEndpoint]
  * @param {(ms: number, signal: AbortSignal|null) => Promise<unknown>} [opts.wait]  the pause between polls; tests pass one that does not sleep
+ * @param {typeof proxyFetch} [opts.fetchImpl]  tests pass one that stalls on cue
+ * @param {{ set: (fn: () => void, ms: number) => any, clear: (handle: any) => void }} [opts.timers]  arms the flow's deadline; tests pass one they fire themselves
  * @returns {Promise<GrokLogin>}
  */
-export async function startGrokLogin({ routing = null, signal = null, timeoutMs = Infinity, deviceEndpoint = DEVICE_ENDPOINT, tokenEndpoint = TOKEN_ENDPOINT, wait = abortableWait } = {}) {
+export async function startGrokLogin({ routing = null, signal = null, timeoutMs = Infinity, deviceEndpoint = DEVICE_ENDPOINT, tokenEndpoint = TOKEN_ENDPOINT, wait = abortableWait, fetchImpl = proxyFetch, timers = { set: setTimeout, clear: clearTimeout } } = {}) {
   // One controller bounds the whole flow, every request and every body read
   // included: a connection that goes quiet mid-reply would otherwise hold a
   // poll (and the panel's sign-in slot) open past the code's own expiry. The
@@ -211,16 +213,16 @@ export async function startGrokLogin({ routing = null, signal = null, timeoutMs 
   const relay = () => flow.abort(signal?.reason);
   if (signal?.aborted) relay();
   else signal?.addEventListener('abort', relay, { once: true });
-  /** @type {NodeJS.Timeout|undefined} */
+  /** @type {any} */
   let timer;
   /** @param {number} ms @param {string} message */
   const deadlineIn = (ms, message) => {
-    clearTimeout(timer);
+    timers.clear(timer);
     // Clamped: setTimeout reads a delay past 2^31-1 ms as 1 ms, and expires_in
     // is the issuer's number.
-    if (Number.isFinite(ms)) timer = setTimeout(() => flow.abort(new Error(message)), Math.min(Math.max(0, ms), 2 ** 31 - 1));
+    if (Number.isFinite(ms)) timer = timers.set(() => flow.abort(new Error(message)), Math.min(Math.max(0, ms), 2 ** 31 - 1));
   };
-  const settle = () => { clearTimeout(timer); signal?.removeEventListener('abort', relay); };
+  const settle = () => { timers.clear(timer); signal?.removeEventListener('abort', relay); };
   /** Settle `promise`, or fail with the flow's abort reason, whichever is first.
    * @template T @param {Promise<T>} promise @returns {Promise<T>} */
   const bounded = promise => new Promise((resolve, reject) => {
@@ -234,7 +236,7 @@ export async function startGrokLogin({ routing = null, signal = null, timeoutMs 
   /** POST a form and read its whole reply, both within the flow's deadline.
    * @param {string} url @param {Record<string, string>} form */
   const post = async (url, form) => {
-    const res = await bounded(postForm(url, form, { routing, signal: flow.signal }));
+    const res = await bounded(postForm(url, form, { routing, signal: flow.signal, fetchImpl }));
     return { status: res.status, ok: res.ok, text: await bounded(res.text()) };
   };
   /** @param {string} text */
