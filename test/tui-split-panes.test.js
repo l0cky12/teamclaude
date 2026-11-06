@@ -313,7 +313,7 @@ test('an account that has not reported yet keeps the Ses column, so it does not 
 // in service, not written by the test.
 test('a Codex row whose five-hour window has expired keeps both cells', () => {
   const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
-  am.applyCodexUsageData(1, {
+  am.applyPlanUsageData(1, {
     fiveHour: { utilization: 0.4, resetAt: Date.now() - 1 },
     sevenDay: { utilization: 0.3, resetAt: Date.now() + 24 * h },
   });

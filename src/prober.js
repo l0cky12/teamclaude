@@ -11,6 +11,7 @@ import { fetchUsage } from './oauth.js';
 import { fetchBackendQuota, hasBackendQuota } from './backend-quota.js';
 import { providerOf } from './provider.js';
 import { fetchCodexUsage } from './codex-usage.js';
+import { fetchGrokUsage } from './grok-usage.js';
 import { fetchResetCreditDetails, creditDetailsDue, CREDIT_DETAILS_RETRY_MS } from './codex-reset-credits.js';
 
 // Node's timers take a 32-bit signed delay: anything above 2^31-1 ms is
@@ -32,17 +33,20 @@ const isAnthropicProbeTarget = (/** @type {any} */ account) => !!account && prov
 const isCodexProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'codex'
   && account.type === 'oauth' && !!account.credential && !!account.accountId && !account.upstream;
 
+const isGrokProbeTarget = (/** @type {any} */ account) => !!account && providerOf(account) === 'grok'
+  && account.type === 'oauth' && !!account.credential && !account.upstream;
+
 const isBackendProbeTarget = (/** @type {any} */ account) => !!account?.credential && hasBackendQuota(account);
 
 /**
  * True when the quota probe has something to read for this account: an
- * Anthropic or Codex subscription, or a third-party backend that publishes a
+ * Anthropic, Codex or Grok subscription, or a third-party backend that publishes a
  * quota of its own. Anything else reads `not-applicable` in the probe status.
  * @param {any} account
  * @returns {boolean}
  */
 export function probeApplicable(account) {
-  return isAnthropicProbeTarget(account) || isCodexProbeTarget(account) || isBackendProbeTarget(account);
+  return isAnthropicProbeTarget(account) || isCodexProbeTarget(account) || isGrokProbeTarget(account) || isBackendProbeTarget(account);
 }
 
 export class Prober {
@@ -53,11 +57,12 @@ export class Prober {
   // notices below are produced later still, by a reload that changes the probe
   // interval, so a captured `console.log` would put them on a terminal the
   // alternate screen has already covered.
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, codexCreditsFn = fetchResetCreditDetails, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, grokProbeFn = fetchGrokUsage, codexCreditsFn = fetchResetCreditDetails, profileFn = null, backendFn = fetchBackendQuota, timeoutMs = 10_000, log = (/** @type {string} */ line) => console.log(line) } = {}) {
     this.am = accountManager;
     this.intervalMs = clampInterval(intervalMs);
     this.probeFn = probeFn;
     this.codexProbeFn = codexProbeFn;
+    this.grokProbeFn = grokProbeFn;
     this.codexCreditsFn = codexCreditsFn;
     // When each Codex account's last credit-row read failed. A failure leaves
     // the dates as due as they were, so without this a 429 or a timeout would
@@ -118,7 +123,7 @@ export class Prober {
     this.nextRunAt = this.intervalMs > 0 ? this.lastRunStartedAt + this.intervalMs : null;
     try {
       const accounts = this.am.accounts.filter(account =>
-        this._probeable(account) && (this._isProbeTarget(account) || this._isCodexProbeTarget(account) || this._isBackendTarget(account)));
+        this._probeable(account) && probeApplicable(account));
       await Promise.all(accounts.map(account => this.probeAccount(account)));
     } finally {
       this.lastRunFinishedAt = Date.now();
@@ -201,6 +206,7 @@ export class Prober {
     // figure, or none. Same schedule, same status row, different source.
     if (this._isBackendTarget(account)) return this._probeBackend(account, startedAt);
     if (this._isCodexProbeTarget(account)) return this._probeCodex(account, startedAt);
+    if (isGrokProbeTarget(account)) return this._probePlanUsage(account, startedAt, this.grokProbeFn);
     try {
       await this.am.ensureTokenFresh(account.index);
       let usage = await this._withTimeout(this.probeFn(account.credential, account.routing ?? null));
@@ -252,18 +258,7 @@ export class Prober {
   }
 
   async _probeCodex(account, startedAt) {
-    try {
-      await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.codexProbeFn(account));
-      if (usage?.status === 401) {
-        await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.codexProbeFn(account));
-      }
-      if (!usage || usage.error) {
-        const finishedAt = Date.now();
-        return this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
-      }
-      this.am.applyCodexUsageData(account.index, usage);
+    return this._probePlanUsage(account, startedAt, this.codexProbeFn, async () => {
       // The usage read counts the account's reset credits but does not say when
       // they expire; the credit rows do. Read them only when that count is new
       // or the dates are old, so a probe costs one more read at most that often.
@@ -278,6 +273,31 @@ export class Prober {
           this._creditReadFailedAt.set(account, Date.now());
         }
       }
+    });
+  }
+
+  /**
+   * Read a subscription's plan usage from its provider's own endpoint (Codex,
+   * Grok), refreshing the token first and once more on a 401.
+   * @param {any} account
+   * @param {number} startedAt
+   * @param {(account: any) => Promise<any>} fetchUsage
+   * @param {() => Promise<void>} [after]  provider extras, once the reading has landed
+   */
+  async _probePlanUsage(account, startedAt, fetchUsage, after) {
+    try {
+      await this.am.ensureTokenFresh(account.index);
+      let usage = await this._withTimeout(fetchUsage(account));
+      if (usage?.status === 401) {
+        await this.am.ensureTokenFresh(account.index, true);
+        usage = await this._withTimeout(fetchUsage(account));
+      }
+      if (!usage || usage.error) {
+        const finishedAt = Date.now();
+        return this._recordAccount(account, { status: usage?.error ? 'error' : 'timeout', error: usage?.error || 'probe timed out', startedAt, finishedAt, durationMs: finishedAt - startedAt });
+      }
+      this.am.applyPlanUsageData(account.index, usage);
+      await after?.();
       const finishedAt = Date.now();
       return this._recordAccount(account, { status: 'ok', error: null, startedAt, finishedAt, durationMs: finishedAt - startedAt });
     } catch (err) {

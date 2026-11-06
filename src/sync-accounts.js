@@ -1,6 +1,5 @@
-import { importCredentials } from './oauth.js';
-import { importCodexCredentials } from './codex-auth.js';
-import { sameIdentity } from './identity.js';
+import { credentialFileFor } from './resolve-accounts.js';
+import { sameIdentity, distinctAccounts } from './identity.js';
 import { safeLine } from './safe-text.js';
 import { removedAccountIds, addedAccountIds, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -25,6 +24,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // first one with that accountUuid.
   const claimed = new Set();
   const claim = (/** @type {Record<string, any>} */ diskAcct) => {
+    const byId = fileBackedById(accountManager.accounts, claimed, diskAcct);
+    if (byId >= 0) {
+      claimed.add(byId);
+      return byId;
+    }
     for (let i = 0; i < accountManager.accounts.length; i++) {
       if (!claimed.has(i) && sameIdentity(accountManager.accounts[i], diskAcct)) {
         claimed.add(i);
@@ -41,6 +45,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
   // pairs an unorged entry with whichever same-uuid disk entry comes first.
   const cfgClaimed = new Set();
   const claimConfig = (/** @type {Record<string, any>} */ diskAcct) => {
+    const byId = fileBackedById(memConfig.accounts, cfgClaimed, diskAcct);
+    if (byId >= 0) {
+      cfgClaimed.add(byId);
+      return memConfig.accounts[byId];
+    }
     for (let i = 0; i < memConfig.accounts.length; i++) {
       if (!cfgClaimed.has(i) && sameIdentity(memConfig.accounts[i], diskAcct)) {
         cfgClaimed.add(i);
@@ -221,9 +230,31 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
         // The file's own format, as resolveAccounts reads it at startup: the
         // Claude reader finds no token in a Codex auth.json, so a Codex login
         // refreshed in its file reached the fleet only on a restart.
-        const creds = providerOf(diskAcct) === 'codex'
-          ? await importCodexCredentials(diskAcct.importFrom)
-          : await importCredentials(diskAcct.importFrom);
+        const creds = await credentialFileFor(diskAcct).read(diskAcct.importFrom);
+        // The file's CLI signed in as someone else since it was last read. Its
+        // token belongs to that login, and so must the identity it is sent with
+        // (Codex scopes it with chatgpt-account-id, Grok with x-userid): the old
+        // login's ids beside the new token are a request upstream refuses or
+        // misattributes. Nor is anything learned about the old login true of
+        // this one, so the slot starts fresh, as a restart would start it.
+        if (creds.accessToken && distinctAccounts(mgr, { ...mgr, ...identityOf(creds) })) {
+          accountManager.replaceAccount(mgrIdx, { ...diskAcct, ...creds });
+          // The running config row may name the old login (a sign-in wrote its
+          // ids there); left so, the next save would put them back on disk.
+          if (cfgAcct) {
+            for (const field of [...IDENTITY_FIELDS, 'email']) {
+              if (!(field in cfgAcct)) continue;
+              if (creds[field]) cfgAcct[field] = creds[field]; else delete cfgAcct[field];
+            }
+          }
+          console.log(`[TeamClaude] "${safeLine(mgr.name, 64)}": ${safeLine(diskAcct.importFrom, 120)} now holds a different login; started it fresh`);
+          accountManager.events?.add({ kind: 'signin', type: 'credentials_updated', provider: providerOf(mgr), account: mgr.name, message: 'A different login in its credentials file; started fresh' });
+          continue;
+        }
+        // The same login: ids the running account lacked travel with its token.
+        const ids = /** @type {Record<string, any>} */ (mgr);
+        for (const [field, value] of Object.entries(identityOf(creds))) if (!ids[field]) ids[field] = value;
+        if (creds.email) mgr.email = creds.email;
         // A Codex auth.json carries no expiry; the staleness check below then
         // leaves the file's token to win, as a fresh login there should.
         freshCred = { accessToken: creds.accessToken, refreshToken: creds.refreshToken, expiresAt: 'expiresAt' in creds ? creds.expiresAt : undefined };
@@ -293,4 +324,40 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     dropped++;
   }
   return { added, removed: dropped };
+}
+
+// The fields of a credentials file that say whose login it holds.
+const IDENTITY_FIELDS = ['accountId', 'userId', 'accountUuid', 'orgUuid'];
+
+/**
+ * The fields of a credentials file that say whose login it holds, as identity.js
+ * compares them. Only the ones the file states: an absent one means "cannot
+ * tell", never "different".
+ * @param {Record<string, any>} creds
+ * @returns {Record<string, string>}
+ */
+function identityOf(creds) {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const field of IDENTITY_FIELDS) {
+    if (typeof creds[field] === 'string' && creds[field]) out[field] = creds[field];
+  }
+  return out;
+}
+
+/**
+ * The unclaimed entry in `list` that a file-backed disk row pairs with by its
+ * config id, or -1. Such a row's login is whatever its file holds now, so the
+ * ids it carries (written by the sign-in that created it) can name a login the
+ * file no longer has. Pairing by those would orphan the account the reload
+ * itself put in its place on the previous pass. The id is the row's own,
+ * stable through any change of login. Rows that hold their own tokens still
+ * pair by identity, as before.
+ * @param {Array<Record<string, any>>} list
+ * @param {Set<number>} taken
+ * @param {Record<string, any>} diskAcct
+ */
+function fileBackedById(list, taken, diskAcct) {
+  if (!diskAcct.importFrom || !diskAcct.id) return -1;
+  return list.findIndex((a, i) => !taken.has(i) && a.id === diskAcct.id && providerOf(a) === providerOf(diskAcct));
 }

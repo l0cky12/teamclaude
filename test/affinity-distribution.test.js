@@ -312,12 +312,12 @@ test('a fresh 5-hour reading feeds the burn learner on every ingestion path', ()
   // learner, and starting would change adaptive-mode picks from readings it
   // already had.
   const am3 = mgr([oauth('codex', { provider: 'codex' })]);
-  am3.applyCodexUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + H }, sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
+  am3.applyPlanUsageData(0, { fiveHour: { utilization: 0.3, resetAt: Date.now() + H }, sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
   assert.notEqual(am3.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
   assert.equal(am3.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
   // A probe that says the plan has no session window observes nothing for it.
   const am4 = mgr([oauth('codex', { provider: 'codex' })]);
-  am4.applyCodexUsageData(0, { sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
+  am4.applyPlanUsageData(0, { sevenDay: { utilization: 0.1, resetAt: Date.now() + 100 * H } });
   assert.equal(am4.burnRateLearner.lastReadingAt(0, 'unified5h'), null);
 });
 
@@ -366,8 +366,8 @@ test('the scored window is the one with the least headroom to its own threshold'
 test('a Codex probe weekly reading leaves the adaptive reserve exactly as before', () => {
   const am = mgr([oauth('a', { provider: 'codex' }), oauth('b', { provider: 'codex' })], { distributeSessions: 'adaptive' });
   const before = am.burnRateLearner.reserve(0, 'unified7d');
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
-  am.applyCodexUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
+  am.applyPlanUsageData(0, { sevenDay: { utilization: 0.965, resetAt: Date.now() + 100 * H } });
   assert.equal(am.burnRateLearner.lastReadingAt(0, 'unified7d'), null);
   assert.equal(am.burnRateLearner.reserve(0, 'unified7d'), before);
 });

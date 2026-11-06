@@ -24,11 +24,12 @@ import {
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
+import { loginGrok, startGrokLogin } from './grok-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { signInEvent, thresholdEvent } from './event-log.js';
 import { WebSignIns } from './web-login.js';
 import { createAccountRemover, serialQueue } from './account-removal.js';
-import { providerOf } from './provider.js';
+import { providerOf, DEFAULT_PROVIDER } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
@@ -818,7 +819,7 @@ async function serverCommand() {
    * can reach the loopback listener, so the panel listens only when it opens
    * one; the dashboard always listens, and hands back the loopback link
    * (`browserUrl`) for a page that is itself on this machine.
-   * @param {'claude' | 'codex'} provider
+   * @param {'claude' | 'codex' | 'grok'} provider
    * @param {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt & { browserUrl?: string | null }) => void, via: 'terminal' | 'dashboard' }} opts
    */
   const signInProvider = async (provider, { signal, onPrompt, via }) => {
@@ -833,7 +834,14 @@ async function serverCommand() {
       const flow = await startCodexLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
       if (openHere && !signal?.aborted) openBrowser(flow.url);
       onPrompt?.({ provider: 'codex', url: flow.url, remote, listening: flow.listening, note: flow.listenError?.message ?? null, submit: flow.submit, settled: flow.settled });
-      outcome = await upsertCodexAccount(undefined, await flow.credentials, null, false);
+      outcome = await upsertProviderLogin('codex', undefined, await flow.credentials, null, false);
+    } else if (provider === 'grok') {
+      // A device sign-in: no listener and nothing to paste. The page shows the
+      // code and the flow polls xAI until it is approved there.
+      const flow = await startGrokLogin({ signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
+      if (openHere && !signal?.aborted) openBrowser(flow.url);
+      onPrompt?.({ provider: 'grok', url: flow.url, userCode: flow.userCode, remote, listening: true, note: null, submit: () => false });
+      outcome = await upsertProviderLogin('grok', undefined, await flow.credentials, null, false);
     } else {
       const flow = await startOAuthLogin({ loopback: via === 'dashboard' || openHere, signal, timeoutMs: PANEL_LOGIN_TIMEOUT_MS });
       if (openHere && flow.browserUrl && !signal?.aborted) openBrowser(flow.browserUrl);
@@ -850,7 +858,7 @@ async function serverCommand() {
   /**
    * A sign-in as an entry on the event log (the dashboard's Logs page):
    * started, then succeeded or failed.
-   * @param {{ provider: 'claude' | 'codex', account: string | null, via: string }} signIn
+   * @param {{ provider: 'claude' | 'codex' | 'grok', account: string | null, via: string }} signIn
    * @param {() => Promise<any>} run
    */
   const loggedSignIn = async (signIn, run) => {
@@ -903,7 +911,8 @@ async function serverCommand() {
       //
       // Each sign-in is also an entry on the event log (the dashboard's Logs page).
       loginAccount: async (/** @type {Record<string, any>} */ account, /** @type {{ signal?: AbortSignal, onPrompt?: (prompt: import('./login-flow.js').LoginPrompt) => void }} */ { signal, onPrompt } = {}) => {
-        const provider = account && providerOf(account) === 'codex' ? 'codex' : 'claude';
+        const owner = account ? providerOf(account) : DEFAULT_PROVIDER;
+        const provider = owner === DEFAULT_PROVIDER ? 'claude' : owner;
         return loggedSignIn({ provider, account: account?.name ?? null, via: 'terminal' },
           () => signInProvider(provider, { signal, onPrompt, via: 'terminal' }));
       },
@@ -1460,7 +1469,7 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  await exitOnAccountLimit(() => upsertCodexAccount(argValue('--name'), creds, routing, store));
+  await exitOnAccountLimit(() => upsertProviderLogin('codex', argValue('--name'), creds, routing, store));
 }
 
 /**
@@ -1481,7 +1490,32 @@ async function exitOnAccountLimit(add) {
 }
 
 /**
- * Store a Codex login: refresh the row for the same ChatGPT account, or add one.
+ * `teamclaude login --grok`: a device sign-in against xAI, then store the
+ * account. The user id and email come from the id token, so there is nothing
+ * further to fetch.
+ */
+async function loginGrokCommand() {
+  const loaded = await loadOrCreateConfig();
+  const { routing, store } = loginRouting(loaded);
+  await requireWorkingRouting(routing, upstreamFor({ type: 'oauth', provider: 'grok' }, loaded.upstream));
+  const remote = isRemoteSession();
+  let creds;
+  try {
+    creds = await loginGrok({ noBrowser: args.includes('--no-browser') || remote, routing });
+  } catch (/** @type {any} */ err) {
+    console.error(`Grok login failed: ${sanitizeText(err?.message || err)}`);
+    console.error('');
+    console.error('Alternative: sign in with Grok Build and pool that login instead —');
+    console.error('  grok login');
+    console.error('  then add: { "name": "...", "type": "oauth", "provider": "grok" }');
+    process.exit(1);
+  }
+  await exitOnAccountLimit(() => upsertProviderLogin('grok', argValue('--name'), creds, routing, store));
+}
+
+/**
+ * Store a Codex or Grok login: refresh the row for the same account (the
+ * ChatGPT account, or the xAI user), or add one.
  *
  * The browser flow that produced `creds` can take minutes, and a running server
  * may have rotated another account's refresh token on disk in the meantime.
@@ -1489,6 +1523,7 @@ async function exitOnAccountLimit(add) {
  * account would fail on its next restart. So the upsert runs against a fresh
  * read of the file, and only this account's row is touched.
  *
+ * @param {'codex' | 'grok'} provider
  * @param {string | null | undefined} requestedName
  * @param {any} creds
  * @param {import('./account-routing.js').RoutingProxy|null} [routing] - the
@@ -1498,21 +1533,22 @@ async function exitOnAccountLimit(add) {
  * with a null `routing` is `--routing none`: the entry's routing is cleared.
  * @returns {Promise<{ action: 'updated' | 'added', name: string, fileBacked?: boolean }>}
  */
-async function upsertCodexAccount(requestedName, creds, routing = null, storeRouting = false) {
+async function upsertProviderLogin(provider, requestedName, creds, routing = null, storeRouting = false) {
   /** @type {{ action: 'updated' | 'added', name: string, fileBacked?: boolean }} */
   let outcome = { action: 'added', name: requestedName || '' };
   /** @type {Record<string, any>|null} */
   let signedIn = null;
   await atomicConfigUpdate(config => {
     const name = requestedName || creds.email
-      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
+      || `${provider}-${config.accounts.filter(a => a.provider === provider).length + 1}`;
 
     const account = {
       name,
       type: 'oauth',
-      provider: 'codex',
+      provider,
       source: 'login',
-      accountId: creds.accountId,
+      // Absent on a Grok login, which is identified by its user id alone.
+      ...(creds.accountId ? { accountId: creds.accountId } : {}),
       userId: creds.userId,
       // From the id token, like the default name above; absent when the token
       // carried none, so a re-login keeps the one already stored.
@@ -1526,10 +1562,11 @@ async function upsertCodexAccount(requestedName, creds, routing = null, storeRou
       ...(routing && storeRouting ? { routing: routingToUrl(routing) } : {}),
     };
 
-    // Identity for a Codex account is its ChatGPT account id and user id; fall
-    // back to the display name when upstream did not supply one.
+    // Identity for a Codex account is its ChatGPT account id and user id, for
+    // a Grok account its user id; fall back to the display name when upstream
+    // did not supply one.
     const idx = config.accounts.findIndex(a => (
-      a.provider === 'codex' && (sameIdentity(a, account) || a.name === account.name)
+      a.provider === provider && (sameIdentity(a, account) || a.name === account.name)
     ));
     if (idx >= 0) {
       const prev = config.accounts[idx];
@@ -1570,6 +1607,10 @@ async function loginCommand() {
     await loginCodexCommand();
     return;
   }
+  if (args.includes('--grok')) {
+    await loginGrokCommand();
+    return;
+  }
 
   // Default to OAuth if not a TTY
   if (!process.stdout.isTTY) {
@@ -1583,12 +1624,14 @@ async function loginCommand() {
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
   console.log('  3. Codex subscription   (ChatGPT Plus, Pro, Team)');
+  console.log('  4. Grok subscription    (SuperGrok, X subscription), for Grok Build');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
 
   switch (choice.trim() || '1') {
     case '3': await loginCodexCommand(); break;
+    case '4': await loginGrokCommand(); break;
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
     default:
@@ -3307,6 +3350,8 @@ Commands:
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --codex       Codex (ChatGPT) login via browser; on a terminal the address
                       the browser lands on can be pasted instead (--no-browser)
+  login --grok        Grok (xAI) login for Grok Build: open the page shown on any
+                      device and approve the code (--no-browser)
   login --api         Add an API key account (a last resort by default:
                       --priority <n> to place it, 0 = level with the rest)
   env [--mitm|--no-mitm]
@@ -3602,7 +3647,7 @@ async function upsertOAuthAccount(name, creds, source = 'unknown', routing = nul
       // display name, entry id, and any disk-only fields (e.g. importFrom).
       const prev = config.accounts[idx];
       config.accounts[idx] = updateAccountEntry(prev, account);
-      // As in upsertCodexAccount: an importFrom entry keeps reading its file.
+      // As in upsertProviderLogin: an importFrom entry keeps reading its file.
       outcome = { action: 'updated', name: prev.name, fileBacked: !!prev.importFrom };
       if (storeRouting && !routing) delete config.accounts[idx].routing; // --routing none
       console.log(`Updated account "${prev.name}"`);

@@ -51,6 +51,9 @@ export function sameOrg(a, b) {
  *   userId when both sides have one (members of one ChatGPT workspace share an
  *   accountId). Same evidence class as the accountUuid below, so it decides
  *   before the name.
+ * - Two Grok logins with a userId: it must match. A Grok login is identified
+ *   by its xAI user alone. Other providers' user ids only qualify an account
+ *   id, as above, so a Codex record without one still falls to the name.
  * - Both have an accountUuid: it must match. If the organizations can be
  *   compared (see sameOrg) they must also match; but if either side's org is
  *   still unknown we treat them as the same. This lets a freshly-profiled login
@@ -64,6 +67,7 @@ export function sameIdentity(a, b) {
   if (a?.accountId && b?.accountId) {
     return a.accountId === b.accountId && (!a.userId || !b.userId || a.userId === b.userId);
   }
+  if (providerOf(a) === 'grok' && a?.userId && b?.userId) return a.userId === b.userId;
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     return sameOrg(a, b) !== false;
@@ -82,6 +86,7 @@ export function distinctAccounts(a, b) {
   if (a?.accountId && b?.accountId) {
     return a.accountId !== b.accountId || (!!a.userId && !!b.userId && a.userId !== b.userId);
   }
+  if (providerOf(a) === 'grok' && a?.userId && b?.userId) return a.userId !== b.userId;
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   return sameOrg(a, b) === false;

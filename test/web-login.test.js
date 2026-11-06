@@ -117,7 +117,7 @@ test('a flow that fails before it asks for the browser fails the start itself', 
   await assert.rejects(signIns.start('claude'), /EMFILE/);
 });
 
-test('only Claude and Codex can be started', async () => {
+test('only Claude, Codex and Grok can be started', async () => {
   const { signIn, runs } = stubFlow();
   const signIns = new WebSignIns({ signIn });
   for (const provider of ['openai', '', undefined, '__proto__']) {

@@ -32,8 +32,10 @@ test('the cap is twenty', () => {
   assert.equal(MAX_ACCOUNTS_PER_PROVIDER, 20);
 });
 
-test('accounts are counted by kind: Claude, Codex, API key, and each backend host', () => {
+test('accounts are counted by kind: Claude, Codex, Grok, API key, and each backend host', () => {
   assert.equal(accountLimitGroup(claude(1)).key, 'claude');
+  assert.deepEqual(accountLimitGroup({ name: 'g', type: 'oauth', provider: 'grok', userId: 'ug1' }), { key: 'grok', label: 'Grok' });
+  assert.equal(accountLimitReached(many(claude, 20), { name: 'g', type: 'oauth', provider: 'grok', userId: 'ug1' }), null, 'Grok logins do not count against Claude');
   assert.equal(accountLimitGroup({ name: 'legacy', type: 'oauth' }).key, 'claude', 'no provider field is Claude');
   assert.equal(accountLimitGroup(codex(1)).key, 'codex');
   assert.equal(accountLimitGroup(apikey(1)).key, 'apikey');

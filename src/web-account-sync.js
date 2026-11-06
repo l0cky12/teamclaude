@@ -20,8 +20,11 @@
 // The card also switches the sync to a store one of your own instances keeps
 // (instance-sync.js), for those who would rather not use an outside service:
 // `mode` makes this machine keep it, follow a linked instance that does, or
-// stops either. The same rule holds: one store at a time, so neither is
-// turned on while the other is.
+// stops either. One store at a time. Choosing one of your own machines
+// cancels a callback.net sign-in that is still waiting, so that approval
+// cannot sign the machine in afterwards. A sign-in already approved is
+// saving its token and is left to finish; a machine already signed in to
+// callback.net still has to sign out first.
 
 import { randomBytes } from 'node:crypto';
 import { loginCallback, loadCallbackToken, saveCallbackTokenIn, callbackSessionEpoch, callbackWhoami, logoutCallback } from './callback-auth.js';
@@ -204,6 +207,12 @@ export class WebAccountSync {
    * does not keep one), `off` goes back to callback.net or to nothing. The
    * accounts stay where they are either way; only where they are shared
    * through changes. The first pass starts at once.
+   *
+   * Host and follow do not use callback.net. A sign-in that is only waiting
+   * is cancelled before the first await, so an approval that arrives while
+   * the switch is checked cannot save a token. One already approved
+   * (`finishing`) is past cancelling: its token is being saved, and the
+   * switch is refused until that has landed and been signed out.
    * @param {{ mode?: unknown, peer?: unknown }} body
    * @returns {Promise<{ mode: SyncMode['mode'], peer: string | null }>}
    */
@@ -215,24 +224,32 @@ export class WebAccountSync {
     if (want === 'off') {
       next = { mode: 'off' };
     } else if (want === 'host' || want === 'follow') {
-      if (this._current && (this._current.state === 'waiting' || this._current.state === 'finishing')) {
-        throw new AccountSyncError('a callback.net sign-in is in progress; cancel it first');
-      }
-      if (await this._load().catch(() => null)) {
-        throw new AccountSyncError('this machine is signed in to callback.net; sign out first, so it syncs with one store only');
-      }
+      // Refusals that need no I/O come first, so a waiting sign-in is left
+      // alone when this machine cannot take the store anyway.
       if (want === 'host') {
         if (!this._canHost()) throw new AccountSyncError('this machine has no proxy key (proxy.apiKey), so your other machines could not reach its store; set one first');
         next = { mode: 'host' };
       } else {
         const peer = typeof body?.peer === 'string' ? body.peer.trim() : '';
         if (!peer || !this._peerNames().includes(peer)) throw new AccountSyncError('choose one of the linked instances of this machine');
-        try {
-          await this._probe(peer);
-        } catch (err) {
-          throw new AccountSyncError(`could not use the account store on ${safeLine(peer, 64)}: ${syncError(err)}`);
-        }
         next = { mode: 'follow', peer };
+      }
+      const cur = this._current;
+      if (cur?.state === 'finishing') {
+        throw new AccountSyncError('the last callback.net sign-in was approved and is still finishing; try again in a moment');
+      }
+      // Synchronous with the approval's own abort check: no token write can
+      // start between here and the awaits below.
+      if (cur?.state === 'waiting') this.cancel(cur.id);
+      if (await this._load().catch(() => null)) {
+        throw new AccountSyncError('this machine is signed in to callback.net; sign out first, so it syncs with one store only');
+      }
+      if (next.mode === 'follow') {
+        try {
+          await this._probe(next.peer);
+        } catch (err) {
+          throw new AccountSyncError(`could not use the account store on ${safeLine(next.peer, 64)}: ${syncError(err)}`);
+        }
       }
     } else {
       throw new AccountSyncError('"mode" must be host, follow or off');

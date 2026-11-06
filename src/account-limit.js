@@ -7,8 +7,9 @@
 // an account (login, import, the TUI, the dashboard, credential sync, a
 // transfer bundle) asks here first and refuses the twenty-first.
 //
-// The cap is per kind: Claude subscriptions, Codex subscriptions, Anthropic
-// API keys, and each third-party backend (by its upstream host) count apart.
+// The cap is per kind: Claude subscriptions, the subscriptions of each other
+// provider (Codex, Grok), Anthropic API keys, and each third-party backend (by
+// its upstream host) count apart.
 // An account that only names its own provider's host as `upstream` counts
 // with that provider.
 //
@@ -33,7 +34,9 @@ export function accountLimitGroup(account) {
     const host = backendHost(account.upstream);
     return { key: `backend:${host}`, label: `${host} backend` };
   }
-  if (provider === 'codex') return { key: 'codex', label: 'Codex' };
+  // Every provider other than Anthropic is its own kind (Codex, Grok): a
+  // provider added to the registry later must not fill the Claude cap.
+  if (provider !== 'anthropic') return { key: provider, label: PROVIDERS[provider].label };
   if (account?.type === 'apikey') return { key: 'apikey', label: 'Anthropic API key' };
   return { key: 'claude', label: 'Claude' };
 }

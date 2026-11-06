@@ -10,20 +10,24 @@
 // One sign-in at a time. Codex's redirect names port 1455, which only one
 // listener can hold, and a second Claude flow would only be a second link the
 // person has to tell apart from the first. Starting a new one cancels the old.
+//
+// Grok's device sign-in has no code to carry back: the page shows the code
+// xAI's page will show, and the flow finishes by polling xAI.
 
 import { randomBytes } from 'node:crypto';
 import { briefError } from './event-log.js';
 import { safeLine } from './safe-text.js';
 
 /** The providers the dashboard can sign in. */
-export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
+export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex', 'grok']);
 
 /**
  * What the page needs to show a started sign-in.
  * @typedef {object} WebSignInStart
  * @property {string} id
- * @property {'claude' | 'codex'} provider
- * @property {string} url  the link that works from any device (Claude's code page, OpenAI's authorize page)
+ * @property {'claude' | 'codex' | 'grok'} provider
+ * @property {string} url  the link that works from any device (Claude's code page, OpenAI's authorize page, xAI's device page)
+ * @property {string | null} userCode  Grok only: the code xAI's device page shows, to compare before approving
  * @property {string | null} browserUrl  Claude only: the link whose redirect reaches this machine's
  *   loopback listener, for a browser running on the proxy's own machine
  * @property {boolean} listening  something on this machine is waiting for the browser to come back by itself
@@ -34,7 +38,7 @@ export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
  * Where a sign-in stands, as the page polls for it.
  * @typedef {object} WebSignInState
  * @property {'waiting' | 'finishing' | 'succeeded' | 'failed' | 'cancelled' | 'unknown'} state
- * @property {'claude' | 'codex'} [provider]
+ * @property {'claude' | 'codex' | 'grok'} [provider]
  * @property {string | null} [account]  the account the tokens went to
  * @property {'added' | 'updated' | null} [action]
  * @property {string | null} [error]  one line, safe for the page
@@ -43,7 +47,7 @@ export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
  */
 
 /**
- * @typedef {(provider: 'claude' | 'codex', opts: {
+ * @typedef {(provider: 'claude' | 'codex' | 'grok', opts: {
  *   signal: AbortSignal,
  *   onPrompt: (prompt: import('./login-flow.js').LoginPrompt & { browserUrl?: string | null }) => void,
  * }) => Promise<{ name?: string, action?: 'added' | 'updated', fileBacked?: boolean } | null | undefined>} SignIn
@@ -52,7 +56,7 @@ export const WEB_SIGN_IN_PROVIDERS = /** @type {const} */ (['claude', 'codex']);
 /**
  * @typedef {object} SignInEntry
  * @property {string} id
- * @property {'claude' | 'codex'} provider
+ * @property {'claude' | 'codex' | 'grok'} provider
  * @property {AbortController} controller
  * @property {((text: string) => boolean) | null} submit  null once the flow is past taking a paste
  * @property {WebSignInState['state']} state
@@ -82,7 +86,7 @@ export class WebSignIns {
    * @returns {Promise<WebSignInStart>}
    */
   async start(provider) {
-    if (provider !== 'claude' && provider !== 'codex') throw new WebSignInError('provider must be "claude" or "codex"');
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok') throw new WebSignInError('provider must be "claude", "codex" or "grok"');
     // A sign-in whose code is already being exchanged will store an account
     // whatever happens here; replacing it would only stop the page from
     // hearing how it ended.
@@ -139,6 +143,7 @@ export class WebSignIns {
       provider,
       url: started.url,
       browserUrl: provider === 'claude' && typeof started.browserUrl === 'string' ? started.browserUrl : null,
+      userCode: typeof started.userCode === 'string' ? started.userCode : null,
       listening: Boolean(started.listening),
       note: started.note ? safeLine(started.note, 200) : null,
     };

@@ -3289,6 +3289,27 @@ test('Account sync: Cancel before the link arrives cancels it once the server na
   }, { autoAnswer: null, manualTimers: true });
 });
 
+test('Account sync: Keep them on this machine is sent while a callback.net sign-in is still waiting', async () => {
+  const waiting = {
+    ok: true, signedIn: false, user: null, userError: null, sync: {},
+    signIn: { id: 'stuck', state: 'waiting' },
+    instance: { mode: 'off', peer: null, peers: ['hub'], canHost: true, supported: true },
+  };
+  await onSettings(async (page) => {
+    await page.answer(200, { accounts: [], peers: [], caller: OPERATOR });
+    await page.answerTo('/teamclaude/peer-links', 200, { self: SELF, peers: [] });
+    await page.answerTo('/teamclaude/account-sync', 200, waiting);
+    assert.ok(shown(page, /^Off: this machine keeps its own sign-ins\.$/));
+    page.click('Keep them on this machine');
+    const mode = page.requests.find(r => r.url === '/teamclaude/account-sync/mode');
+    assert.ok(mode, 'local sharing is sent without a cancel first');
+    assert.equal(page.requests.some(r => String(r.url).endsWith('/cancel')), false);
+    assert.deepEqual(JSON.parse(mode.init.body), { mode: 'host' });
+    await page.answerTo('/teamclaude/account-sync/mode', 200, { ok: true, mode: 'host', peer: null });
+    assert.ok(shown(page, /^On: this machine keeps the accounts\./));
+  }, { autoAnswer: null, manualTimers: true });
+});
+
 test('Account sync: while one sign-in is open, no other can be started', async () => {
   const peers = [{ name: 'desk', url: 'http://100.64.0.2:3456', state: 'online' }];
   await onSettings(async (page) => {

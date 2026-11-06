@@ -1,6 +1,26 @@
 import { importCredentials } from './oauth.js';
 import { importCodexCredentials, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
+import { importGrokCredentials, DEFAULT_GROK_CREDENTIALS_PATH } from './grok-auth.js';
 import { providerOf } from './provider.js';
+
+// How each provider's own CLI stores its login, for `importFrom`. A provider
+// with a default path is pooled from its CLI's file when the entry carries no
+// token of its own; Claude Code's file has no single home, so it needs the path.
+const CREDENTIAL_FILES = {
+  anthropic: { read: importCredentials, defaultPath: null },
+  codex: { read: importCodexCredentials, defaultPath: DEFAULT_CODEX_CREDENTIALS_PATH },
+  grok: { read: importGrokCredentials, defaultPath: DEFAULT_GROK_CREDENTIALS_PATH },
+};
+
+/**
+ * The reader for an account's credentials file, and the file its provider's
+ * CLI keeps when the entry names none.
+ * @param {Record<string, any>} acct
+ * @returns {{ read: (path: string) => Promise<Record<string, any>>, defaultPath: string|null }}
+ */
+export function credentialFileFor(acct) {
+  return CREDENTIAL_FILES[providerOf(acct)];
+}
 
 /**
  * Turn configured accounts into the objects the AccountManager is built from:
@@ -18,18 +38,17 @@ export async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      // A Codex account defaults to the Codex CLI's own credentials file, so
-      // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough to
-      // pool an already-signed-in Codex login. A default, not an override: that
-      // file holds ONE ChatGPT login, and importing it over an account that has
-      // its own credential collapsed every Codex row onto that login, discarding
+      // A Codex or Grok account defaults to its CLI's own credentials file,
+      // so `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough
+      // to pool an already-signed-in login. A default, not an override: that
+      // file holds ONE login, and importing it over an account that has its
+      // own credential collapsed every Codex row onto that login, discarding
       // what `teamclaude login --codex` had stored.
-      const isCodex = providerOf(acct) === 'codex';
-      if (acct.importFrom || (isCodex && !acct.accessToken)) {
-        const from = acct.importFrom || (isCodex ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
-        if (!from) { console.error(`No token for "${acct.name}", skipping`); continue; }
+      const file = credentialFileFor(acct);
+      if (acct.importFrom || (file.defaultPath && !acct.accessToken)) {
+        const from = acct.importFrom || file.defaultPath;
         try {
-          const creds = isCodex ? await importCodexCredentials(from) : await importCredentials(from);
+          const creds = await file.read(from);
           // A readable file with no token is as unusable as a missing one; the
           // non-import branch below already refuses that case, and pushing it
           // anyway would send `Bearer undefined` upstream on every request.
