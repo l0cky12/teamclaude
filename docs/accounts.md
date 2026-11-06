@@ -174,10 +174,27 @@ While signed in, every **OAuth** account (Claude and Codex) is kept as one row o
 
 The same sync works without callback.net or any other outside account. One of your TeamClaude instances keeps the store. Your other instances follow it, over the [linked-instance](usage.md#linked-instances) connection they already have. Everything else in the section above still applies: which accounts travel, the per-account lock that stops two machines renewing the same login, tombstones for removed accounts, and rows emptied for a sign-in.
 
-**Set it up from the dashboard.** First link the machines (**Settings**, **Linked instances**). Then, in the **Account sync** card:
+**Set it up from the dashboard.** The pictures use stand-in names. `home-server` keeps the sign-ins, and `laptop` and `desk` follow it. Your Instance picker will show your own names. Link the machines first (**Settings**, **Linked instances**), and use an address each machine can reach, such as a Tailscale or LAN address. The machine that keeps the store needs a proxy key (`proxy.apiKey`), since that is how the others reach it. Pick one that is usually on, such as a server.
 
-1. On the machine that will keep the sign-ins (pick it in the Instance picker if this page shows another one), click **Keep them on this machine**. Pick one that is usually on, such as a server. It needs a proxy key (`proxy.apiKey`), since that is how the other machines reach it.
-2. On each other machine, choose the first one in the list next to **Follow** and click **Follow**. The card checks that the machine answers and keeps the store before it saves anything.
+Each machine needs a current TeamRouter. If **Account sync** ends at the blue **Turn on account sync** button, with no **Or keep them on one of your own machines** under it, reload the page. If it is still missing, that machine is on an older version: update it, then reload.
+
+1. Open **Settings** on the machine that will keep the sign-ins. If the page is showing another machine, pick this one in the Instance picker first.
+
+![Settings on home-server. Account sync is off. Keep them on this machine is under the blue callback.net button. laptop and desk are linked and online.](../screenshots/account-sync-keep.png)
+
+Click **Keep them on this machine**.
+
+Leave the blue **Turn on account sync** button alone. That starts a callback.net sign-in. Leave **Follow** alone on this page too: the dropdown lists the other machines, and Follow here would make this machine follow one of them. The **Set up** buttons in the Linked instances table are that same callback.net sign-in, started on the machine in that row.
+
+2. For every other machine, pick it in the Instance picker (or click **Open** on its row). On its **Account sync** card, choose the machine from step 1 in the dropdown, then click **Follow**.
+
+![Settings showing laptop, reached through home-server. The follow dropdown is set to home-server.](../screenshots/account-sync-follow.png)
+
+Leave **Keep them on laptop** alone. That would make the laptop the store instead of home-server. A machine that does not list home-server in the dropdown is not linked to it yet: link it first, then come back to this step. Repeat it for desk, and for any later machine.
+
+The card checks that the chosen machine answers and is keeping the store before it saves. It then says this machine follows it:
+
+![Account sync on laptop after Follow: it follows the accounts kept on home-server, with Sync now and Turn off.](../screenshots/account-sync-on.png)
 
 The card then shows which machine keeps the accounts, how many accounts the store holds and when it last synced. **Sync now** runs a pass at once. **Turn off** (click it twice) stops sharing; the accounts stay where they are. A machine signed in to callback.net can't be switched until it signs out there, and the callback.net sign-in is refused while this is on, so a machine always syncs with one store only.
 
