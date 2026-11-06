@@ -50,7 +50,9 @@ TeamClaude holds at most **20 accounts of each kind**. The kinds are counted sep
 - Anthropic API keys
 - each third-party backend, by its upstream host (20 DeepSeek keys and 20 z.ai keys are both allowed)
 
-Disabled accounts count. Once a kind has 20, every way of adding another one refuses it: `teamclaude login`, `login --api`, `login --codex`, `import`, the TUI, the dashboard's sign-in buttons, `teamclaude accounts import`, and accounts arriving through [account sync](#syncing-accounts-across-machines-callbacknet). The refusal says which kind is full, for example `Account limit reached: 20 Claude accounts already (at most 20). Remove one before adding another.` Nothing is written when an add is refused. `login --api` refuses before it asks for the key.
+An account whose `upstream` is its own provider's address (`https://chatgpt.com` on a Codex account, `https://api.anthropic.com` on an API key) counts with that provider, and so does a subscription login sent through any `upstream`.
+
+Disabled accounts count. A running server checks the config file itself, under its lock, before it adds an account, so an account another process saved a moment ago counts too. Once a kind has 20, every way of adding another one refuses it: `teamclaude login`, `login --api`, `login --codex`, `import`, the TUI, the dashboard's sign-in buttons, `teamclaude accounts import`, and accounts arriving through [account sync](#syncing-accounts-across-machines-callbacknet). The refusal says which kind is full, for example `Account limit reached: 20/20 Claude accounts. Remove one to add another.` Nothing is written when an add is refused. `login --api` refuses before it asks for the key.
 
 Signing in again to an account you already have is an update, not an add, so it still works at the cap. An `accounts import` adds until the kind is full and lists the rest as skipped. An account that sync could not add is logged once and left in the store.
 

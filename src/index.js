@@ -64,7 +64,7 @@ import { WebAccountSync } from './web-account-sync.js';
 import { accountSyncMode, createSyncTransport, peerStoreApi, storeLabel, INSTANCE_SYNC_INTERVAL_MS } from './instance-sync.js';
 import { createSyncStore } from './sync-store.js';
 import { configuredPeers } from './peers.js';
-import { accountLimitReached, assertAccountLimit, AccountLimitError } from './account-limit.js';
+import { accountLimitReached, assertAccountLimit, admitUnderCap, AccountLimitError } from './account-limit.js';
 import { collectExportAccounts, createBundle, openBundle, isEncryptedBundle, checkBundle, mergeImportedAccounts, changedSinceExport, writePrivateFile, TransferError } from './account-transfer.js';
 
 // The server's credential sync, once it runs; a CLI command that changes an
@@ -456,25 +456,22 @@ async function serverCommand() {
   // config, manager, disk — and the same guard against an entry already there.
   /** @type {Set<string>} */
   const limitRefusalsLogged = new Set();
-  const admitAccount = (/** @type {Record<string, any>} */ entry) => {
-    if (config.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry)) || accountManager.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) return null;
-    // Past the per-kind cap (account-limit.js) the store's account stays out.
-    // Said once per account: every sync pass would otherwise say it again.
-    const reached = accountLimitReached(config.accounts, entry);
-    if (reached) {
-      const key = entry.id || entry.name;
-      if (!limitRefusalsLogged.has(key)) {
-        limitRefusalsLogged.add(key);
-        console.error(`[TeamClaude] Not adding "${safeLine(entry.name, 64)}" from ${credentialSync.where()}: ${reached.message}`);
-      }
-      return null;
+  /**
+   * A new account into config, disk and manager, under the per-kind cap
+   * (account-limit.js), checked and written against a fresh read of the file
+   * so a running process's stale count cannot let a twenty-first in. The TUI's
+   * adds take this too.
+   * @param {Record<string, any>} entry
+   */
+  const admitNewAccount = (entry) => admitUnderCap({ entry, config, accountManager, update: atomicConfigUpdate });
+  const admitAccount = async (/** @type {Record<string, any>} */ entry) => {
+    const { idx, reason } = await admitNewAccount(entry);
+    // Past the cap the store's account stays out. Said once per account:
+    // every sync pass would otherwise say it again.
+    if (reason && !limitRefusalsLogged.has(entry.name)) {
+      limitRefusalsLogged.add(entry.name);
+      console.error(`[TeamClaude] Not adding "${safeLine(entry.name, 64)}" from ${credentialSync.where()}: ${reason}`);
     }
-    config.accounts.push(entry);
-    ensureAccountIds(config.accounts);
-    const idx = accountManager.addAccount(entry);
-    atomicConfigUpdate((/** @type {any} */ diskConfig) => {
-      if (!diskConfig.accounts.some((/** @type {any} */ a) => sameIdentity(a, entry))) diskConfig.accounts.push(entry);
-    }).catch((/** @type {any} */ err) => console.error(`[TeamClaude] Failed to save an account added from ${credentialSync.where()}: ${err.message}`));
     return idx;
   };
 
@@ -873,6 +870,7 @@ async function serverCommand() {
   if (useTUI) {
     tui = new TUI({
       accountManager, config, sx, activityLogPath, sessionTitles, versionLabel, updateAvailable,
+      admitAccount: admitNewAccount,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         mergeAccountsOnto(diskConfig);
         // Persist sx.org settings (set/cleared from the TUI settings screen).

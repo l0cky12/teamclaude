@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  MAX_ACCOUNTS_PER_PROVIDER, accountLimitGroup, accountLimitReached, assertAccountLimit, AccountLimitError,
+  MAX_ACCOUNTS_PER_PROVIDER, accountLimitGroup, accountLimitReached, assertAccountLimit, AccountLimitError, admitUnderCap,
 } from '../src/account-limit.js';
+import { atomicConfigUpdate } from '../src/config.js';
 import { mergeImportedAccounts } from '../src/account-transfer.js';
 import { TUI } from '../src/tui.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -40,13 +41,27 @@ test('accounts are counted by kind: Claude, Codex, API key, and each backend hos
   assert.notEqual(accountLimitGroup(backend(1, 'https://api.z.ai/api/anthropic')).key, accountLimitGroup(backend(1)).key);
 });
 
+test('an upstream naming the provider\'s own host, or a subscription\'s upstream, does not make a backend', () => {
+  assert.equal(accountLimitGroup({ ...codex(1), upstream: 'https://chatgpt.com' }).key, 'codex');
+  assert.equal(accountLimitGroup({ ...apikey(1), upstream: 'https://API.anthropic.com/' }).key, 'apikey');
+  assert.equal(accountLimitGroup({ ...claude(1), upstream: 'https://relay.example.com' }).key, 'claude', 'an OAuth login is a subscription wherever it is sent');
+  assert.equal(accountLimitGroup({ ...codex(1), upstream: 'https://relay.example.com' }).key, 'codex');
+  // Twenty Codex logins spelled with an explicit upstream still fill Codex.
+  const spelled = many(codex, 20).map((a) => ({ ...a, upstream: 'https://chatgpt.com' }));
+  assert.ok(accountLimitReached(spelled, codex(99)));
+  const config = { accounts: spelled };
+  const result = mergeImportedAccounts(config, [codex(99)]);
+  assert.deepEqual(result.added, []);
+  assert.equal(config.accounts.length, 20);
+});
+
 test('the twentieth of a kind is taken, the twenty-first is refused', () => {
   assert.equal(accountLimitReached(many(claude, 19), claude(99)), null);
   const reached = accountLimitReached(many(claude, 20), claude(99));
   assert.ok(reached);
   assert.equal(reached.count, 20);
   assert.equal(reached.limit, 20);
-  assert.match(reached.message, /20 Claude accounts already \(at most 20\)/);
+  assert.match(reached.message, /Account limit reached: 20\/20 Claude accounts\. Remove one to add another\./);
   assert.throws(() => assertAccountLimit(many(codex, 20), codex(99)), AccountLimitError);
 });
 
@@ -69,7 +84,94 @@ test('a transfer import adds up to the cap and skips the rest, while updates sti
   assert.equal(config.accounts.length, 20);
 });
 
-async function makeTUI(configAccounts) {
+// A running server's count can be stale: another process (`teamclaude login`
+// in a second terminal) may have saved the twentieth account before this one
+// reloaded. admitUnderCap checks and writes under the config lock against a
+// fresh read of the file, so the stale count cannot let a twenty-first in.
+async function withConfigFile(accounts, fn) {
+  const dir = await mkdtemp(join(tmpdir(), 'teamclaude-admit-'));
+  const path = join(dir, 'config.json');
+  await writeFile(path, JSON.stringify({ proxy: { port: 1 }, upstreamProxy: false, accounts }));
+  const saved = { TEAMCLAUDE_CONFIG: process.env.TEAMCLAUDE_CONFIG, TEAMROUTER_CONFIG: process.env.TEAMROUTER_CONFIG };
+  process.env.TEAMCLAUDE_CONFIG = path;
+  process.env.TEAMROUTER_CONFIG = path;
+  try {
+    return await fn(path);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
+
+const withIds = (accounts) => accounts.map((a, i) => ({ id: `id-${a.name}-${i}`, ...a }));
+
+test('a stale running count does not let a twenty-first in: the file is checked under its lock', async () => {
+  const running = withIds(many(apikey, 19));
+  // The file also holds the twentieth, saved by another process.
+  const onDisk = [...running, { id: 'id-other', ...apikey(19) }];
+  await withConfigFile(onDisk, async (path) => {
+    const before = await readFile(path, 'utf8');
+    const config = { accounts: [...running] };
+    const am = new AccountManager(await resolveAccounts({ accounts: running }), 0.98);
+    const res = await admitUnderCap({ entry: apikey(50), config, accountManager: am, update: atomicConfigUpdate });
+    assert.equal(res.idx, null);
+    assert.match(res.reason, /20\/20 Anthropic API key accounts/);
+    assert.equal(await readFile(path, 'utf8'), before, 'a refusal writes nothing');
+    assert.equal(config.accounts.length, 19);
+    assert.equal(am.accounts.length, 19);
+  });
+});
+
+test('below the cap the row is written first, then joins the running lists', async () => {
+  const running = withIds(many(apikey, 18));
+  await withConfigFile(running, async (path) => {
+    const config = { accounts: [...running] };
+    const am = new AccountManager(await resolveAccounts({ accounts: running }), 0.98);
+    const entry = apikey(50);
+    const res = await admitUnderCap({ entry, config, accountManager: am, update: atomicConfigUpdate });
+    assert.equal(res.added, true);
+    assert.equal(res.idx, 18);
+    assert.equal(am.accounts[18].id, entry.id);
+    assert.equal(config.accounts.at(-1), entry);
+    const disk = JSON.parse(await readFile(path, 'utf8'));
+    assert.ok(disk.accounts.some((a) => a.id === entry.id && a.apiKey === entry.apiKey));
+  });
+});
+
+test('an add not yet saved counts, and two adds racing for the last place take one between them', async () => {
+  const running = withIds(many(apikey, 19));
+  await withConfigFile(running, async (path) => {
+    const config = { accounts: [...running] };
+    const am = new AccountManager(await resolveAccounts({ accounts: running }), 0.98);
+    const results = await Promise.all([apikey(50), apikey(51)].map((entry) => admitUnderCap({ entry, config, accountManager: am, update: atomicConfigUpdate })));
+    assert.equal(results.filter((r) => r.added).length, 1);
+    assert.equal(results.filter((r) => r.reason).length, 1);
+    const disk = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(disk.accounts.length, 20);
+    assert.equal(am.accounts.length, 20);
+  });
+
+  // An account this process runs but has not saved yet counts too.
+  const unsaved = { id: 'id-unsaved', ...apikey(40) };
+  await withConfigFile(withIds(many(apikey, 19)), async (path) => {
+    const config = { accounts: [...withIds(many(apikey, 19)), unsaved] };
+    const am = new AccountManager(await resolveAccounts({ accounts: config.accounts }), 0.98);
+    const res = await admitUnderCap({ entry: apikey(50), config, accountManager: am, update: atomicConfigUpdate });
+    assert.ok(res.reason);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).accounts.length, 19);
+  });
+});
+
+test('an account already in the pool is not added again, and is not called a refusal', async () => {
+  const running = withIds(many(apikey, 3));
+  await withConfigFile(running, async () => {
+    const config = { accounts: [...running] };
+    const am = new AccountManager(await resolveAccounts({ accounts: running }), 0.98);
+    const res = await admitUnderCap({ entry: apikey(1), config, accountManager: am, update: atomicConfigUpdate });
+    assert.deepEqual(res, { added: false, idx: null, reason: null });
+  });
+});
+
+async function makeTUI(configAccounts, extra = {}) {
   ensureAccountIds(configAccounts);
   const am = new AccountManager(await resolveAccounts({ accounts: configAccounts }), 0.98);
   const config = { proxy: { port: 1 }, accounts: configAccounts, routes: [] };
@@ -79,6 +181,7 @@ async function makeTUI(configAccounts) {
     saveConfig: async () => {},
     syncAccounts: async () => 0,
     onQuit: () => {},
+    ...extra,
   });
   tui.render = () => {};
   const addLog = tui._addLog.bind(tui);
@@ -92,6 +195,21 @@ test('the TUI refuses a twenty-first API key and leaves both lists alone', async
   assert.equal(config.accounts.length, 20);
   assert.equal(am.accounts.length, 20);
   assert.ok(logs.some((l) => /API key not added: Account limit reached/.test(l)), logs.join('\n'));
+});
+
+test('the TUI on a server checks the file, not its own stale list', async () => {
+  const running = withIds(many(apikey, 19));
+  await withConfigFile([...running, { id: 'id-other', ...apikey(19) }], async (path) => {
+    const before = await readFile(path, 'utf8');
+    let tuiState;
+    const admitAccount = (entry) => admitUnderCap({ entry, config: tuiState.config, accountManager: tuiState.am, update: atomicConfigUpdate });
+    tuiState = await makeTUI(running, { admitAccount });
+    await tuiState.tui._doAddKey('sk-demo-extra');
+    assert.equal(tuiState.config.accounts.length, 19);
+    assert.equal(tuiState.am.accounts.length, 19);
+    assert.equal(await readFile(path, 'utf8'), before);
+    assert.ok(tuiState.logs.some((l) => /API key not added: Account limit reached/.test(l)), tuiState.logs.join('\n'));
+  });
 });
 
 test('the TUI adds a key below the cap', async () => {
@@ -138,7 +256,7 @@ test('login --api refuses at the cap before prompting, and leaves the file alone
     child.on('exit', (c) => { clearTimeout(timer); resolve(c); });
   });
   assert.equal(code, 1, stderr);
-  assert.match(stderr, /Account limit reached: 20 Anthropic API key accounts already/);
+  assert.match(stderr, /Account limit reached: 20\/20 Anthropic API key accounts/);
   assert.doesNotMatch(stderr, /Anthropic API key:/, 'refused before the prompt');
   assert.equal(await readFile(configPath, 'utf8'), before);
 });

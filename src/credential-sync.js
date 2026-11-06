@@ -320,7 +320,7 @@ export class CredentialSync {
   /**
    * @param {Object} opts
    * @param {import('./account-manager.js').AccountManager} opts.accountManager
-   * @param {(entry: Record<string, any>) => number|null} opts.addAccount  admit a new account (config, disk, manager); its manager index, or null when refused
+   * @param {(entry: Record<string, any>) => number|null|Promise<number|null>} opts.addAccount  admit a new account (config, disk, manager); its manager index, or null when refused
    * @param {(account: Record<string, any>) => void} [opts.evictAccount]  remove an account the store says is gone (config, disk, manager)
    * @param {Api} [opts.api]
    * @param {() => Promise<boolean>} [opts.isSignedIn]
@@ -551,7 +551,7 @@ export class CredentialSync {
         // install does not have.
         if (this.am.accounts.some((a) => sameIdentity(a, row.blob))) continue;
         const entry = entryFromBlob(row.blob);
-        const idx = this.addAccount(entry);
+        const idx = await this.addAccount(entry);
         if (idx == null) continue;
         result.added++;
         this.log(`[TeamClaude] Account "${safeLine(entry.name, 64)}" added from ${this.where()} (signed in on ${safeLine(row.blob.by, 48)})`);
