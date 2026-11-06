@@ -679,8 +679,9 @@ test('the dashboard card draws its Weekly row by the same rule', () => {
   const html = renderDashboardHtml();
   assert.ok(html.includes(showWeeklyRow.toString()), 'the page carries the shared helper');
   // A row's meters come from accountMeters, which owns the 7-day column.
-  assert.match(html, /if \(showWeeklyRow\(q\)\) slots\[2\] = quotaMeter\('7-day limit'/);
-  assert.equal(html.split("quotaMeter('7-day limit'").length, 2, 'and no 7-day meter drawn outside it');
+  // The label names the plan's period (a monthly Grok plan), the gate is the same.
+  assert.match(html, /if \(showWeeklyRow\(q\)\) slots\[2\] = quotaMeter\(q\.planPeriod === 'monthly' \? 'Monthly limit' : '7-day limit'/);
+  assert.equal(html.split("'7-day limit'").length, 2, 'and no 7-day meter drawn outside it');
   const quota = { unified5h: 0.3, unified7d: null, weeklyWindowStated: false };
   assert.equal(accountMeters({ provider: 'anthropic', quota }).slots[2], null);
   assert.ok(accountMeters({ provider: 'anthropic', quota: { ...quota, weeklyWindowStated: true } }).slots[2]);
