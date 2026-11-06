@@ -462,8 +462,9 @@ async function serverCommand() {
    * so a running process's stale count cannot let a twenty-first in. The TUI's
    * adds take this too.
    * @param {Record<string, any>} entry
+   * @param {{ pickName?: ((taken: Set<string>) => string) | null }} [opts]
    */
-  const admitNewAccount = (entry) => admitUnderCap({ entry, config, accountManager, update: atomicConfigUpdate });
+  const admitNewAccount = (entry, { pickName = null } = {}) => admitUnderCap({ entry, config, accountManager, update: atomicConfigUpdate, pickName });
   const admitAccount = async (/** @type {Record<string, any>} */ entry) => {
     const { idx, reason } = await admitNewAccount(entry);
     // Past the cap the store's account stays out. Said once per account:

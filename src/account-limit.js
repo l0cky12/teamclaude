@@ -90,6 +90,9 @@ export class AccountLimitError extends Error {
   constructor(reached) {
     super(reached.message);
     this.name = 'AccountLimitError';
+    // Our own words, no upstream text in them: the dashboard and the event log
+    // show it as is (event-log.js briefError) instead of a generic failure.
+    this.publicMessage = reached.message;
     this.label = reached.label;
     this.count = reached.count;
     this.limit = reached.limit;
@@ -127,9 +130,15 @@ export function assertAccountLimit(accounts, entry, limit = MAX_ACCOUNTS_PER_PRO
  * @param {{ accounts: Array<Record<string, any>>, addAccount: (entry: Record<string, any>) => number }} opts.accountManager
  * @param {(updater: (disk: { accounts: Array<Record<string, any>> }) => void) => Promise<any>} opts.update
  * @param {number} [opts.limit]
+ * @param {((taken: Set<string>) => string) | null} [opts.pickName]  names the entry from the
+ *   names already taken, for an account named by the proxy (`api-N`) rather than by its
+ *   login. Asked again under the lock with the file's names too: an API key's identity
+ *   is its name, so a name another row holds would read as that account.
  * @returns {Promise<{ added: boolean, idx: number | null, reason: string | null }>}
  */
-export async function admitUnderCap({ entry, config, accountManager, update, limit = MAX_ACCOUNTS_PER_PROVIDER }) {
+export async function admitUnderCap({ entry, config, accountManager, update, limit = MAX_ACCOUNTS_PER_PROVIDER, pickName = null }) {
+  const namesIn = (/** @type {Array<Array<Record<string, any>>>} */ lists) => new Set(lists.flat().map((a) => a?.name).filter(Boolean));
+  if (pickName) entry.name = pickName(namesIn([config.accounts, accountManager.accounts]));
   const held = (/** @type {Record<string, any>} */ a) => sameIdentity(a, entry);
   if (config.accounts.some(held) || accountManager.accounts.some(held)) return { added: false, idx: null, reason: null };
   if (!entry.id) entry.id = mintAccountId();
@@ -137,6 +146,7 @@ export async function admitUnderCap({ entry, config, accountManager, update, lim
   let reason = null;
   try {
     await update((disk) => {
+      if (pickName) entry.name = pickName(namesIn([disk.accounts, config.accounts, accountManager.accounts]));
       // On disk already (another process added it): the next reload brings it in.
       if (disk.accounts.some(held)) throw new NotAdded(null);
       // The file's rows, and this process's own that the file does not have

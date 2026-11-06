@@ -9,6 +9,7 @@ import {
   MAX_ACCOUNTS_PER_PROVIDER, accountLimitGroup, accountLimitReached, assertAccountLimit, AccountLimitError, admitUnderCap,
 } from '../src/account-limit.js';
 import { atomicConfigUpdate } from '../src/config.js';
+import { briefError } from '../src/event-log.js';
 import { mergeImportedAccounts } from '../src/account-transfer.js';
 import { TUI } from '../src/tui.js';
 import { AccountManager } from '../src/account-manager.js';
@@ -63,6 +64,13 @@ test('the twentieth of a kind is taken, the twenty-first is refused', () => {
   assert.equal(reached.limit, 20);
   assert.match(reached.message, /Account limit reached: 20\/20 Claude accounts\. Remove one to add another\./);
   assert.throws(() => assertAccountLimit(many(codex, 20), codex(99)), AccountLimitError);
+});
+
+// A dashboard sign-in failure shows only what briefError lets through; the
+// refusal is ours, so the page says why instead of pointing at the server log.
+test('a refusal reaches the dashboard and event log in its own words', () => {
+  const err = new AccountLimitError(accountLimitReached(many(codex, 20), codex(99)));
+  assert.equal(briefError(err), 'Account limit reached: 20/20 Codex accounts. Remove one to add another.');
 });
 
 test('a full kind does not hold back another kind', () => {
@@ -209,6 +217,35 @@ test('the TUI on a server checks the file, not its own stale list', async () => 
     assert.equal(tuiState.am.accounts.length, 19);
     assert.equal(await readFile(path, 'utf8'), before);
     assert.ok(tuiState.logs.some((l) => /API key not added: Account limit reached/.test(l)), tuiState.logs.join('\n'));
+  });
+});
+
+// An API key's identity is its name. The TUI names a key api-<count + 1>, and
+// after a removal that count lands on a name still in use: the new key read as
+// that account and was never added, leaving the pool one short.
+test('after a removal the TUI adds the replacement key under a free name', async () => {
+  const { tui, config, am, logs } = await makeTUI(many((i) => apikey(i + 1), 20));
+  await tui._doRemove(0); // api-1
+  assert.equal(config.accounts.length, 19);
+  await tui._doAddKey('sk-demo-fresh');
+  assert.equal(config.accounts.length, 20, logs.join('\n'));
+  assert.equal(am.accounts.length, 20);
+  const added = config.accounts.find((a) => a.apiKey === 'sk-demo-fresh');
+  assert.equal(added.name, 'api-21', 'api-20 is still taken');
+  assert.equal(new Set(config.accounts.map((a) => a.name)).size, 20, 'every name is distinct');
+});
+
+test('on a server the TUI also steps past a name another process saved', async () => {
+  const running = withIds(many((i) => apikey(i + 1), 18)); // api-1..api-18
+  await withConfigFile([...running, { id: 'id-cli', ...apikey(19) }], async (path) => {
+    let tuiState;
+    const admitAccount = (entry, opts) => admitUnderCap({ entry, config: tuiState.config, accountManager: tuiState.am, update: atomicConfigUpdate, ...opts });
+    tuiState = await makeTUI(running, { admitAccount });
+    await tuiState.tui._doAddKey('sk-demo-fresh');
+    const disk = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(disk.accounts.length, 20, tuiState.logs.join('\n'));
+    assert.equal(disk.accounts.find((a) => a.apiKey === 'sk-demo-fresh').name, 'api-20', 'api-19 is the other process\'s');
+    assert.equal(disk.accounts.find((a) => a.name === 'api-19').apiKey, 'sk-demo-19', 'and it is left alone');
   });
 });
 

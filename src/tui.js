@@ -745,7 +745,7 @@ export class TUI {
     // config file (account-limit.js admitUnderCap); index.js passes the
     // server's. Without one (no server behind this TUI) the check runs on the
     // lists held here.
-    admitAccount = /** @type {((entry: Record<string, any>) => Promise<{ added: boolean, idx: number | null, reason: string | null }>) | null} */ (null),
+    admitAccount = /** @type {((entry: Record<string, any>, opts?: { pickName?: ((taken: Set<string>) => string) | null }) => Promise<{ added: boolean, idx: number | null, reason: string | null }>) | null} */ (null),
     activityLogPath = null,
     // Attach mode: the accounts belong to a server in another process, reached
     // over its control plane. Everything that would mutate local state is off,
@@ -2311,23 +2311,30 @@ export class TUI {
    * write run against a fresh read of the file; without one, against the
    * lists held here, and the caller's save writes it.
    * @param {Record<string, any>} entry
+   * @param {{ pickName?: ((taken: Set<string>) => string) | null }} [opts]
    * @returns {Promise<{ added: boolean, idx: number | null, reason: string | null }>}
    */
-  _admit(entry) {
-    if (this.admitAccount) return this.admitAccount(entry);
+  _admit(entry, { pickName = null } = {}) {
+    if (this.admitAccount) return this.admitAccount(entry, { pickName });
     return admitUnderCap({
-      entry, config: this.config, accountManager: this.am,
+      entry, config: this.config, accountManager: this.am, pickName,
       update: async (fn) => fn({ accounts: [...this.config.accounts] }),
     });
   }
 
   async _doAddKey(apiKey) {
-    const n = this.config.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-    const name = `api-${n}`;
     // One object, not two equal literals: the account has to be built from the
     // entry itself to carry its id, which is what pairs the two afterwards.
-    const entry = { id: mintAccountId(), name, type: 'apikey', apiKey };
-    const { added, reason } = await this._admit(entry);
+    const entry = { id: mintAccountId(), name: '', type: 'apikey', apiKey };
+    // api-N after the keys there are, stepping past a name still taken: after a
+    // removal the count lands on one that is, and an API key's identity is its
+    // name, so the new key would read as that account and never be added.
+    const pickName = (/** @type {Set<string>} */ taken) => {
+      let n = [...taken].filter(t => t.startsWith('api-')).length + 1;
+      while (taken.has(`api-${n}`)) n++;
+      return `api-${n}`;
+    };
+    const { added, reason } = await this._admit(entry, { pickName });
     if (!added) {
       this._addLog(`API key not added: ${reason || 'that key is already in the pool'}`);
       return;
@@ -2336,7 +2343,7 @@ export class TUI {
     // disk, and a reload in between must not read the file as a removal.
     markAccountAdded(this.config, entry.id);
     await this.saveConfig(this.config);
-    this._addLog(`Added API key account "${name}"`);
+    this._addLog(`Added API key account "${entry.name}"`);
   }
 
   async _doRemove(idx) {
