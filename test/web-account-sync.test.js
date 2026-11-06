@@ -21,7 +21,7 @@ async function settle() {
  * A WebAccountSync over stand-ins. `approve()` lets the pending sign-in
  * finish with a token; `fail(err)` makes it fail.
  */
-function harness({ token = null, whoami, beforeUrl, saveGate = null } = {}) {
+function harness({ token = null, whoami, beforeUrl, saveGate = null, store = null } = {}) {
   const state = { token, saved: [], syncs: [], logouts: 0, whoamiCalls: 0, logs: [], loginOpts: null };
   let approve = () => {};
   let fail = () => {};
@@ -47,6 +47,15 @@ function harness({ token = null, whoami, beforeUrl, saveGate = null } = {}) {
     whoami: whoami || (async () => { state.whoamiCalls++; return { id: 'u1', email: 'me@example.com', name: 'Me' }; }),
     logout: async () => { state.logouts++; const was = !!state.token; state.token = null; return { wasSignedIn: was, revoked: was }; },
     log: (l) => state.logs.push(l),
+    // `store`, when given, is the dashboard's switch to a store this machine
+    // keeps or follows. Absent, the card cannot switch, as before.
+    ...(store ? {
+      mode: () => store.current,
+      setMode: async (next) => { store.set.push(next); store.current = next; },
+      canHost: () => store.canHost !== false,
+      peerNames: () => store.peers || [],
+      probe: store.probe || (async () => ({})),
+    } : {}),
   });
   return { sync, state, approve: () => approve(), fail: (e) => fail(e) };
 }
@@ -74,6 +83,80 @@ test('start is refused while signed in, so a sign-in never switches the store si
   const { sync, state } = harness({ token: { access_token: 'at-1', refresh_token: 'rt-1' } });
   await assert.rejects(sync.start(), (err) => err instanceof AccountSyncError && /sign out first/.test(err.message));
   assert.equal(state.loginOpts, null, 'no sign-in was begun');
+});
+
+test('keeping the accounts on your own machines cancels a callback.net sign-in that is only waiting', async () => {
+  const store = { current: { mode: 'off' }, set: [], canHost: true, peers: ['hub'] };
+  const { sync, state, approve } = harness({ store });
+  const started = await sync.start();
+  assert.equal(sync.status(started.id).state, 'waiting');
+  assert.deepEqual((await sync.view()).signIn, { id: started.id, state: 'waiting' });
+
+  // The dashboard's "Keep them on this machine". It must not answer
+  // "a callback.net sign-in is in progress; cancel it first".
+  assert.deepEqual(await sync.changeMode({ mode: 'host' }), { mode: 'host', peer: null });
+  assert.equal(sync.status(started.id).state, 'cancelled');
+  assert.equal((await sync.view()).signIn, null);
+  assert.deepEqual(store.set, [{ mode: 'host' }]);
+
+  approve();
+  await settle();
+  assert.deepEqual(state.saved, [], 'an approval that lands after the switch is not kept');
+  assert.deepEqual(state.syncs, [], 'no callback.net pass runs');
+  assert.equal(store.current.mode, 'host');
+
+  store.current = { mode: 'off' };
+  store.set.length = 0;
+  const again = await sync.start();
+  assert.deepEqual(await sync.changeMode({ mode: 'follow', peer: 'hub' }), { mode: 'follow', peer: 'hub' });
+  assert.equal(sync.status(again.id).state, 'cancelled');
+  assert.deepEqual(store.set, [{ mode: 'follow', peer: 'hub' }]);
+});
+
+test('a callback.net sign-in that is already saving its token still blocks the switch to a local store', async () => {
+  const g = gate();
+  const store = { current: { mode: 'off' }, set: [], canHost: true, peers: ['hub'] };
+  const { sync, approve } = harness({ saveGate: g.promise, store });
+  const { id } = await sync.start();
+  approve();
+  await settle();
+  assert.equal(sync.status(id).state, 'finishing');
+  await assert.rejects(
+    sync.changeMode({ mode: 'host' }),
+    (err) => err instanceof AccountSyncError && /still finishing/.test(err.message),
+  );
+  assert.deepEqual(store.set, [], 'nothing saved while the token write is in flight');
+  g.open();
+  await settle();
+  assert.equal(sync.status(id).state, 'succeeded');
+});
+
+test('a local switch this machine cannot make leaves the waiting callback.net sign-in alone', async () => {
+  const store = { current: { mode: 'off' }, set: [], canHost: false, peers: ['hub'] };
+  const { sync } = harness({ store });
+  const { id } = await sync.start();
+  await assert.rejects(sync.changeMode({ mode: 'host' }), (err) => err instanceof AccountSyncError && /no proxy key/.test(err.message));
+  await assert.rejects(sync.changeMode({ mode: 'follow', peer: 'elsewhere' }), (err) => err instanceof AccountSyncError && /linked instances/.test(err.message));
+  assert.equal(sync.status(id).state, 'waiting');
+  assert.deepEqual(store.set, []);
+});
+
+test('a follow the linked machine cannot serve does not switch, and drops the waiting sign-in so its approval cannot land', async () => {
+  const store = {
+    current: { mode: 'off' }, set: [], canHost: true, peers: ['hub'],
+    probe: async () => { throw new Error('hub does not keep the accounts; turn that on there first'); },
+  };
+  const { sync, state, approve } = harness({ store });
+  const { id } = await sync.start();
+  await assert.rejects(
+    sync.changeMode({ mode: 'follow', peer: 'hub' }),
+    (err) => err instanceof AccountSyncError && /could not use the account store on hub/.test(err.message),
+  );
+  assert.equal(sync.status(id).state, 'cancelled');
+  assert.deepEqual(store.set, []);
+  approve();
+  await settle();
+  assert.deepEqual(state.saved, []);
 });
 
 test('an approval that lands after Cancel is not kept', async () => {
