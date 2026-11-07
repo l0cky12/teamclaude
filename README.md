@@ -71,6 +71,7 @@ Some shortcuts:
 
 - Already signed in to Claude Code? `teamclaude import` copies that sign-in instead.
 - Want plain `claude` to always use the proxy? Run `teamclaude alias --install`.
+- `teamclaude connect` points Claude Code, Codex and Grok Build at the proxy by writing their settings for you (`teamclaude disconnect` undoes it). See [Connecting your tools in one step](docs/usage.md#connecting-your-tools-in-one-step).
 - Signing in on a server over SSH? `teamclaude login --token` gives you a link to open on any device and a box to paste the code into.
 
 You can add up to 20 accounts of each kind (Claude, Codex, Grok, API keys, and each third-party backend). More on accounts, including API keys and one email in several organisations: [docs/accounts.md](docs/accounts.md).

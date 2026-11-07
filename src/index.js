@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile, unlink } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { createDefaultConfig, loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -34,6 +34,7 @@ import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
+import { ConnectError, clientStatus, loopbackOrigin, parseClientIds, runClientAction } from './client-connect.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
@@ -295,6 +296,10 @@ switch (command) {
   case 'alias':
     aliasCommand();
     process.exit(0);
+    break;
+  case 'connect':
+  case 'disconnect':
+    await connectCommand(/** @type {'connect'|'disconnect'} */ (command));
     break;
   case 'service':
     await serviceCommand();
@@ -2732,6 +2737,65 @@ function aliasCommand() {
   }
 }
 
+// ── connect / disconnect ────────────────────────────────────
+
+/**
+ * One line for a client's status, for the terminal.
+ * @param {import('./client-connect.js').ClientStatus} c
+ */
+function connectLine(c) {
+  const state = c.state === 'connected' ? 'connected'
+    : c.state === 'disconnected' ? 'not connected'
+      : c.state === 'elsewhere' ? `uses ${c.current}`
+        : `unreadable: ${c.problem}`;
+  return `  ${c.label.padEnd(12)} ${state}\n  ${' '.repeat(12)} ${c.where}`;
+}
+
+// Writes the settings of Claude Code, the Codex CLI and Grok Build on this
+// machine, so they reach the proxy without anyone editing those files.
+/** @param {'connect'|'disconnect'} action */
+async function connectCommand(action) {
+  const flags = args.slice(1);
+  const unknownFlag = flags.find(f => f.startsWith('-') && !['--replace', '--status'].includes(f));
+  if (unknownFlag) {
+    console.error(`teamclaude ${action}: unknown option ${unknownFlag}`);
+    console.error('Usage: teamclaude connect [all|claude|codex|grok ...] [--replace] | --status');
+    console.error('       teamclaude disconnect [all|claude|codex|grok ...]');
+    process.exit(1);
+  }
+  let ids;
+  try {
+    ids = parseClientIds(flags.filter(f => !f.startsWith('-')));
+  } catch (err) {
+    if (!(err instanceof ConnectError)) throw err;
+    console.error(`teamclaude ${action}: ${err.message}`);
+    process.exit(1);
+  }
+  // No config yet is a fresh install: the server will create the default one,
+  // so its port is the one to point at. Nothing is written here.
+  const config = (await loadConfig()) ?? createDefaultConfig();
+  const origin = loopbackOrigin(config.proxy, envVar('HOST') || config.proxy.host, config.proxy.port);
+  if (!origin) {
+    console.error(`teamclaude ${action}: this proxy answers no loopback address (proxy.trustLoopback is false, or proxy.host is one address other than this machine's own),`);
+    console.error('so a client here cannot reach it without a key, and these settings carry none. Point the clients at it by hand: see docs/accounts.md.');
+    process.exit(1);
+  }
+
+  if (flags.includes('--status')) {
+    for (const id of ids) console.log(connectLine(await clientStatus(id, origin)));
+    process.exit(0);
+  }
+  const { clients, errors } = await runClientAction(action, ids, origin, { replace: flags.includes('--replace') });
+  for (const c of clients) console.log(connectLine(c));
+  for (const e of errors) console.error(`\n${e.error}`);
+  const grok = clients.find(c => c.id === 'grok' && !errors.some(e => e.id === 'grok'));
+  if (grok?.note) console.log(`\n${grok.note}`);
+  if (action === 'connect' && !errors.length && !(await isServerUp(config))) {
+    console.log(`\nThe proxy is not running yet. Start it with: teamclaude server`);
+  }
+  process.exit(errors.length ? 1 : 0);
+}
+
 // ── service ─────────────────────────────────────────────────
 
 async function serviceCommand() {
@@ -3503,6 +3567,13 @@ Commands:
                       the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  connect [all|claude|codex|grok ...] [--replace]
+                      Point Claude Code, the Codex CLI and Grok Build on this
+                      machine at the proxy by writing their settings (all of
+                      them by default). A setting that names another address
+                      is kept unless --replace; --status only shows each one
+  disconnect [all|claude|codex|grok ...]
+                      Take out the settings connect wrote, and only those
   service <sub>       Run the proxy as a user service that starts at login and
                       restarts on its own: install | uninstall | status | print
                       (LaunchAgent on macOS, systemd --user unit on Linux;

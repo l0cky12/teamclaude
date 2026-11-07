@@ -306,6 +306,30 @@ This is an interactive-shell alias — it affects `claude` typed at a prompt, no
 
 The Claude Code extension for VS Code starts `claude` itself in its chat panel, so neither the alias nor `run` reaches it there. It takes the proxy settings from its own setting instead: see [VS Code extension](vscode.md). In terminal mode (`claudeCode.useTerminal`) on macOS and Linux, and on Windows in a Git Bash or WSL terminal, it types `claude` into an integrated terminal, where the alias does apply.
 
+### Connecting your tools in one step
+
+`teamclaude connect` points Claude Code, the Codex CLI and Grok Build on this machine at the proxy by writing their own settings, so you don't edit any of them by hand:
+
+```bash
+teamclaude connect                  # all three
+teamclaude connect codex grok       # or only some: claude, codex, grok
+teamclaude connect --status         # where each one points now; changes nothing
+teamclaude disconnect               # take out what connect wrote (also per client)
+```
+
+| Client | Where | What connect writes |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR` when set) | `env.ANTHROPIC_BASE_URL = "http://127.0.0.1:<port>"`. Every other key is kept. No `ANTHROPIC_API_KEY`: a loopback client needs no key, and a key would take Claude Code out of subscription mode. |
+| Codex CLI | `~/.codex/config.toml` (`$CODEX_HOME` when set) | `model_provider = "teamclaude"` and the `[model_providers.teamclaude]` table from [Codex accounts](accounts.md#codex-accounts-experimental). A table you added by hand is replaced, never duplicated. |
+| Grok Build | On Windows, your user environment. Elsewhere, your shell's rc file (`~/.bashrc`, `~/.zshrc`, `~/.profile`, or fish's `conf.d/teamclaude.fish`) | `GROK_CLI_CHAT_PROXY_BASE_URL = "http://127.0.0.1:<port>/grok/v1"`. Grok Build reads it when it starts, so open a new terminal after connecting. |
+
+Each client prints one line: `connected`, `not connected`, `uses <setting>` when it points somewhere else, or `unreadable` with the reason (a `settings.json` that is not valid JSON is never overwritten).
+
+- **A setting that points elsewhere is kept.** If Claude Code already has another `ANTHROPIC_BASE_URL`, or Codex another `model_provider`, `connect` says so, changes nothing for that client, and exits non-zero. `--replace` overwrites it. For Codex the previous provider is kept in a comment on the new line (`model_provider = "teamclaude" # teamclaude: was "openai"`), and `disconnect` puts it back.
+- **`disconnect` removes only what is ours.** A setting that names another address stays as it is. Running either command twice has the same effect as once.
+- **The address is the proxy's loopback address**, from `proxy.port` and the bind. A proxy with none (`proxy.trustLoopback` is `false`, or `proxy.host` is one address other than loopback) is refused: a client on this machine could only reach it with a key, and these settings carry none.
+- **Claude Code then reaches the proxy by base URL, from every terminal and the background agents alike.** It skips the check `teamclaude run` makes that the proxy is up, and Claude Code treats a base URL that is not Anthropic's as a gateway (tool search and Remote Control off; see [Why MITM mode, not a base URL](vscode.md#why-mitm-mode-not-a-base-url)). If you rely on those, use `teamclaude run` or the alias instead and `teamclaude disconnect claude`.
+
 ## Command reference
 
 ```bash
@@ -315,6 +339,8 @@ teamclaude server            # Start the proxy (--headless for plain logs)
 teamclaude run               # Run Claude Code through the proxy
 teamclaude env               # Print export lines for routing claude yourself
 teamclaude alias             # Print/install a `claude` alias that routes via the proxy
+teamclaude connect           # Point Claude Code, Codex and Grok Build at the proxy (--status, --replace)
+teamclaude disconnect        # Take those settings out again
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude attach            # Open the live dashboard against a running server
