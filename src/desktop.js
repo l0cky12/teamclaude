@@ -107,9 +107,8 @@ export async function launchDesktop({
   let started = false;
   if (pid == null) {
     const child = start(logFile);
-    started = true;
     pid = await waitForServer(child, { probe, sleep, now, timeoutMs, logFile });
-    if (pid !== child.pid) started = false;
+    started = pid === child.pid;
   }
   if (open) await openUrl(url);
   return { url, pid, started };
