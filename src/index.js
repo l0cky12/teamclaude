@@ -699,6 +699,8 @@ async function serverCommand() {
       // The shared key is read per request too, so a rotated key on disk
       // takes effect on reload the same way.
       config.proxy.apiKey = diskConfig.proxy.apiKey;
+      // Read per sign-in, so a password set or cleared applies at once.
+      config.proxy.dashboardLogin = diskConfig.proxy.dashboardLogin;
     }
     // The MCP endpoint's mode: read per request, so this is what opens,
     // narrows or closes it without a restart. Outside the guard above on

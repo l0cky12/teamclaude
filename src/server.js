@@ -31,6 +31,7 @@ import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setOutsideSpendHidePercent, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
+import { configuredLogin, createDashboardLogin, passwordLoginAvailable, setDashboardLogin } from './dashboard-login.js';
 import { AccountSyncError } from './web-account-sync.js';
 import { SyncStoreError } from './sync-store.js';
 import { RemovalRefused, serialQueue } from './account-removal.js';
@@ -477,6 +478,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/instance-name', 'a client key cannot change settings'],
   ['/teamclaude/instance-address', 'a client key cannot change settings'],
   ['/teamclaude/outside-spend-hide', 'a client key cannot change settings'],
+  // The password answers with the proxy key, so setting it is handing that out.
+  ['/teamclaude/dashboard-login', 'a client key cannot change settings'],
   ['/teamclaude/priority', 'a client key cannot change accounts'],
   ['/teamclaude/disable', 'a client key cannot change accounts'],
   ['/teamclaude/remove', 'a client key cannot change accounts'],
@@ -575,6 +578,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // Two clicks in quick succession must not both read a settings file before
   // either writes it.
   const connectQueue = serialQueue();
+  const dashboardLogin = createDashboardLogin();
 
   /**
    * Save the entries a mesh join found for this machine, then reload so the
@@ -651,6 +655,44 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           'X-Content-Type-Options': 'nosniff',
         });
         res.end(renderDashboardHtml());
+        return;
+      }
+
+      // Password sign-in for the dashboard (dashboard-login.js), before the key
+      // gate since it is how a browser without the key gets it. `methods` tells
+      // the page whether to show the username and password fields.
+      if (req.method === 'GET' && req.url === '/teamclaude/auth/methods') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ password: passwordLoginAvailable(config.proxy) }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/teamclaude/auth/login') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body, /** @type {Record<string, string>} */ headers = {}) => {
+          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
+          res.end(JSON.stringify(body));
+        };
+        // Only the dashboard's own page may ask. Another site cannot read the
+        // reply anyway, but it could still spend this address's guesses.
+        if (!isSameOriginControlRequest(req, { keyed: true })) {
+          reply(403, { ok: false, error: 'cross-origin request refused' });
+          return;
+        }
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        const addr = req.socket.remoteAddress || 'unknown';
+        const out = await dashboardLogin.attempt(config.proxy, addr, body);
+        if (out.key) {
+          console.log(`[TeamClaude] Dashboard signed in with the password from ${safeLine(addr, 64)}`);
+          reply(200, { ok: true, key: out.key });
+        } else if (out.reason === 'unavailable') {
+          reply(404, { ok: false, error: 'password sign-in is not set up on this proxy' });
+        } else if (out.reason === 'wrong') {
+          console.log(`[TeamClaude] Dashboard password sign-in refused from ${safeLine(addr, 64)}`);
+          reply(401, { ok: false, error: 'wrong username or password' });
+        } else {
+          const wait = out.retryAfterSec ?? 1;
+          reply(429, { ok: false, error: out.reason === 'locked' ? `too many wrong tries; wait ${wait} s` : 'busy; try again', retryAfterSec: wait }, { 'Retry-After': String(wait) });
+        }
         return;
       }
 
@@ -1074,7 +1116,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // `instance` is what the picker calls this machine and what the
           // Settings page's Instance name row shows: `custom` when
           // instanceName set it, and the host name it falls back to.
-          ...(req.tcClient ? {} : { peers: peerDirectory.list(config), instance: instanceView(config) }) }, null, 2));
+          // `dashboardLogin` is the password sign-in's username, or null.
+          ...(req.tcClient ? {} : { peers: peerDirectory.list(config), instance: instanceView(config), dashboardLogin: configuredLogin(config.proxy)?.username ?? null }) }, null, 2));
         return;
       }
 
@@ -1721,6 +1764,46 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         const view = instanceView(config);
         console.log(`[TeamClaude] Instance name ${view.custom ? `set to "${safeLine(view.name, 80)}"` : 'cleared; using the host name'} (dashboard)`);
         reply(200, { ok: true, ...view });
+        return;
+      }
+
+      // Dashboard password: the Settings page's Dashboard sign-in row.
+      // Body: {"username", "password"}, or both empty to turn it off.
+      if (req.method === 'POST' && req.url === '/teamclaude/dashboard-login') {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        };
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        if (!hooks.reload) { reply(501, { ok: false, error: 'dashboard password change not supported' }); return; }
+        /** @type {string|null} */ let username = null;
+        try {
+          // Hashed before the lock is taken: it is the slow part.
+          /** @type {Record<string, any>} */ const staged = { proxy: { apiKey: config.proxy?.apiKey } };
+          username = await setDashboardLogin(staged, body);
+          const entry = staged.proxy.dashboardLogin ?? null;
+          await atomicConfigUpdate((/** @type {Record<string, any>} */ c) => {
+            if (!entry) { if (c.proxy) delete c.proxy.dashboardLogin; return; }
+            if (!c.proxy?.apiKey) throw new ConfigOpError('Set a proxy key (proxy.apiKey) first: signing in hands the page that key.');
+            c.proxy.dashboardLogin = entry;
+          });
+        } catch (err) {
+          const message = /** @type {Error} */ (err).message;
+          const bad = err instanceof ConfigOpError;
+          console.error('[TeamClaude] Dashboard password change failed:', message);
+          reply(bad ? 400 : 500, { ok: false, error: bad ? message : 'dashboard password change failed; see the proxy log' });
+          return;
+        }
+        try {
+          await hooks.reload();
+        } catch (err) {
+          console.error('[TeamClaude] Reload after a dashboard password change failed:', /** @type {Error} */ (err).message);
+          reply(500, { ok: false, error: 'saved to the config file, but the reload failed; see the proxy log' });
+          return;
+        }
+        console.log(`[TeamClaude] Dashboard password ${username ? `set for "${safeLine(username, 64)}"` : 'turned off'} (dashboard)`);
+        reply(200, { ok: true, username });
         return;
       }
 

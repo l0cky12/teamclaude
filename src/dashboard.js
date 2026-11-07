@@ -715,6 +715,62 @@ export function instanceNameOutcome(res) {
 }
 
 /**
+ * The key box's password sign-in. A right password is answered with the proxy
+ * key, which the page then keeps like a typed one.
+ * @param {string} username
+ * @param {string} password
+ */
+export function passwordLoginRequest(username, password) {
+  return {
+    url: '/teamclaude/auth/login',
+    init: {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password }),
+    },
+  };
+}
+
+/**
+ * @param {number} status
+ * @param {any} res
+ * @returns {{ key: string } | { error: string }}
+ */
+export function passwordLoginOutcome(status, res) {
+  if (res && res.ok && typeof res.key === 'string' && res.key) return { key: res.key };
+  if (status === 401) return { error: 'Wrong username or password.' };
+  if (status === 429) return { error: 'Too many wrong tries. Wait ' + ((res && res.retryAfterSec) || 60) + ' seconds and try again.' };
+  if (status === 404) return { error: 'This proxy has no dashboard password. Enter the proxy key instead.' };
+  return { error: 'Sign-in failed' + (res && res.error ? ': ' + res.error : ' (status ' + status + ')') + '.' };
+}
+
+/**
+ * Set the dashboard password, or turn it off with both fields empty.
+ * @param {string} username
+ * @param {string} password
+ * @param {string|null|undefined} key
+ */
+export function dashboardLoginRequest(username, password, key) {
+  return {
+    url: '/teamclaude/dashboard-login',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password }),
+    },
+  };
+}
+
+/**
+ * @param {any} res
+ * @returns {{ kind: string, text: string }}
+ */
+export function dashboardLoginOutcome(res) {
+  if (!res || !res.ok) return { kind: 'error', text: 'dashboard password change failed' + (res && res.error ? ': ' + res.error : '') };
+  return { kind: 'ok', text: res.username ? 'dashboard password set for ' + res.username : 'dashboard password turned off' };
+}
+
+/**
  * @param {string} address  '' goes back to the guess
  * @param {string|null|undefined} key
  */
@@ -2418,6 +2474,7 @@ const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
+  passwordLoginRequest, passwordLoginOutcome, dashboardLoginRequest, dashboardLoginOutcome,
   outsideSpendHideRequest, outsideSpendHideOutcome, outsideSpendText, forecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
@@ -2747,6 +2804,10 @@ const PAGE = `<!doctype html>
   #keybox { display: none; margin: 80px auto; max-width: 420px; text-align: center; padding: 0 16px; }
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
+  #keybox input + input { margin-top: 0; }
+  #keybox .or { margin: 28px 0 4px; color: var(--dim); font-size: 13px; }
+  #keybox .kerr { color: var(--bad); font-size: 13px; min-height: 1.4em; margin: 8px 0 0; }
+  .thr input.pw { width: 150px; text-align: left; }
   .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .insbar .lbl { color: var(--dim); font-size: 12px; }
   .insbar .insscope { display: flex; gap: 8px 14px; align-items: center; }
@@ -2819,7 +2880,15 @@ const PAGE = `<!doctype html>
 <body>
 <div id="keybox">
   <h1>TeamRouter</h1>
-  <p class="sub">Enter your proxy key to view status.</p>
+  <form id="pwForm" style="display:none">
+    <p class="sub">Sign in to view status.</p>
+    <input id="pwUser" placeholder="Username" autocomplete="username" spellcheck="false" autocapitalize="off">
+    <input id="pwPass" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="pwGo" type="submit">Sign in</button>
+    <p id="pwErr" class="kerr"></p>
+    <p class="or">Or enter the proxy key.</p>
+  </form>
+  <p class="sub" id="keySub">Enter your proxy key to view status.</p>
   <input id="key" type="password" placeholder="tc-..." autocomplete="off">
   <br><button id="go">Connect</button>
 </div>
@@ -2985,6 +3054,15 @@ const PAGE = `<!doctype html>
         <div class="setting">
           <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
           <button id="probe" class="btn" type="button">Probe quotas</button>
+        </div>
+        <div class="setting" id="pwRow" style="display:none">
+          <div><b>Dashboard password</b><span class="tag" id="pwTag">Sign in from another machine with a username and password instead of the proxy key. Saved to the config file as a hash.</span></div>
+          <form class="thr" id="pwSetForm">
+            <input id="pwSetUser" class="pw" placeholder="Username" maxlength="64" spellcheck="false" autocomplete="username" autocapitalize="off" aria-label="Username">
+            <input id="pwSetPass" class="pw" type="password" placeholder="New password" autocomplete="new-password" aria-label="New password">
+            <button id="pwSet" class="btn" type="submit">Save</button>
+            <button id="pwOff" class="btn" type="button" style="display:none">Turn off</button>
+          </form>
         </div>
         <div class="setting">
           <div><b>Proxy key</b><span class="tag">Forget the key this browser stored and enter another.</span></div>
@@ -5517,6 +5595,17 @@ ${SHARED_HELPERS}
       nameInput.value = inst.custom ? inst.name : '';
       nameInput.placeholder = inst.host || '';
     }
+    // Only the operator is told whether a password is set; the row is for them.
+    var hasPw = s.dashboardLogin !== undefined && callerCan(s.caller, '/teamclaude/dashboard-login');
+    document.getElementById('pwRow').style.display = hasPw ? '' : 'none';
+    if (hasPw) {
+      document.getElementById('pwOff').style.display = s.dashboardLogin ? '' : 'none';
+      document.getElementById('pwTag').textContent = s.dashboardLogin
+        ? 'On for ' + s.dashboardLogin + '. Enter a username and a new password to change it.'
+        : 'Sign in from another machine with a username and password instead of the proxy key. Saved to the config file as a hash.';
+      var pwUser = document.getElementById('pwSetUser');
+      if (document.activeElement !== pwUser && !pwUser.value) pwUser.value = s.dashboardLogin || '';
+    }
     // A proxy too old to say its address has no row for it either.
     var hasAddr = !!inst && typeof inst.address === 'string';
     document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
@@ -6062,6 +6151,28 @@ ${SHARED_HELPERS}
       .finally(function () { btn.disabled = false; });
   }
 
+  function doDashboardLogin(username, password, btn) {
+    btn.disabled = true;
+    var r = dashboardLoginRequest(username, password, localStorage.getItem(KEY));
+    fetch(at(r.url), r.init)
+      .then(function (res) {
+        if (res.status === 401) { localStorage.removeItem(KEY); showKeybox(); return null; }
+        return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; });
+      })
+      .then(function (json) {
+        if (!json) return;
+        var out = dashboardLoginOutcome(json);
+        note(out.kind, out.text);
+        if (json.ok) {
+          document.getElementById('pwSetPass').value = '';
+          document.getElementById('pwSetUser').value = json.username || '';
+        }
+        poll();
+      })
+      .catch(function (e) { note('error', 'dashboard password change failed: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
   function doInstanceAddress(btn) {
     var input = document.getElementById('addrVal');
     btn.disabled = true;
@@ -6218,6 +6329,36 @@ ${SHARED_HELPERS}
     document.getElementById('app').style.display = 'none';
     document.getElementById('keybox').style.display = 'block';
     document.getElementById('key').focus();
+    // Always asked of this machine: the password hands out its own key.
+    fetch('/teamclaude/auth/methods')
+      .then(function (res) { return res.ok ? res.json() : null; })
+      .then(function (j) {
+        var on = !!(j && j.password);
+        document.getElementById('pwForm').style.display = on ? '' : 'none';
+        document.getElementById('keySub').style.display = on ? 'none' : '';
+        if (on) document.getElementById('pwUser').focus();
+      })
+      .catch(function () { /* the key field still works */ });
+  }
+
+  function signInWithPassword() {
+    var btn = document.getElementById('pwGo');
+    var errBox = document.getElementById('pwErr');
+    var r = passwordLoginRequest(document.getElementById('pwUser').value.trim(), document.getElementById('pwPass').value);
+    btn.disabled = true;
+    errBox.textContent = '';
+    fetch(r.url, r.init)
+      .then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (j) { return passwordLoginOutcome(res.status, j); });
+      })
+      .then(function (out) {
+        if ('error' in out) { errBox.textContent = out.error; return; }
+        document.getElementById('pwPass').value = '';
+        localStorage.setItem(KEY, out.key);
+        start();
+      })
+      .catch(function (e) { errBox.textContent = 'Cannot reach the proxy: ' + e.message; })
+      .finally(function () { btn.disabled = false; });
   }
 
   function poll() {
@@ -6322,6 +6463,15 @@ ${SHARED_HELPERS}
   document.getElementById('key').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') document.getElementById('go').click();
   });
+  document.getElementById('pwForm').addEventListener('submit', function (e) { e.preventDefault(); signInWithPassword(); });
+  document.getElementById('pwSetForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var user = document.getElementById('pwSetUser').value.trim();
+    var pass = document.getElementById('pwSetPass').value;
+    if (!user || !pass) { note('error', 'Enter a username and a password first.'); return; }
+    doDashboardLogin(user, pass, document.getElementById('pwSet'));
+  });
+  document.getElementById('pwOff').addEventListener('click', function () { doDashboardLogin('', '', this); });
   // Theme: system → light → dark → system. "system" is the absence of a
   // stored choice, so a viewer who never touches this keeps following their
   // desktop, and one who does is not re-decided for by it later.
