@@ -4,7 +4,8 @@ name: Publish
 # CI finishes on a master commit and compares the package.json version against
 # what is already on npm, so it only publishes when CI passed AND the version
 # is new — merging any other PR is a no-op. Publishing is idempotent:
-# re-running on the same version simply skips.
+# re-running on the same version simply skips. The GitHub release it creates
+# gets the Windows installer (TeamClaude-Setup-<version>.exe) attached.
 #
 # Authentication uses npm Trusted Publishing (OIDC) — no long-lived NPM_TOKEN.
 # npm mints a short-lived credential from the GitHub OIDC token at publish time,
@@ -61,6 +62,9 @@ jobs:
       contents: write   # create the git tag + GitHub release
       id-token: write   # OIDC token for npm Trusted Publishing + provenance
       actions: read     # list CI runs for the manual-dispatch gate
+    outputs:
+      version: ${{ steps.pkg.outputs.version }}
+      released: ${{ steps.release.outputs.created }}
     env:
       # The commit CI passed on (or master's tip for a manual run).
       HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -143,6 +147,7 @@ jobs:
         run: npm publish --access public
 
       - name: Tag the release and create a GitHub release
+        id: release
         if: steps.check.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -156,4 +161,42 @@ jobs:
               --target "$HEAD_SHA" \
               --title "$tag" \
               --generate-notes
+            echo "created=true" >> "$GITHUB_OUTPUT"
           fi
+
+  # The Windows installer for the release just created, built from the same
+  # commit. A job of its own so that the apt packages it needs never run
+  # beside the npm publishing credentials.
+  windows-installer:
+    name: attach the Windows installer
+    needs: publish
+    if: needs.publish.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # upload the installer to the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nsis unzip
+
+      - name: Build the installer
+        run: node scripts/build-windows-installer.mjs
+
+      - name: Upload it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.publish.outputs.version }}
+        run: gh release upload "v${VERSION}" "dist/TeamClaude-Setup-${VERSION}.exe" --clobber
