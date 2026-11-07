@@ -2807,7 +2807,8 @@ const PAGE = `<!doctype html>
   #keybox input + input { margin-top: 0; }
   #keybox .or { margin: 28px 0 4px; color: var(--dim); font-size: 13px; }
   #keybox .kerr { color: var(--bad); font-size: 13px; min-height: 1.4em; margin: 8px 0 0; }
-  .thr input.pw { width: 150px; text-align: left; }
+  .thr input.pw { width: 150px; min-width: 0; text-align: left; }
+  #pwSetForm { flex-wrap: wrap; }
   .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .insbar .lbl { color: var(--dim); font-size: 12px; }
   .insbar .insscope { display: flex; gap: 8px 14px; align-items: center; }
