@@ -89,7 +89,7 @@ export function startDetachedServer(logFile) {
  * @param {number} [opts.timeoutMs]
  * @param {() => Promise<number|null>} [opts.probe]
  * @param {(logFile: string) => StartedServer} [opts.start]
- * @param {(url: string) => Promise<void>} [opts.openUrl]
+ * @param {(url: string, opts?: { wait?: boolean }) => Promise<void>} [opts.openUrl]
  * @param {(ms: number) => Promise<void>} [opts.sleep]
  * @param {() => number} [opts.now]
  * @returns {Promise<{ url: string, pid: number, started: boolean }>}
@@ -110,7 +110,7 @@ export async function launchDesktop({
     pid = await waitForServer(child, { probe, sleep, now, timeoutMs, logFile });
     started = pid === child.pid;
   }
-  if (open) await openUrl(url);
+  if (open) await openUrl(url, { wait: true });
   return { url, pid, started };
 }
 

@@ -21,11 +21,12 @@ function answers(...values) {
 
 function fakes() {
   const opened = [];
+  const openOpts = [];
   const starts = [];
   let clock = 0;
   return {
-    opened, starts,
-    openUrl: async url => { opened.push(url); },
+    opened, openOpts, starts,
+    openUrl: async (url, opts) => { opened.push(url); openOpts.push(opts); },
     sleep: async ms => { clock += ms; },
     now: () => clock,
   };
@@ -40,6 +41,9 @@ test('a proxy that is already up is not started again; its dashboard is opened',
   assert.deepEqual(res, { url: 'http://127.0.0.1:4100/teamclaude/dashboard', pid: 111, started: false });
   assert.equal(f.starts.length, 0);
   assert.deepEqual(f.opened, ['http://127.0.0.1:4100/teamclaude/dashboard']);
+  // desktop exits right after, so the opener must be waited for (on Windows
+  // an un-waited `start` is killed with this process).
+  assert.deepEqual(f.openOpts, [{ wait: true }]);
 });
 
 test('a stopped proxy is started, waited for until it answers with its own pid, then opened', async () => {

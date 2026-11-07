@@ -79,16 +79,19 @@ export function isRemoteSession(env = process.env, platform = process.platform) 
  * cannot hold the sign-in up. No shell outside Windows, so nothing in the URL
  * can be read as shell syntax.
  *
- * The promise settles once the opener no longer needs this process, for a
- * caller about to exit. Elsewhere that is at once, since the detached opener
- * outlives us. On Windows it is when `start` returns: Node puts each child it
- * does not detach in a job object that kills it when Node exits, and a
- * detached cmd would open a console window of its own.
+ * `wait` is for a caller about to exit: the promise then settles once the
+ * opener no longer needs this process. Elsewhere that is at once, since the
+ * detached opener outlives us. On Windows it is when `start` returns: Node
+ * puts each child it does not detach in a job object that kills it when Node
+ * exits, and a detached cmd would open a console window of its own. Without
+ * `wait` the child is unref'd, so a `start` that never returns cannot keep a
+ * finished sign-in alive.
  *
  * @param {string} url
+ * @param {{ wait?: boolean }} [opts]
  * @returns {Promise<void>}
  */
-export function openBrowser(url) {
+export function openBrowser(url, { wait = false } = {}) {
   const win = process.platform === 'win32';
   const opener = process.platform === 'darwin' ? 'open' : win ? 'start' : 'xdg-open';
   const report = (/** @type {string} */ why) => console.error(`Could not open a browser (${opener}): ${why}. Open the link by hand instead.`);
@@ -111,7 +114,7 @@ export function openBrowser(url) {
       const child = spawn(opener, win ? ['""', `"${href}"`] : [href], { stdio: 'ignore', shell: win, detached: !win, windowsHide: true });
       child.on('error', err => { report(err.message); resolve(); });
       child.on('exit', code => { if (code) report(`exit code ${code}`); resolve(); });
-      if (win) return;
+      if (win && wait) return;
       child.unref();
       resolve();
     } catch (err) {
