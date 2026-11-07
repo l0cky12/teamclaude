@@ -40,7 +40,6 @@ test('wrong guesses lock the address out, longer each time, and a right one clea
   const proxy = { apiKey: KEY, dashboardLogin: { username: 'me', passwordHash: await hashPassword('long enough') } };
   const wrong = { username: 'me', password: 'nope nope' };
   for (let i = 0; i < 5; i++) assert.equal((await login.attempt(proxy, 'a', wrong)).reason, 'wrong');
-  assert.equal((await login.attempt(proxy, 'a', wrong)).reason, 'wrong', 'the sixth is still checked');
   const locked = await login.attempt(proxy, 'a', { username: 'me', password: 'long enough' });
   assert.equal(locked.reason, 'locked', 'even the right password waits out the lock');
   assert.equal(locked.retryAfterSec, 60);
@@ -212,7 +211,7 @@ test('the instance address is a name the sign-in is taken at', async () => {
 test('wrong guesses count against the socket address, whatever X-Forwarded-For says', async () => {
   await withLoginServer({}, async (port) => {
     const at = { host: `127.0.0.1:${port}` };
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 5; i++) {
       const res = await send(port, 'POST', '/teamclaude/auth/login', { ...at, 'x-forwarded-for': `198.51.100.${i}` }, { username: 'me', password: 'nope nope' });
       assert.equal(res.status, 401);
     }

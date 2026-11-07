@@ -26,9 +26,9 @@ const KDF_MAXMEM = 64 * 1024 * 1024;
 export const MIN_PASSWORD_LENGTH = 8;
 const USERNAME = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
 
-// Five wrong guesses are free. Each one after that locks the address out for
-// twice as long as the last, from one minute up to an hour.
-const FREE_FAILURES = 5;
+// The fifth wrong guess locks the address out for a minute, and each one after
+// that for twice as long as the last, up to an hour.
+const LOCK_AFTER_FAILURES = 5;
 const FIRST_LOCK_MS = 60_000;
 const MAX_LOCK_MS = 60 * 60_000;
 // An address that stops guessing is forgotten after a day.
@@ -241,8 +241,8 @@ export function createDashboardLogin({ now = Date.now } = {}) {
     const c = callers.get(addr) ?? { failures: 0, lockedUntil: 0, lastAt: 0 };
     c.failures++;
     c.lastAt = now();
-    if (c.failures > FREE_FAILURES) {
-      const lockMs = Math.min(MAX_LOCK_MS, FIRST_LOCK_MS * 2 ** (c.failures - FREE_FAILURES - 1));
+    if (c.failures >= LOCK_AFTER_FAILURES) {
+      const lockMs = Math.min(MAX_LOCK_MS, FIRST_LOCK_MS * 2 ** (c.failures - LOCK_AFTER_FAILURES));
       c.lockedUntil = now() + lockMs;
     }
     callers.set(addr, c);
