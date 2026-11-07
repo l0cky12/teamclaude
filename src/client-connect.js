@@ -165,8 +165,9 @@ export const claudeCodec = {
 
 const PROVIDER_NAME = 'teamclaude';
 const HEADER_RE = /^\s*\[\[?([^[\]]*)\]\]?\s*(?:#.*)?$/;
-const TOP_PROVIDER_RE = /^\s*model_provider\s*=\s*(.*)$/;
-const WAS_RE = /^#\s*teamclaude: was ("(?:[^"\\]|\\.)*")\s*$/;
+const PROVIDER_RE = /^(\s*)model_provider\s*=\s*(.*)$/;
+const PROFILE_RE = /^\s*profile\s*=\s*(.*)$/;
+const WAS_RE = /^#\s*teamclaude: was ("(?:[^"\\]|\\.)*")\s*(.*)$/;
 
 /**
  * The dotted key path of a table header line, or null for any other line.
@@ -199,28 +200,80 @@ function parseTomlString(rest) {
 }
 
 /**
- * The parts of a config.toml this module reads, located by line.
+ * Which lines continue a multi-line string (`"""` or `'''`) opened on an
+ * earlier line. Their text is string content, so a `[table]` or `key = ...`
+ * there is not one.
+ * @param {string[]} lines
+ */
+function multilineContinuations(lines) {
+  const inside = lines.map(() => false);
+  /** @type {string|null} */
+  let open = null;
+  lines.forEach((line, i) => {
+    if (open) {
+      inside[i] = true;
+      if (line.split(open).length % 2 === 0) open = null;
+      return;
+    }
+    for (const delim of ['"""', "'''"]) {
+      if (line.split(delim).length % 2 === 0) { open = delim; break; }
+    }
+  });
+  return inside;
+}
+
+/**
+ * A `model_provider = "..."` line, its value and the value it replaced.
+ * @typedef {{ index: number, indent: string, value: string, was: string|null, comment: string }} ProviderLine
+ */
+
+/**
+ * @param {string} line
+ * @param {number} index
+ * @returns {ProviderLine|null}
+ */
+function providerLine(line, index) {
+  const m = PROVIDER_RE.exec(line);
+  if (!m) return null;
+  const parsed = parseTomlString(m[2]);
+  if (!parsed) throw new ConnectError('its model_provider is not a plain string; change it by hand');
+  const was = WAS_RE.exec(parsed.comment);
+  return was
+    ? { index, indent: m[1], value: parsed.value, was: JSON.parse(was[1]), comment: was[2] }
+    : { index, indent: m[1], value: parsed.value, was: null, comment: parsed.comment };
+}
+
+/**
+ * The parts of a config.toml this module reads, located by line. `provider`
+ * is the model_provider Codex uses: the one in the profile the root `profile`
+ * key selects when that profile sets one, since it wins over the root key.
  * @param {string|null} text
  */
 function parseCodexConfig(text) {
   const eol = (text ?? '').includes('\r\n') ? '\r\n' : '\n';
   const lines = text ? text.split(/\r?\n/) : [];
   if (lines.length && lines[lines.length - 1] === '') lines.pop();
-  const paths = lines.map(headerPath);
+  const inString = multilineContinuations(lines);
+  const paths = lines.map((line, i) => (inString[i] ? null : headerPath(line)));
   const firstHeader = paths.findIndex(Boolean);
   const topEnd = firstHeader < 0 ? lines.length : firstHeader;
 
-  /** @type {{ index: number, value: string, was: string|null }|null} */
+  /** @type {ProviderLine|null} */
   let top = null;
+  /** @type {string|null} */
+  let profile = null;
   for (let i = 0; i < topEnd; i++) {
+    if (inString[i]) continue;
     if (/^\s*model_providers\s*\.\s*["']?teamclaude\b/.test(lines[i])) throw unsupportedProvider();
-    const m = TOP_PROVIDER_RE.exec(lines[i]);
-    if (!m) continue;
-    const parsed = parseTomlString(m[1]);
-    if (!parsed) throw new ConnectError('its model_provider is not a plain string; change it by hand');
-    const was = WAS_RE.exec(parsed.comment);
-    top = { index: i, value: parsed.value, was: was ? JSON.parse(was[1]) : null };
+    const p = PROFILE_RE.exec(lines[i]);
+    if (p) profile = parseTomlString(p[1])?.value ?? null;
+    const found = providerLine(lines[i], i);
+    if (!found) continue;
+    if (top) throw new ConnectError('it sets model_provider more than once; fix that by hand');
+    top = found;
   }
+  /** @type {ProviderLine|null} */
+  let profileProvider = null;
 
   /** @type {{ start: number, end: number }[]} */
   const tables = [];
@@ -231,11 +284,21 @@ function parseCodexConfig(text) {
     if (!path) continue;
     let end = i + 1;
     while (end < lines.length && (!paths[end] || (isOurTable(path) && isOurTable(paths[end])))) end++;
+    if (profile != null && path.length === 2 && path[0] === 'profiles' && path[1] === profile) {
+      for (let k = i + 1; k < end; k++) {
+        const found = inString[k] ? null : providerLine(lines[k], k);
+        if (!found) continue;
+        if (profileProvider) throw new ConnectError(`profile "${profile}" sets model_provider more than once; fix that by hand`);
+        profileProvider = found;
+      }
+    }
     if (path.length === 1 && path[0] === 'model_providers'
       && lines.slice(i + 1, end).some(l => /^\s*["']?teamclaude["']?\s*[.=]/.test(l))) throw unsupportedProvider();
     if (isOurTable(path)) {
       if (path.length === 2) {
-        for (const line of lines.slice(i + 1, end)) {
+        for (let k = i + 1; k < end; k++) {
+          if (inString[k]) continue;
+          const line = lines[k];
           const kv = /^\s*(\w+)\s*=\s*(.*)$/.exec(line);
           const parsed = kv && parseTomlString(kv[2]);
           if (kv && parsed) fields[kv[1]] = parsed.value;
@@ -248,7 +311,7 @@ function parseCodexConfig(text) {
     }
     i = end - 1;
   }
-  return { eol, lines, topEnd, top, tables, fields };
+  return { eol, lines, topEnd, top, provider: profileProvider ?? top, profile: profileProvider ? profile : null, tables, fields };
 }
 
 function unsupportedProvider() {
@@ -285,6 +348,17 @@ function withoutOurTables(doc, replacement = null) {
   return lines;
 }
 
+/**
+ * The text of a provider line after a connect, keeping the operator's comment.
+ * @param {ProviderLine} line
+ * @param {string} value
+ * @param {string|null} was  the value it replaced, to restore on disconnect
+ */
+function providerText(line, value, was) {
+  const notes = [was != null ? `# teamclaude: was ${JSON.stringify(was)}` : '', line.comment].filter(Boolean).join(' ');
+  return `${line.indent}model_provider = ${JSON.stringify(value)}${notes ? ` ${notes}` : ''}`;
+}
+
 /** @param {string} target */
 function ourTable(target) {
   return [`[model_providers.${PROVIDER_NAME}]`, `name = "${PROVIDER_NAME}"`, `base_url = ${JSON.stringify(target)}`, 'wire_api = "responses"'];
@@ -293,13 +367,16 @@ function ourTable(target) {
 /** @type {Codec} */
 export const codexCodec = {
   inspect(text, target) {
-    const { top, tables, fields } = parseCodexConfig(text);
-    if (!top) return { state: 'disconnected' };
-    if (top.value !== PROVIDER_NAME) return { state: 'elsewhere', current: `model_provider "${top.value}"` };
+    const { provider, profile, tables, fields } = parseCodexConfig(text);
+    if (fields.base_url && !sameAddress(fields.base_url, target)) return { state: 'elsewhere', current: fields.base_url };
+    if (!provider) return { state: 'disconnected' };
+    if (provider.value !== PROVIDER_NAME) {
+      return { state: 'elsewhere', current: `${profile != null ? `profile "${profile}" ` : ''}model_provider "${provider.value}"` };
+    }
     // model_provider names us but the table is missing or partial: Codex fails
     // on that as it stands, and connecting writes the table.
     if (!tables.length || !fields.base_url || fields.wire_api !== 'responses') return { state: 'disconnected' };
-    return sameAddress(fields.base_url, target) ? { state: 'connected' } : { state: 'elsewhere', current: fields.base_url };
+    return { state: 'connected' };
   },
   apply(text, target) {
     const doc = parseCodexConfig(text);
@@ -311,9 +388,9 @@ export const codexCodec = {
       lines.push(...table);
     }
     const ours = `model_provider = "${PROVIDER_NAME}"`;
-    if (doc.top && doc.top.value !== PROVIDER_NAME) {
-      lines[doc.top.index] = `${ours} # teamclaude: was ${JSON.stringify(doc.top.value)}`;
-    } else if (!doc.top) {
+    if (doc.provider && doc.provider.value !== PROVIDER_NAME) {
+      lines[doc.provider.index] = providerText(doc.provider, PROVIDER_NAME, doc.provider.value);
+    } else if (!doc.provider) {
       // Above any comment that introduces the first table.
       let k = doc.topEnd;
       while (k > 0 && /^\s*(#.*)?$/.test(lines[k - 1])) k--;
@@ -325,9 +402,9 @@ export const codexCodec = {
   remove(text) {
     const doc = parseCodexConfig(text);
     const lines = withoutOurTables(doc);
-    const top = /** @type {NonNullable<typeof doc.top>} */ (doc.top);
+    const top = /** @type {ProviderLine} */ (doc.provider);
     if (top.was != null) {
-      lines[top.index] = `model_provider = ${JSON.stringify(top.was)}`;
+      lines[top.index] = providerText(top, top.was, null);
     } else {
       lines.splice(top.index, 1);
       if ((top.index === 0 || isBlank(lines[top.index - 1])) && top.index < lines.length && isBlank(lines[top.index])) lines.splice(top.index, 1);

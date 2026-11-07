@@ -153,6 +153,48 @@ test('codex: connecting twice writes the same file', async () => {
   });
 });
 
+test('codex: the provider of the active profile is the one that counts, and a round trip restores it', () => {
+  const original = 'profile = "work"\n\n[profiles.work]\nmodel_provider = "openai" # my work account\nmodel = "gpt-5"\n';
+  assert.deepEqual(codexCodec.inspect(original, CODEX_TARGET), { state: 'elsewhere', current: 'profile "work" model_provider "openai"' });
+  const connected = codexCodec.apply(original, CODEX_TARGET);
+  assert.match(connected, /\[profiles\.work\]\nmodel_provider = "teamclaude" # teamclaude: was "openai" # my work account\n/);
+  assert.doesNotMatch(connected.split('[')[0], /model_provider/, 'the root key, which the profile overrides, is not added');
+  assert.equal(codexCodec.inspect(connected, CODEX_TARGET).state, 'connected');
+  assert.equal(codexCodec.remove(connected, CODEX_TARGET), original);
+});
+
+test('codex: a profile that is not selected does not count', () => {
+  const original = 'model_provider = "openai"\n\n[profiles.other]\nmodel_provider = "azure"\n';
+  assert.deepEqual(codexCodec.inspect(original, CODEX_TARGET), { state: 'elsewhere', current: 'model_provider "openai"' });
+  assert.match(codexCodec.apply(original, CODEX_TARGET), /\[profiles\.other\]\nmodel_provider = "azure"\n/);
+});
+
+test('codex: our table naming another address is kept without replace, whatever its wire_api', async () => {
+  for (const wire of ['', 'wire_api = "chat"\n']) {
+    await withHome(async (home, ctx) => {
+      const path = join(home, '.codex', 'config.toml');
+      const foreign = `model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "http://10.0.0.2:3456/backend-api/codex"\n${wire}`;
+      await put(path, foreign);
+      const out = await runClientAction('connect', ['codex'], ORIGIN, {}, ctx);
+      assert.equal(out.clients[0].state, 'elsewhere');
+      assert.equal(out.errors[0].replaceable, true);
+      assert.equal(await readFile(path, 'utf8'), foreign);
+    });
+  }
+});
+
+test('codex: a file that sets model_provider twice is refused, not half-edited', () => {
+  assert.throws(() => codexCodec.inspect('model_provider = "a"\nmodel_provider = "b"\n', CODEX_TARGET), /more than once/);
+});
+
+test('codex: a table header inside a multi-line string is string content', () => {
+  const original = 'notes = """\nhello\n[model_providers.teamclaude]\n"""\nmodel = "gpt-5"\n';
+  assert.equal(codexCodec.inspect(original, CODEX_TARGET).state, 'disconnected');
+  const connected = codexCodec.apply(original, CODEX_TARGET);
+  assert.ok(connected.startsWith(original.replace('model = "gpt-5"\n', 'model = "gpt-5"\nmodel_provider = "teamclaude"\n')), connected);
+  assert.equal(codexCodec.remove(connected, CODEX_TARGET), original);
+});
+
 test('codex: the table hand-added from the docs is recognised, and replaced rather than duplicated', () => {
   const handAdded = 'model_provider = "teamclaude"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "http://127.0.0.1:4000/backend-api/codex"\nwire_api = "responses"\nhttp_headers = { "x-api-key" = "k" }\n\n[profiles.x]\nmodel = "m"\n';
   assert.equal(codexCodec.inspect(handAdded, `http://127.0.0.1:4000/backend-api/codex`).state, 'connected');
