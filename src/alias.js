@@ -24,7 +24,7 @@ const MARKER = '# teamclaude alias';
  * @param {string} path
  * @param {string} text
  */
-function writeFileAtomic(path, text) {
+export function writeFileAtomic(path, text) {
   let mode = null;
   try { mode = statSync(path).mode & 0o777; } catch { /* new file: default mode */ }
   const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
@@ -38,9 +38,12 @@ function writeFileAtomic(path, text) {
   }
 }
 
-/** Basename of the user's login shell, e.g. "zsh". Defaults to bash. */
-export function detectShell() {
-  return (process.env.SHELL || '').split('/').pop() || 'bash';
+/**
+ * Basename of the user's login shell, e.g. "zsh". Defaults to bash.
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function detectShell(env = process.env) {
+  return (env.SHELL || '').split('/').pop() || 'bash';
 }
 
 /**
@@ -86,14 +89,18 @@ export function aliasLine(shell = detectShell(), ref = teamclaudeRef()) {
   return `alias claude='${body}'`;
 }
 
-/** The rc file an alias for this shell should live in. */
-export function rcPathForShell(shell = detectShell()) {
-  const home = homedir();
+/**
+ * The rc file an alias for this shell should live in.
+ * @param {string} [shell]
+ * @param {string} [home]
+ * @param {NodeJS.ProcessEnv} [env]
+ */
+export function rcPathForShell(shell = detectShell(), home = homedir(), env = process.env) {
   switch (shell) {
     case 'zsh':  return join(home, '.zshrc');
     case 'sh':   return join(home, '.profile');
     case 'fish': {
-      const cfg = process.env.XDG_CONFIG_HOME || join(home, '.config');
+      const cfg = env.XDG_CONFIG_HOME || join(home, '.config');
       return join(cfg, 'fish', 'conf.d', 'teamclaude.fish');
     }
     case 'bash':
@@ -135,12 +142,9 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
     return;
   }
   const text = readFileSync(rcPath, 'utf8');
-  // Strip our marked block: the marker comment + the single line after it.
   // Matching by marker (not by exact alias text) makes this robust even if the
   // embedded teamclaude path differs from what's computed now.
-  const blockRe = new RegExp(`\\n?${escapeRe(MARKER)}\\n[^\\n]*\\n?`, 'g');
-  let cleaned = text.replace(blockRe, '\n');
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+  const cleaned = removeMarkedLine(text, MARKER);
 
   if (cleaned === text) {
     console.log(`Alias not found in ${rcPath}`);
@@ -155,6 +159,45 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
   }
   writeFileAtomic(rcPath, cleaned);
   console.log(`Removed alias from ${rcPath}`);
+}
+
+/**
+ * The line a `marker` comment line owns (the one right after it), or null when
+ * the marker is absent.
+ * @param {string} text
+ * @param {string} marker
+ * @returns {string|null}
+ */
+export function markedLine(text, marker) {
+  const lines = text.split('\n');
+  const at = lines.indexOf(marker);
+  return at >= 0 && at + 1 < lines.length ? lines[at + 1] : null;
+}
+
+/**
+ * `text` with the line `marker` owns set to `line`, or the pair appended.
+ * @param {string} text
+ * @param {string} marker
+ * @param {string} line
+ */
+export function setMarkedLine(text, marker, line) {
+  const lines = text.split('\n');
+  const at = lines.indexOf(marker);
+  if (at >= 0 && at + 1 < lines.length) {
+    lines[at + 1] = line;
+    return lines.join('\n');
+  }
+  return `${text && !text.endsWith('\n') ? `${text}\n` : text}${marker}\n${line}\n`;
+}
+
+/**
+ * `text` without any `marker` comment and the line after it.
+ * @param {string} text
+ * @param {string} marker
+ */
+export function removeMarkedLine(text, marker) {
+  const blockRe = new RegExp(`\\n?${escapeRe(marker)}\\n[^\\n]*\\n?`, 'g');
+  return text.replace(blockRe, '\n').replace(/\n{3,}/g, '\n\n');
 }
 
 /**

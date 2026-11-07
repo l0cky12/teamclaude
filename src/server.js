@@ -37,6 +37,7 @@ import { RemovalRefused } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
 import { insightsRange } from './usage-history.js';
+import { CLIENTS, loopbackOrigin } from './client-connect.js';
 import { fleetInsights, insightsScope } from './fleet-insights.js';
 import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceAddress, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -316,13 +317,8 @@ export function isLoopbackAddr(addr) {
  * @returns {string|null}
  */
 export function grokLocalBase(proxyConfig, bindHost, port) {
-  if (proxyConfig?.trustLoopback === false || !(port > 0)) return null;
-  const host = String(bindHost || '127.0.0.1').replace(/^\[|\]$/g, '').toLowerCase();
-  let loopback;
-  if (host === '::1') loopback = '[::1]';
-  else if (['127.0.0.1', 'localhost', '0.0.0.0', '::'].includes(host)) loopback = '127.0.0.1';
-  else return null;
-  return `http://${loopback}:${port}${PROVIDERS.grok.pathPrefix}/v1`;
+  const origin = loopbackOrigin(proxyConfig, bindHost, port);
+  return origin && `${origin}${CLIENTS.grok.suffix}`;
 }
 
 // Headers a forwarding proxy adds to name the caller it forwards for. Any of
