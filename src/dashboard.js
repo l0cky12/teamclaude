@@ -1073,6 +1073,77 @@ export function clientKeySetup(origin, key, grokLocal) {
 }
 
 /**
+ * The request behind a Connect your tools button: connect or disconnect the
+ * named clients (client-connect.js). `replace` is sent only after the second
+ * click on a client that points elsewhere.
+ *
+ * @param {string[]} clients
+ * @param {'connect'|'disconnect'} action
+ * @param {boolean} replace
+ * @param {string|null} key
+ */
+export function connectRequest(clients, action, replace, key) {
+  /** @type {{ clients: string[], action: string, replace?: boolean }} */
+  var body = { clients: clients, action: action };
+  if (replace) body.replace = true;
+  return {
+    url: '/teamclaude/clients/connect',
+    init: {
+      method: 'POST',
+      headers: { 'x-api-key': key || '', 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+/**
+ * One row of the Connect your tools card: the pill, the lines under the
+ * name, and the button (null when there is nothing a click can do).
+ * `armed`: the row's Connect was clicked once over a setting that points
+ * elsewhere, so the button now replaces it.
+ *
+ * @param {any} c  a client status from /teamclaude/clients/connect
+ * @param {boolean} armed
+ */
+export function connectRowView(c, armed) {
+  /** @type {Record<string, { cls: string, text: string }>} */
+  var pills = {
+    connected: { cls: 'badge active', text: 'Connected' },
+    disconnected: { cls: 'badge', text: 'Not connected' },
+    elsewhere: { cls: 'badge throttled', text: 'Uses another setting' },
+    unreadable: { cls: 'badge error', text: 'Cannot read' },
+  };
+  var lines = [c.where];
+  if (c.state === 'elsewhere' && c.current) lines.push('Now set to ' + c.current);
+  if (c.state === 'unreadable' && c.problem) lines.push(c.problem);
+  if (c.note) lines.push(c.note);
+  var action = null;
+  if (c.state === 'connected') action = { label: 'Disconnect', cls: 'btn', action: 'disconnect', replace: false, title: 'Take out the setting Connect wrote' };
+  else if (c.state === 'disconnected') action = { label: 'Connect', cls: 'btn primary', action: 'connect', replace: false, title: 'Point ' + c.label + ' at this proxy' };
+  else if (c.state === 'elsewhere') {
+    action = armed
+      ? { label: 'Replace', cls: 'btn danger', action: 'connect', replace: true, title: 'Click again: overwrite ' + c.current + ' with this proxy' }
+      : { label: 'Connect', cls: 'btn', action: 'connect', replace: false, title: 'It points somewhere else now; a second click replaces that' };
+  }
+  return { pill: pills[c.state] || pills.unreadable, lines: lines, button: action };
+}
+
+/**
+ * What to say after a connect or disconnect: the errors when any client was
+ * left as it was, else what was done and what still has to happen.
+ *
+ * @param {any} res  the POST reply
+ * @param {'connect'|'disconnect'} action
+ */
+export function connectOutcome(res, action) {
+  if (!res || (!res.ok && !Array.isArray(res.errors))) return { kind: 'error', text: (res && res.error) || 'The change failed.' };
+  if (res.errors.length) return { kind: 'warn', text: res.errors.map(function (/** @type {any} */ e) { return e.error; }).join(' ') };
+  var done = action === 'connect' ? 'Connected. Sessions started from now on go through the proxy.' : 'Disconnected.';
+  var notes = (res.clients || []).filter(function (/** @type {any} */ c) { return c.note; }).map(function (/** @type {any} */ c) { return c.note; });
+  return { kind: 'ok', text: [done].concat(notes).join(' ') };
+}
+
+/**
  * Whether a status read made with the new key came back as that client. A
  * loopback browser is admitted without a key, so a 200 alone proves nothing:
  * the caller the server reports has to be the key's name.
@@ -2355,6 +2426,7 @@ const SHARED_HELPERS = [
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
+  connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
   fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fleetMissingText,
@@ -2577,6 +2649,10 @@ const PAGE = `<!doctype html>
   .ckeys table { margin-top: 8px; }
   /* Show details and Revoke stack on a phone; keep them apart there too. */
   .ckeys td .btn + .btn { margin-top: 4px; }
+  .connect .crow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .connect .crow .who { flex: 1 1 220px; min-width: 0; }
+  .connect .crow .hint { display: block; margin: 2px 0 0; overflow-wrap: anywhere; }
+  .connect .cfoot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
   /* The Linked instances card reuses the client-key look, with its form as labelled rows. */
   .links { margin-top: 16px; }
   .links form, #linkBackFields { display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: 6px; }
@@ -2795,6 +2871,11 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-clients" style="display:none">
+      <div id="connectCard" class="card ckeys connect" style="display:none">
+        <div class="ckh"><b>Connect your tools</b><span class="hint">Points Claude Code, the Codex CLI and Grok Build on this machine at this proxy, by writing their settings for you.</span></div>
+        <div id="connectRows"></div>
+        <div class="cfoot"><button id="connectAll" class="btn primary" type="button">Connect all</button><span id="connectStatus" class="st" style="display:none"></span></div>
+      </div>
       <div id="clientKeys" class="card ckeys" style="display:none">
         <div class="ckh"><b>Client keys</b><span class="hint">One per machine or agent of yours. Requests made with a key are counted here under its name.</span></div>
         <form id="ckForm" autocomplete="off">
@@ -3345,7 +3426,7 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     if (!accounts.length) {
-      acc.appendChild(el('div', 'card empty', 'No accounts yet. Sign one in on the Accounts page, or run teamclaude login.'));
+      acc.appendChild(el('div', 'card empty', 'No accounts yet. Sign one in on the Accounts page, or run teamclaude login. Next: connect your tools on the Clients page.'));
       return;
     }
     var probeAccounts = (s.probe || {}).accounts || [];
@@ -3586,6 +3667,99 @@ ${SHARED_HELPERS}
       table.appendChild(tr);
     });
   }
+
+  // Connect your tools. Read when the Clients page opens, not on every poll
+  // (on Windows each read starts PowerShell). The server answers only a
+  // caller on its own machine, so a refusal hides the card for good; a page
+  // showing a linked instance never asks, since it would edit this machine.
+  var connectState = 'unasked'; // 'unasked' | 'asking' | 'done' | 'hidden'
+  var connectClients = [];
+  // Rows whose Connect was clicked once over another address. No prototype.
+  var connectArmed = Object.create(null);
+
+  function loadConnect() {
+    connectState = 'asking';
+    fetch('/teamclaude/clients/connect', { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
+      .then(function (res) {
+        // 404: a proxy from before this card. 403 and 409: not this machine,
+        // or no loopback address to point the tools at.
+        if (res.status === 403 || res.status === 404 || res.status === 409) return null;
+        if (!res.ok) throw new Error('status ' + res.status);
+        return res.json();
+      })
+      .then(function (j) {
+        connectState = j ? 'done' : 'hidden';
+        if (j) connectClients = j.clients || [];
+        if (lastStatus) renderConnect(lastStatus);
+      })
+      // Asked again on a later render, as the linked-instance card does.
+      .catch(function () { connectState = 'unasked'; });
+  }
+
+  function renderConnect(s) {
+    var card = document.getElementById('connectCard');
+    var can = !peer && callerCan(s.caller, '/teamclaude/clients/connect');
+    if (can && connectState === 'unasked' && currentPage === 'clients') loadConnect();
+    // A re-read on a later visit keeps the rows it is about to refresh on screen.
+    var shown = can && connectState !== 'hidden' && connectClients.length > 0;
+    card.style.display = shown ? '' : 'none';
+    if (!shown) return;
+    var rows = document.getElementById('connectRows');
+    rows.textContent = '';
+    connectClients.forEach(function (c) {
+      var armedAt = connectArmed[c.id];
+      var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+      var view = connectRowView(c, armed);
+      var row = el('div', 'crow');
+      var who = el('div', 'who');
+      who.appendChild(el('b', '', c.label));
+      view.lines.forEach(function (line) { who.appendChild(el('span', 'hint', line)); });
+      row.appendChild(who);
+      row.appendChild(el('span', view.pill.cls, view.pill.text));
+      if (view.button) {
+        var act = view.button;
+        var b = button(act.cls, act.label, function () {
+          if (c.state === 'elsewhere' && !armed) { connectArmed[c.id] = Date.now(); renderConnect(s); return; }
+          if (armed && Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
+          delete connectArmed[c.id];
+          doConnect([c.id], act.action, act.replace, b);
+        });
+        b.title = act.title;
+        row.appendChild(b);
+      }
+      rows.appendChild(row);
+    });
+    var all = document.getElementById('connectAll');
+    all.style.display = connectClients.some(function (c) { return c.state === 'disconnected'; }) ? '' : 'none';
+  }
+
+  function connectStatusLine(kind, text) {
+    var st = document.getElementById('connectStatus');
+    st.className = 'st ' + kind;
+    st.textContent = text;
+    st.style.display = text ? '' : 'none';
+  }
+
+  function doConnect(ids, action, replace, btn) {
+    btn.disabled = true;
+    var r = connectRequest(ids, action, replace, localStorage.getItem(KEY));
+    fetch(r.url, r.init)
+      .then(function (res) { return res.json().catch(function () { return { ok: false, error: 'status ' + res.status }; }); })
+      .then(function (json) {
+        var out = connectOutcome(json, action);
+        connectStatusLine(out.kind, out.text);
+        (json.clients || []).forEach(function (c) {
+          connectClients = connectClients.map(function (old) { return old.id === c.id ? c : old; });
+        });
+        if (lastStatus) renderConnect(lastStatus);
+      })
+      .catch(function (e) { connectStatusLine('error', 'The change did not reach the proxy: ' + e.message); })
+      .finally(function () { btn.disabled = false; });
+  }
+
+  document.getElementById('connectAll').addEventListener('click', function (e) {
+    doConnect(['all'], 'connect', false, e.currentTarget);
+  });
 
   // Client keys: the form and the panel holding a new key are static, so a name
   // being typed and a key not yet copied survive the poll; only the list of
@@ -5389,6 +5563,7 @@ ${SHARED_HELPERS}
     renderAccountsPage(s);
     renderProblems(s);
     renderRouting(s);
+    renderConnect(s);
     renderClientKeys(s);
     renderLinks(s);
     renderSync(s);
@@ -6131,6 +6306,11 @@ ${SHARED_HELPERS}
     hideInsightsTip();
     if (page.key === 'insights') { renderInsights(); pollInsights(false); }
     if (page.key === 'settings' && lastStatus) { renderLinks(lastStatus); renderSync(lastStatus); }
+    // Read afresh on each visit: teamclaude connect may have changed a file since.
+    if (page.key === 'clients') {
+      if (connectState === 'done') connectState = 'unasked';
+      if (lastStatus) renderConnect(lastStatus);
+    }
   }
 
   document.getElementById('go').addEventListener('click', function () {
