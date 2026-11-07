@@ -52,6 +52,13 @@ test('the outcome reports the clients left as they were, and a refusal', () => {
   assert.equal(connectOutcome({ ok: false, error: 'only a caller on the machine' }, 'connect').kind, 'error');
 });
 
+test('a setting connect would replace is explained in the page\'s own terms, not the CLI flag', () => {
+  const out = connectOutcome({ ok: false, clients: [], errors: [{ id: 'codex', error: 'Codex CLI: already set to model_provider "openai", left as it is.', replaceable: true }] }, 'connect');
+  assert.equal(out.kind, 'warn');
+  assert.match(out.text, /press Connect on its row, then Replace/);
+  assert.doesNotMatch(out.text, /--replace/);
+});
+
 test('the page carries the card, closed until the server answers', () => {
   const html = renderDashboardHtml();
   assert.match(html, /<div id="connectCard" class="card ckeys connect" style="display:none">/);

@@ -106,7 +106,7 @@ test('claude: another address is kept until replace is asked for, and disconnect
 
     let out = await runClientAction('connect', ['claude'], ORIGIN, {}, ctx);
     assert.deepEqual(out.clients[0], { id: 'claude', label: 'Claude Code', where: path, state: 'elsewhere', current: 'http://10.0.0.2:3456' });
-    assert.match(out.errors[0].error, /replace/);
+    assert.equal(out.errors[0].replaceable, true);
     assert.equal(await readFile(path, 'utf8'), foreign);
 
     out = await runClientAction('disconnect', ['claude'], ORIGIN, {}, ctx);

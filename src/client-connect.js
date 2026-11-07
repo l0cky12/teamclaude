@@ -66,7 +66,16 @@ import { detectShell, markedLine, rcPathForShell, removeMarkedLine, setMarkedLin
  */
 
 /** A setting this module refuses to touch, with the reason to show. */
-export class ConnectError extends Error {}
+export class ConnectError extends Error {
+  /**
+   * @param {string} message
+   * @param {{ replaceable?: boolean }} [opts]  true when connecting with `replace` would go ahead
+   */
+  constructor(message, { replaceable = false } = {}) {
+    super(message);
+    this.replaceable = replaceable;
+  }
+}
 
 /**
  * The proxy's origin as a client on this machine reaches it without a key, or
@@ -536,7 +545,7 @@ async function act(action, id, origin, { replace = false }, ctx) {
   const seen = codec.inspect(text, target);
   if (action === 'connect') {
     if (seen.state === 'elsewhere' && !replace) {
-      throw new ConnectError(`set to ${seen.current}; replace that setting to use the proxy (--replace, or Replace on the dashboard)`);
+      throw new ConnectError(`already set to ${seen.current}, left as it is.`, { replaceable: true });
     }
     if (seen.state !== 'connected') await store.write(codec.apply(text, target));
   } else if (seen.state === 'connected') {
@@ -552,10 +561,10 @@ async function act(action, id, origin, { replace = false }, ctx) {
  * @param {string} origin
  * @param {{ replace?: boolean }} [opts]
  * @param {ConnectContext} [ctx]
- * @returns {Promise<{ clients: ClientStatus[], errors: { id: ClientId, error: string }[] }>}
+ * @returns {Promise<{ clients: ClientStatus[], errors: { id: ClientId, error: string, replaceable?: true }[] }>}
  */
 export async function runClientAction(action, ids, origin, opts = {}, ctx = defaultContext()) {
-  /** @type {{ id: ClientId, error: string }[]} */
+  /** @type {{ id: ClientId, error: string, replaceable?: true }[]} */
   const errors = [];
   /** @type {ClientStatus[]} */
   const clients = [];
@@ -563,7 +572,8 @@ export async function runClientAction(action, ids, origin, opts = {}, ctx = defa
     try {
       await act(action, id, origin, opts, ctx);
     } catch (err) {
-      errors.push({ id, error: `${CLIENTS[id].label}: ${/** @type {Error} */ (err).message}` });
+      const replaceable = err instanceof ConnectError && err.replaceable;
+      errors.push({ id, error: `${CLIENTS[id].label}: ${/** @type {Error} */ (err).message}`, ...(replaceable ? { replaceable: /** @type {const} */ (true) } : {}) });
     }
     clients.push(await clientStatus(id, origin, ctx));
   }

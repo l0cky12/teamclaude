@@ -2813,7 +2813,7 @@ async function connectCommand(action) {
   }
   const { clients, errors } = await runClientAction(action, ids, origin, { replace: flags.includes('--replace') });
   for (const c of clients) console.log(connectLine(c));
-  for (const e of errors) console.error(`\n${e.error}`);
+  for (const e of errors) console.error(`\n${e.error}${e.replaceable ? ` To replace it: teamclaude connect ${e.id} --replace` : ''}`);
   const grok = clients.find(c => c.id === 'grok' && !errors.some(e => e.id === 'grok'));
   if (grok?.note) console.log(`\n${grok.note}`);
   if (action === 'connect' && !errors.length && !(await isServerUp(config))) {

@@ -1137,7 +1137,7 @@ export function connectRowView(c, armed) {
  */
 export function connectOutcome(res, action) {
   if (!res || (!res.ok && !Array.isArray(res.errors))) return { kind: 'error', text: (res && res.error) || 'The change failed.' };
-  if (res.errors.length) return { kind: 'warn', text: res.errors.map(function (/** @type {any} */ e) { return e.error; }).join(' ') };
+  if (res.errors.length) return { kind: 'warn', text: res.errors.map(function (/** @type {any} */ e) { return e.replaceable ? e.error + ' To replace it, press Connect on its row, then Replace.' : e.error; }).join(' ') };
   var done = action === 'connect' ? 'Connected. Sessions started from now on go through the proxy.' : 'Disconnected.';
   var notes = (res.clients || []).filter(function (/** @type {any} */ c) { return c.note; }).map(function (/** @type {any} */ c) { return c.note; });
   return { kind: 'ok', text: [done].concat(notes).join(' ') };
