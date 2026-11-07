@@ -11,6 +11,7 @@ Unicode true
 !include MUI2.nsh
 !include LogicLib.nsh
 !include FileFunc.nsh
+!include Sections.nsh
 
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TeamClaude"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
@@ -107,6 +108,22 @@ SectionEnd
 Section "Start TeamClaude when I sign in" SecRun
   WriteRegStr HKCU "${RUN_KEY}" "TeamClaude" '"$INSTDIR\TeamClaude.exe" --no-open'
 SectionEnd
+
+; An upgrade keeps the earlier choice: with TeamClaude already installed and no
+; Run value, the person turned starting at sign-in off, and a silent /S
+; reinstall has no page on which to turn it off again.
+Function .onInit
+  ClearErrors
+  ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"
+  ${If} ${Errors}
+    Return
+  ${EndIf}
+  ClearErrors
+  ReadRegStr $0 HKCU "${RUN_KEY}" "TeamClaude"
+  ${If} ${Errors}
+    !insertmacro UnselectSection ${SecRun}
+  ${EndIf}
+FunctionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "The TeamClaude proxy and the Node runtime it runs on."
