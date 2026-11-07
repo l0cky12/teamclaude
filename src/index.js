@@ -46,7 +46,7 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, updateAdvice, PKG_NAME, RELEASES_URL } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
@@ -3273,6 +3273,15 @@ async function updateCommand() {
     console.log('This is a git checkout — npm will not update it.');
     console.log('A docker compose checkout updates on a schedule with: teamclaude update compose install');
     console.log('That runs scripts/redeploy.sh: git pull, docker compose build, docker compose up -d.');
+    return;
+  }
+  // The Windows installer's copy has no npm to run: it is replaced by the
+  // next installer, which this only points at.
+  if (kind === 'bundle') {
+    const info = await checkForUpdate({ force: true });
+    if (!info) console.log(`Could not check for a newer version. Releases: ${RELEASES_URL}`);
+    else if (!info.updateAvailable) console.log(`Already up to date (latest is ${info.latest}).`);
+    else console.log(`TeamClaude ${info.latest} is available. ${updateAdvice(kind)}`);
     return;
   }
   // `npm install -g` would put a second copy in npm's global directory and
