@@ -245,7 +245,7 @@ test('status reports the caller, and its refused list is what the gate refuses',
     assert.equal(client.client, 'ci');
     assert.deepEqual([...client.refused].sort(), [
       '/teamclaude/account-sync/cancel', '/teamclaude/account-sync/mode', '/teamclaude/account-sync/sign-out', '/teamclaude/account-sync/start', '/teamclaude/account-sync/status', '/teamclaude/account-sync/sync',
-      '/teamclaude/client-keys/create', '/teamclaude/client-keys/revoke', '/teamclaude/client-keys/show',
+      '/teamclaude/client-keys/create', '/teamclaude/client-keys/revoke', '/teamclaude/client-keys/show', '/teamclaude/clients/connect',
       '/teamclaude/disable', '/teamclaude/instance-address', '/teamclaude/instance-name',
       '/teamclaude/login/cancel', '/teamclaude/login/code', '/teamclaude/login/start', '/teamclaude/login/status',
       '/teamclaude/outside-spend-hide',

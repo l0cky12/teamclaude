@@ -228,6 +228,29 @@ curl -X POST http://localhost:3456/teamclaude/client-keys/create \
 
 `POST /teamclaude/client-keys/create` takes `{"name"}`: up to 64 letters, digits, spaces and `. _ @ -`, starting with a letter or digit. It generates a key, writes `{ "name", "key" }` to `proxy.clientKeys` under the config lock, reloads, and answers `{"ok": true, "name", "key", "firstKey", "grokLocal"}`. `grokLocal` is the address a Grok Build on the proxy's machine uses with no key (`http://127.0.0.1:<port>/grok/v1`), or `null` when the proxy has none. `/teamclaude/status` lists the configured names under `clientKeys` and never the keys; only this reply and `show` return one. `firstKey` is `true` when the proxy had no key at all before, so callers on other machines, which the open gate admitted until then, now need one. A name already in use is a `400`, since two keys under one name would share one usage counter. `POST /teamclaude/client-keys/revoke` takes `{"name"}`, removes every entry under that name, reloads, and answers `{"ok": true, "name", "removed"}`. A client using the key is refused from then on. The usage already booked under the name stays. An unknown name is a `400`, and so is the proxy's last key when there is no `proxy.apiKey`: with no key left the gate would admit everybody, so set `proxy.apiKey` first. A reload failure on either is a `500` that says the file was saved. `POST /teamclaude/client-keys/show` takes `{"name"}` and answers `{"ok": true, "name", "key", "grokLocal"}` with the key stored under that name (the first, if a hand edit gave the name two), uncached, writing nothing. An unknown name is a `400`. All three are refused with `403` for a `proxy.clientKeys` key, so only the shared proxy key or a key-exempt loopback caller can manage or read keys.
 
+### Client connect endpoint
+
+The Clients page's **Connect your tools** card reads and changes the same settings as [`teamclaude connect`](#connecting-your-tools-in-one-step), on the machine the proxy runs on:
+
+```bash
+curl http://localhost:3456/teamclaude/clients/connect
+curl -X POST http://localhost:3456/teamclaude/clients/connect \
+  -H 'content-type: application/json' -d '{"clients": ["claude", "codex", "grok"], "action": "connect"}'
+```
+
+`GET /teamclaude/clients/connect` answers `{"ok": true, "clients": [...]}`, one entry per client:
+
+```json
+{ "id": "codex", "label": "Codex CLI", "where": "/home/me/.codex/config.toml",
+  "state": "elsewhere", "current": "model_provider \"openai\"" }
+```
+
+`state` is `connected`, `disconnected`, `elsewhere` (with `current`, the setting it has now) or `unreadable` (with `problem`, for example a `settings.json` that is not valid JSON). `where` is the file, or `Windows user environment` for Grok Build on Windows. The Grok Build entry also has a `note`: it reads the variable when it starts, from a terminal opened afterwards.
+
+`POST /teamclaude/clients/connect` takes `{"clients": [...], "action": "connect" | "disconnect", "replace": true}`, with `clients` a non-empty list of `claude`, `codex`, `grok` (or `all`) and `replace` optional. Each client is handled as `teamclaude connect` handles it: a setting that names another address is kept unless `replace` is `true`, and `disconnect` takes out only what is ours. It answers `200` with `{"ok", "clients", "errors"}`: the states after the change, and one `{"id", "error"}` per client that was left as it was. `ok` is `false` when `errors` is not empty. A body that names no action or an unknown client is a `400`.
+
+Both are refused with `403` for any caller that is not on the proxy's own machine, even with a valid proxy key: they edit the files of the user the proxy runs as. That means a direct loopback connection, with no forwarding header and a `Host` that names this proxy, and `proxy.trustLoopback` not `false`. A Docker port mapping or a reverse proxy does not count, so the card is hidden there. A `proxy.clientKeys` key is refused too, and a web page on another origin is refused like every other control `POST`.
+
 ### TUI keyboard shortcuts
 
 | Key | Action |
