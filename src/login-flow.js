@@ -79,7 +79,14 @@ export function isRemoteSession(env = process.env, platform = process.platform) 
  * cannot hold the sign-in up. No shell outside Windows, so nothing in the URL
  * can be read as shell syntax.
  *
+ * The promise settles once the opener no longer needs this process, for a
+ * caller about to exit. Elsewhere that is at once, since the detached opener
+ * outlives us. On Windows it is when `start` returns: Node puts each child it
+ * does not detach in a job object that kills it when Node exits, and a
+ * detached cmd would open a console window of its own.
+ *
  * @param {string} url
+ * @returns {Promise<void>}
  */
 export function openBrowser(url) {
   const win = process.platform === 'win32';
@@ -95,18 +102,23 @@ export function openBrowser(url) {
     href = u.href;
   } catch (err) {
     report(err instanceof Error ? err.message : String(err));
-    return;
+    return Promise.resolve();
   }
-  try {
-    // `start` reads its first quoted argument as a window title, and cmd would
-    // split an unquoted URL at `&`.
-    const child = spawn(opener, win ? ['""', `"${href}"`] : [href], { stdio: 'ignore', shell: win, detached: !win });
-    child.on('error', err => report(err.message));
-    child.on('exit', code => { if (code) report(`exit code ${code}`); });
-    child.unref();
-  } catch (err) {
-    report(err instanceof Error ? err.message : String(err));
-  }
+  return new Promise(resolve => {
+    try {
+      // `start` reads its first quoted argument as a window title, and cmd would
+      // split an unquoted URL at `&`.
+      const child = spawn(opener, win ? ['""', `"${href}"`] : [href], { stdio: 'ignore', shell: win, detached: !win, windowsHide: true });
+      child.on('error', err => { report(err.message); resolve(); });
+      child.on('exit', code => { if (code) report(`exit code ${code}`); resolve(); });
+      if (win) return;
+      child.unref();
+      resolve();
+    } catch (err) {
+      report(err instanceof Error ? err.message : String(err));
+      resolve();
+    }
+  });
 }
 
 /**

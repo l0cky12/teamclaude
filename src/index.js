@@ -53,6 +53,7 @@ import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
+import { launchDesktop } from './desktop.js';
 import { COMPOSE_UPDATE_USAGE, envAssignments, installComposeUpdate, uninstallComposeUpdate, composeUpdateStatus, renderComposeUpdate } from './compose-update.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -259,6 +260,10 @@ switch (command) {
     break;
   case 'dashboard':
     await dashboardCommand();
+    process.exit(0);
+    break;
+  case 'desktop':
+    await desktopCommand();
     process.exit(0);
     break;
   case 'accounts':
@@ -2141,6 +2146,27 @@ async function dashboardCommand() {
   if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
+// Start the proxy in the background unless it is already up, then open the
+// dashboard: the one step a person with no terminal takes (TeamClaude.exe on
+// Windows runs this). Unlike `dashboard` it starts a server, with its output
+// in the log file `status` points at.
+async function desktopCommand() {
+  const config = await loadOrCreateConfig();
+  const bound = envVar('HOST') || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const logFile = logPath();
+  try {
+    const { url, pid, started } = await launchDesktop({
+      host, port: config.proxy.port, apiKey: config.proxy.apiKey, logFile, open: !args.includes('--no-open'),
+    });
+    console.log(started ? `Started the proxy (pid ${pid}). Log: ${logFile}` : `The proxy is already running (pid ${pid}).`);
+    console.log(`Dashboard: ${url}`);
+  } catch (err) {
+    console.error(`[TeamClaude] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 // ── switch ──────────────────────────────────────────────────
 
 // Manual account switch against a RUNNING server — the headless equivalent of
@@ -3583,6 +3609,9 @@ Commands:
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser
+  desktop [--no-open] Start the proxy in the background if it is not running,
+                      then open the dashboard (what TeamClaude.exe runs on
+                      Windows); --no-open only starts it
   accounts            List configured accounts
   accounts export <file> [--plain] [--force] [--disable-source]
                       Write every account's login to an encrypted file, to set

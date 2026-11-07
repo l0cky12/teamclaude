@@ -30,6 +30,11 @@ test('unit files land in the per-user locations', () => {
   assert.equal(systemdUnitPath('/home/x', null), '/home/x/.config/systemd/user/teamclaude.service');
   assert.equal(systemdUnitPath('/home/x', '/cfg'), '/cfg/systemd/user/teamclaude.service');
   assert.equal(logPath('/Users/x', 'darwin'), '/Users/x/Library/Logs/teamclaude.log');
+  assert.equal(logPath('/home/x', 'linux', {}), '/home/x/.local/state/teamclaude.log');
+  assert.equal(logPath('/home/x', 'linux', { XDG_STATE_HOME: '/state' }), '/state/teamclaude.log');
+  assert.equal(logPath('C:\\Users\\x', 'win32', { LOCALAPPDATA: 'D:\\Local' }), 'D:\\Local\\TeamClaude\\teamclaude.log');
+  // No %LOCALAPPDATA% (a stripped environment): the same folder, found from home.
+  assert.equal(logPath('C:\\Users\\x', 'win32', {}), 'C:\\Users\\x\\AppData\\Local\\TeamClaude\\teamclaude.log');
 });
 
 // The regression this guards: process.execPath on a Homebrew node points into
