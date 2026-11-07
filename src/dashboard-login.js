@@ -8,8 +8,14 @@
 //
 // A password can be guessed where a 32-byte key cannot, so failures are
 // limited per caller address and the hashing that answers a guess is capped.
+//
+// The route answers with the key and needs none, so a DNS-rebinding page
+// (attacker.example re-resolved to this machine) could read that answer: the
+// browser sees it as same-origin. The Host header is the one thing such a page
+// cannot choose, so a sign-in is taken only at a Host that names this proxy.
 
 import { scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
+import { isIP } from 'node:net';
 import { ConfigOpError } from './config-ops.js';
 
 // N = 2^15 costs about 50 ms and 32 MiB per guess: slow for a guesser, and
@@ -28,8 +34,58 @@ const MAX_LOCK_MS = 60 * 60_000;
 // An address that stops guessing is forgotten after a day.
 const FORGET_MS = 24 * 60 * 60_000;
 // Hashes running at once, across every caller. A guess past this is refused
-// before it costs anything.
-const MAX_IN_FLIGHT = 4;
+// before it costs anything. Kept under libuv's default pool of four, which
+// config writes and the rest of node:crypto share.
+const MAX_IN_FLIGHT = 2;
+
+/**
+ * The host part of a Host header or an address, lowercased, brackets and port
+ * removed; null when it is not one.
+ * @param {unknown} value
+ */
+function hostnameOf(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const name = new URL(value.includes('://') ? value.trim() : 'http://' + value.trim()).hostname.toLowerCase();
+    return name.replace(/^\[(.*)\]$/, '$1') || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a sign-in may be answered at this Host. An IP address or localhost
+ * is never a rebinding name, so those pass, as do the address the proxy binds
+ * and its `instanceAddress`. Any other name is refused: reach the proxy at its
+ * IP, or set Instance address to the name you use.
+ * @param {unknown} host  the request's Host header
+ * @param {{ boundHost?: string|null, instanceAddress?: string|null }} self
+ */
+export function loginHostAllowed(host, { boundHost = null, instanceAddress = null } = {}) {
+  const name = hostnameOf(host);
+  if (!name) return false;
+  if (isIP(name) || name === 'localhost') return true;
+  return name === hostnameOf(boundHost) || name === hostnameOf(instanceAddress);
+}
+
+/**
+ * The address wrong guesses are counted under. An IPv4 address seen through a
+ * dual-stack socket is the same caller as the plain one, and one host holds a
+ * whole IPv6 /64, so an address there counts as its /64.
+ * @param {string|undefined} addr
+ */
+export function guessBucket(addr) {
+  if (typeof addr !== 'string' || !addr) return 'unknown';
+  const plain = addr.replace(/%.*$/, '').toLowerCase();
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(plain);
+  if (mapped) return mapped[1];
+  if (isIP(plain) !== 6) return plain;
+  const [head, tail = ''] = plain.split('::');
+  const left = head ? head.split(':') : [];
+  const right = plain.includes('::') && tail ? tail.split(':') : [];
+  const groups = plain.includes('::') ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
+  return groups.slice(0, 4).map(g => g.replace(/^0+(?=.)/, '')).join(':') + '::/64';
+}
 
 /**
  * @typedef {object} DashboardLogin  `proxy.dashboardLogin`
@@ -151,11 +207,12 @@ export function createDashboardLogin({ now = Date.now } = {}) {
 
   /**
    * @param {Record<string, any>|undefined} proxyConfig
-   * @param {string} addr  the caller's address
+   * @param {string|undefined} remoteAddress  the caller's socket address
    * @param {{ username?: unknown, password?: unknown }} body
    * @returns {Promise<LoginOutcome>}
    */
-  async function attempt(proxyConfig, addr, body) {
+  async function attempt(proxyConfig, remoteAddress, body) {
+    const addr = guessBucket(remoteAddress);
     const login = configuredLogin(proxyConfig);
     const key = proxyConfig?.apiKey;
     if (!login || typeof key !== 'string' || !key) return { key: null, reason: 'unavailable' };

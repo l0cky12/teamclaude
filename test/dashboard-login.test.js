@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { createDashboardLogin, hashPassword, setDashboardLogin, verifyPassword } from '../src/dashboard-login.js';
+import { AccountManager } from '../src/account-manager.js';
+import { createProxyServer } from '../src/server.js';
+import { createDashboardLogin, guessBucket, hashPassword, loginHostAllowed, setDashboardLogin, verifyPassword } from '../src/dashboard-login.js';
 import { passwordLoginOutcome } from '../src/dashboard.js';
 import { spawnServer } from '../test-helpers/spawn-server.js';
 
@@ -123,4 +126,98 @@ test('a remote browser sets the password with the key, then signs in with it and
   } finally {
     await server.stop();
   }
+});
+
+test('loginHostAllowed takes IPs, localhost, the bound address and the instance address, and no other name', () => {
+  assert.equal(loginHostAllowed('100.64.0.2:3456'), true);
+  assert.equal(loginHostAllowed('[fd7a:115c::1]:3456'), true);
+  assert.equal(loginHostAllowed('localhost:3456'), true);
+  assert.equal(loginHostAllowed('attacker.example:3456'), false, 'a rebinding name');
+  assert.equal(loginHostAllowed('hub.tail1234.ts.net:3456'), false);
+  assert.equal(loginHostAllowed('HUB.tail1234.ts.net:3456', { instanceAddress: 'http://hub.tail1234.ts.net:3456' }), true);
+  assert.equal(loginHostAllowed('proxy.example.com', { instanceAddress: 'https://proxy.example.com/' }), true);
+  assert.equal(loginHostAllowed('box.lan:3456', { boundHost: 'box.lan' }), true);
+  assert.equal(loginHostAllowed('box.lan:3456', { boundHost: '0.0.0.0' }), false);
+  assert.equal(loginHostAllowed(undefined), false);
+});
+
+test('guessBucket counts a mapped IPv4 as itself and an IPv6 address by its /64', () => {
+  assert.equal(guessBucket('::ffff:203.0.113.5'), '203.0.113.5');
+  assert.equal(guessBucket('203.0.113.5'), '203.0.113.5');
+  assert.equal(guessBucket('2001:db8:1:2:aaaa::1'), guessBucket('2001:db8:1:2:bbbb:cccc:dddd:eeee'));
+  assert.notEqual(guessBucket('2001:db8:1:2::1'), guessBucket('2001:db8:1:3::1'));
+  assert.equal(guessBucket('2001:db8::1'), '2001:db8:0:0::/64');
+  assert.equal(guessBucket('fe80::1%eth0'), 'fe80:0:0:0::/64');
+});
+
+// In-process, so each request can carry the Host a browser would have sent.
+async function withLoginServer(extra, fn) {
+  const am = new AccountManager([{ name: 'demo-a@example.com', type: 'apikey', apiKey: 'sk-demo-1' }], 0.98);
+  const proxy = createProxyServer(am, {
+    proxy: { apiKey: KEY, dashboardLogin: { username: 'me', passwordHash: await hashPassword('long enough') } },
+    upstream: 'https://api.anthropic.com',
+    ...extra,
+  });
+  await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
+  try {
+    await fn(/** @type {import('node:net').AddressInfo} */ (proxy.address()).port);
+  } finally {
+    proxy.close();
+  }
+}
+
+function send(port, method, path, headers, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path, headers: { 'content-type': 'application/json', ...headers } }, (res) => {
+      let text = '';
+      res.on('data', (c) => { text += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: text }));
+    });
+    req.on('error', reject);
+    req.end(body == null ? undefined : JSON.stringify(body));
+  });
+}
+
+const RIGHT = { username: 'me', password: 'long enough' };
+
+test('a DNS-rebinding page never gets the key, however it dresses the request', async () => {
+  await withLoginServer({}, async (port) => {
+    const rebound = { host: `attacker.example:${port}` };
+    for (const headers of [
+      { ...rebound, 'sec-fetch-site': 'same-origin' },
+      { ...rebound, origin: `http://attacker.example:${port}` },
+      { ...rebound, 'x-forwarded-for': '198.51.100.7' },
+    ]) {
+      const res = await send(port, 'POST', '/teamclaude/auth/login', headers, RIGHT);
+      assert.equal(res.status, 403, JSON.stringify(headers));
+      assert.ok(!res.body.includes(KEY), 'the key is not in the refusal');
+    }
+    const methods = await send(port, 'GET', '/teamclaude/auth/methods', rebound);
+    assert.deepEqual(JSON.parse(methods.body), { password: false, hostRefused: true });
+
+    const atIp = await send(port, 'POST', '/teamclaude/auth/login', { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}` }, RIGHT);
+    assert.equal(atIp.status, 200);
+    assert.equal(JSON.parse(atIp.body).key, KEY);
+  });
+});
+
+test('the instance address is a name the sign-in is taken at', async () => {
+  await withLoginServer({ instanceAddress: 'https://proxy.example.com' }, async (port) => {
+    const res = await send(port, 'POST', '/teamclaude/auth/login', { host: 'proxy.example.com', 'x-forwarded-for': '198.51.100.7' }, RIGHT);
+    assert.equal(res.status, 200);
+    assert.equal(JSON.parse(res.body).key, KEY);
+  });
+});
+
+test('wrong guesses count against the socket address, whatever X-Forwarded-For says', async () => {
+  await withLoginServer({}, async (port) => {
+    const at = { host: `127.0.0.1:${port}` };
+    for (let i = 0; i < 6; i++) {
+      const res = await send(port, 'POST', '/teamclaude/auth/login', { ...at, 'x-forwarded-for': `198.51.100.${i}` }, { username: 'me', password: 'nope nope' });
+      assert.equal(res.status, 401);
+    }
+    const locked = await send(port, 'POST', '/teamclaude/auth/login', { ...at, 'x-forwarded-for': '198.51.100.99' }, RIGHT);
+    assert.equal(locked.status, 429, 'a new header value is not a new count');
+    assert.ok(!locked.body.includes(KEY));
+  });
 });

@@ -2572,6 +2572,14 @@ test('the key box offers a password sign-in when the proxy has one, and keeps th
   assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-from-password');
 });
 
+test('at a host name the proxy does not take a sign-in at, the key box says to use its address', async () => {
+  const page = bootPage();
+  await page.answer(401, {});
+  await page.answer(200, { password: false, hostRefused: true });
+  assert.equal(page.byId('pwForm').style.display, 'none');
+  assert.equal(page.byId('pwHere').style.display, '');
+});
+
 test('the Dashboard password row saves a username and password with the key, and turns it off', async () => {
   const page = bootPage({ storedKey: 'tc-operator' });
   await page.answer(200, { accounts: [], caller: { kind: 'operator', client: null, refused: [] }, dashboardLogin: null });

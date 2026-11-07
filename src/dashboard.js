@@ -741,6 +741,7 @@ export function passwordLoginOutcome(status, res) {
   if (status === 401) return { error: 'Wrong username or password.' };
   if (status === 429) return { error: 'Too many wrong tries. Wait ' + ((res && res.retryAfterSec) || 60) + ' seconds and try again.' };
   if (status === 404) return { error: 'This proxy has no dashboard password. Enter the proxy key instead.' };
+  if (status === 403 && res && res.error) return { error: 'Refused: ' + res.error + '.' };
   return { error: 'Sign-in failed' + (res && res.error ? ': ' + res.error : ' (status ' + status + ')') + '.' };
 }
 
@@ -2806,6 +2807,7 @@ const PAGE = `<!doctype html>
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: #fff; font-weight: 600; cursor: pointer; }
   #keybox input + input { margin-top: 0; }
   #keybox .or { margin: 28px 0 4px; color: var(--dim); font-size: 13px; }
+  #keybox .hint { color: var(--dim); font-size: 13px; margin: 0 0 16px; }
   #keybox .kerr { color: var(--bad); font-size: 13px; min-height: 1.4em; margin: 8px 0 0; }
   .thr input.pw { width: 150px; min-width: 0; text-align: left; }
   #pwSetForm { flex-wrap: wrap; }
@@ -2889,6 +2891,7 @@ const PAGE = `<!doctype html>
     <p id="pwErr" class="kerr"></p>
     <p class="or">Or enter the proxy key.</p>
   </form>
+  <p id="pwHere" class="hint" style="display:none">Password sign-in works only at this proxy's own address: its IP address, or the Instance address set on its Settings page.</p>
   <p class="sub" id="keySub">Enter your proxy key to view status.</p>
   <input id="key" type="password" placeholder="tc-..." autocomplete="off">
   <br><button id="go">Connect</button>
@@ -6336,6 +6339,7 @@ ${SHARED_HELPERS}
       .then(function (j) {
         var on = !!(j && j.password);
         document.getElementById('pwForm').style.display = on ? '' : 'none';
+        document.getElementById('pwHere').style.display = j && j.hostRefused ? '' : 'none';
         document.getElementById('keySub').style.display = on ? 'none' : '';
         if (on) document.getElementById('pwUser').focus();
       })

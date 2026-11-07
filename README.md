@@ -104,7 +104,7 @@ You can also set a priority order, send certain models to certain accounts (`tea
 
 ### A web dashboard you can use from anywhere
 
-Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`. To use it from another machine, set `proxy.host` to `0.0.0.0` (or a Tailscale or LAN address), open the same page at that address, and enter the proxy key.
+Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`. To use it from another machine, set `proxy.host` to `0.0.0.0` (or a Tailscale or LAN address), open the same page at that address, and sign in with the username and password set under **Settings**, **Dashboard password** (or enter the proxy key).
 
 - **Quota:** how much is left on every account, as 5-hour, weekly and Fable bars with reset times. Tabs for Claude, Codex, Grok and each backend, plus pooled summary cards. Accounts that are out of quota are hidden until you ask to see them. Enabled accounts whose quota can be read get a **Refresh quota** button, which checks it without spending any.
 - **Accounts:** **Sign in to Claude** and **Sign in to Codex** buttons add accounts from the browser, including from a phone or another computer. You can also sign an account in again, remove it, switch to it, disable it, or move it up or down the priority order.

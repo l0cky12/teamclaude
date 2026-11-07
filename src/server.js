@@ -31,7 +31,7 @@ import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, addClientKey, addPeer, clientKeyNames, peerAddress, removePeer, revokeClientKey, setInstanceAddress, setInstanceName, setOutsideSpendHidePercent, setProbeSeconds, showClientKey, setThreshold, thresholdRatio } from './config-ops.js';
 import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
-import { configuredLogin, createDashboardLogin, passwordLoginAvailable, setDashboardLogin } from './dashboard-login.js';
+import { configuredLogin, createDashboardLogin, loginHostAllowed, passwordLoginAvailable, setDashboardLogin } from './dashboard-login.js';
 import { AccountSyncError } from './web-account-sync.js';
 import { SyncStoreError } from './sync-store.js';
 import { RemovalRefused, serialQueue } from './account-removal.js';
@@ -661,9 +661,13 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
       // Password sign-in for the dashboard (dashboard-login.js), before the key
       // gate since it is how a browser without the key gets it. `methods` tells
       // the page whether to show the username and password fields.
+      const loginHostOk = () => loginHostAllowed(req.headers.host, { boundHost: boundHost(), instanceAddress: instanceAddress(config) });
       if (req.method === 'GET' && req.url === '/teamclaude/auth/methods') {
+        const available = passwordLoginAvailable(config.proxy);
+        const hostOk = loginHostOk();
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify({ password: passwordLoginAvailable(config.proxy) }));
+        // `hostRefused` lets the page say why there is no password form here.
+        res.end(JSON.stringify({ password: available && hostOk, ...(available && !hostOk ? { hostRefused: true } : {}) }));
         return;
       }
       if (req.method === 'POST' && req.url === '/teamclaude/auth/login') {
@@ -671,6 +675,10 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
           res.end(JSON.stringify(body));
         };
+        if (!loginHostOk()) {
+          reply(403, { ok: false, error: 'password sign-in works only at this proxy\'s own address: its IP address, or the Instance address set on its Settings page' });
+          return;
+        }
         // Only the dashboard's own page may ask. Another site cannot read the
         // reply anyway, but it could still spend this address's guesses.
         if (!isSameOriginControlRequest(req, { keyed: true })) {
@@ -679,6 +687,8 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         const body = await readControlJson(req, res);
         if (!body) return;
+        // The socket's address, never X-Forwarded-For: a header the caller
+        // writes would give it a fresh count with every new value.
         const addr = req.socket.remoteAddress || 'unknown';
         const out = await dashboardLogin.attempt(config.proxy, addr, body);
         if (out.key) {
