@@ -11,6 +11,7 @@
       { "name": "ref", "header": "x-teamclaude-ref" }
     ],
     "sessionDetail": true,
+    "dashboardLogin": { "username": "me", "passwordHash": "scrypt$32768$8$1$set-from-the-dashboard$not-by-hand" },
     "logPrompts": false,
     "mcp": "off"
   },

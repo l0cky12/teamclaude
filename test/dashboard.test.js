@@ -2530,6 +2530,9 @@ test('a linked instance that is down never hides the way back, even across a key
   const page = bootPage({ storedInstance: 'server' });
   await page.answer(401, {});
   assert.equal(page.byId('keybox').style.display, 'block');
+  assert.equal(page.requests[0].url, '/teamclaude/auth/methods');
+  await page.answer(200, { password: false });
+  assert.equal(page.byId('pwForm').style.display, 'none', 'no password set: the key field alone');
   page.byId('key').value = 'tc-local';
   page.byId('go').fire('click');
   assert.equal(page.requests[0].url, '/teamclaude/peers');
@@ -2541,6 +2544,68 @@ test('a linked instance that is down never hides the way back, even across a key
   assert.equal(page.byId('instanceNote').style.display, '');
   assert.match(page.byId('err').textContent, /server is unreachable/);
   assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-local', 'the local key was never at fault');
+});
+
+test('the key box offers a password sign-in when the proxy has one, and keeps the key it is answered with', async () => {
+  const page = bootPage();
+  await page.answer(401, {});
+  assert.equal(page.requests[0].url, '/teamclaude/auth/methods');
+  await page.answer(200, { password: true });
+  assert.equal(page.byId('pwForm').style.display, '');
+  assert.equal(page.byId('keySub').style.display, 'none');
+
+  page.byId('pwUser').value = ' me ';
+  page.byId('pwPass').value = 'long enough';
+  page.byId('pwForm').fire('submit', { preventDefault() {} });
+  assert.equal(page.requests[0].url, '/teamclaude/auth/login');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { username: 'me', password: 'long enough' });
+  assert.equal(page.requests[0].init.headers['x-api-key'], undefined, 'no key to send yet');
+  await page.answer(401, { ok: false, error: 'wrong username or password' });
+  assert.match(page.byId('pwErr').textContent, /Wrong username or password/);
+  assert.equal(page.store.has('teamclaude-dashboard-key'), false);
+
+  page.byId('pwForm').fire('submit', { preventDefault() {} });
+  await page.answer(200, { ok: true, key: 'tc-from-password' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-from-password');
+  assert.equal(page.byId('pwPass').value, '', 'the password is not left in the field');
+  assert.equal(page.requests[0].url, '/teamclaude/status');
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-from-password');
+});
+
+test('at a host name the proxy does not take a sign-in at, the key box says to use its address', async () => {
+  const page = bootPage();
+  await page.answer(401, {});
+  await page.answer(200, { password: false, hostRefused: true });
+  assert.equal(page.byId('pwForm').style.display, 'none');
+  assert.equal(page.byId('pwHere').style.display, '');
+});
+
+test('the Dashboard password row saves a username and password with the key, and turns it off', async () => {
+  const page = bootPage({ storedKey: 'tc-operator' });
+  await page.answer(200, { accounts: [], caller: { kind: 'operator', client: null, refused: [] }, dashboardLogin: null });
+  assert.equal(page.byId('pwRow').style.display, '');
+  assert.equal(page.byId('pwOff').style.display, 'none', 'nothing to turn off yet');
+  page.byId('pwSetUser').value = 'me';
+  page.byId('pwSetPass').value = 'long enough';
+  page.byId('pwSetForm').fire('submit', { preventDefault() {} });
+  assert.equal(page.requests[0].url, '/teamclaude/dashboard-login');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { username: 'me', password: 'long enough' });
+  assert.equal(page.requests[0].init.headers['x-api-key'], 'tc-operator');
+  await page.answer(200, { ok: true, username: 'me' });
+  assert.match(page.byId('note').textContent, /dashboard password set for me/);
+  assert.equal(page.byId('pwSetPass').value, '');
+  await page.answer(200, { accounts: [], caller: { kind: 'operator', client: null, refused: [] }, dashboardLogin: 'me' });
+  assert.equal(page.byId('pwOff').style.display, '');
+  assert.match(page.byId('pwTag').textContent, /On for me/);
+
+  page.byId('pwOff').fire('click');
+  assert.deepEqual(JSON.parse(page.requests[0].init.body), { username: '', password: '' });
+});
+
+test('a client key sees no Dashboard password row', async () => {
+  const page = bootPage({ storedKey: 'tc-client' });
+  await page.answer(200, { accounts: [], caller: { kind: 'client', client: 'ci', refused: ['/teamclaude/dashboard-login'] } });
+  assert.equal(page.byId('pwRow').style.display, 'none');
 });
 
 test('a client key with a linked instance still picked goes back to this machine and keeps its key', async () => {
