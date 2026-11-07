@@ -298,3 +298,36 @@ test('grok: a PowerShell failure reads as unreadable rather than throwing', asyn
     assert.match(status.problem, /PowerShell/);
   }, { platform: 'win32', runPowerShell: async () => { throw new Error('PowerShell failed: not found'); } });
 });
+
+test('codex: the active profile is edited in place whichever comes first, its table or ours', () => {
+  const ourFirst = 'profile = "work"\n\n[model_providers.teamclaude]\nname = "teamclaude"\nbase_url = "http://127.0.0.1:3456/backend-api/codex"\nwire_api = "chat"\nhttp_headers = { "x" = "y" }\nrequest_max_retries = 2\n\n[profiles.work]\nmodel_provider = "openai"\nmodel = "gpt-5"\n';
+  const connected = codexCodec.apply(ourFirst, CODEX_TARGET);
+  assert.equal(connected,
+    `profile = "work"\n\n${CODEX_BLOCK}\n[profiles.work]\nmodel_provider = "teamclaude" # teamclaude: was "openai"\nmodel = "gpt-5"\n`);
+  assert.equal(codexCodec.inspect(connected, CODEX_TARGET).state, 'connected');
+  assert.equal(codexCodec.remove(connected, CODEX_TARGET), 'profile = "work"\n\n[profiles.work]\nmodel_provider = "openai"\nmodel = "gpt-5"\n');
+});
+
+test('codex: a hand-written provider line with no note is removed on disconnect, with our table before it', () => {
+  const handWritten = `profile = "work"\n\n${CODEX_BLOCK}\n[profiles.work]\nmodel_provider = "teamclaude"\nmodel = "gpt-5"\n`;
+  assert.equal(codexCodec.inspect(handWritten, CODEX_TARGET).state, 'connected');
+  assert.equal(codexCodec.remove(handWritten, CODEX_TARGET), 'profile = "work"\n\n[profiles.work]\nmodel = "gpt-5"\n');
+});
+
+test('codex: triple quotes inside a comment or a one-line string open no multi-line string', () => {
+  for (const noise of ['# see the """ example', "# don't use ''' here", 'title = "say \\"\\"\\" here"']) {
+    const original = `${noise}\nmodel_provider = "openai"\n`;
+    assert.deepEqual(codexCodec.inspect(original, CODEX_TARGET), { state: 'elsewhere', current: 'model_provider "openai"' }, noise);
+  }
+  const commentedHeader = 'model_provider = "teamclaude"\n\n[model_providers.teamclaude] # docs use """\nname = "teamclaude"\nbase_url = "http://10.0.0.2:9999/backend-api/codex"\n';
+  assert.deepEqual(codexCodec.inspect(commentedHeader, CODEX_TARGET), { state: 'elsewhere', current: 'http://10.0.0.2:9999/backend-api/codex' });
+});
+
+test('codex: a profile model_provider written as a dotted key is refused, not shadowed', () => {
+  assert.throws(() => codexCodec.inspect('profile = "work"\nprofiles.work.model_provider = "openai"\n', CODEX_TARGET), /dotted key/);
+  assert.throws(() => codexCodec.inspect('profile = "work"\n\n[profiles]\nwork.model_provider = "openai"\n', CODEX_TARGET), /dotted key/);
+});
+
+test('the IPv6 loopback and 127.0.0.1 are the same machine', () => {
+  assert.ok(sameAddress('http://[::1]:3456', ORIGIN));
+});

@@ -202,23 +202,52 @@ function parseTomlString(rest) {
 /**
  * Which lines continue a multi-line string (`"""` or `'''`) opened on an
  * earlier line. Their text is string content, so a `[table]` or `key = ...`
- * there is not one.
+ * there is not one. Comments and one-line strings are stepped over while
+ * looking for a delimiter, so a `"""` quoted in either opens nothing.
  * @param {string[]} lines
  */
 function multilineContinuations(lines) {
-  const inside = lines.map(() => false);
+  /** @type {boolean[]} */
+  const inside = [];
   /** @type {string|null} */
   let open = null;
-  lines.forEach((line, i) => {
-    if (open) {
-      inside[i] = true;
-      if (line.split(open).length % 2 === 0) open = null;
-      return;
+  for (const line of lines) {
+    inside.push(open !== null);
+    let i = 0;
+    while (i < line.length) {
+      if (open) {
+        if (open === '"""' && line[i] === '\\') { i += 2; continue; }
+        if (line.startsWith(open, i)) {
+          // Up to two more quotes may close it: `"""a"""""` is the string `a""`.
+          i += 3;
+          while (line[i] === open[0]) i++;
+          open = null;
+          continue;
+        }
+        i++;
+        continue;
+      }
+      const c = line[i];
+      if (c === '#') break;
+      if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
+        open = line.slice(i, i + 3);
+        i += 3;
+        continue;
+      }
+      if (c === '"') {
+        i++;
+        while (i < line.length && line[i] !== '"') i += line[i] === '\\' ? 2 : 1;
+        i++;
+        continue;
+      }
+      if (c === "'") {
+        const close = line.indexOf("'", i + 1);
+        i = close < 0 ? line.length : close + 1;
+        continue;
+      }
+      i++;
     }
-    for (const delim of ['"""', "'''"]) {
-      if (line.split(delim).length % 2 === 0) { open = delim; break; }
-    }
-  });
+  }
   return inside;
 }
 
@@ -265,6 +294,7 @@ function parseCodexConfig(text) {
   for (let i = 0; i < topEnd; i++) {
     if (inString[i]) continue;
     if (/^\s*model_providers\s*\.\s*["']?teamclaude\b/.test(lines[i])) throw unsupportedProvider();
+    if (/^\s*profiles\s*\./.test(lines[i]) && DOTTED_PROFILE_PROVIDER_RE.test(lines[i])) throw dottedProfileProvider();
     const p = PROFILE_RE.exec(lines[i]);
     if (p) profile = parseTomlString(p[1])?.value ?? null;
     const found = providerLine(lines[i], i);
@@ -292,8 +322,10 @@ function parseCodexConfig(text) {
         profileProvider = found;
       }
     }
+    if (path.length === 1 && path[0] === 'profiles'
+      && lines.slice(i + 1, end).some((l, k) => !inString[i + 1 + k] && DOTTED_PROFILE_PROVIDER_RE.test(l))) throw dottedProfileProvider();
     if (path.length === 1 && path[0] === 'model_providers'
-      && lines.slice(i + 1, end).some(l => /^\s*["']?teamclaude["']?\s*[.=]/.test(l))) throw unsupportedProvider();
+      && lines.slice(i + 1, end).some(l =>/^\s*["']?teamclaude["']?\s*[.=]/.test(l))) throw unsupportedProvider();
     if (isOurTable(path)) {
       if (path.length === 2) {
         for (let k = i + 1; k < end; k++) {
@@ -318,6 +350,14 @@ function unsupportedProvider() {
   return new ConnectError('it defines model_providers.teamclaude in a form this command does not edit; change it by hand');
 }
 
+// `profiles.work.model_provider = ...` at the root, or `work.model_provider`
+// inside `[profiles]`: the profile key this module reads, in dotted form.
+const DOTTED_PROFILE_PROVIDER_RE = /^\s*(?:profiles\s*\.\s*)?["']?[\w-]+["']?\s*\.\s*model_provider\s*=/;
+
+function dottedProfileProvider() {
+  return new ConnectError("it sets a profile's model_provider as a dotted key, a form this command does not edit; change it by hand");
+}
+
 /** @param {string} line */
 const isBlank = line => !line.trim();
 
@@ -332,15 +372,17 @@ function joinLines(lines, eol) {
 }
 
 /**
- * The lines with our provider tables taken out, or with the first one
- * swapped for `replacement` in place.
- * @param {ReturnType<typeof parseCodexConfig>} doc
+ * `source` with our provider tables taken out, or with the first one swapped
+ * for `replacement` in place. `tables` are ranges into `source`, so an edit
+ * made before this must keep the line count.
+ * @param {string[]} source
+ * @param {{ start: number, end: number }[]} tables
  * @param {string[]|null} [replacement]
  */
-function withoutOurTables(doc, replacement = null) {
-  const lines = [...doc.lines];
-  for (let n = doc.tables.length - 1; n >= 0; n--) {
-    const { start, end } = doc.tables[n];
+function withoutOurTables(source, tables, replacement = null) {
+  const lines = [...source];
+  for (let n = tables.length - 1; n >= 0; n--) {
+    const { start, end } = tables[n];
     if (n === 0 && replacement) { lines.splice(start, end - start, ...replacement); continue; }
     lines.splice(start, end - start);
     if (start > 0 && isBlank(lines[start - 1]) && (start >= lines.length || isBlank(lines[start]))) lines.splice(start - 1, 1);
@@ -358,6 +400,9 @@ function providerText(line, value, was) {
   const notes = [was != null ? `# teamclaude: was ${JSON.stringify(was)}` : '', line.comment].filter(Boolean).join(' ');
   return `${line.indent}model_provider = ${JSON.stringify(value)}${notes ? ` ${notes}` : ''}`;
 }
+
+// Cannot occur in a text file: TOML forbids a raw NUL.
+const DELETED_LINE = '\u0000teamclaude: deleted line';
 
 /** @param {string} target */
 function ourTable(target) {
@@ -381,16 +426,21 @@ export const codexCodec = {
   apply(text, target) {
     const doc = parseCodexConfig(text);
     const table = ourTable(target);
-    const lines = withoutOurTables(doc, table);
+    // The provider line is rewritten while its index still holds, before any
+    // table moves. A new root line goes in after: the root region sits above
+    // every table, so moving them does not shift it.
+    const edited = [...doc.lines];
+    if (doc.provider && doc.provider.value !== PROVIDER_NAME) {
+      edited[doc.provider.index] = providerText(doc.provider, PROVIDER_NAME, doc.provider.value);
+    }
+    const lines = withoutOurTables(edited, doc.tables, table);
     if (!doc.tables.length) {
       while (lines.length && isBlank(lines[lines.length - 1])) lines.pop();
       if (lines.length) lines.push('');
       lines.push(...table);
     }
     const ours = `model_provider = "${PROVIDER_NAME}"`;
-    if (doc.provider && doc.provider.value !== PROVIDER_NAME) {
-      lines[doc.provider.index] = providerText(doc.provider, PROVIDER_NAME, doc.provider.value);
-    } else if (!doc.provider) {
+    if (!doc.provider) {
       // Above any comment that introduces the first table.
       let k = doc.topEnd;
       while (k > 0 && /^\s*(#.*)?$/.test(lines[k - 1])) k--;
@@ -401,13 +451,16 @@ export const codexCodec = {
   },
   remove(text) {
     const doc = parseCodexConfig(text);
-    const lines = withoutOurTables(doc);
     const top = /** @type {ProviderLine} */ (doc.provider);
-    if (top.was != null) {
-      lines[top.index] = providerText(top, top.was, null);
-    } else {
-      lines.splice(top.index, 1);
-      if ((top.index === 0 || isBlank(lines[top.index - 1])) && top.index < lines.length && isBlank(lines[top.index])) lines.splice(top.index, 1);
+    // Edited in place and a deleted line marked, not spliced, so the table
+    // ranges stay valid; the mark is found again once the tables are gone.
+    const edited = [...doc.lines];
+    edited[top.index] = top.was != null ? providerText(top, top.was, null) : DELETED_LINE;
+    const lines = withoutOurTables(edited, doc.tables);
+    const at = lines.indexOf(DELETED_LINE);
+    if (at >= 0) {
+      lines.splice(at, 1);
+      if ((at === 0 || isBlank(lines[at - 1])) && at < lines.length && isBlank(lines[at])) lines.splice(at, 1);
     }
     return joinLines(lines, doc.eol);
   },
