@@ -1,4 +1,6 @@
 export default [
+  // Build output of scripts/build-windows-installer.mjs, a copy of src/.
+  { ignores: ['dist/', '.cache/'] },
   {
     languageOptions: {
       ecmaVersion: 2022,

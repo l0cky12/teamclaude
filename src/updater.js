@@ -3,7 +3,9 @@
 // We ONLY ever touch a global npm install (`npm install -g @karpeleslab/teamclaude`):
 //   - a git checkout (a `.git` at the package root) is a dev tree — never touched;
 //   - a pnpm install is pointed at pnpm, since npm cannot update it;
-//   - a local dependency / npx copy is left alone (we only notify).
+//   - a local dependency / npx copy is left alone (we only notify);
+//   - the Windows installer's copy has no npm, so it is pointed at the
+//     GitHub releases page for the next installer.
 // Checks hit the npm registry at most once a day (cached in a small file next to
 // the config), so the overwhelmingly common invocation does zero network I/O.
 // Disable entirely with TEAMCLAUDE_DISABLE_AUTOUPDATE=1 or config.autoUpdate=false.
@@ -22,6 +24,9 @@ import { safeLine } from './safe-text.js';
 import { envVar } from './brand.js';
 
 export const PKG_NAME = '@karpeleslab/teamclaude';
+export const RELEASES_URL = 'https://github.com/KarpelesLab/teamclaude/releases';
+/** Dropped next to package.json by scripts/build-windows-installer.mjs. */
+export const BUNDLE_MARKER = 'windows-bundle';
 const REGISTRY = 'https://registry.npmjs.org';
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Wide enough for `v1.2.3-rc.1+build`, narrow enough that a tag cannot be the
@@ -108,9 +113,10 @@ function npmGlobalRoot() {
   });
 }
 
-/** How this copy was installed: 'git', 'global', 'pnpm', 'local', or 'unknown'. */
+/** How this copy was installed: 'git', 'bundle', 'global', 'pnpm', 'local', or 'unknown'. */
 export async function installKind({ root = packageRoot(), globalRoot = npmGlobalRoot } = {}) {
   if (existsSync(join(root, '.git'))) return 'git';
+  if (existsSync(join(root, BUNDLE_MARKER))) return 'bundle';
   const norm = root.split('\\').join('/');
   if (!norm.includes('/node_modules/')) return 'unknown';
   // pnpm links a package out of its `.pnpm` store, and the package root is the
@@ -131,6 +137,18 @@ export async function installKind({ root = packageRoot(), globalRoot = npmGlobal
  */
 export function updateCommandFor(kind) {
   return kind === 'pnpm' ? `pnpm add -g ${PKG_NAME}@latest` : 'teamclaude update';
+}
+
+/**
+ * What to tell the operator to do about a newer version of a copy installed
+ * as `kind`. The Windows installer's copy is replaced by running the next
+ * installer, which nothing here downloads or runs.
+ * @param {string} kind
+ */
+export function updateAdvice(kind) {
+  return kind === 'bundle'
+    ? `Download the new installer from ${RELEASES_URL}`
+    : `Run: ${updateCommandFor(kind)}`;
 }
 
 /** Fetch the registry's current "latest" version (null on any failure/timeout). */
@@ -311,7 +329,7 @@ export async function autoUpdate({
 
   const how = await kind({ root });
   if (how !== 'global') {
-    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. Run: ${updateCommandFor(how)}`);
+    log(`[TeamClaude] Update available: ${info.current} → ${info.latest}. ${updateAdvice(how)}`);
     return { ...info, notified: true };
   }
   log(`[TeamClaude] Updating ${info.current} → ${info.latest}…`);

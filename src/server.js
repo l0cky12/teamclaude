@@ -33,10 +33,11 @@ import { outsideSpendHidePercent } from './outside-spend.js';
 import { WebSignInError } from './web-login.js';
 import { AccountSyncError } from './web-account-sync.js';
 import { SyncStoreError } from './sync-store.js';
-import { RemovalRefused } from './account-removal.js';
+import { RemovalRefused, serialQueue } from './account-removal.js';
 import { envVar, legacyControlUrl } from './brand.js';
 import { clientAgent, logsAfter, requestPrompt } from './event-log.js';
 import { insightsRange } from './usage-history.js';
+import { CLIENTS, CLIENT_IDS, clientStatus, loopbackOrigin, parseClientIds, runClientAction } from './client-connect.js';
 import { fleetInsights, insightsScope } from './fleet-insights.js';
 import { askPeerToLinkBack, configuredPeers, createPeerDirectory, hostInstanceName, instanceAddress, instanceName, joinPeerMesh, parsePeerUrl, relayToPeer, selfLinkInfo, testPeerLink } from './peers.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -316,13 +317,8 @@ export function isLoopbackAddr(addr) {
  * @returns {string|null}
  */
 export function grokLocalBase(proxyConfig, bindHost, port) {
-  if (proxyConfig?.trustLoopback === false || !(port > 0)) return null;
-  const host = String(bindHost || '127.0.0.1').replace(/^\[|\]$/g, '').toLowerCase();
-  let loopback;
-  if (host === '::1') loopback = '[::1]';
-  else if (['127.0.0.1', 'localhost', '0.0.0.0', '::'].includes(host)) loopback = '127.0.0.1';
-  else return null;
-  return `http://${loopback}:${port}${PROVIDERS.grok.pathPrefix}/v1`;
+  const origin = loopbackOrigin(proxyConfig, bindHost, port);
+  return origin && `${origin}${CLIENTS.grok.suffix}`;
 }
 
 // Headers a forwarding proxy adds to name the caller it forwards for. Any of
@@ -386,9 +382,24 @@ export function loopbackExempt(headers, remoteAddress, proxyConfig) {
  */
 export function keylessMcpRefusal(headers, remoteAddress, proxyConfig, boundHost = null) {
   if (!resolveClientAuth(proxyConfig, undefined).ok) return null;
-  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) {
-    return 'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere';
-  }
+  return localCallerRefusal(headers, remoteAddress, proxyConfig, boundHost,
+    'request refused: with no proxy key configured the MCP endpoint serves only this machine; set proxy.apiKey to reach it from elsewhere');
+}
+
+/**
+ * Why a caller is not on this machine, or null when it is: a loopback peer,
+ * no forwarding header, `trustLoopback` not switched off, and a Host header
+ * naming this proxy (a page rebound to 127.0.0.1 arrives from loopback too).
+ * A key does not change the answer: it says who the caller is, not where.
+ * @param {import('node:http').IncomingHttpHeaders} headers
+ * @param {string|undefined} remoteAddress
+ * @param {Record<string, any>|undefined} proxyConfig
+ * @param {string|null} boundHost  the address the server bound, when it is not `proxyConfig.host`
+ * @param {string} notLocal  the refusal for a caller that is not on this machine
+ * @returns {string|null}
+ */
+export function localCallerRefusal(headers, remoteAddress, proxyConfig, boundHost, notLocal) {
+  if (!loopbackExempt(headers, remoteAddress, proxyConfig)) return notLocal;
   // The address actually bound, when the caller knows it (TEAMCLAUDE_HOST can
   // differ from proxy.host — see createProxyServer's `bindHost`).
   if (!isLocalHostHeader(headers.host ?? headers[':authority'], boundHost || proxyConfig?.host)) {
@@ -459,6 +470,7 @@ function hasConfiguredKey(proxyConfig) {
 // Control-plane writes that change the config file, with the refusal a
 // caller holding a client key (rather than the operator's proxy.apiKey) gets.
 // See the check in createProxyServer for why a tenant may not reach these.
+const CONNECT_CLIENT_KEY_REFUSAL = 'a client key cannot change the client settings of the machine the proxy runs on';
 const CLIENT_KEY_REFUSED_PATHS = new Map([
   ['/teamclaude/threshold', 'a client key cannot change settings'],
   ['/teamclaude/probe-interval', 'a client key cannot change settings'],
@@ -509,6 +521,8 @@ const CLIENT_KEY_REFUSED_PATHS = new Map([
   // The master and backups check one another here, and a backup copies the
   // whole store through it.
   ['/teamclaude/sync-cluster', 'a client key cannot read the account store'],
+  // Writes the settings files of the user the proxy runs as.
+  ['/teamclaude/clients/connect', CONNECT_CLIENT_KEY_REFUSAL],
 ]);
 
 /**
@@ -558,6 +572,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
   const peerDirectory = createPeerDirectory();
+  // Two clicks in quick succession must not both read a settings file before
+  // either writes it.
+  const connectQueue = serialQueue();
 
   /**
    * Save the entries a mesh join found for this machine, then reload so the
@@ -1840,6 +1857,44 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
         }
         res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({ ok: true, ...result, grokLocal: grokLocalBase(config.proxy, boundHost(), req.socket.localPort || 0) }));
+        return;
+      }
+
+      // Connect your tools: the Clients page's card that points Claude Code,
+      // the Codex CLI and Grok Build at this proxy (client-connect.js). It
+      // edits files of the user the proxy runs as, so only a caller on this
+      // machine may use it, with a key or without.
+      if (req.url === '/teamclaude/clients/connect' && (req.method === 'GET' || req.method === 'POST')) {
+        const reply = (/** @type {number} */ status, /** @type {any} */ body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify(body));
+        };
+        const refusal = req.tcClient ? CONNECT_CLIENT_KEY_REFUSAL
+          : localCallerRefusal(req.headers, req.socket.remoteAddress, config.proxy, boundHost(),
+            'only a caller on the machine the proxy runs on can change its client settings');
+        if (refusal) { reply(403, { ok: false, error: refusal }); return; }
+        const origin = loopbackOrigin(config.proxy, boundHost(), req.socket.localPort || 0);
+        if (!origin) { reply(409, { ok: false, error: 'this proxy answers no loopback address, so a client on this machine could not reach it without a key' }); return; }
+        if (req.method === 'GET') {
+          reply(200, { ok: true, clients: await Promise.all(CLIENT_IDS.map(id => clientStatus(id, origin))) });
+          return;
+        }
+        const body = await readControlJson(req, res);
+        if (!body) return;
+        const action = body.action;
+        if (action !== 'connect' && action !== 'disconnect') { reply(400, { ok: false, error: 'action must be "connect" or "disconnect"' }); return; }
+        if (!Array.isArray(body.clients) || !body.clients.length) { reply(400, { ok: false, error: `clients must list at least one of ${CLIENT_IDS.join(', ')}` }); return; }
+        /** @type {import('./client-connect.js').ClientId[]} */ let ids;
+        try {
+          ids = parseClientIds(body.clients);
+        } catch (err) {
+          reply(400, { ok: false, error: /** @type {Error} */ (err).message });
+          return;
+        }
+        const result = await connectQueue(() => runClientAction(action, ids, origin, { replace: body.replace === true }));
+        const changed = result.clients.filter(c => !result.errors.some(e => e.id === c.id)).map(c => c.label);
+        if (changed.length) console.log(`[TeamClaude] ${action === 'connect' ? 'Connected' : 'Disconnected'} ${changed.join(', ')} (dashboard)`);
+        reply(200, { ok: !result.errors.length, ...result });
         return;
       }
 

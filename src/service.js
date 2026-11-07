@@ -13,7 +13,7 @@ import { writeFile, mkdir, rm, readFile } from 'node:fs/promises';
 import { existsSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, win32 } from 'node:path';
 
 export const LABEL = 'com.karpeleslab.teamclaude';
 export const UNIT_NAME = 'teamclaude.service';
@@ -33,10 +33,21 @@ export function systemdUnitPath(home = homedir(), xdgConfig = process.env.XDG_CO
   return join(xdgConfig || join(home, '.config'), 'systemd', 'user', UNIT_NAME);
 }
 
-export function logPath(home = homedir(), platform = process.platform) {
+/**
+ * Where a background proxy writes its output: the LaunchAgent's log on macOS,
+ * and the log `teamclaude desktop` starts the server with everywhere.
+ *
+ * @param {string} [home]
+ * @param {string} [platform]
+ * @param {Record<string, string|undefined>} [env]
+ */
+export function logPath(home = homedir(), platform = process.platform, env = process.env) {
+  if (platform === 'win32') {
+    return win32.join(env.LOCALAPPDATA || win32.join(home, 'AppData', 'Local'), 'TeamClaude', 'teamclaude.log');
+  }
   return platform === 'darwin'
     ? join(home, 'Library', 'Logs', 'teamclaude.log')
-    : join(home, '.local', 'state', 'teamclaude.log');
+    : join(env.XDG_STATE_HOME || join(home, '.local', 'state'), 'teamclaude.log');
 }
 
 /**

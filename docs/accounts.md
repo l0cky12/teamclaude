@@ -520,7 +520,7 @@ CODEX_HOME=~/.codex-second codex login
   "importFrom": "~/.codex-second/auth.json" }
 ```
 
-Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
+Then tell Codex to reach TeamClaude instead of OpenAI. `teamclaude connect codex` writes this to `~/.codex/config.toml` for you (see [Connecting your tools in one step](usage.md#connecting-your-tools-in-one-step)); by hand, it is:
 
 ```toml
 model_provider = "teamclaude"
@@ -781,6 +781,11 @@ Then point Grok Build at TeamClaude:
 ```bash
 GROK_CLI_CHAT_PROXY_BASE_URL=http://127.0.0.1:3456/grok/v1 grok
 ```
+
+`teamclaude connect grok` sets that variable for good: in your Windows user
+environment, or in your shell's rc file elsewhere. Grok Build then reaches the
+pool from any terminal opened afterwards (see [Connecting your tools in one
+step](usage.md#connecting-your-tools-in-one-step)).
 
 Grok Build still has to be signed in itself (`grok login`), but its token is
 replaced on every request by the pooled account's.

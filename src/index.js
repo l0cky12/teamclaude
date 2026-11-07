@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { createWriteStream, existsSync } from 'node:fs';
 import { readFile, unlink } from 'node:fs/promises';
 import net from 'node:net';
-import { loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
+import { createDefaultConfig, loadOrCreateConfig, loadConfig, loadConfigPersistingIds, saveConfig, atomicConfigUpdate, withConfigLock, getConfigPath, getCrashLogPath, loadState, saveState } from './config.js';
 import { installCrashHandlers } from './crash-log.js';
 import { AccountManager, distributionMode, accountRouting } from './account-manager.js';
 import { validateAdaptiveConfig } from './adaptive-distribution.js';
@@ -34,6 +34,7 @@ import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds, accountIdsComplete } from './account-id.js';
 import * as alias from './alias.js';
+import { ConnectError, clientStatus, loopbackOrigin, parseClientIds, runClientAction } from './client-connect.js';
 import { ensureCerts, mitmHosts, caCertPath } from './mitm.js';
 import { Prober, probeApplicable } from './prober.js';
 import { ResetCreditRedeemer } from './codex-reset-credits.js';
@@ -45,13 +46,14 @@ import { SessionTitles } from './session-titles.js';
 import { captureEarlyConsole } from './early-log.js';
 import { RemoteControl, createAttachSession } from './tui-remote.js';
 import { SxManager } from './sx.js';
-import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, PKG_NAME } from './updater.js';
+import { autoUpdate, checkForUpdate, currentVersion, resolveVersionLabel, runUpdate, installKind, updateAvailableFromCache, updateCommandFor, updateAdvice, PKG_NAME, RELEASES_URL } from './updater.js';
 import { renderStatus, formatPercent } from './status-renderer.js';
 import { sanitizeText, safeLine } from './safe-text.js';
 import { modelLabel } from './model.js';
 import { ClientUsageTracker, UsageDimensionTracker } from './client-usage.js';
 import { buildClaudeEnvLines, bypassesAllHosts, clearSelfProxyEnvLines, encodePinComponent, LOCAL_LOGIN_HINT_WINDOW_MS, localLoginHint, mergeNoProxy, resolveClientMode } from './claude-env.js';
 import { serviceKind, installService, uninstallService, serviceStatus, renderService, logPath } from './service.js';
+import { launchDesktop } from './desktop.js';
 import { COMPOSE_UPDATE_USAGE, envAssignments, installComposeUpdate, uninstallComposeUpdate, composeUpdateStatus, renderComposeUpdate } from './compose-update.js';
 import { formatTerminalTitle, titleSequence, TITLE_STACK_PUSH, TITLE_STACK_POP } from './terminal-title.js';
 import { getUpstreamProxy, describeProxy, describeSelfProxy, localListener, isSelfProxy } from './upstream-proxy.js';
@@ -260,6 +262,10 @@ switch (command) {
     await dashboardCommand();
     process.exit(0);
     break;
+  case 'desktop':
+    await desktopCommand();
+    process.exit(0);
+    break;
   case 'accounts':
     await accountsCommand();
     process.exit(0);
@@ -295,6 +301,10 @@ switch (command) {
   case 'alias':
     aliasCommand();
     process.exit(0);
+    break;
+  case 'connect':
+  case 'disconnect':
+    await connectCommand(/** @type {'connect'|'disconnect'} */ (command));
     break;
   case 'service':
     await serviceCommand();
@@ -2136,6 +2146,27 @@ async function dashboardCommand() {
   if (opened.error || opened.status !== 0) console.error('Could not open a browser; open the URL above by hand.');
 }
 
+// Start the proxy in the background unless it is already up, then open the
+// dashboard: the one step a person with no terminal takes (TeamClaude.exe on
+// Windows runs this). Unlike `dashboard` it starts a server, with its output
+// in the log file `status` points at.
+async function desktopCommand() {
+  const config = await loadOrCreateConfig();
+  const bound = envVar('HOST') || config.proxy.host || '127.0.0.1';
+  const host = (bound === '0.0.0.0' || bound === '::') ? '127.0.0.1' : bound;
+  const logFile = logPath();
+  try {
+    const { url, pid, started } = await launchDesktop({
+      host, port: config.proxy.port, apiKey: config.proxy.apiKey, logFile, open: !args.includes('--no-open'),
+    });
+    console.log(started ? `Started the proxy (pid ${pid}). Log: ${logFile}` : `The proxy is already running (pid ${pid}).`);
+    console.log(`Dashboard: ${url}`);
+  } catch (err) {
+    console.error(`[TeamClaude] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
 // ── switch ──────────────────────────────────────────────────
 
 // Manual account switch against a RUNNING server — the headless equivalent of
@@ -2732,6 +2763,65 @@ function aliasCommand() {
   }
 }
 
+// ── connect / disconnect ────────────────────────────────────
+
+/**
+ * One line for a client's status, for the terminal.
+ * @param {import('./client-connect.js').ClientStatus} c
+ */
+function connectLine(c) {
+  const state = c.state === 'connected' ? 'connected'
+    : c.state === 'disconnected' ? 'not connected'
+      : c.state === 'elsewhere' ? `uses ${c.current}`
+        : `unreadable: ${c.problem}`;
+  return `  ${c.label.padEnd(12)} ${state}\n  ${' '.repeat(12)} ${c.where}`;
+}
+
+// Writes the settings of Claude Code, the Codex CLI and Grok Build on this
+// machine, so they reach the proxy without anyone editing those files.
+/** @param {'connect'|'disconnect'} action */
+async function connectCommand(action) {
+  const flags = args.slice(1);
+  const unknownFlag = flags.find(f => f.startsWith('-') && !['--replace', '--status'].includes(f));
+  if (unknownFlag) {
+    console.error(`teamclaude ${action}: unknown option ${unknownFlag}`);
+    console.error('Usage: teamclaude connect [all|claude|codex|grok ...] [--replace] | --status');
+    console.error('       teamclaude disconnect [all|claude|codex|grok ...]');
+    process.exit(1);
+  }
+  let ids;
+  try {
+    ids = parseClientIds(flags.filter(f => !f.startsWith('-')));
+  } catch (err) {
+    if (!(err instanceof ConnectError)) throw err;
+    console.error(`teamclaude ${action}: ${err.message}`);
+    process.exit(1);
+  }
+  // No config yet is a fresh install: the server will create the default one,
+  // so its port is the one to point at. Nothing is written here.
+  const config = (await loadConfig()) ?? createDefaultConfig();
+  const origin = loopbackOrigin(config.proxy, envVar('HOST') || config.proxy.host, config.proxy.port);
+  if (!origin) {
+    console.error(`teamclaude ${action}: this proxy answers no loopback address (proxy.trustLoopback is false, or proxy.host is one address other than this machine's own),`);
+    console.error('so a client here cannot reach it without a key, and these settings carry none. Point the clients at it by hand: see docs/accounts.md.');
+    process.exit(1);
+  }
+
+  if (flags.includes('--status')) {
+    for (const id of ids) console.log(connectLine(await clientStatus(id, origin)));
+    process.exit(0);
+  }
+  const { clients, errors } = await runClientAction(action, ids, origin, { replace: flags.includes('--replace') });
+  for (const c of clients) console.log(connectLine(c));
+  for (const e of errors) console.error(`\n${e.error}${e.replaceable ? ` To replace it: teamclaude connect ${e.id} --replace` : ''}`);
+  const grok = clients.find(c => c.id === 'grok' && !errors.some(e => e.id === 'grok'));
+  if (grok?.note) console.log(`\n${grok.note}`);
+  if (action === 'connect' && !errors.length && !(await isServerUp(config))) {
+    console.log(`\nThe proxy is not running yet. Start it with: teamclaude server`);
+  }
+  process.exit(errors.length ? 1 : 0);
+}
+
 // ── service ─────────────────────────────────────────────────
 
 async function serviceCommand() {
@@ -3185,6 +3275,15 @@ async function updateCommand() {
     console.log('That runs scripts/redeploy.sh: git pull, docker compose build, docker compose up -d.');
     return;
   }
+  // The Windows installer's copy has no npm to run: it is replaced by the
+  // next installer, which this only points at.
+  if (kind === 'bundle') {
+    const info = await checkForUpdate({ force: true });
+    if (!info) console.log(`Could not check for a newer version. Releases: ${RELEASES_URL}`);
+    else if (!info.updateAvailable) console.log(`Already up to date (latest is ${info.latest}).`);
+    else console.log(`TeamClaude ${info.latest} is available. ${updateAdvice(kind)}`);
+    return;
+  }
   // `npm install -g` would put a second copy in npm's global directory and
   // leave this one, the one on PATH, as it is.
   if (kind === 'pnpm') {
@@ -3503,6 +3602,13 @@ Commands:
                       the session to one account (see Environment below)
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
+  connect [all|claude|codex|grok ...] [--replace]
+                      Point Claude Code, the Codex CLI and Grok Build on this
+                      machine at the proxy by writing their settings (all of
+                      them by default). A setting that names another address
+                      is kept unless --replace; --status only shows each one
+  disconnect [all|claude|codex|grok ...]
+                      Take out the settings connect wrote, and only those
   service <sub>       Run the proxy as a user service that starts at login and
                       restarts on its own: install | uninstall | status | print
                       (LaunchAgent on macOS, systemd --user unit on Linux;
@@ -3512,6 +3618,9 @@ Commands:
   attach              Open the live dashboard against a running server; s
                       switches account, R reloads config, q leaves it running
   dashboard           Open the web dashboard of a running server in the browser
+  desktop [--no-open] Start the proxy in the background if it is not running,
+                      then open the dashboard (what TeamClaude.exe runs on
+                      Windows); --no-open only starts it
   accounts            List configured accounts
   accounts export <file> [--plain] [--force] [--disable-source]
                       Write every account's login to an encrypted file, to set

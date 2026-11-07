@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   compareVersions, installKind, fetchLatestVersion, checkForUpdate, runUpdate, autoUpdate, isReleaseVersion,
-  resolveVersionLabel, updateAvailableFromCache, updateCommandFor, PKG_NAME,
+  resolveVersionLabel, updateAvailableFromCache, updateCommandFor, updateAdvice, PKG_NAME, RELEASES_URL, BUNDLE_MARKER,
 } from '../src/updater.js';
 
 // ── compareVersions ─────────────────────────────────────────
@@ -241,6 +241,42 @@ test('autoUpdate points a pnpm copy at pnpm and installs nothing', async () => {
     assert.equal(logs.length, 1);
     assert.match(logs[0], /Update available: 1\.0\.0 → 2\.0\.0\. Run: pnpm add -g @karpeleslab\/teamclaude@latest$/);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('installKind recognizes the Windows installer copy by its marker, without asking npm', async () => {
+  const root = nonGitRoot();
+  writeFileSync(join(root, BUNDLE_MARKER), '');
+  let asked = 0;
+  try {
+    assert.equal(await installKind({ root, globalRoot: () => { asked++; return '/usr/lib/node_modules'; } }), 'bundle');
+    assert.equal(asked, 0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// The installed copy has no npm: `npm install -g` would fail, or worse, put a
+// second copy in some other npm's global directory.
+test('autoUpdate points the Windows installer copy at the releases page and installs nothing', async () => {
+  const root = nonGitRoot();
+  writeFileSync(join(root, BUNDLE_MARKER), '');
+  const logs = [];
+  let installed = 0;
+  try {
+    const res = await autoUpdate({
+      root, uid: undefined, log: (m) => logs.push(m),
+      check: async () => ({ current: '1.0.0', latest: '2.0.0', updateAvailable: true }),
+      install: () => { installed++; return true; },
+    });
+    assert.equal(res.notified, true);
+    assert.equal(installed, 0);
+    assert.deepEqual(logs, [`[TeamClaude] Update available: 1.0.0 → 2.0.0. Download the new installer from ${RELEASES_URL}`]);
+    assert.equal(RELEASES_URL, 'https://github.com/KarpelesLab/teamclaude/releases');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('updateAdvice names the command for npm and pnpm copies and the releases page for the installer', () => {
+  assert.equal(updateAdvice('local'), 'Run: teamclaude update');
+  assert.equal(updateAdvice('pnpm'), `Run: pnpm add -g ${PKG_NAME}@latest`);
+  assert.equal(updateAdvice('bundle'), `Download the new installer from ${RELEASES_URL}`);
 });
 
 // `sudo teamclaude server` would otherwise run `npm install -g` as root every

@@ -211,6 +211,133 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL,HIGH
 
+  # The Windows installer, built the way publish.yml builds it for a release:
+  # pinned Node for win-x64 (checksum verified by the script) plus the app,
+  # packed with NSIS on Linux.
+  windows-installer:
+    name: windows installer build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install NSIS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nsis unzip
+
+      - name: Build the installer
+        run: node scripts/build-windows-installer.mjs
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-installer
+          path: dist/TeamClaude-Setup-*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  # The installer on real Windows, run the way a person runs it but silently:
+  # install, start the proxy through TeamClaude.exe on a throwaway config,
+  # load the dashboard, stop it, uninstall, and check what is left behind.
+  windows-smoke:
+    name: windows installer smoke test
+    needs: windows-installer
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download the installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-installer
+          path: installer
+
+      - name: Install silently
+        run: |
+          $setup = (Get-ChildItem installer\TeamClaude-Setup-*.exe | Select-Object -First 1).FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'TeamClaude'
+          # /D= must come last and unquoted: NSIS reads the rest of the line as the folder.
+          $p = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$dir" -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(300000)) { throw 'The installer did not finish' }
+          if ($p.ExitCode -ne 0) { throw "The installer exited $($p.ExitCode)" }
+          foreach ($f in 'TeamClaude.exe', 'Uninstall.exe', 'LICENSE.txt', 'node\teamclaude-node.exe', 'app\src\index.js', 'app\package.json', 'app\windows-bundle') {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "Missing after install: $f" }
+          }
+          $menu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\TeamClaude'
+          foreach ($f in 'TeamClaude.lnk', 'Stop TeamClaude.lnk', 'Uninstall TeamClaude.lnk') {
+            if (-not (Test-Path (Join-Path $menu $f))) { throw "Missing Start Menu shortcut: $f" }
+          }
+          $run = Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name TeamClaude
+          if ($run -ne "`"$dir\TeamClaude.exe`" --no-open") { throw "Unexpected Run value: $run" }
+          $uninstall = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TeamClaude'
+          "Installed $($uninstall.DisplayName) $($uninstall.DisplayVersion) at $($uninstall.InstallLocation)"
+          "INSTALL_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Start the proxy through TeamClaude.exe
+        run: |
+          $cfgDir = Join-Path $env:RUNNER_TEMP 'tc-config'
+          New-Item -ItemType Directory -Path $cfgDir | Out-Null
+          $cfg = Join-Path $cfgDir 'teamclaude.json'
+          Set-Content -Path $cfg -Encoding ascii -Value '{"proxy":{"port":3477},"upstreamProxy":false,"autoUpdate":false}'
+          "TEAMCLAUDE_CONFIG=$cfg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEAMROUTER_CONFIG=$cfg" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:TEAMCLAUDE_CONFIG = $cfg
+          $env:TEAMROUTER_CONFIG = $cfg
+          $log = Join-Path $env:LOCALAPPDATA 'TeamClaude\teamclaude.log'
+          # WaitForExit, not -Wait: PowerShell's -Wait also waits for the
+          # proxy the launcher leaves running.
+          $p = Start-Process -FilePath "$env:INSTALL_DIR\TeamClaude.exe" -ArgumentList '--no-open' -PassThru
+          $null = $p.Handle
+          if (-not $p.WaitForExit(90000)) { Get-Content $log -ErrorAction SilentlyContinue; throw 'TeamClaude.exe did not return' }
+          if ($p.ExitCode -ne 0) { Get-Content $log -ErrorAction SilentlyContinue; throw "TeamClaude.exe exited $($p.ExitCode)" }
+          $status = Invoke-RestMethod -Uri 'http://127.0.0.1:3477/teamclaude/status'
+          $proc = Get-Process -Id $status.server.pid
+          if ($proc.ProcessName -ne 'teamclaude-node') { throw "Status came from $($proc.ProcessName)" }
+          "Proxy $($status.server.version) answered from pid $($status.server.pid)"
+          $page = Invoke-WebRequest -Uri 'http://127.0.0.1:3477/teamclaude/dashboard' -UseBasicParsing
+          if ($page.StatusCode -ne 200 -or $page.Content -notmatch '<title>TeamRouter</title>') { throw 'The dashboard did not load' }
+          if (-not (Test-Path $log)) { throw "No log at $log" }
+          Get-Content $log
+
+      - name: Run desktop again while the proxy is up
+        run: |
+          $out = & "$env:INSTALL_DIR\node\teamclaude-node.exe" "$env:INSTALL_DIR\app\src\index.js" desktop --no-open
+          if ($LASTEXITCODE -ne 0) { throw "desktop exited $LASTEXITCODE" }
+          $out
+          if (-not ($out -match 'already running')) { throw 'desktop started a second proxy' }
+
+      - name: Stop the proxy through TeamClaude.exe --stop
+        run: |
+          $p = Start-Process -FilePath "$env:INSTALL_DIR\TeamClaude.exe" -ArgumentList '--stop' -PassThru
+          if (-not $p.WaitForExit(60000)) { throw 'TeamClaude.exe --stop did not return' }
+          for ($i = 0; $i -lt 20 -and (Get-Process -Name teamclaude-node -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Get-Process -Name teamclaude-node -ErrorAction SilentlyContinue) { throw 'The proxy is still running' }
+
+      - name: Uninstall silently
+        run: |
+          $p = Start-Process -FilePath "$env:INSTALL_DIR\Uninstall.exe" -ArgumentList '/S' -PassThru
+          if (-not $p.WaitForExit(120000)) { throw 'The uninstaller did not return' }
+          # The uninstaller runs from a copy in %TEMP% so it can delete itself,
+          # and the process started above returns before that copy finishes.
+          for ($i = 0; $i -lt 60 -and (Test-Path $env:INSTALL_DIR); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $env:INSTALL_DIR) { Get-ChildItem -Recurse $env:INSTALL_DIR; throw 'The install folder is still there' }
+          if (Test-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\TeamClaude')) { throw 'The Start Menu folder is still there' }
+          if (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name TeamClaude -ErrorAction SilentlyContinue) { throw 'The Run value is still there' }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TeamClaude') { throw 'The uninstall entry is still there' }
+          if (-not (Test-Path $env:TEAMCLAUDE_CONFIG)) { throw 'The uninstaller removed the config' }
+          'Uninstalled; the config was kept.'
+
   # Every commit in the history, scanned for anything that looks like a
   # credential. CONTRIBUTING.md forbids tokens, account ids and emails in the
   # repository; this is the check. Known non-secrets are allowlisted in
@@ -320,7 +447,7 @@ jobs:
   # required job did not succeed (so it is never silently "skipped").
   test:
     name: test
-    needs: [node, package, container, secrets, workflows, links, nix]
+    needs: [node, package, container, windows-installer, windows-smoke, secrets, workflows, links, nix]
     if: always()
     runs-on: ubuntu-latest
     steps:
