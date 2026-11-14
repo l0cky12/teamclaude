@@ -2379,16 +2379,25 @@ export function seriesStats(values, from) {
 }
 
 // The first bucket of a reply that recording covers: the one holding
-// `since`. Buckets before it were not idle, they were not recorded.
+// `since`. Buckets before it were not idle, they were not recorded. Never
+// later than the first bucket that holds any usage: a machine in another time
+// zone, on a version that does not say its first day, can put usage on a day
+// this clock calls the day before, and an average that left that day out of
+// its count but not its total would read above the peak.
 /** @param {any} data  a GET /teamclaude/insights reply */
 export function recordedFrom(data) {
   var d = data || {};
   var b = d.buckets || [];
-  if (d.since == null) return b.length;
-  for (var i = 0; i < b.length; i++) {
-    if (d.unit === 'hour' ? Number(b[i]) + 3600000 > d.since : String(b[i]) >= (d.sinceDay || insightsDayKey(d.since))) return i;
+  var k = d.kinds || {};
+  var first = b.length;
+  for (var j = 0; j < b.length && first === b.length; j++) {
+    if (((k.input || [])[j] || 0) + ((k.output || [])[j] || 0) + ((k.cacheRead || [])[j] || 0) + ((k.cacheWrite || [])[j] || 0) > 0) first = j;
   }
-  return b.length;
+  if (d.since == null) return first;
+  for (var i = 0; i < b.length; i++) {
+    if (d.unit === 'hour' ? Number(b[i]) + 3600000 > d.since : String(b[i]) >= (d.sinceDay || insightsDayKey(d.since))) return Math.min(i, first);
+  }
+  return first;
 }
 
 // The local calendar day of a time, as the history keys its days.

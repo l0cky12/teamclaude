@@ -401,3 +401,22 @@ test('a reply from the previous version, read on its own, takes provider counts 
   const g = /** @type {any} */ (grokSummary(old, []));
   assert.equal(g.history.requests, 1);
 });
+
+test('an older machine in another time zone cannot push the average above the peak', () => {
+  // Merged or read on its own, an old reply without sinceDay: its first spend
+  // lands on a day this clock calls the day before the one it computes.
+  const zeros = [0, 0, 0, 0, 0, 0, 0];
+  const input = [0, 50, 80, 80, 80, 80, 80];
+  const reply = {
+    unit: 'day', since: Date.UTC(2026, 10, 6, 7), sinceDay: '2026-11-06',
+    buckets: ['2026-11-04', '2026-11-05', '2026-11-06', '2026-11-07', '2026-11-08', '2026-11-09', '2026-11-10'],
+    kinds: { input, output: zeros, cacheRead: zeros, cacheWrite: zeros },
+  };
+  const from = recordedFrom(reply);
+  assert.equal(from, 1, 'the day with the first spend');
+  const st = seriesStats(input, from);
+  assert.ok(st.avg <= st.max, `avg ${st.avg} <= peak ${st.max}`);
+  assert.equal(peakBucket(input, from)?.ratio, 80 / st.avg);
+  // A reply with nothing in it starts nowhere.
+  assert.equal(recordedFrom({ unit: 'day', since: null, buckets: ['a', 'b'], kinds: { input: [0, 0] } }), 2);
+});
