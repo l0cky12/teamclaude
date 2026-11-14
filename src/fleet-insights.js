@@ -20,6 +20,7 @@
 // without it: one laptop asleep should not blank the page.
 
 import { peerRequest } from './peers.js';
+import { dayKey } from './usage-history.js';
 
 /** @typedef {import('./usage-history.js').Insights} Insights */
 /** @typedef {import('./usage-history.js').Tally} Tally */
@@ -32,7 +33,10 @@ import { peerRequest } from './peers.js';
  *   name: string, self: boolean, state: 'ok'|'unreachable'|'refused'|'outdated'|'error', error?: string,
  *   since: number|null, tokens: number, requests: number, cost: number, unpricedTokens: number, values: number[],
  * }} FleetInstance
- * @typedef {Insights & { scope: 'all', instances: FleetInstance[] }} FleetInsights
+ * `splitDetail` is false when a machine counted is too old to send each
+ * provider's and account's requests and cost per bucket: the sum of those
+ * series would draw its share as nothing, so the page draws one series.
+ * @typedef {Insights & { scope: 'all', instances: FleetInstance[], splitDetail: boolean }} FleetInsights
  */
 
 /** How long one peer gets to answer before the sum goes on without it. */
@@ -128,10 +132,16 @@ export function mergeInsights(parts) {
   let previous = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   /** @type {number|null} */
   let since = null;
-  /** @type {Map<string, { provider: string, tokens: number, cost: number, values: number[] }>} */
+  /** @type {string|null} */
+  let sinceDay = null;
+  /** @typedef {import('./usage-history.js').Series} Series */
+  /** @type {Map<string, Series>} */
   const providers = new Map();
-  /** @type {Map<string, { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }>} */
+  /** @type {Map<string, Series & { account: string }>} */
   const accounts = new Map();
+  let splitDetail = true;
+  /** @returns {Omit<Series, 'provider'>} */
+  const series = () => ({ tokens: 0, cost: 0, values: zeros(), requestValues: zeros(), costValues: zeros(), requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
   /** @type {Map<string, any>} */
   const models = new Map();
   /** @type {FleetInstance[]} */
@@ -157,6 +167,12 @@ export function mergeInsights(parts) {
     inst.requests = num(t.requests);
     inst.since = typeof d.since === 'number' ? d.since : null;
     if (inst.since != null && (since == null || inst.since < since)) since = inst.since;
+    // Each machine's first day by its own clock: in different time zones the
+    // earliest instant is not always the earliest day on the axis. So the sum's
+    // since (hourly ranges) and sinceDay (daily ranges) may come from different
+    // machines, and each is right for the ranges that read it.
+    const firstDay = typeof d.sinceDay === 'string' ? d.sinceDay : inst.since != null ? dayKey(inst.since) : null;
+    if (firstDay != null && (sinceDay == null || firstDay < sinceDay)) sinceDay = firstDay;
     addSeries(d.requests, requests);
     for (const k of /** @type {const} */ (['cacheRead', 'cacheWrite', 'input', 'output'])) {
       addSeries(d.kinds?.[k], kinds[k]);
@@ -184,35 +200,58 @@ export function mergeInsights(parts) {
     cost.total += inst.cost;
     cost.unpricedTokens += inst.unpricedTokens;
 
+    // A machine from before the per-provider counts sends a provider's
+    // tokens and cost only. Its models have always carried their requests
+    // and token kinds, so a provider's are summed from those instead of
+    // being counted as zero, which would halve its requests and double its
+    // cost per request in the Providers table.
+    /** @type {Map<string, Record<string, number>>} */
+    const fromModels = new Map();
+    for (const m of Array.isArray(d.models) ? d.models : []) {
+      let t = fromModels.get(m.provider);
+      if (!t) fromModels.set(m.provider, t = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+      for (const k of Object.keys(t)) t[k] += num(m[k]);
+    }
+    /** @param {Omit<Series, 'provider'>} e @param {any} r @param {Record<string, number>|undefined} [fallback] */
+    const addRow = (e, r, fallback) => {
+      if (!Array.isArray(r.requestValues) || !Array.isArray(r.costValues)) splitDetail = false;
+      e.tokens += num(r.tokens);
+      e.cost += num(r.cost);
+      const counts = typeof r.requests !== 'number' && fallback ? fallback : r;
+      for (const k of /** @type {const} */ (['requests', 'input', 'output', 'cacheRead', 'cacheWrite'])) e[k] += num(counts[k]);
+      addSeries(r.values, e.values);
+      addSeries(r.requestValues, e.requestValues);
+      addSeries(r.costValues, e.costValues);
+    };
     for (const p of Array.isArray(d.providers) ? d.providers : []) {
       let e = providers.get(p.provider);
-      if (!e) providers.set(p.provider, e = { provider: p.provider, tokens: 0, cost: 0, values: zeros() });
-      e.tokens += num(p.tokens);
-      e.cost += num(p.cost);
-      addSeries(p.values, e.values);
+      if (!e) providers.set(p.provider, e = { provider: p.provider, ...series() });
+      addRow(e, p, fromModels.get(p.provider));
     }
     // Accounts by provider and name: an account synced to several machines
     // (credential-sync.js) is one account, spending on each of them.
     for (const a of Array.isArray(d.accounts) ? d.accounts : []) {
       const key = a.provider + '\u0000' + a.account;
       let e = accounts.get(key);
-      if (!e) accounts.set(key, e = { provider: a.provider, account: a.account, tokens: 0, requests: 0, cost: 0, values: zeros() });
-      e.tokens += num(a.tokens);
-      e.requests += num(a.requests);
-      e.cost += num(a.cost);
-      addSeries(a.values, e.values);
+      if (!e) accounts.set(key, e = { provider: a.provider, account: a.account, ...series() });
+      addRow(e, a);
     }
     for (const m of Array.isArray(d.models) ? d.models : []) {
       const key = m.provider + '\u0000' + m.model;
       let e = models.get(key);
-      if (!e) models.set(key, e = { provider: m.provider, model: m.model, tokens: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null });
+      if (!e) models.set(key, e = { provider: m.provider, model: m.model, tokens: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, pricedRequests: 0 });
       e.tokens += num(m.tokens);
       e.requests += num(m.requests);
       e.input += num(m.input);
       e.output += num(m.output);
       e.cacheRead += num(m.cacheRead);
       e.cacheWrite += num(m.cacheWrite);
-      if (typeof m.cost === 'number') e.cost = (e.cost ?? 0) + num(m.cost);
+      // A machine that could not price the model (too old for the estimate,
+      // or an older price table) adds requests the cost does not cover.
+      if (typeof m.cost === 'number') {
+        e.cost = (e.cost ?? 0) + num(m.cost);
+        e.pricedRequests += typeof m.pricedRequests === 'number' ? m.pricedRequests : num(m.requests);
+      }
     }
   }
   // `all` has nothing before it, on any machine, and a fleet that has
@@ -227,6 +266,7 @@ export function mergeInsights(parts) {
     unit: local.unit,
     buckets,
     since,
+    sinceDay,
     totals,
     previous,
     requests,
@@ -237,5 +277,6 @@ export function mergeInsights(parts) {
     models: [...models.values()].sort(byTokens),
     scope: 'all',
     instances,
+    splitDetail,
   };
 }

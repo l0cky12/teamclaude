@@ -229,3 +229,70 @@ test('GET /teamclaude/insights?scope=all reads a linked proxy over HTTP, operato
   assert.equal(clientLocal.status, 200, 'but still reads this machine\'s');
   await clientLocal.text();
 });
+
+test('requests and cost per bucket add up across machines, and a machine too old to send them says so', () => {
+  const now = Date.now();
+  const desk = history(now);
+  const server = history(now);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  server.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const both = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: desk.insights('7d') },
+    { name: 'server', self: false, state: 'ok', data: JSON.parse(JSON.stringify(server.insights('7d'))) },
+  ]);
+  assert.equal(both.splitDetail, true);
+  assert.equal(both.providers[0].requestValues.at(-1), 2);
+  assert.equal(both.accounts[0].requests, 2);
+  assert.ok(Math.abs(both.providers[0].costValues.at(-1) - 2 * desk.insights('7d').providers[0].cost) < 1e-9);
+  // A peer from before the per-bucket arrays: summed for what it has, and the
+  // page is told to draw one total rather than a share of nothing.
+  // The shape the previous version sent: a provider is its tokens and cost
+  // only, an account adds its requests, and the models carry the rest.
+  const old = JSON.parse(JSON.stringify(server.insights('7d')));
+  old.providers = old.providers.map((/** @type {any} */ p) => ({ provider: p.provider, tokens: p.tokens, cost: p.cost, values: p.values }));
+  old.accounts = old.accounts.map((/** @type {any} */ a) => ({ provider: a.provider, account: a.account, tokens: a.tokens, requests: a.requests, cost: a.cost, values: a.values }));
+  const mixed = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: desk.insights('7d') },
+    { name: 'server', self: false, state: 'ok', data: old },
+  ]);
+  assert.equal(mixed.splitDetail, false);
+  for (const k of ['tokens', 'requests', 'input', 'output', 'cacheRead', 'cacheWrite']) {
+    assert.equal(mixed.providers[0][k], both.providers[0][k], `${k}: the old machine's taken from its models`);
+  }
+});
+
+test('a model\'s priced requests count only the machines that priced it', () => {
+  const now = Date.now();
+  const desk = history(now);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const mine = desk.insights('7d');
+  assert.equal(mine.models[0].pricedRequests, 1);
+  assert.equal(mine.sinceDay, mine.buckets[mine.buckets.length - 1]);
+  // A peer too old for the estimate: its model has no cost and no pricedRequests.
+  const old = JSON.parse(JSON.stringify(mine));
+  delete old.cost;
+  old.models = old.models.map((/** @type {any} */ m) => ({ ...m, cost: null, pricedRequests: undefined }));
+  const m = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: mine },
+    { name: 'old', self: false, state: 'ok', data: old },
+  ]);
+  assert.equal(m.models[0].requests, 2);
+  assert.equal(m.models[0].pricedRequests, 1);
+  assert.equal(m.sinceDay, mine.sinceDay);
+});
+
+test('a fleet in two time zones starts its days at the earliest first day of any machine', () => {
+  // The answering machine began on the 6th by its clock; a laptop in another
+  // zone began on the 5th by its own, at a later instant.
+  const at = Date.now();
+  const desk = history(at);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const mine = { ...desk.insights('7d'), sinceDay: '2026-11-06', since: 1000 };
+  const laptop = { ...JSON.parse(JSON.stringify(desk.insights('7d'))), sinceDay: '2026-11-05', since: 2000 };
+  const m = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: mine },
+    { name: 'laptop', self: false, state: 'ok', data: laptop },
+  ]);
+  assert.equal(m.since, 1000);
+  assert.equal(m.sinceDay, '2026-11-05');
+});
