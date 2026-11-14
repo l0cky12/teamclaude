@@ -168,7 +168,9 @@ export function mergeInsights(parts) {
     inst.since = typeof d.since === 'number' ? d.since : null;
     if (inst.since != null && (since == null || inst.since < since)) since = inst.since;
     // Each machine's first day by its own clock: in different time zones the
-    // earliest instant is not always the earliest day on the axis.
+    // earliest instant is not always the earliest day on the axis. So the sum's
+    // since (hourly ranges) and sinceDay (daily ranges) may come from different
+    // machines, and each is right for the ranges that read it.
     const firstDay = typeof d.sinceDay === 'string' ? d.sinceDay : inst.since != null ? dayKey(inst.since) : null;
     if (firstDay != null && (sinceDay == null || firstDay < sinceDay)) sinceDay = firstDay;
     addSeries(d.requests, requests);
