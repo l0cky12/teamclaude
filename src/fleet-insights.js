@@ -20,6 +20,7 @@
 // without it: one laptop asleep should not blank the page.
 
 import { peerRequest } from './peers.js';
+import { dayKey } from './usage-history.js';
 
 /** @typedef {import('./usage-history.js').Insights} Insights */
 /** @typedef {import('./usage-history.js').Tally} Tally */
@@ -230,14 +231,19 @@ export function mergeInsights(parts) {
     for (const m of Array.isArray(d.models) ? d.models : []) {
       const key = m.provider + '\u0000' + m.model;
       let e = models.get(key);
-      if (!e) models.set(key, e = { provider: m.provider, model: m.model, tokens: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null });
+      if (!e) models.set(key, e = { provider: m.provider, model: m.model, tokens: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, pricedRequests: 0 });
       e.tokens += num(m.tokens);
       e.requests += num(m.requests);
       e.input += num(m.input);
       e.output += num(m.output);
       e.cacheRead += num(m.cacheRead);
       e.cacheWrite += num(m.cacheWrite);
-      if (typeof m.cost === 'number') e.cost = (e.cost ?? 0) + num(m.cost);
+      // A machine that could not price the model (too old for the estimate,
+      // or an older price table) adds requests the cost does not cover.
+      if (typeof m.cost === 'number') {
+        e.cost = (e.cost ?? 0) + num(m.cost);
+        e.pricedRequests += typeof m.pricedRequests === 'number' ? m.pricedRequests : num(m.requests);
+      }
     }
   }
   // `all` has nothing before it, on any machine, and a fleet that has
@@ -252,6 +258,7 @@ export function mergeInsights(parts) {
     unit: local.unit,
     buckets,
     since,
+    sinceDay: since == null ? null : dayKey(since),
     totals,
     previous,
     requests,

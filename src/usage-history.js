@@ -49,6 +49,7 @@ import { costAt, priceLookup } from './api-pricing.js';
  *   unit: 'hour'|'day',
  *   buckets: (string|number)[],
  *   since: number|null,
+ *   sinceDay: string|null,
  *   totals: Tally,
  *   previous: Tally|null,
  *   requests: number[],
@@ -56,7 +57,7 @@ import { costAt, priceLookup } from './api-pricing.js';
  *   cost: InsightsCost,
  *   providers: Series[],
  *   accounts: (Series & { account: string })[],
- *   models: ({ provider: string, model: string, tokens: number, requests: number, cost: number|null } & Tally)[],
+ *   models: ({ provider: string, model: string, tokens: number, requests: number, cost: number|null, pricedRequests: number } & Tally)[],
  * }} Insights
  */
 /**
@@ -455,7 +456,7 @@ function summarize(range, unit, buckets, current, before, since) {
     e.costValues[i] += usd ?? 0;
     addTally(e, t);
   };
-  /** @type {Map<string, { provider: string, model: string, tokens: number, cost: number|null } & Tally>} */
+  /** @type {Map<string, { provider: string, model: string, tokens: number, cost: number|null, pricedRequests: number } & Tally>} */
   const models = new Map();
   current.forEach((bucket, i) => {
     for (const row of bucket.values()) {
@@ -481,10 +482,10 @@ function summarize(range, unit, buckets, current, before, since) {
       let m = models.get(mk);
       // A model is priced or not as a whole, so its cost is null exactly when
       // its every row's is.
-      if (!m) models.set(mk, m = { provider: row.provider, model: row.model, tokens: 0, cost: usd == null ? null : 0, ...emptyTally() });
+      if (!m) models.set(mk, m = { provider: row.provider, model: row.model, tokens: 0, cost: usd == null ? null : 0, pricedRequests: 0, ...emptyTally() });
       m.tokens += tokens;
       addTally(m, t);
-      if (usd != null) m.cost = (m.cost ?? 0) + usd;
+      if (usd != null) { m.cost = (m.cost ?? 0) + usd; m.pricedRequests += t.requests; }
     }
   });
   /** @type {Tally|null} */
@@ -508,6 +509,9 @@ function summarize(range, unit, buckets, current, before, since) {
     unit,
     buckets,
     since,
+    // The day recording began, by this proxy's clock: the page's own clock
+    // may be in another time zone, and the day buckets are this one's.
+    sinceDay: since == null ? null : dayKey(since),
     totals,
     previous,
     requests,

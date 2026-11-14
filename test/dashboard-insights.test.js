@@ -374,3 +374,14 @@ test('cost per request divides by requests to priced models only', () => {
   // Nothing priced: no figure rather than $0.
   assert.equal(providerRows({ ...detailed, models: [{ provider: 'grok', model: 'x', requests: 3, cost: null }] }).find(r => r.key === 'grok')?.perRequest, null);
 });
+
+test('day boundaries are the proxy\'s, not the browser\'s', () => {
+  // The proxy says recording began on the 6th; the browser's clock would say otherwise.
+  const days = ['2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'];
+  assert.equal(recordedFrom({ unit: 'day', buckets: days, since: 1, sinceDay: '2026-10-06' }), 2);
+});
+
+test('a fleet sum prices only the requests a machine could price', () => {
+  // This machine priced 2 of the model's requests; the peer, too old to, sent 8.
+  assert.deepEqual(pricedRequests([{ provider: 'grok', model: 'x', requests: 10, cost: 1, pricedRequests: 2 }]), { all: 2, grok: 2 });
+});

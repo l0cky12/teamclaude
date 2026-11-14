@@ -260,3 +260,23 @@ test('requests and cost per bucket add up across machines, and a machine too old
     assert.equal(mixed.providers[0][k], both.providers[0][k], `${k}: the old machine's taken from its models`);
   }
 });
+
+test('a model\'s priced requests count only the machines that priced it', () => {
+  const now = Date.now();
+  const desk = history(now);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const mine = desk.insights('7d');
+  assert.equal(mine.models[0].pricedRequests, 1);
+  assert.equal(mine.sinceDay, mine.buckets[mine.buckets.length - 1]);
+  // A peer too old for the estimate: its model has no cost and no pricedRequests.
+  const old = JSON.parse(JSON.stringify(mine));
+  delete old.cost;
+  old.models = old.models.map((/** @type {any} */ m) => ({ ...m, cost: null, pricedRequests: undefined }));
+  const m = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: mine },
+    { name: 'old', self: false, state: 'ok', data: old },
+  ]);
+  assert.equal(m.models[0].requests, 2);
+  assert.equal(m.models[0].pricedRequests, 1);
+  assert.equal(m.sinceDay, mine.sinceDay);
+});
