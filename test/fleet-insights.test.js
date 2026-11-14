@@ -246,12 +246,17 @@ test('requests and cost per bucket add up across machines, and a machine too old
   assert.ok(Math.abs(both.providers[0].costValues.at(-1) - 2 * desk.insights('7d').providers[0].cost) < 1e-9);
   // A peer from before the per-bucket arrays: summed for what it has, and the
   // page is told to draw one total rather than a share of nothing.
+  // The shape the previous version sent: a provider is its tokens and cost
+  // only, an account adds its requests, and the models carry the rest.
   const old = JSON.parse(JSON.stringify(server.insights('7d')));
-  for (const row of [...old.providers, ...old.accounts]) { delete row.requestValues; delete row.costValues; }
+  old.providers = old.providers.map((/** @type {any} */ p) => ({ provider: p.provider, tokens: p.tokens, cost: p.cost, values: p.values }));
+  old.accounts = old.accounts.map((/** @type {any} */ a) => ({ provider: a.provider, account: a.account, tokens: a.tokens, requests: a.requests, cost: a.cost, values: a.values }));
   const mixed = mergeInsights([
     { name: 'desk', self: true, state: 'ok', data: desk.insights('7d') },
     { name: 'server', self: false, state: 'ok', data: old },
   ]);
   assert.equal(mixed.splitDetail, false);
-  assert.equal(mixed.providers[0].tokens, both.providers[0].tokens);
+  for (const k of ['tokens', 'requests', 'input', 'output', 'cacheRead', 'cacheWrite']) {
+    assert.equal(mixed.providers[0][k], both.providers[0][k], `${k}: the old machine's taken from its models`);
+  }
 });

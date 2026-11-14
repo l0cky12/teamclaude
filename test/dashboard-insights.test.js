@@ -8,12 +8,14 @@ import {
   renderDashboardHtml, fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel,
   insightsSeries, stackSeries, topModels, insightsKpis, fmtUsd, fleetMissingText,
   seriesStats, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary,
+  recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests,
 } from '../src/dashboard.js';
 
 test('the page ships every Insights helper it is tested against', () => {
   const html = renderDashboardHtml();
   for (const fn of [fmtTokens, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, topModels, insightsKpis, fmtUsd, fleetMissingText,
-    seriesStats, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary]) {
+    seriesStats, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary,
+    recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
@@ -183,8 +185,10 @@ test('the headline tiles: six, the same on one machine or many', () => {
 });
 
 test('the per-request tile: estimated cost, tokens and output per request', () => {
-  const t = insightsKpis({ ...data, cost: { total: 3, values: [1, 2], previous: null, unpricedTokens: 0 } }).find(x => x.key === 'perRequest');
-  assert.equal(t?.value, '$1.00');
+  // Five requests, all to priced models.
+  const priced = data.models.map(m => ({ ...m, cost: 0.1 }));
+  const t = insightsKpis({ ...data, models: priced, cost: { total: 3, values: [1, 2], previous: null, unpricedTokens: 0 } }).find(x => x.key === 'perRequest');
+  assert.equal(t?.value, '$0.60');
   assert.equal(t?.sub, '333 tokens · 7 output');
 });
 
@@ -324,4 +328,49 @@ test('the Grok panel: its share of the history, its models, and each plan as las
   assert.match(g.accounts[1].text, /Refresh quota/);
   assert.equal(grokSummary(data, [{ name: 'a', provider: 'anthropic' }]), null, 'no Grok anywhere: no panel');
   assert.equal(/** @type {any} */ (grokSummary(data, accounts)).history, null, 'a Grok account with no history still shows its plan');
+});
+
+test('averages and peaks count from the first bucket recorded', () => {
+  // A 7-day range on a history that began on the 6th day.
+  const since = new Date(2026, 9, 6, 15, 0).getTime();
+  const days = ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07'];
+  assert.equal(recordedFrom({ unit: 'day', buckets: days, since }), 5);
+  assert.equal(recordedFrom({ unit: 'day', buckets: days, since: null }), 7);
+  assert.equal(insightsDayKey(since), '2026-10-06');
+  assert.deepEqual(seriesStats([0, 0, 0, 0, 0, 4, 6], 5), { total: 10, avg: 5, max: 6, last: 6 });
+  assert.equal(peakBucket([0, 0, 0, 0, 0, 4, 6], 5)?.ratio, 1.2);
+  // Hours: the bucket holding `since` is the first.
+  const h0 = Math.floor(since / 3600000) * 3600000;
+  assert.equal(recordedFrom({ unit: 'hour', buckets: [h0 - 3600000, h0, h0 + 3600000], since }), 1);
+});
+
+test('one x is one bucket on every panel, and labels never touch', () => {
+  // 24 hourly buckets across 480px: 20px each.
+  assert.equal(bucketAt(0, 20, 24), 0);
+  assert.equal(bucketAt(39.9, 20, 24), 1);
+  assert.equal(bucketAt(479, 20, 24), 23);
+  assert.equal(bucketAt(-5, 20, 24), 0, 'left of the plot is the first bucket');
+  assert.equal(bucketAt(9999, 20, 24), 23, 'right of it, the last');
+  assert.equal(bucketAt(100, 900, 1), 0, 'one bucket');
+  // A year on a phone: 366 buckets across 240px.
+  assert.equal(bucketAt(239, 240 / 366, 366), 364);
+  // "Nov 13" (6 characters) needs 57px: every bucket at 60px, every 3rd at 20px.
+  assert.equal(labelStep(6, 60), 1);
+  assert.equal(labelStep(6, 20), 3);
+  assert.equal(labelStep(6, 240 / 366), 87);
+});
+
+test('cost per request divides by requests to priced models only', () => {
+  const models = [
+    { provider: 'grok', model: 'grok-4.7', requests: 2, cost: 1 },
+    { provider: 'grok', model: 'grok-mystery', requests: 8, cost: null },
+    { provider: 'anthropic', model: 'claude-opus-5-5', requests: 1, cost: 2 },
+  ];
+  assert.deepEqual(pricedRequests(models), { all: 3, grok: 2, claude: 1 });
+  const rows = providerRows({ ...detailed, models });
+  assert.equal(rows.find(r => r.key === 'grok')?.perRequest, 0.5 / 2);
+  const tile = insightsKpis({ ...data, models, cost: { total: 3, values: [1, 2], previous: null, unpricedTokens: 10 } }).find(t => t.key === 'perRequest');
+  assert.equal(tile?.value, '$1.00');
+  // Nothing priced: no figure rather than $0.
+  assert.equal(providerRows({ ...detailed, models: [{ provider: 'grok', model: 'x', requests: 3, cost: null }] }).find(r => r.key === 'grok')?.perRequest, null);
 });

@@ -191,12 +191,25 @@ export function mergeInsights(parts) {
     cost.total += inst.cost;
     cost.unpricedTokens += inst.unpricedTokens;
 
-    /** @param {Omit<Series, 'provider'>} e @param {any} r */
-    const addRow = (e, r) => {
+    // A machine from before the per-provider counts sends a provider's
+    // tokens and cost only. Its models have always carried their requests
+    // and token kinds, so a provider's are summed from those instead of
+    // being counted as zero, which would halve its requests and double its
+    // cost per request in the Providers table.
+    /** @type {Map<string, Record<string, number>>} */
+    const fromModels = new Map();
+    for (const m of Array.isArray(d.models) ? d.models : []) {
+      let t = fromModels.get(m.provider);
+      if (!t) fromModels.set(m.provider, t = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+      for (const k of Object.keys(t)) t[k] += num(m[k]);
+    }
+    /** @param {Omit<Series, 'provider'>} e @param {any} r @param {Record<string, number>|undefined} [fallback] */
+    const addRow = (e, r, fallback) => {
       if (!Array.isArray(r.requestValues) || !Array.isArray(r.costValues)) splitDetail = false;
       e.tokens += num(r.tokens);
       e.cost += num(r.cost);
-      for (const k of /** @type {const} */ (['requests', 'input', 'output', 'cacheRead', 'cacheWrite'])) e[k] += num(r[k]);
+      const counts = typeof r.requests !== 'number' && fallback ? fallback : r;
+      for (const k of /** @type {const} */ (['requests', 'input', 'output', 'cacheRead', 'cacheWrite'])) e[k] += num(counts[k]);
       addSeries(r.values, e.values);
       addSeries(r.requestValues, e.requestValues);
       addSeries(r.costValues, e.costValues);
@@ -204,7 +217,7 @@ export function mergeInsights(parts) {
     for (const p of Array.isArray(d.providers) ? d.providers : []) {
       let e = providers.get(p.provider);
       if (!e) providers.set(p.provider, e = { provider: p.provider, ...series() });
-      addRow(e, p);
+      addRow(e, p, fromModels.get(p.provider));
     }
     // Accounts by provider and name: an account synced to several machines
     // (credential-sync.js) is one account, spending on each of them.

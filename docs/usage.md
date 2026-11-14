@@ -505,10 +505,10 @@ The page is laid out like a monitoring dashboard (Grafana, Zabbix): a row of sta
 - Six tiles, each with a sparkline where it has one:
   - tokens, the [estimated API cost](#estimated-api-cost) and requests in the range, each compared with the period just before it (*▲ 15% vs the previous 30 days*)
   - the **cache hit rate**: cache reads as a share of prompt tokens (input, cache reads and cache writes; output is never cached), against the period before in percentage points
-  - **per request**: the estimated cost, tokens and output tokens of an average request
+  - **per request**: the estimated cost of an average request to a priced model, and the tokens and output tokens of an average request
   - the **busiest** hour or day, and how many times the average one it was
-- **Tokens over time**, per hour for 24 hours and per day otherwise, stacked by provider, by account or by token type (**Split by**). Each series is a line over a light fill. Under it, the legend is a table of each series' total, average, peak and **Now** (the hour or day still in progress). Click a row to hide or show that series.
-- **Requests** (bars) and **Estimated API cost** per hour or day, stacked by the same split when it is by provider or account, and the **Cache hit rate** per hour or day on a 0–100% axis with its average as a dashed line. Hovering any of these charts, or **Tokens over time**, marks the same hour or day on all four.
+- **Tokens over time**, per hour for 24 hours and per day otherwise, stacked by provider, by account or by token type (**Split by**). Each series is a line over a light fill. Under it, the legend is a table of each series' total, average, peak and **Now** (the hour or day still in progress). Click a row to hide or show that series. The average and peak count from the first hour or day recorded, so a history younger than the range is not averaged over days it never saw.
+- **Requests** (bars) and **Estimated API cost** per hour or day, stacked by the same split when it is by provider or account, and the **Cache hit rate** per hour or day on a 0–100% axis with its average as a dashed line. Hovering (or tapping) any of these charts, or **Tokens over time**, marks the same hour or day on all of them; a tap's reading stays until you tap elsewhere.
 - **Providers**: each provider's share of tokens as one bar, and a table of its accounts, requests, estimated cost, cost per request and cache hit rate. **Token mix**: cache read, cache write, input and output as one bar.
 - **Grok**, when a Grok account is configured or Grok has history: its tokens, requests, estimated cost and cache hit rate for the range, its tokens over time, its models, and each Grok account's plan (**Monthly limit** or **7-day limit**, what is left, and when it resets). The plan is the last reading this machine took, so it is only as fresh as the last **Refresh quota**; the page never asks Grok for it.
 - **Models** and **Accounts** as ranked bars, with each model's estimated cost and each account's share of the range.
@@ -544,7 +544,7 @@ The history is kept by the proxy from the first request this version serves. It 
 
 Add `&scope=all` for every linked machine at once. The reply has the same fields, summed, plus `scope: "all"`, `splitDetail` and `instances`. `splitDetail` is `false` when a machine counted runs a version from before `requestValues` and `costValues`; the page then draws requests and cost as one total. `instances` is one `{ name, self, state, error?, since, tokens, requests, cost, unpricedTokens, values }` per machine, this one first. `state` is `ok`, `unreachable`, `refused`, `outdated` or `error`, and only `ok` machines are in the sums. Each linked machine is asked for its own history only (no `scope`), in parallel, with 8 seconds to answer. With `scope=all`, a client key gets a 403, as it does for every route that reaches linked instances.
 
-A `provider` is `anthropic`, `codex`, or `backend:<host>` for an API key on a third-party backend. It has the same gate as `/teamclaude/status`, so a client key may read it. Accounts are named by their configured name, never an email or a token.
+A `provider` is `anthropic`, `codex`, `grok`, or `backend:<host>` for an API key on a third-party backend. It has the same gate as `/teamclaude/status`, so a client key may read it. Accounts are named by their configured name, never an email or a token.
 
 ### Keys and access
 

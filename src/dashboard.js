@@ -2360,9 +2360,13 @@ export function stackSeries(series, n) {
 // What a series' legend row says: its total, its average bucket, its busiest
 // bucket and its latest. The latest is the bucket still filling (this hour,
 // today), which is why the page heads that column "Now".
-/** @param {number[]|null|undefined} values */
-export function seriesStats(values) {
+//
+// `from` is the first bucket recording covers (recordedFrom): a 30-day range
+// on a history three days old averages three days, not thirty.
+/** @param {number[]|null|undefined} values @param {number} [from] */
+export function seriesStats(values, from) {
   var v = values || [];
+  var start = Math.min(Math.max(0, from || 0), v.length);
   var total = 0;
   var max = 0;
   for (var i = 0; i < v.length; i++) {
@@ -2370,7 +2374,59 @@ export function seriesStats(values) {
     total += x;
     if (x > max) max = x;
   }
-  return { total: total, avg: v.length ? total / v.length : 0, max: max, last: v.length ? Number(v[v.length - 1]) || 0 : 0 };
+  var n = v.length - start;
+  return { total: total, avg: n > 0 ? total / n : 0, max: max, last: v.length ? Number(v[v.length - 1]) || 0 : 0 };
+}
+
+// The first bucket of a reply that recording covers: the one holding
+// `since`. Buckets before it were not idle, they were not recorded.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function recordedFrom(data) {
+  var d = data || {};
+  var b = d.buckets || [];
+  if (d.since == null) return b.length;
+  for (var i = 0; i < b.length; i++) {
+    if (d.unit === 'hour' ? Number(b[i]) + 3600000 > d.since : String(b[i]) >= insightsDayKey(d.since)) return i;
+  }
+  return b.length;
+}
+
+// The local calendar day of a time, as the history keys its days.
+/** @param {number} ts */
+export function insightsDayKey(ts) {
+  var t = new Date(ts);
+  return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' + String(t.getDate()).padStart(2, '0');
+}
+
+// Which bucket a pointer at `x` pixels into the plot is over: every panel
+// gives bucket i the same band, so one x is one bucket on all of them.
+/** @param {number} x @param {number} band @param {number} n */
+export function bucketAt(x, band, n) {
+  return Math.max(0, Math.min(n - 1, Math.floor(x / band)));
+}
+
+// Every how many buckets an axis label goes, so labels about `chars` long
+// never touch: about 6.5px a character and 18px between them.
+/** @param {number} chars @param {number} band */
+export function labelStep(chars, band) {
+  return Math.max(1, Math.ceil((chars * 6.5 + 18) / band));
+}
+
+// Requests to models with a known price, by provider tone and in all. A cost
+// per request divides priced cost by these, not by every request: a request
+// to an unpriced model costs nothing in the estimate, and counting it would
+// pull the figure down (or to $0 for a provider priced not at all).
+/** @param {any[]|null|undefined} models  insights.models */
+export function pricedRequests(models) {
+  /** @type {Record<string, number>} */
+  var out = { all: 0 };
+  (models || []).forEach(function (/** @type {any} */ m) {
+    if (typeof m.cost !== 'number') return;
+    var tone = providerTone(m.provider);
+    out[tone] = (out[tone] || 0) + (m.requests || 0);
+    out.all += m.requests || 0;
+  });
+  return out;
 }
 
 // The share of prompt tokens the prompt cache served: cache reads over every
@@ -2399,10 +2455,10 @@ export function cacheHitSeries(kinds) {
 
 // The busiest bucket: which one, its value, and how many average buckets it
 // is worth. Null when the range spent nothing.
-/** @param {number[]|null|undefined} values */
-export function peakBucket(values) {
+/** @param {number[]|null|undefined} values @param {number} [from]  see seriesStats */
+export function peakBucket(values, from) {
   var v = values || [];
-  var st = seriesStats(v);
+  var st = seriesStats(v, from);
   if (!(st.max > 0)) return null;
   var index = 0;
   for (var i = 0; i < v.length; i++) if ((Number(v[i]) || 0) === st.max) { index = i; break; }
@@ -2431,11 +2487,12 @@ export function providerRows(data) {
     var r = by[providerTone(a.provider)];
     if (r) r.accounts++;
   });
+  var priced = pricedRequests(d.models);
   return ['claude', 'codex', 'grok', 'backend'].filter(function (k) { return by[k]; }).map(function (k) {
     var r = by[k];
     r.share = total > 0 ? r.tokens / total : 0;
     r.hit = cacheHitRate(r);
-    r.perRequest = r.requests > 0 ? r.cost / r.requests : null;
+    r.perRequest = priced[k] > 0 ? r.cost / priced[k] : null;
     return r;
   });
 }
@@ -2518,12 +2575,13 @@ export function insightsKpis(data) {
   var hitSub = hit == null ? 'no prompt tokens yet'
     : prevHit == null || Math.abs(hit - prevHit) < 0.0005 ? 'of prompt tokens were cache reads'
       : (hit > prevHit ? '▲ ' : '▼ ') + Math.abs((hit - prevHit) * 100).toFixed(1) + ' pts vs the previous period';
-  var perReq = cost && t.requests > 0 ? cost.total / t.requests : null;
+  var priced = pricedRequests(data && data.models).all;
+  var perReq = cost && priced > 0 ? cost.total / priced : null;
   var tokensPer = (data && data.kinds && data.kinds.input || []).map(function (/** @type {number} */ _, /** @type {number} */ i) {
     var k = data.kinds;
     return (k.input[i] || 0) + (k.output[i] || 0) + (k.cacheRead[i] || 0) + (k.cacheWrite[i] || 0);
   });
-  var peak = peakBucket(tokensPer);
+  var peak = peakBucket(tokensPer, recordedFrom(data));
   var unit = data && data.unit === 'hour' ? 'hour' : 'day';
   return [
     { key: 'tokens', label: 'Tokens', value: fmtTokens(tokens),
@@ -2575,7 +2633,7 @@ const SHARED_HELPERS = [
   connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
-  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary, topModels, insightsKpis, fleetMissingText,
+  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary, topModels, insightsKpis, fleetMissingText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -2934,9 +2992,10 @@ const PAGE = `<!doctype html>
   .inslegt th { color: var(--dim); font-weight: 500; font-size: 11.5px; text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
   .inslegt td { padding: 4px 8px; border-bottom: 1px solid var(--igrid); white-space: nowrap; }
   .inslegt .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .inslegt tr[role="button"] { cursor: pointer; }
-  .inslegt tr[role="button"]:hover td { background: var(--panel2); }
-  .inslegt tr[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .inslegt tr.tog { cursor: pointer; }
+  .inslegt tr.tog:hover td { background: var(--panel2); }
+  .inslegb { display: inline-flex; align-items: center; border: 0; background: none; color: inherit; font: inherit; padding: 0; cursor: inherit; text-align: left; }
+  .inslegb:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
   .inslegt tr.off td { opacity: .45; }
   .inslegt tr.off .insl { background: var(--dim) !important; }
   .inscomp { display: flex; gap: 2px; height: 14px; border-radius: 4px; overflow: hidden; margin: 4px 0 12px; background: var(--track); }
@@ -5175,6 +5234,7 @@ ${SHARED_HELPERS}
   var insTip = null;
 
   function buildInsightsControls() {
+
     var range = document.getElementById('insRange');
     var split = document.getElementById('insSplit');
     INS_RANGES.forEach(function (o) {
@@ -5212,6 +5272,14 @@ ${SHARED_HELPERS}
     });
     markInsightsChips();
     if (typeof window !== 'undefined' && window.addEventListener) {
+      // A tap's reading stays until a tap somewhere that is not a chart.
+      window.addEventListener('pointerdown', function (e) {
+        if (e.pointerType === 'mouse') return;
+        var at = e.target;
+        if (at && at.closest && (at.closest('svg.inschart') || at.closest('.ihb'))) return;
+        insightsCursor(null);
+        hideInsightsTip();
+      });
       var t = null;
       window.addEventListener('resize', function () {
         clearTimeout(t);
@@ -5331,7 +5399,7 @@ ${SHARED_HELPERS}
   // The legend as a table, the way monitoring tools draw it: each series with
   // its total, average, peak and latest bucket. A row hides or shows its
   // series; the last one shown cannot be hidden.
-  function legendTable(host, series, fmt) {
+  function legendTable(host, series, fmt, from) {
     var tbl = el('table', 'inslegt');
     var hr = el('tr');
     ['', 'Total', 'Avg', 'Peak', 'Now'].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' + (i === 2 || i === 4 ? ' opt' : '') : '', h)); });
@@ -5339,27 +5407,31 @@ ${SHARED_HELPERS}
     var shown = series.filter(function (sr) { return !ins.hidden[sr.key]; }).length;
     series.forEach(function (sr) {
       var off = !!ins.hidden[sr.key];
-      var st = seriesStats(sr.values);
+      var st = seriesStats(sr.values, from);
       var tr = el('tr', off ? 'off' : '');
       var name = el('td', 'n');
+      // A real button in the name cell, so the row stays a table row to a
+      // screen reader; a click anywhere on the row does the same.
+      var btn = el('button', 'inslegb');
+      btn.type = 'button';
       var sw = el('i', 'insl');
       sw.style.background = sr.color;
-      name.appendChild(sw);
-      name.appendChild(el('span', '', sr.label));
+      btn.appendChild(sw);
+      btn.appendChild(el('span', '', sr.label));
+      name.appendChild(btn);
       tr.appendChild(name);
       [st.total, st.avg, st.max, st.last].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 1 || i === 3 ? ' opt' : ''), fmt(v))); });
       if (series.length > 1) {
-        tr.tabIndex = 0;
-        tr.setAttribute('role', 'button');
-        tr.setAttribute('aria-pressed', off ? 'false' : 'true');
-        tr.title = off ? 'Show ' + sr.label : 'Hide ' + sr.label;
-        var toggle = function () {
+        tr.className += ' tog';
+        btn.setAttribute('aria-pressed', off ? 'false' : 'true');
+        btn.title = off ? 'Show ' + sr.label : 'Hide ' + sr.label;
+        tr.addEventListener('click', function () {
           if (!off && shown <= 1) return;
           ins.hidden[sr.key] = !off;
           renderInsights();
-        };
-        tr.addEventListener('click', toggle);
-        tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+        });
+      } else {
+        btn.disabled = true;
       }
       tbl.appendChild(tr);
     });
@@ -5409,7 +5481,8 @@ ${SHARED_HELPERS}
     var max = 0;
     if (cols) cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
     else shown.forEach(function (sr) { sr.values.forEach(function (v) { if (v != null && v > max) max = v; }); });
-    var top = o.top || (o.count ? 4 * niceStep(max / 4) : niceCeil(max));
+    // A range that spent nothing still gets four distinct gridline labels.
+    var top = o.top || (!(max > 0) ? 4 : o.count ? 4 * niceStep(max / 4) : niceCeil(max));
     var Y = function (v) { return m.t + ph - Math.min(v, top) / top * ph; };
     var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': o.name }, host);
     // Four bands of grid: dashed and faint, with a solid baseline.
@@ -5422,7 +5495,7 @@ ${SHARED_HELPERS}
     // Labels anchored on the latest bucket and stepped back from it, as far
     // apart as the widest label needs.
     var sample = insightsBucketLabel(d.buckets[n - 1], d.unit, false);
-    var step = Math.max(1, Math.ceil((sample.length * 6.5 + 18) / band));
+    var step = labelStep(sample.length, band);
     for (var li = n - 1; li >= 0; li -= step) {
       var lx = X(li);
       var half = sample.length * 3.3;
@@ -5431,7 +5504,8 @@ ${SHARED_HELPERS}
     }
     if (o.type === 'bars') {
       var gap = band >= 6 ? Math.min(6, band * 0.25) : 0;
-      var bw = Math.max(1, band - gap);
+      // Under a pixel a bucket, a bar is its band: a year on a phone.
+      var bw = band >= 1 ? Math.max(1, band - gap) : band;
       for (var bi = 0; bi < n; bi++) {
         shown.forEach(function (sr, si) {
           var lo = cols[bi][si][0];
@@ -5447,7 +5521,13 @@ ${SHARED_HELPERS}
         if (n === 1) {
           var lo = cols[0][si][0];
           var hi = cols[0][si][1];
-          if (hi > lo) paint(svgEl('rect', { x: X(0) - 16, y: Y(hi), width: 32, height: Math.max(1, Y(lo) - Y(hi)) }, s), sr.color);
+          // One bucket (All, on the day recording began) is a band drawn
+          // like the areas: the light fill, and the line on its top.
+          if (!(hi > lo)) return;
+          var bx = m.l + band * 0.1;
+          var bwid = band * 0.8;
+          paint(svgEl('rect', { x: bx, y: Y(hi), width: bwid, height: Math.max(1, Y(lo) - Y(hi)), class: 'insfill' }, s), sr.color);
+          paint(svgEl('path', { d: 'M' + bx + ',' + Y(hi) + 'h' + bwid, 'stroke-width': 1.5 }, s), null, sr.color);
           return;
         }
         var up = '';
@@ -5509,7 +5589,7 @@ ${SHARED_HELPERS}
     var hit = svgEl('rect', { x: m.l, y: m.t, width: pw, height: ph, fill: 'transparent' }, s);
     var at = function (e) {
       var box = s.getBoundingClientRect();
-      return Math.max(0, Math.min(n - 1, Math.floor((e.clientX - box.left - m.l) / band)));
+      return bucketAt(e.clientX - box.left - m.l, band, n);
     };
     var move = function (e) {
       var i = at(e);
@@ -5520,7 +5600,9 @@ ${SHARED_HELPERS}
     };
     hit.addEventListener('pointermove', move);
     hit.addEventListener('pointerdown', move);
-    hit.addEventListener('pointerleave', function () { insightsCursor(null); hideInsightsTip(); });
+    // A finger lifting is a pointerleave too: a tap keeps its reading until
+    // the next tap elsewhere (buildInsightsControls).
+    hit.addEventListener('pointerleave', function (e) { if (e.pointerType !== 'mouse') return; insightsCursor(null); hideInsightsTip(); });
   }
 
   // A part of a whole as one 100% bar, then a row per part with its share.
@@ -5578,26 +5660,42 @@ ${SHARED_HELPERS}
       row.appendChild(el('span', 'v', it.text != null ? it.text : fmtTokens(it.value)));
       row.addEventListener('pointermove', function (e) { showInsightsTip(e, it.label, it.tip); });
       row.addEventListener('pointerdown', function (e) { showInsightsTip(e, it.label, it.tip); });
-      row.addEventListener('pointerleave', hideInsightsTip);
+      row.addEventListener('pointerleave', function (e) { if (e.pointerType === 'mouse') hideInsightsTip(); });
       host.appendChild(row);
     });
   }
 
   // A tile's sparkline, drawn at the width the tile has rather than
   // stretched to it, with a dot on the latest bucket.
-  function sparkline(parent, values, color) {
-    var W = Math.max(60, parent.clientWidth - 32 || 180);
+  // A tile's sparkline, drawn at the width its box has (less pad, the
+  // box's own padding) rather than stretched to it, with a dot on the latest
+  // bucket. A null is a gap: an idle hour has no cache hit rate, and drawing
+  // it as 0% would read as a cold cache.
+  function sparkline(parent, values, color, pad) {
+    var W = Math.max(60, (parent.clientWidth || 212) - (pad == null ? 32 : pad));
     var H = 26;
     var n = values.length;
     var max = Math.max.apply(null, values.map(function (v) { return v || 0; }).concat([0])) || 1;
     var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' }, parent);
     var px = function (i) { return n === 1 ? W / 2 : 2 + i * (W - 4) / (n - 1); };
     var py = function (v) { return H - 3 - (v || 0) / max * (H - 7); };
-    var d = '';
-    values.forEach(function (v, i) { d += (i ? 'L' : 'M') + px(i).toFixed(1) + ',' + py(v).toFixed(1); });
-    paint(svgEl('path', { d: d + 'L' + px(n - 1).toFixed(1) + ',' + H + 'L' + px(0).toFixed(1) + ',' + H + 'Z', class: 'insfill' }, s), color);
-    paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, color);
-    paint(svgEl('circle', { cx: px(n - 1), cy: py(values[n - 1]), r: 2.5 }, s), color);
+    // One run of buckets with values at a time: its line, and the fill under it.
+    var run = [];
+    var flush = function () {
+      if (!run.length) return;
+      var d = run.map(function (i, k) { return (k ? 'L' : 'M') + px(i).toFixed(1) + ',' + py(values[i]).toFixed(1); }).join('');
+      paint(svgEl('path', { d: d + 'L' + px(run[run.length - 1]).toFixed(1) + ',' + H + 'L' + px(run[0]).toFixed(1) + ',' + H + 'Z', class: 'insfill' }, s), color);
+      paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, color);
+      run = [];
+    };
+    var last = -1;
+    values.forEach(function (v, i) {
+      if (v == null) { flush(); return; }
+      run.push(i);
+      last = i;
+    });
+    flush();
+    if (last >= 0) paint(svgEl('circle', { cx: px(last), cy: py(values[last]), r: 2.5 }, s), color);
   }
 
   // A chart card with a Table button: every chart can be read as numbers too,
@@ -5639,7 +5737,7 @@ ${SHARED_HELPERS}
     var accounts = (lastStatus && lastStatus.accounts) || [];
     return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) {
       var q = a.quota || {};
-      return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : '') + (a.provider === 'grok' ? '@' + q.unified7d + '/' + q.unified7dReset : '');
+      return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : '') + (a.provider === 'grok' ? '@' + JSON.stringify([q.unified5h, q.unified5hReset, q.unified7d, q.unified7dReset, q.planPeriod, a.plan || q.planType]) : '');
     }).join('\\n');
   }
 
@@ -5686,18 +5784,75 @@ ${SHARED_HELPERS}
       if (k.key === 'tokens') sparkline(c, tokensPer, 'var(--is1)');
       if (k.key === 'cost' && cost) sparkline(c, cost.values, 'var(--is7)');
       if (k.key === 'requests') sparkline(c, d.requests, 'var(--is4)');
-      if (k.key === 'cache') sparkline(c, hits.map(function (h) { return h == null ? 0 : h; }), 'var(--ik-cacheRead)');
+      if (k.key === 'cache') sparkline(c, hits, 'var(--ik-cacheRead)');
     });
     var missed = fleet ? fleetMissingText(d) : null;
     if (missed) body.appendChild(el('p', 'sub', missed));
-    if (d.since == null) return;
+    // Grok: what it spent in the range, its models, and each account's plan
+    // as the last quota reading left it. Shown whenever Grok is in the pool
+    // or in the history.
+    var renderGrok = function () {
+    var grok = grokSummary(d, accounts);
+    if (grok) {
+      var gh = grok.history;
+      insightsCard(body, 'grok', 'Grok', 'usage ' + rangeText + ' · plans as last read on this machine', function (host) {
+        var wrap = el('div', 'insgrok');
+        var left = el('div', 'gstats');
+        [['Tokens', gh ? fmtTokens(gh.tokens) : '0'], ['Requests', gh ? num(gh.requests) : '0'], ['Est. API cost', gh ? usd(gh.cost) : '$0'], ['Cache hit', gh ? pct(gh.hit) : '—']].forEach(function (kv) {
+          var st = el('div', 'gstat');
+          st.appendChild(el('div', 'l', kv[0]));
+          st.appendChild(el('div', 'v', kv[1]));
+          left.appendChild(st);
+        });
+        var spark = el('div', 'gspark');
+        left.appendChild(spark);
+        wrap.appendChild(left);
+        var right = el('div', 'gplans');
+        if (!grok.accounts.length) right.appendChild(el('p', 'hint', 'No Grok account on this machine; the usage here is from the history.'));
+        grok.accounts.forEach(function (a) {
+          var row = el('div', 'gplan');
+          var who = el('div', 'gwho');
+          who.appendChild(el('span', 'name', a.name));
+          if (a.plan) who.appendChild(el('span', 'badge plan', a.plan));
+          if (a.disabled) who.appendChild(el('span', 'badge', 'disabled'));
+          row.appendChild(who);
+          if (a.meters.length) a.meters.forEach(function (mt) { row.appendChild(meterEl(mt)); });
+          else row.appendChild(el('p', 'hint', a.text || 'quota unknown'));
+          right.appendChild(row);
+        });
+        wrap.appendChild(right);
+        host.appendChild(wrap);
+        if (grok.values.length > 1 && gh) sparkline(spark, grok.values, 'var(--ip-grok)', 0);
+        if (grok.models.length) {
+          var mlist = el('div', 'gmodels');
+          drawRanked(mlist, grok.models.map(function (mo) {
+            return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-grok)',
+              tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Cache hit', value: pct(cacheHitRate(mo)) }] };
+          }));
+          host.appendChild(mlist);
+        }
+      }, function () {
+        return { cols: ['Model', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
+          rows: grok.models.map(function (mo) { return [mo.label, num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)]; }) };
+      });
+    }
+    };
+
+    // Nothing recorded yet: a Grok account's plan is still worth showing.
+    if (d.since == null) { renderGrok(); return; }
+    var from = recordedFrom(d);
 
     var splitKey = insightsSplit();
     var split = INS_SPLITS.filter(function (o) { return o.key === splitKey; })[0];
     var series = insightsSeries(d, splitKey, accounts);
+    // Only the series this split and range have can be hidden, and never all
+    // of them: the chart, its legend and the panels under it agree on which.
+    var keys = series.map(function (sr) { return sr.key; });
+    Object.keys(ins.hidden).forEach(function (k) { if (keys.indexOf(k) < 0) delete ins.hidden[k]; });
+    if (keys.length && keys.every(function (k) { return ins.hidden[k]; })) ins.hidden = Object.create(null);
     insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text + (series.length > 1 ? ' · click a row to hide it' : ''), function (host) {
       drawTimeSeries(host, d, series, { type: 'area', height: 220, name: 'Tokens over time', fmt: fmtTokens, fmtTip: fmtTokens });
-      legendTable(host, series, fmtTokens);
+      legendTable(host, series, fmtTokens, from);
     }, function () {
       return {
         cols: ['When'].concat(series.map(function (sr) { return sr.label; }), ['Total']),
@@ -5717,7 +5872,10 @@ ${SHARED_HELPERS}
       drawTimeSeries(host, d, reqSeries, { type: 'bars', height: 150, name: 'Requests', count: true, fmt: fmtTokens, fmtTip: count });
       if (reqSeries.length > 1) insightsLegend(host, reqSeries, count);
     }, function () {
-      return { cols: ['When', 'Requests'], rows: d.buckets.map(function (b, i) { return [when(b), num(d.requests[i])]; }).reverse() };
+      // The same columns as the chart's stack, then the total.
+      var many = reqSeries.length > 1;
+      return { cols: ['When'].concat(many ? reqSeries.map(function (sr) { return sr.label; }) : [], ['Requests']),
+        rows: d.buckets.map(function (b, i) { return [when(b)].concat(many ? reqSeries.map(function (sr) { return num(sr.values[i] || 0); }) : [], [num(d.requests[i])]); }).reverse() };
     });
     if (cost) {
       var costSeries = insightsSeries(d, splitKey, accounts, 'cost');
@@ -5726,7 +5884,9 @@ ${SHARED_HELPERS}
         drawTimeSeries(host, d, costSeries, { type: 'area', height: 150, name: 'Estimated API cost', fmt: fmtUsd, fmtTip: fmtUsd });
         if (costSeries.length > 1) insightsLegend(host, costSeries, fmtUsd);
       }, function () {
-        return { cols: ['When', 'Est. API cost'], rows: d.buckets.map(function (b, i) { return [when(b), fmtUsd(cost.values[i])]; }).reverse() };
+        var many = costSeries.length > 1;
+        return { cols: ['When'].concat(many ? costSeries.map(function (sr) { return sr.label; }) : [], ['Est. API cost']),
+          rows: d.buckets.map(function (b, i) { return [when(b)].concat(many ? costSeries.map(function (sr) { return fmtUsd(sr.values[i] || 0); }) : [], [fmtUsd(cost.values[i])]); }).reverse() };
       });
     }
     var hitAll = cacheHitRate(d.totals);
@@ -5778,8 +5938,8 @@ ${SHARED_HELPERS}
       wrap.appendChild(tbl);
       host.appendChild(wrap);
     }, function () {
-      return { cols: ['Provider', 'Tokens', 'Share', 'Input', 'Output', 'Cache read', 'Cache write'],
-        rows: provs.map(function (p) { return [p.label, num(p.tokens), pctOf(p.share), num(p.input), num(p.output), num(p.cacheRead), num(p.cacheWrite)]; }) };
+      return { cols: ['Provider', 'Accounts', 'Requests', 'Tokens', 'Share', 'Est. cost', 'Per request', 'Cache hit', 'Input', 'Output', 'Cache read', 'Cache write'],
+        rows: provs.map(function (p) { return [p.label, String(p.accounts), num(p.requests), num(p.tokens), pctOf(p.share), usd(p.cost), usd(p.perRequest), pct(p.hit), num(p.input), num(p.output), num(p.cacheRead), num(p.cacheWrite)]; }) };
     });
     var t = d.totals;
     var kinds = insightsSeries(d, 'kind', accounts).map(function (k) { return { label: k.label, value: k.total, color: k.color }; });
@@ -5794,53 +5954,7 @@ ${SHARED_HELPERS}
       return { cols: ['Type', 'Tokens', 'Share'], rows: kinds.map(function (k) { return [k.label, num(k.value), tokens > 0 ? (k.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
     });
 
-    // Grok: what it spent in the range, its models, and each account's plan
-    // as the last quota reading left it. Shown whenever Grok is in the pool
-    // or in the history.
-    var grok = grokSummary(d, accounts);
-    if (grok) {
-      var gh = grok.history;
-      insightsCard(body, 'grok', 'Grok', 'usage ' + rangeText + ' · plans as last read on this machine', function (host) {
-        var wrap = el('div', 'insgrok');
-        var left = el('div', 'gstats');
-        [['Tokens', gh ? fmtTokens(gh.tokens) : '0'], ['Requests', gh ? num(gh.requests) : '0'], ['Est. API cost', gh ? usd(gh.cost) : '$0'], ['Cache hit', gh ? pct(gh.hit) : '—']].forEach(function (kv) {
-          var st = el('div', 'gstat');
-          st.appendChild(el('div', 'l', kv[0]));
-          st.appendChild(el('div', 'v', kv[1]));
-          left.appendChild(st);
-        });
-        var spark = el('div', 'gspark');
-        left.appendChild(spark);
-        wrap.appendChild(left);
-        var right = el('div', 'gplans');
-        if (!grok.accounts.length) right.appendChild(el('p', 'hint', 'No Grok account on this machine; the usage here is from the history.'));
-        grok.accounts.forEach(function (a) {
-          var row = el('div', 'gplan');
-          var who = el('div', 'gwho');
-          who.appendChild(el('span', 'name', a.name));
-          if (a.plan) who.appendChild(el('span', 'badge plan', a.plan));
-          if (a.disabled) who.appendChild(el('span', 'badge', 'disabled'));
-          row.appendChild(who);
-          if (a.meters.length) a.meters.forEach(function (mt) { row.appendChild(meterEl(mt)); });
-          else row.appendChild(el('p', 'hint', a.text || 'quota unknown'));
-          right.appendChild(row);
-        });
-        wrap.appendChild(right);
-        host.appendChild(wrap);
-        if (grok.values.length > 1 && gh) sparkline(spark, grok.values, 'var(--ip-grok)');
-        if (grok.models.length) {
-          var mlist = el('div', 'gmodels');
-          drawRanked(mlist, grok.models.map(function (mo) {
-            return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-grok)',
-              tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Cache hit', value: pct(cacheHitRate(mo)) }] };
-          }));
-          host.appendChild(mlist);
-        }
-      }, function () {
-        return { cols: ['Model', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
-          rows: grok.models.map(function (mo) { return [mo.label, num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)]; }) };
-      });
-    }
+    renderGrok();
 
     var lists = el('div', 'insgrid two');
     body.appendChild(lists);
