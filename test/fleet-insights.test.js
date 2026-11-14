@@ -280,3 +280,19 @@ test('a model\'s priced requests count only the machines that priced it', () => 
   assert.equal(m.models[0].pricedRequests, 1);
   assert.equal(m.sinceDay, mine.sinceDay);
 });
+
+test('a fleet in two time zones starts its days at the earliest first day of any machine', () => {
+  // The answering machine began on the 6th by its clock; a laptop in another
+  // zone began on the 5th by its own, at a later instant.
+  const at = Date.now();
+  const desk = history(at);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const mine = { ...desk.insights('7d'), sinceDay: '2026-11-06', since: 1000 };
+  const laptop = { ...JSON.parse(JSON.stringify(desk.insights('7d'))), sinceDay: '2026-11-05', since: 2000 };
+  const m = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: mine },
+    { name: 'laptop', self: false, state: 'ok', data: laptop },
+  ]);
+  assert.equal(m.since, 1000);
+  assert.equal(m.sinceDay, '2026-11-05');
+});

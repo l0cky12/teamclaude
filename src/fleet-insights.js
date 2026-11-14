@@ -132,6 +132,8 @@ export function mergeInsights(parts) {
   let previous = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   /** @type {number|null} */
   let since = null;
+  /** @type {string|null} */
+  let sinceDay = null;
   /** @typedef {import('./usage-history.js').Series} Series */
   /** @type {Map<string, Series>} */
   const providers = new Map();
@@ -165,6 +167,10 @@ export function mergeInsights(parts) {
     inst.requests = num(t.requests);
     inst.since = typeof d.since === 'number' ? d.since : null;
     if (inst.since != null && (since == null || inst.since < since)) since = inst.since;
+    // Each machine's first day by its own clock: in different time zones the
+    // earliest instant is not always the earliest day on the axis.
+    const firstDay = typeof d.sinceDay === 'string' ? d.sinceDay : inst.since != null ? dayKey(inst.since) : null;
+    if (firstDay != null && (sinceDay == null || firstDay < sinceDay)) sinceDay = firstDay;
     addSeries(d.requests, requests);
     for (const k of /** @type {const} */ (['cacheRead', 'cacheWrite', 'input', 'output'])) {
       addSeries(d.kinds?.[k], kinds[k]);
@@ -258,7 +264,7 @@ export function mergeInsights(parts) {
     unit: local.unit,
     buckets,
     since,
-    sinceDay: since == null ? null : dayKey(since),
+    sinceDay,
     totals,
     previous,
     requests,

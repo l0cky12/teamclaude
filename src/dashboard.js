@@ -5279,7 +5279,7 @@ ${SHARED_HELPERS}
       window.addEventListener('pointerdown', function (e) {
         if (e.pointerType !== 'touch') return;
         var at = e.target;
-        if (at && at.closest && (at.closest('svg.inschart') || at.closest('.ihb'))) return;
+        if (at && at.closest && (at.closest('svg.inschart:not(.insspark)') || at.closest('.ihb'))) return;
         insightsCursor(null);
         hideInsightsTip();
       });
@@ -5430,7 +5430,10 @@ ${SHARED_HELPERS}
         btn.setAttribute('aria-pressed', off ? 'false' : 'true');
         btn.title = off ? 'Show ' + sr.label : 'Hide ' + sr.label;
         // The last series shown cannot be hidden.
-        if (!off && shown <= 1) btn.setAttribute('aria-disabled', 'true');
+        if (!off && shown <= 1) {
+          btn.setAttribute('aria-disabled', 'true');
+          btn.title = sr.label + ' stays shown: it is the only series left';
+        }
         tr.addEventListener('click', function () {
           if (!off && shown <= 1) return;
           ins.hidden[sr.key] = !off;
@@ -5683,7 +5686,8 @@ ${SHARED_HELPERS}
     var H = 26;
     var n = values.length;
     var max = Math.max.apply(null, values.map(function (v) { return v || 0; }).concat([0])) || 1;
-    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' }, parent);
+    // insspark: a tap here is not a tap on a chart (it has no crosshair).
+    var s = svgEl('svg', { class: 'inschart insspark', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' }, parent);
     var px = function (i) { return n === 1 ? W / 2 : 2 + i * (W - 4) / (n - 1); };
     var py = function (v) { return H - 3 - (v || 0) / max * (H - 7); };
     // One run of buckets with values at a time: its line, and the fill under it.
