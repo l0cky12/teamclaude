@@ -32,7 +32,10 @@ import { peerRequest } from './peers.js';
  *   name: string, self: boolean, state: 'ok'|'unreachable'|'refused'|'outdated'|'error', error?: string,
  *   since: number|null, tokens: number, requests: number, cost: number, unpricedTokens: number, values: number[],
  * }} FleetInstance
- * @typedef {Insights & { scope: 'all', instances: FleetInstance[] }} FleetInsights
+ * `splitDetail` is false when a machine counted is too old to send each
+ * provider's and account's requests and cost per bucket: the sum of those
+ * series would draw its share as nothing, so the page draws one series.
+ * @typedef {Insights & { scope: 'all', instances: FleetInstance[], splitDetail: boolean }} FleetInsights
  */
 
 /** How long one peer gets to answer before the sum goes on without it. */
@@ -128,10 +131,14 @@ export function mergeInsights(parts) {
   let previous = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   /** @type {number|null} */
   let since = null;
-  /** @type {Map<string, { provider: string, tokens: number, cost: number, values: number[] }>} */
+  /** @typedef {import('./usage-history.js').Series} Series */
+  /** @type {Map<string, Series>} */
   const providers = new Map();
-  /** @type {Map<string, { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }>} */
+  /** @type {Map<string, Series & { account: string }>} */
   const accounts = new Map();
+  let splitDetail = true;
+  /** @returns {Omit<Series, 'provider'>} */
+  const series = () => ({ tokens: 0, cost: 0, values: zeros(), requestValues: zeros(), costValues: zeros(), requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
   /** @type {Map<string, any>} */
   const models = new Map();
   /** @type {FleetInstance[]} */
@@ -184,23 +191,28 @@ export function mergeInsights(parts) {
     cost.total += inst.cost;
     cost.unpricedTokens += inst.unpricedTokens;
 
+    /** @param {Omit<Series, 'provider'>} e @param {any} r */
+    const addRow = (e, r) => {
+      if (!Array.isArray(r.requestValues) || !Array.isArray(r.costValues)) splitDetail = false;
+      e.tokens += num(r.tokens);
+      e.cost += num(r.cost);
+      for (const k of /** @type {const} */ (['requests', 'input', 'output', 'cacheRead', 'cacheWrite'])) e[k] += num(r[k]);
+      addSeries(r.values, e.values);
+      addSeries(r.requestValues, e.requestValues);
+      addSeries(r.costValues, e.costValues);
+    };
     for (const p of Array.isArray(d.providers) ? d.providers : []) {
       let e = providers.get(p.provider);
-      if (!e) providers.set(p.provider, e = { provider: p.provider, tokens: 0, cost: 0, values: zeros() });
-      e.tokens += num(p.tokens);
-      e.cost += num(p.cost);
-      addSeries(p.values, e.values);
+      if (!e) providers.set(p.provider, e = { provider: p.provider, ...series() });
+      addRow(e, p);
     }
     // Accounts by provider and name: an account synced to several machines
     // (credential-sync.js) is one account, spending on each of them.
     for (const a of Array.isArray(d.accounts) ? d.accounts : []) {
       const key = a.provider + '\u0000' + a.account;
       let e = accounts.get(key);
-      if (!e) accounts.set(key, e = { provider: a.provider, account: a.account, tokens: 0, requests: 0, cost: 0, values: zeros() });
-      e.tokens += num(a.tokens);
-      e.requests += num(a.requests);
-      e.cost += num(a.cost);
-      addSeries(a.values, e.values);
+      if (!e) accounts.set(key, e = { provider: a.provider, account: a.account, ...series() });
+      addRow(e, a);
     }
     for (const m of Array.isArray(d.models) ? d.models : []) {
       const key = m.provider + '\u0000' + m.model;
@@ -237,5 +249,6 @@ export function mergeInsights(parts) {
     models: [...models.values()].sort(byTokens),
     scope: 'all',
     instances,
+    splitDetail,
   };
 }

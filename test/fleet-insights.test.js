@@ -229,3 +229,29 @@ test('GET /teamclaude/insights?scope=all reads a linked proxy over HTTP, operato
   assert.equal(clientLocal.status, 200, 'but still reads this machine\'s');
   await clientLocal.text();
 });
+
+test('requests and cost per bucket add up across machines, and a machine too old to send them says so', () => {
+  const now = Date.now();
+  const desk = history(now);
+  const server = history(now);
+  desk.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  server.record({ provider: 'anthropic', account: 'max', model: 'claude-opus-5-5', usage: usage() });
+  const both = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: desk.insights('7d') },
+    { name: 'server', self: false, state: 'ok', data: JSON.parse(JSON.stringify(server.insights('7d'))) },
+  ]);
+  assert.equal(both.splitDetail, true);
+  assert.equal(both.providers[0].requestValues.at(-1), 2);
+  assert.equal(both.accounts[0].requests, 2);
+  assert.ok(Math.abs(both.providers[0].costValues.at(-1) - 2 * desk.insights('7d').providers[0].cost) < 1e-9);
+  // A peer from before the per-bucket arrays: summed for what it has, and the
+  // page is told to draw one total rather than a share of nothing.
+  const old = JSON.parse(JSON.stringify(server.insights('7d')));
+  for (const row of [...old.providers, ...old.accounts]) { delete row.requestValues; delete row.costValues; }
+  const mixed = mergeInsights([
+    { name: 'desk', self: true, state: 'ok', data: desk.insights('7d') },
+    { name: 'server', self: false, state: 'ok', data: old },
+  ]);
+  assert.equal(mixed.splitDetail, false);
+  assert.equal(mixed.providers[0].tokens, both.providers[0].tokens);
+});

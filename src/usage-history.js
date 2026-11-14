@@ -54,10 +54,17 @@ import { costAt, priceLookup } from './api-pricing.js';
  *   requests: number[],
  *   kinds: { cacheRead: number[], cacheWrite: number[], input: number[], output: number[] },
  *   cost: InsightsCost,
- *   providers: { provider: string, tokens: number, cost: number, values: number[] }[],
- *   accounts: { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }[],
+ *   providers: Series[],
+ *   accounts: (Series & { account: string })[],
  *   models: ({ provider: string, model: string, tokens: number, requests: number, cost: number|null } & Tally)[],
  * }} Insights
+ */
+/**
+ * One provider's or account's share of the range: its counts, and per bucket
+ * its tokens (`values`), requests (`requestValues`) and estimated cost
+ * (`costValues`), so the page can stack requests and cost the way it stacks
+ * tokens.
+ * @typedef {{ provider: string, tokens: number, cost: number, values: number[], requestValues: number[], costValues: number[] } & Tally} Series
  */
 /**
  * The range's tokens at API list prices (api-pricing.js), in USD: in all,
@@ -427,10 +434,27 @@ function summarize(range, unit, buckets, current, before, since) {
   /** @param {Row} row */
   const rowCost = row => { const p = price(row.provider, row.model); return p ? costAt(p, row.tally) : null; };
   const cost = { total: 0, values: zeros(), previous: /** @type {number|null} */ (null), unpricedTokens: 0 };
-  /** @type {Map<string, { provider: string, tokens: number, cost: number, values: number[] }>} */
+  /** @type {Map<string, Series>} */
   const providers = new Map();
-  /** @type {Map<string, { provider: string, account: string, tokens: number, requests: number, cost: number, values: number[] }>} */
+  /** @type {Map<string, Series & { account: string }>} */
   const accounts = new Map();
+  /** @returns {Omit<Series, 'provider'>} */
+  const series = () => ({ tokens: 0, cost: 0, values: zeros(), requestValues: zeros(), costValues: zeros(), ...emptyTally() });
+  /**
+   * @param {Omit<Series, 'provider'>} e
+   * @param {number} i
+   * @param {Tally} t
+   * @param {number} tokens
+   * @param {number|null} usd
+   */
+  const book = (e, i, t, tokens, usd) => {
+    e.tokens += tokens;
+    e.cost += usd ?? 0;
+    e.values[i] += tokens;
+    e.requestValues[i] += t.requests;
+    e.costValues[i] += usd ?? 0;
+    addTally(e, t);
+  };
   /** @type {Map<string, { provider: string, model: string, tokens: number, cost: number|null } & Tally>} */
   const models = new Map();
   current.forEach((bucket, i) => {
@@ -447,17 +471,12 @@ function summarize(range, unit, buckets, current, before, since) {
       kinds.input[i] += t.input;
       kinds.output[i] += t.output;
       let p = providers.get(row.provider);
-      if (!p) providers.set(row.provider, p = { provider: row.provider, tokens: 0, cost: 0, values: zeros() });
-      p.tokens += tokens;
-      p.cost += usd ?? 0;
-      p.values[i] += tokens;
+      if (!p) providers.set(row.provider, p = { provider: row.provider, ...series() });
+      book(p, i, t, tokens, usd);
       const ak = rowKey(row.provider, row.account, '');
       let a = accounts.get(ak);
-      if (!a) accounts.set(ak, a = { provider: row.provider, account: row.account, tokens: 0, requests: 0, cost: 0, values: zeros() });
-      a.tokens += tokens;
-      a.requests += t.requests;
-      a.cost += usd ?? 0;
-      a.values[i] += tokens;
+      if (!a) accounts.set(ak, a = { provider: row.provider, account: row.account, ...series() });
+      book(a, i, t, tokens, usd);
       const mk = rowKey(row.provider, '', row.model);
       let m = models.get(mk);
       // A model is priced or not as a whole, so its cost is null exactly when

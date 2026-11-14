@@ -2130,8 +2130,12 @@ export function usageFor(entry, view) {
 //
 // The page draws GET /teamclaude/insights (usage-history.js). What follows is
 // its arithmetic: number formats, axis tops, the series each "split by" choice
-// stacks, the donut geometry and the headline tiles. The drawing itself is in
-// the page script, which only turns these numbers into SVG.
+// stacks, the legend's statistics, the rates and the headline tiles. The
+// drawing itself is in the page script, which only turns these numbers into
+// SVG, laid out the way monitoring dashboards (Grafana, Zabbix, Datadog) lay
+// out time series: thin lines over light fills, one time axis shared by every
+// panel, and a legend that is a table of each series' total, average, peak
+// and latest value.
 
 // Token counts as the page prints them: 4.48B, 340M, 12.3k. Three significant
 // figures at most, since the axis and the tiles are read at a glance and the
@@ -2238,14 +2242,29 @@ export function insightsBucketLabel(bucket, unit, long) {
 // the config (`accounts` is status.accounts, which keeps config order), so an
 // account keeps its colour whatever the range; past the palette's eight, and
 // for an account no longer configured, they are summed into one grey "Other".
+//
+// `metric` picks what is stacked: tokens (the default), requests or estimated
+// cost. Only a provider or account split can stack the last two, since token
+// types have no requests of their own and machines send only their tokens per
+// bucket. Those, and a reply from a proxy too old to send the per-bucket
+// arrays, give no series, and the page draws one total instead.
 /**
  * @param {any} data  a GET /teamclaude/insights reply
- * @param {string} split  'provider' | 'account' | 'kind'
+ * @param {string} split  'provider' | 'account' | 'kind' | 'instance'
  * @param {any[]} accounts  status.accounts
+ * @param {string} [metric]  'tokens' | 'requests' | 'cost'
  * @returns {{ key: string, label: string, color: string, values: number[], total: number }[]}
  */
-export function insightsSeries(data, split, accounts) {
+export function insightsSeries(data, split, accounts, metric) {
   var n = (data && data.buckets ? data.buckets.length : 0);
+  var m = metric || 'tokens';
+  var pick = function (/** @type {any} */ row) { return m === 'requests' ? row.requestValues : m === 'cost' ? row.costValues : row.values; };
+  var tot = function (/** @type {any} */ row) { return (m === 'requests' ? row.requests : m === 'cost' ? row.cost : row.tokens) || 0; };
+  if (data && m !== 'tokens') {
+    if (split === 'kind' || split === 'instance' || data.splitDetail === false) return [];
+    var rows = split === 'account' ? data.accounts : data.providers;
+    if ((rows || []).some(function (/** @type {any} */ r) { return !Array.isArray(pick(r)); })) return [];
+  }
   var zeros = function () { /** @type {number[]} */ var a = []; for (var i = 0; i < n; i++) a.push(0); return a; };
   var sum = function (/** @type {number[]} */ vals) { return vals.reduce(function (x, y) { return x + y; }, 0); };
   /** @type {{ key: string, label: string, color: string, values: number[], total: number }[]} */
@@ -2284,11 +2303,11 @@ export function insightsSeries(data, split, accounts) {
     (data.accounts || []).forEach(function (/** @type {any} */ a) {
       var slot = known.indexOf(a.provider + '/' + a.account);
       if (slot >= 0 && slot < 8) {
-        bySlot[slot] = { key: a.provider + '/' + a.account, label: a.account, color: 'var(--is' + (slot + 1) + ')', values: a.values.slice(), total: a.tokens };
+        bySlot[slot] = { key: a.provider + '/' + a.account, label: a.account, color: 'var(--is' + (slot + 1) + ')', values: pick(a).slice(), total: tot(a) };
       } else {
         if (!other) other = { key: 'other', label: 'Other', color: 'var(--dim)', values: zeros(), total: 0 };
-        for (var i = 0; i < n; i++) other.values[i] += a.values[i] || 0;
-        other.total += a.tokens;
+        for (var i = 0; i < n; i++) other.values[i] += pick(a)[i] || 0;
+        other.total += tot(a);
       }
     });
     Object.keys(bySlot).map(Number).sort(function (x, y) { return x - y; }).forEach(function (s) { out.push(bySlot[s]); });
@@ -2305,8 +2324,8 @@ export function insightsSeries(data, split, accounts) {
     var t = tones[tone];
     t.members++;
     if (tone === 'backend' && t.members > 1) t.label = 'Backends';
-    for (var i = 0; i < n; i++) t.values[i] += p.values[i] || 0;
-    t.total += p.tokens;
+    for (var i = 0; i < n; i++) t.values[i] += pick(p)[i] || 0;
+    t.total += tot(p);
   });
   ['claude', 'codex', 'grok', 'backend'].forEach(function (tone) {
     if (!tones[tone]) return;
@@ -2338,38 +2357,116 @@ export function stackSeries(series, n) {
   return cols;
 }
 
-// One SVG path per slice of a donut centred at (c, c), outer radius r, inner
-// radius ir, starting at twelve o'clock and going clockwise. A zero slice gets
-// null. A slice that is (all but) the whole is a ring instead: an arc whose ends
-// meet draws nothing, and one drawn a hair short of a full turn has inner ends
-// that round to the same point, so the inner arc vanished and the hole filled.
-// The ring is the outer circle clockwise and the inner one anticlockwise, as
-// two half-turns each; the opposite windings leave the centre unfilled.
-/**
- * @param {number[]} values
- * @param {number} c
- * @param {number} r
- * @param {number} ir
- */
-export function donutArcs(values, c, r, ir) {
-  var total = values.reduce(function (x, y) { return x + (y > 0 ? y : 0); }, 0);
-  var a0 = -Math.PI / 2;
-  var pt = function (/** @type {number} */ rad, /** @type {number} */ a) { return (c + rad * Math.cos(a)).toFixed(2) + ',' + (c + rad * Math.sin(a)).toFixed(2); };
-  var ring = function (/** @type {number} */ rad, /** @type {number} */ sweep) {
-    return 'M' + c + ',' + (c - rad) + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c + rad)
-      + 'A' + rad + ',' + rad + ' 0 1 ' + sweep + ' ' + c + ',' + (c - rad) + 'Z';
-  };
-  return values.map(function (v) {
-    if (!(v > 0) || !(total > 0)) return null;
-    var sweep = v / total * Math.PI * 2;
-    if (sweep > Math.PI * 2 - 0.01) { a0 += sweep; return ring(r, 1) + ring(ir, 0); }
-    var a1 = a0 + sweep;
-    var large = sweep > Math.PI ? 1 : 0;
-    var d = 'M' + pt(r, a0) + 'A' + r + ',' + r + ' 0 ' + large + ' 1 ' + pt(r, a1)
-      + 'L' + pt(ir, a1) + 'A' + ir + ',' + ir + ' 0 ' + large + ' 0 ' + pt(ir, a0) + 'Z';
-    a0 = a1;
-    return d;
+// What a series' legend row says: its total, its average bucket, its busiest
+// bucket and its latest. The latest is the bucket still filling (this hour,
+// today), which is why the page heads that column "Now".
+/** @param {number[]|null|undefined} values */
+export function seriesStats(values) {
+  var v = values || [];
+  var total = 0;
+  var max = 0;
+  for (var i = 0; i < v.length; i++) {
+    var x = Number(v[i]) || 0;
+    total += x;
+    if (x > max) max = x;
+  }
+  return { total: total, avg: v.length ? total / v.length : 0, max: max, last: v.length ? Number(v[v.length - 1]) || 0 : 0 };
+}
+
+// The share of prompt tokens the prompt cache served: cache reads over every
+// prompt token (input, cache reads, cache writes). Output is never served
+// from the cache, so it is not in the denominator. Null with no prompt tokens.
+/** @param {{ input?: number, cacheRead?: number, cacheWrite?: number }|null|undefined} t */
+export function cacheHitRate(t) {
+  var x = t || {};
+  var prompt = (x.input || 0) + (x.cacheRead || 0) + (x.cacheWrite || 0);
+  return prompt > 0 ? (x.cacheRead || 0) / prompt : null;
+}
+
+// The cache hit rate of each bucket, null where a bucket had no prompt tokens:
+// an idle hour has no rate, and drawing it as 0% would read as a cold cache.
+/** @param {any} kinds  insights.kinds */
+export function cacheHitSeries(kinds) {
+  var k = kinds || {};
+  var n = (k.input || []).length;
+  /** @type {(number|null)[]} */
+  var out = [];
+  for (var i = 0; i < n; i++) {
+    out.push(cacheHitRate({ input: (k.input || [])[i], cacheRead: (k.cacheRead || [])[i], cacheWrite: (k.cacheWrite || [])[i] }));
+  }
+  return out;
+}
+
+// The busiest bucket: which one, its value, and how many average buckets it
+// is worth. Null when the range spent nothing.
+/** @param {number[]|null|undefined} values */
+export function peakBucket(values) {
+  var v = values || [];
+  var st = seriesStats(v);
+  if (!(st.max > 0)) return null;
+  var index = 0;
+  for (var i = 0; i < v.length; i++) if ((Number(v[i]) || 0) === st.max) { index = i; break; }
+  return { index: index, value: st.max, ratio: st.avg > 0 ? st.max / st.avg : null };
+}
+
+// One row per provider for the Providers table, in the timeline's order and
+// colours: what it spent, its share of the range's tokens, the estimated cost
+// per request and its cache hit rate. All third-party backends are one row.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function providerRows(data) {
+  /** @type {Record<string, any>} */
+  var by = {};
+  var total = 0;
+  var d = data || {};
+  (d.providers || []).forEach(function (/** @type {any} */ p) {
+    var tone = providerTone(p.provider);
+    var r = by[tone];
+    if (!r) r = by[tone] = { key: tone, label: groupLabel(p.provider), color: 'var(--ip-' + tone + ')', members: 0, accounts: 0, tokens: 0, cost: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    r.members++;
+    if (tone === 'backend' && r.members > 1) r.label = 'Backends';
+    ['tokens', 'cost', 'requests', 'input', 'output', 'cacheRead', 'cacheWrite'].forEach(function (k) { r[k] += Number(p[k]) || 0; });
+    total += Number(p.tokens) || 0;
   });
+  (d.accounts || []).forEach(function (/** @type {any} */ a) {
+    var r = by[providerTone(a.provider)];
+    if (r) r.accounts++;
+  });
+  return ['claude', 'codex', 'grok', 'backend'].filter(function (k) { return by[k]; }).map(function (k) {
+    var r = by[k];
+    r.share = total > 0 ? r.tokens / total : 0;
+    r.hit = cacheHitRate(r);
+    r.perRequest = r.requests > 0 ? r.cost / r.requests : null;
+    return r;
+  });
+}
+
+// The Grok panel: Grok's share of the range from the usage history, its
+// models, and each Grok account's plan as the last quota reading left it.
+// Grok states its quota only when asked (grok-usage.js), so the reading is
+// as old as the last refresh, and this never asks. Null with no Grok at all.
+/**
+ * @param {any} data  a GET /teamclaude/insights reply
+ * @param {any[]} accounts  status.accounts
+ * @param {number} [now]
+ */
+export function grokSummary(data, accounts, now) {
+  var d = data || {};
+  var n = (d.buckets || []).length;
+  var history = providerRows(d).filter(function (r) { return r.key === 'grok'; })[0] || null;
+  /** @type {number[]} */
+  var values = [];
+  for (var i = 0; i < n; i++) values.push(0);
+  (d.providers || []).forEach(function (/** @type {any} */ p) {
+    if (providerTone(p.provider) !== 'grok') return;
+    for (var j = 0; j < n; j++) values[j] += (p.values || [])[j] || 0;
+  });
+  var models = topModels((d.models || []).filter(function (/** @type {any} */ m) { return providerTone(m.provider) === 'grok'; }), 8);
+  var plans = (accounts || []).filter(function (a) { return a.provider === 'grok'; }).map(function (a) {
+    var m = accountMeters(a, undefined, now);
+    return { name: a.name, plan: a.plan || (a.quota && a.quota.planType) || null, disabled: !!a.disabled, meters: m.slots.concat(m.extra).filter(Boolean), text: m.text };
+  });
+  if (!history && !plans.length) return null;
+  return { history: history, values: values, models: models, accounts: plans };
 }
 
 // The ranked model list: dated snapshots of one model ("…-20251001") are one
@@ -2403,51 +2500,42 @@ export function topModels(models, limit) {
     .slice(0, limit || 6);
 }
 
-// The headline tiles: tokens and requests for the range (each against the
-// period before it), the pool as configured now, and how much of the range's
-// tokens the prompt cache served.
-/**
- * @param {any} data  a GET /teamclaude/insights reply
- * @param {any[]} accounts  status.accounts
- */
-export function insightsKpis(data, accounts) {
+// The headline tiles, six of a kind: tokens, estimated cost and requests for
+// the range (each against the period before it), the prompt cache's hit rate,
+// the cost of a request, and the busiest bucket against the average one.
+/** @param {any} data  a GET /teamclaude/insights reply */
+export function insightsKpis(data) {
   var t = (data && data.totals) || { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
   var p = data && data.previous;
   var range = data ? data.range : '30d';
-  var list = accounts || [];
-  /** @type {Record<string, number>} */
-  var tally = { claude: 0, codex: 0, grok: 0, backend: 0 };
-  list.forEach(function (a) { tally[providerTone(accountGroup(a))]++; });
-  /** @type {string[]} */
-  var parts = [];
-  if (tally.claude) parts.push(tally.claude + ' Claude');
-  if (tally.codex) parts.push(tally.codex + ' Codex');
-  if (tally.grok) parts.push(tally.grok + ' Grok');
-  if (tally.backend) parts.push(tally.backend + (tally.backend === 1 ? ' backend' : ' backends'));
-  var enabled = list.filter(function (a) { return !a.disabled; }).length;
   var cost = data && data.cost;
   var costSub = !cost ? 'this proxy is too old to estimate it'
     : insightsDelta(cost.total, cost.previous, range) || 'at API list prices';
   if (cost && cost.unpricedTokens > 0) costSub += ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced';
-  // Every machine at once: the tile counts machines, since the accounts this
-  // page knows the state of are only this machine's.
-  var instances = data && data.scope === 'all' && Array.isArray(data.instances) ? data.instances : null;
-  var counted = instances ? instances.filter(function (/** @type {any} */ m) { return m.state === 'ok'; }).length : 0;
-  var fourth = instances
-    ? { key: 'machines', label: 'Machines', value: String(counted),
-      sub: counted === instances.length ? (counted === 1 ? 'this one; none linked' : 'all linked machines counted') : counted + ' of ' + instances.length + ' counted' }
-    : { key: 'accounts', label: 'Accounts', value: String(list.length),
-      sub: (list.length ? enabled + ' enabled' + (parts.length ? ' · ' + parts.join(' · ') : '') : 'none configured') };
+  var hit = cacheHitRate(t);
+  var prevHit = p ? cacheHitRate(p) : null;
+  var hitSub = hit == null ? 'no prompt tokens yet'
+    : prevHit == null || Math.abs(hit - prevHit) < 0.0005 ? 'of prompt tokens were cache reads'
+      : (hit > prevHit ? '▲ ' : '▼ ') + Math.abs((hit - prevHit) * 100).toFixed(1) + ' pts vs the previous period';
+  var perReq = cost && t.requests > 0 ? cost.total / t.requests : null;
+  var tokensPer = (data && data.kinds && data.kinds.input || []).map(function (/** @type {number} */ _, /** @type {number} */ i) {
+    var k = data.kinds;
+    return (k.input[i] || 0) + (k.output[i] || 0) + (k.cacheRead[i] || 0) + (k.cacheWrite[i] || 0);
+  });
+  var peak = peakBucket(tokensPer);
+  var unit = data && data.unit === 'hour' ? 'hour' : 'day';
   return [
-    { key: 'tokens', label: 'Tokens · ' + insightsRangeText(range), value: fmtTokens(tokens),
+    { key: 'tokens', label: 'Tokens', value: fmtTokens(tokens),
       sub: insightsDelta(tokens, p ? p.input + p.output + p.cacheRead + p.cacheWrite : null, range) || (data && data.since == null ? 'nothing recorded yet' : 'no earlier period on record') },
     { key: 'cost', label: 'Est. API cost', value: cost ? fmtUsd(cost.total) : '—', sub: costSub },
     { key: 'requests', label: 'Requests', value: t.requests.toLocaleString(),
       sub: insightsDelta(t.requests, p ? p.requests : null, range) || 'responses that reported usage' },
-    fourth,
-    { key: 'cache', label: 'Served from cache', value: tokens > 0 ? (t.cacheRead / tokens * 100).toFixed(1) + '%' : '—',
-      sub: 'of these tokens were cache reads' },
+    { key: 'cache', label: 'Cache hit rate', value: hit == null ? '—' : (hit * 100).toFixed(1) + '%', sub: hitSub },
+    { key: 'perRequest', label: 'Per request', value: perReq == null ? '—' : fmtUsd(perReq),
+      sub: t.requests > 0 ? fmtTokens(tokens / t.requests) + ' tokens · ' + fmtTokens(t.output / t.requests) + ' output' : 'no requests yet' },
+    { key: 'peak', label: 'Busiest ' + unit, value: peak ? fmtTokens(peak.value) : '—',
+      sub: peak ? insightsBucketLabel(data.buckets[peak.index], unit, true) + (peak.ratio ? ' · ' + peak.ratio.toFixed(1) + '× the average' : '') : 'nothing spent yet' },
   ];
 }
 
@@ -2487,7 +2575,7 @@ const SHARED_HELPERS = [
   connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
-  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, donutArcs, topModels, insightsKpis, fleetMissingText,
+  fmtTokens, fmtUsd, niceCeil, niceStep, insightsRangeText, insightsDelta, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, cacheHitRate, cacheHitSeries, peakBucket, providerRows, grokSummary, topModels, insightsKpis, fleetMissingText,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -2814,41 +2902,87 @@ const PAGE = `<!doctype html>
   .insbar { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
   .insbar .lbl { color: var(--dim); font-size: 12px; }
   .insbar .insscope { display: flex; gap: 8px 14px; align-items: center; }
-  .inskpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 12px; margin-bottom: 12px; }
-  .inskpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; min-width: 0; }
-  .inskpi .l { color: var(--dim); font-size: 12px; }
-  .inskpi .v { font-size: 26px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3; }
-  .inskpi .d { color: var(--dim); font-size: 12px; }
+  /* Insights, laid out like a monitoring dashboard: an even row of stat
+     tiles, then panels that share one time axis. */
+  .inskpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .inskpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px 10px; min-width: 0; }
+  .inskpi .l { color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .inskpi .v { font-size: 24px; font-weight: 650; letter-spacing: -.01em; line-height: 1.3; font-variant-numeric: tabular-nums; }
+  .inskpi .d { color: var(--dim); font-size: 11.5px; min-height: 2.8em; }
   .inskpi svg { display: block; margin-top: 6px; }
-  .insgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 12px; margin-bottom: 12px; }
-  .insgrid.wide { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+  .insgrid { display: grid; gap: 12px; margin-bottom: 12px; }
+  .insgrid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .insgrid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .insgrid .card, #insBody > .card { margin-bottom: 0; min-width: 0; }
   #insBody > .card { margin-bottom: 12px; }
   .insh { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
   .insh b { font-size: 13.5px; }
   .insh .s { display: block; color: var(--dim); font-size: 12px; }
-  svg.inschart { display: block; overflow: visible; }
+  svg.inschart { display: block; overflow: visible; touch-action: pan-y; }
   svg.inschart text { fill: var(--dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+  /* An area's fill is light so the line on its top edge, and the grid under
+     it, carry the reading; a little more in the dark, where it recedes. */
+  .insfill { fill-opacity: .22; }
+  :root[data-theme="dark"] .insfill { fill-opacity: .3; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .insfill { fill-opacity: .3; } }
   .inslegend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--dim); margin-top: 6px; }
   .inslegend b { color: var(--text); font-weight: 600; margin-left: 4px; }
   .insw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
-  .insdonut { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-  .insdonut svg { flex: none; }
-  .insdonut .insrows { flex: 1; min-width: 160px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
-  .insdonut .insrow { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
-  .insdonut .insrow span:last-child { font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .ihb { display: grid; grid-template-columns: minmax(64px, 34%) minmax(0, 1fr) auto; gap: 10px; align-items: center; font-size: 12.5px; padding: 4px 0; }
+  .insl { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 8px; vertical-align: 3px; }
+  .inslegw { overflow-x: auto; margin-top: 8px; }
+  .inslegt { width: 100%; max-width: 760px; border-collapse: collapse; font-size: 12.5px; }
+  .inslegt th { color: var(--dim); font-weight: 500; font-size: 11.5px; text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  .inslegt td { padding: 4px 8px; border-bottom: 1px solid var(--igrid); white-space: nowrap; }
+  .inslegt .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .inslegt tr[role="button"] { cursor: pointer; }
+  .inslegt tr[role="button"]:hover td { background: var(--panel2); }
+  .inslegt tr[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .inslegt tr.off td { opacity: .45; }
+  .inslegt tr.off .insl { background: var(--dim) !important; }
+  .inscomp { display: flex; gap: 2px; height: 14px; border-radius: 4px; overflow: hidden; margin: 4px 0 12px; background: var(--track); }
+  .inscomp i { display: block; min-width: 2px; }
+  .insrows { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+  .insrows .insrow { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
+  .insrows .insrow span:last-child { font-variant-numeric: tabular-nums; }
+  .insnote { margin-top: 10px; font-size: 12px; }
+  .instab { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+  .instab th { color: var(--dim); font-weight: 500; font-size: 11.5px; text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  .instab td { padding: 5px 8px; border-bottom: 1px solid var(--igrid); white-space: nowrap; }
+  .instab .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ihb { display: grid; grid-template-columns: minmax(64px, 34%) minmax(0, 1fr) auto; gap: 10px; align-items: center; font-size: 12.5px; padding: 5px 0; }
   .ihb .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ihb .t { height: 12px; background: var(--track); border-radius: 4px; overflow: hidden; }
-  .ihb .f { height: 100%; border-radius: 0 4px 4px 0; }
-  .ihb .v { font-variant-numeric: tabular-nums; }
+  .ihb .t { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .ihb .f { height: 100%; border-radius: 0 3px 3px 0; }
+  .ihb .v { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .insgrok { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; }
+  .insgrok .gstats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; align-content: start; }
+  .insgrok .gstat .l { color: var(--dim); font-size: 12px; }
+  .insgrok .gstat .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .insgrok .gspark { grid-column: 1 / -1; }
+  .insgrok .gplans { display: flex; flex-direction: column; gap: 10px; }
+  .insgrok .gplan { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 4px 12px; align-items: center; }
+  .insgrok .gwho { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; }
+  .insgrok .gwho .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .insgrok .gplan .meter { min-width: 0; }
+  .gmodels { margin-top: 12px; border-top: 1px solid var(--igrid); padding-top: 8px; }
   .instip { position: fixed; z-index: 50; pointer-events: none; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0,0,0,.25); min-width: 150px; }
   .instip .tt { font-weight: 600; margin-bottom: 4px; }
   .instip .insrow { display: flex; justify-content: space-between; gap: 14px; font-variant-numeric: tabular-nums; }
   .instip .insrow span:first-child { color: var(--dim); }
+  .instip .insrow.sum { border-top: 1px solid var(--line); margin-top: 3px; padding-top: 3px; font-weight: 600; }
   .instv { max-height: 320px; overflow: auto; }
+  @media (max-width: 1240px) {
+    .inskpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
   @media (max-width: 1080px) {
-    .insgrid.wide { grid-template-columns: 1fr; }
+    .insgrid.three, .insgrid.two, .insgrok { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .inskpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .inskpi .v { font-size: 20px; }
+    .inslegt .opt, .instab .opt { display: none; }
+    .insgrok .gstats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .insgrok .gplan { grid-template-columns: 1fr; }
   }
   @media (max-width: 1080px) {
     .arow { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -5031,7 +5165,7 @@ ${SHARED_HELPERS}
   var INS_SCOPES = [{ key: 'all', label: 'All' }, { key: 'local', label: 'This one' }];
   var INS_SCOPE_KEY = 'teamclaude-insights-scope';
   var INSIGHTS_REFRESH_MS = 60 * 1000;
-  var ins = { range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
+  var ins = { charts: [], hidden: Object.create(null), range: '30d', split: 'provider', scope: localStorage.getItem(INS_SCOPE_KEY) === 'local' ? 'local' : 'all', linked: 0, asked: '', data: null, error: null, missing: false, pending: false, at: 0, inFlight: false, tables: Object.create(null), chips: [], drawn: '' };
 
   // The scope the page draws: "all" needs this machine to have linked instances.
   function insightsScope() {
@@ -5168,7 +5302,7 @@ ${SHARED_HELPERS}
     insTip.textContent = '';
     insTip.appendChild(el('div', 'tt', title));
     rows.forEach(function (r) {
-      var row = el('div', 'insrow');
+      var row = el('div', 'insrow' + (r.strong ? ' sum' : ''));
       var l = el('span');
       if (r.color) { var sw = el('i', 'insw'); sw.style.background = r.color; l.appendChild(sw); }
       l.appendChild(el('span', '', r.label));
@@ -5187,143 +5321,223 @@ ${SHARED_HELPERS}
 
   function hideInsightsTip() { if (insTip) insTip.style.display = 'none'; }
 
-  function insightsLegend(host, series) {
+  // Every time panel shares one cursor, as Grafana's shared crosshair does:
+  // hovering (or tapping) a bucket on any of them marks that bucket on all
+  // of them, and the tooltip opens on the one under the pointer.
+  function insightsCursor(i) {
+    ins.charts.forEach(function (c) { c.mark(i); });
+  }
+
+  // The legend as a table, the way monitoring tools draw it: each series with
+  // its total, average, peak and latest bucket. A row hides or shows its
+  // series; the last one shown cannot be hidden.
+  function legendTable(host, series, fmt) {
+    var tbl = el('table', 'inslegt');
+    var hr = el('tr');
+    ['', 'Total', 'Avg', 'Peak', 'Now'].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' + (i === 2 || i === 4 ? ' opt' : '') : '', h)); });
+    tbl.appendChild(hr);
+    var shown = series.filter(function (sr) { return !ins.hidden[sr.key]; }).length;
+    series.forEach(function (sr) {
+      var off = !!ins.hidden[sr.key];
+      var st = seriesStats(sr.values);
+      var tr = el('tr', off ? 'off' : '');
+      var name = el('td', 'n');
+      var sw = el('i', 'insl');
+      sw.style.background = sr.color;
+      name.appendChild(sw);
+      name.appendChild(el('span', '', sr.label));
+      tr.appendChild(name);
+      [st.total, st.avg, st.max, st.last].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 1 || i === 3 ? ' opt' : ''), fmt(v))); });
+      if (series.length > 1) {
+        tr.tabIndex = 0;
+        tr.setAttribute('role', 'button');
+        tr.setAttribute('aria-pressed', off ? 'false' : 'true');
+        tr.title = off ? 'Show ' + sr.label : 'Hide ' + sr.label;
+        var toggle = function () {
+          if (!off && shown <= 1) return;
+          ins.hidden[sr.key] = !off;
+          renderInsights();
+        };
+        tr.addEventListener('click', toggle);
+        tr.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+      }
+      tbl.appendChild(tr);
+    });
+    var wrap = el('div', 'inslegw');
+    wrap.appendChild(tbl);
+    host.appendChild(wrap);
+  }
+
+  // A compact legend for a small panel: the series are the ones the table
+  // under "Tokens over time" names, in the same colours.
+  function insightsLegend(host, series, fmt) {
     var box = el('div', 'inslegend');
     series.forEach(function (sr) {
+      if (ins.hidden[sr.key]) return;
       var item = el('span');
-      var sw = el('i', 'insw');
+      var sw = el('i', 'insl');
       sw.style.background = sr.color;
       item.appendChild(sw);
       item.appendChild(el('span', '', sr.label));
-      if (sr.total != null) item.appendChild(el('b', '', fmtTokens(sr.total)));
+      item.appendChild(el('b', '', fmt(sr.total)));
       box.appendChild(item);
     });
     host.appendChild(box);
   }
 
-  // A bar with a 4px rounded end at its value and a square end on the axis.
-  function barPath(x, y, w, h) {
-    var r = Math.min(4, w / 2, h);
-    return 'M' + x + ',' + (y + h) + 'v' + (r - h) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + (-r)
-      + 'h' + (w - 2 * r) + 'a' + r + ',' + r + ' 0 0 1 ' + r + ',' + r + 'v' + (h - r) + 'z';
-  }
+  var INS_M = { l: 52, r: 10, t: 12, b: 22 };
 
-  function insightsAxis(s, W, H, m, top, fmt) {
-    var ph = H - m.t - m.b;
-    for (var g = 0; g <= 4; g++) {
-      var y = m.t + ph - ph * g / 4;
-      paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: y, y2: y, 'stroke-width': 1 }, s), null, g ? 'var(--igrid)' : 'var(--iaxis)');
-      svgEl('text', { x: m.l - 6, y: y + 4, 'text-anchor': 'end' }, s).textContent = fmt(top * g / 4);
-    }
-  }
-
-  function drawTimeline(host, d, series) {
-    var W = Math.max(280, host.clientWidth || 640);
-    var H = 240;
-    var m = { l: 48, r: 12, t: 10, b: 24 };
+  // One time panel. Every panel puts bucket i at the same x (the middle of
+  // its band), so the shared cursor lines up from one to the next.
+  //   type 'area'  stacked areas: a light fill under a 1.5px line per series
+  //   type 'bars'  stacked bars, square-ended, a 1px surface gap between them
+  //   type 'line'  one unstacked line that breaks where a bucket has no value
+  // o.top fixes the axis (a rate's 100%); o.count keeps it on whole steps;
+  // o.avg draws the series' average as a dashed reference line.
+  function drawTimeSeries(host, d, series, o) {
+    var W = Math.max(260, host.clientWidth || 600);
+    var H = o.height;
+    var m = INS_M;
     var pw = W - m.l - m.r;
     var ph = H - m.t - m.b;
     var n = d.buckets.length;
-    var cols = stackSeries(series, n);
+    var band = pw / Math.max(1, n);
+    var X = function (i) { return m.l + (i + 0.5) * band; };
+    var shown = series.filter(function (sr) { return !ins.hidden[sr.key]; });
+    if (!shown.length) shown = series;
+    var cols = o.type === 'line' ? null : stackSeries(shown, n);
     var max = 0;
-    cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
-    var top = niceCeil(max);
-    var X = function (i) { return m.l + (n === 1 ? pw / 2 : i * pw / (n - 1)); };
-    var Y = function (v) { return m.t + ph - v / top * ph; };
-    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Tokens over time' }, host);
-    insightsAxis(s, W, H, m, top, fmtTokens);
-    var want = Math.max(2, Math.min(n, Math.floor(pw / 70)));
-    var lastX = -1e9;
-    for (var t = 0; t < want; t++) {
-      var i = Math.round(t * (n - 1) / Math.max(1, want - 1));
-      var x = X(i);
-      if (x - lastX < 56) continue;
-      lastX = x;
-      var anchor = n === 1 ? 'middle' : i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle';
-      svgEl('text', { x: x, y: H - 6, 'text-anchor': anchor }, s).textContent = insightsBucketLabel(d.buckets[i], d.unit, false);
+    if (cols) cols.forEach(function (c) { if (c.length) max = Math.max(max, c[c.length - 1][1]); });
+    else shown.forEach(function (sr) { sr.values.forEach(function (v) { if (v != null && v > max) max = v; }); });
+    var top = o.top || (o.count ? 4 * niceStep(max / 4) : niceCeil(max));
+    var Y = function (v) { return m.t + ph - Math.min(v, top) / top * ph; };
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': o.name }, host);
+    // Four bands of grid: dashed and faint, with a solid baseline.
+    for (var g = 0; g <= 4; g++) {
+      var gy = m.t + ph - ph * g / 4;
+      var line = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: gy, y2: gy, 'stroke-width': 1 }, s), null, g ? 'var(--igrid)' : 'var(--iaxis)');
+      if (g) line.setAttribute('stroke-dasharray', '3 3');
+      svgEl('text', { x: m.l - 8, y: gy + 4, 'text-anchor': 'end' }, s).textContent = g ? o.fmt(top * g / 4) : '0';
     }
-    series.forEach(function (sr, si) {
-      if (n === 1) {
-        var lo = cols[0][si][0];
-        var hi = cols[0][si][1];
-        if (hi > lo) paint(svgEl('rect', { x: X(0) - 20, y: Y(hi), width: 40, height: Math.max(0, Y(lo) - Y(hi) - 1) }, s), sr.color);
-        return;
+    // Labels anchored on the latest bucket and stepped back from it, as far
+    // apart as the widest label needs.
+    var sample = insightsBucketLabel(d.buckets[n - 1], d.unit, false);
+    var step = Math.max(1, Math.ceil((sample.length * 6.5 + 18) / band));
+    for (var li = n - 1; li >= 0; li -= step) {
+      var lx = X(li);
+      var half = sample.length * 3.3;
+      if (lx - half < 2 || lx + half > W - 2) continue;
+      svgEl('text', { x: lx, y: H - 6, 'text-anchor': 'middle' }, s).textContent = insightsBucketLabel(d.buckets[li], d.unit, false);
+    }
+    if (o.type === 'bars') {
+      var gap = band >= 6 ? Math.min(6, band * 0.25) : 0;
+      var bw = Math.max(1, band - gap);
+      for (var bi = 0; bi < n; bi++) {
+        shown.forEach(function (sr, si) {
+          var lo = cols[bi][si][0];
+          var hi = cols[bi][si][1];
+          if (!(hi > lo)) return;
+          var y0 = Y(hi);
+          var h = Math.max(1, Y(lo) - y0 - (si ? 1 : 0));
+          paint(svgEl('rect', { x: m.l + bi * band + gap / 2, y: y0, width: bw, height: h }, s), sr.color);
+        });
       }
-      var up = '';
-      var down = '';
-      for (var i = 0; i < n; i++) {
-        up += (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(cols[i][si][1]).toFixed(1);
-        down = 'L' + X(i).toFixed(1) + ',' + Y(cols[i][si][0]).toFixed(1) + down;
-      }
-      // The panel-coloured stroke is the gap between layers, so neighbouring
-      // series never touch.
-      paint(svgEl('path', { d: up + down + 'Z', 'fill-opacity': 0.88, 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), sr.color, 'var(--panel)');
+    } else if (o.type === 'area') {
+      shown.forEach(function (sr, si) {
+        if (n === 1) {
+          var lo = cols[0][si][0];
+          var hi = cols[0][si][1];
+          if (hi > lo) paint(svgEl('rect', { x: X(0) - 16, y: Y(hi), width: 32, height: Math.max(1, Y(lo) - Y(hi)) }, s), sr.color);
+          return;
+        }
+        var up = '';
+        var down = '';
+        for (var i = 0; i < n; i++) {
+          up += (i ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(cols[i][si][1]).toFixed(1);
+          down = 'L' + X(i).toFixed(1) + ',' + Y(cols[i][si][0]).toFixed(1) + down;
+        }
+        paint(svgEl('path', { d: up + down + 'Z', class: 'insfill' }, s), sr.color);
+        paint(svgEl('path', { d: up, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, sr.color);
+      });
+    } else {
+      shown.forEach(function (sr) {
+        var dpath = '';
+        var pen = false;
+        sr.values.forEach(function (v, i) {
+          if (v == null) { pen = false; return; }
+          dpath += (pen ? 'L' : 'M') + X(i).toFixed(1) + ',' + Y(v).toFixed(1);
+          pen = true;
+        });
+        // A bucket with neighbours on neither side would be a path of one
+        // point, which draws nothing: give it a dot.
+        sr.values.forEach(function (v, i) {
+          if (v != null && sr.values[i - 1] == null && sr.values[i + 1] == null) paint(svgEl('circle', { cx: X(i), cy: Y(v), r: 2 }, s), sr.color);
+        });
+        paint(svgEl('path', { d: dpath, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, sr.color);
+      });
+    }
+    if (o.avg != null) {
+      var ay = Y(o.avg);
+      var avgLine = paint(svgEl('line', { x1: m.l, x2: W - m.r, y1: ay, y2: ay, 'stroke-width': 1, 'stroke-dasharray': '6 4' }, s), null, 'var(--dim)');
+      avgLine.style.opacity = '0.7';
+      svgEl('text', { x: W - m.r, y: ay - 4, 'text-anchor': 'end' }, s).textContent = 'avg ' + o.fmt(o.avg);
+    }
+    // The shared cursor: a hairline, and a dot where it crosses each line.
+    var cur = svgEl('g', { class: 'inscur' }, s);
+    cur.style.display = 'none';
+    paint(svgEl('line', { y1: m.t, y2: m.t + ph, 'stroke-width': 1 }, cur), null, 'var(--dim)');
+    var dots = o.type === 'bars' ? [] : shown.map(function (sr) {
+      var c = svgEl('circle', { r: 3, 'stroke-width': 2 }, cur);
+      paint(c, sr.color, 'var(--panel)');
+      return c;
     });
-    var cross = paint(svgEl('line', { y1: m.t, y2: m.t + ph, 'stroke-width': 1 }, s), null, 'var(--dim)');
-    cross.style.opacity = '0';
+    ins.charts.push({
+      mark: function (i) {
+        if (i == null || i >= n) { cur.style.display = 'none'; return; }
+        cur.style.display = '';
+        var x = X(i);
+        cur.firstChild.setAttribute('x1', x);
+        cur.firstChild.setAttribute('x2', x);
+        shown.forEach(function (sr, si) {
+          if (!dots[si]) return;
+          var v = cols ? cols[i][si][1] : sr.values[i];
+          dots[si].style.display = v == null ? 'none' : '';
+          if (v != null) { dots[si].setAttribute('cx', x); dots[si].setAttribute('cy', Y(v)); }
+        });
+      },
+    });
     var hit = svgEl('rect', { x: m.l, y: m.t, width: pw, height: ph, fill: 'transparent' }, s);
-    hit.addEventListener('mousemove', function (e) {
+    var at = function (e) {
       var box = s.getBoundingClientRect();
-      var i = n === 1 ? 0 : Math.max(0, Math.min(n - 1, Math.round((e.clientX - box.left - m.l) / pw * (n - 1))));
-      cross.setAttribute('x1', X(i));
-      cross.setAttribute('x2', X(i));
-      cross.style.opacity = '1';
-      var rows = series.map(function (sr) { return { label: sr.label, value: fmtTokens(sr.values[i] || 0), color: sr.color }; }).reverse();
-      if (series.length > 1) rows.push({ label: 'Total', value: fmtTokens(cols[i].length ? cols[i][cols[i].length - 1][1] : 0) });
+      return Math.max(0, Math.min(n - 1, Math.floor((e.clientX - box.left - m.l) / band)));
+    };
+    var move = function (e) {
+      var i = at(e);
+      insightsCursor(i);
+      var rows = o.tip ? o.tip(i) : shown.slice().reverse().map(function (sr) { return { label: sr.label, value: o.fmtTip(sr.values[i] || 0), color: sr.color }; });
+      if (!o.tip && shown.length > 1) rows.push({ label: 'Total', value: o.fmtTip(cols[i].length ? cols[i][cols[i].length - 1][1] : 0), strong: true });
       showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), rows);
-    });
-    hit.addEventListener('mouseleave', function () { cross.style.opacity = '0'; hideInsightsTip(); });
+    };
+    hit.addEventListener('pointermove', move);
+    hit.addEventListener('pointerdown', move);
+    hit.addEventListener('pointerleave', function () { insightsCursor(null); hideInsightsTip(); });
   }
 
-  // fmt prints a value on the axis and in the tooltip; counts by default.
-  function drawBars(host, d, values, color, name, fmt) {
-    var axisFmt = fmt || fmtTokens;
-    var tipFmt = fmt || function (v) { return v.toLocaleString(); };
-    var W = Math.max(260, host.clientWidth || 520);
-    var H = 200;
-    var m = { l: 44, r: 8, t: 10, b: 24 };
-    var pw = W - m.l - m.r;
-    var ph = H - m.t - m.b;
-    var n = values.length;
-    var peak = Math.max.apply(null, values.concat([0]));
-    // Dollars are not counted in ones, so their axis may land on $2.50.
-    var top = fmt ? niceCeil(peak) : 4 * niceStep(peak / 4);
-    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': name }, host);
-    insightsAxis(s, W, H, m, top, axisFmt);
-    var band = pw / n;
-    var gap = Math.max(1, Math.min(band * 0.25, 8));
-    var bw = Math.max(1, band - gap);
-    var every = Math.max(1, Math.ceil(n / Math.max(1, Math.floor(pw / 52))));
-    values.forEach(function (v, i) {
-      var x = m.l + i * band + gap / 2;
-      var h = v / top * ph;
-      if (h > 0) paint(svgEl('path', { d: barPath(x, m.t + ph - h, bw, h) }, s), color);
-      if (i % every === 0) svgEl('text', { x: x + bw / 2, y: H - 6, 'text-anchor': 'middle' }, s).textContent = insightsBucketLabel(d.buckets[i], d.unit, false);
-      var hit = svgEl('rect', { x: m.l + i * band, y: m.t, width: band, height: ph, fill: 'transparent' }, s);
-      hit.addEventListener('mousemove', function (e) { showInsightsTip(e, insightsBucketLabel(d.buckets[i], d.unit, true), [{ label: name, value: tipFmt(v), color: color }]); });
-      hit.addEventListener('mouseleave', hideInsightsTip);
-    });
-  }
-
-  function drawDonut(host, items, centerValue, centerLabel) {
+  // A part of a whole as one 100% bar, then a row per part with its share.
+  // Monitoring tools draw composition this way rather than as a pie: a slice
+  // of 1% is still a sliver you can find, and the numbers sit beside it.
+  function compositionBar(host, items, fmt) {
     var total = items.reduce(function (x, it) { return x + it.value; }, 0);
-    var wrap = el('div', 'insdonut');
-    host.appendChild(wrap);
-    var s = svgEl('svg', { class: 'inschart', width: 130, height: 130, viewBox: '0 0 150 150', role: 'img', 'aria-label': centerLabel }, wrap);
-    var share = function (v) { var p = total > 0 ? v / total * 100 : 0; return (p > 0 && p < 10 ? p.toFixed(1) : Math.round(p)) + '%'; };
-    donutArcs(items.map(function (it) { return it.value; }), 75, 74, 48).forEach(function (path, i) {
-      if (!path) return;
-      var it = items[i];
-      var p = paint(svgEl('path', { d: path, 'stroke-width': 2, 'stroke-linejoin': 'round' }, s), it.color, 'var(--panel)');
-      p.addEventListener('mousemove', function (e) { showInsightsTip(e, it.label, [{ label: 'Tokens', value: fmtTokens(it.value), color: it.color }, { label: 'Share', value: share(it.value) }]); });
-      p.addEventListener('mouseleave', hideInsightsTip);
+    var bar = el('div', 'inscomp');
+    items.forEach(function (it) {
+      if (!(it.value > 0)) return;
+      var seg = el('i');
+      seg.style.background = it.color;
+      seg.style.flexGrow = String(it.value);
+      seg.title = it.label;
+      bar.appendChild(seg);
     });
-    var v = svgEl('text', { x: 75, y: 78, 'text-anchor': 'middle' }, s);
-    v.textContent = centerValue;
-    v.style.fill = 'var(--text)';
-    v.style.fontSize = '18px';
-    v.style.fontWeight = '650';
-    svgEl('text', { x: 75, y: 95, 'text-anchor': 'middle' }, s).textContent = centerLabel;
+    host.appendChild(bar);
     var rows = el('div', 'insrows');
     items.forEach(function (it) {
       var row = el('div', 'insrow');
@@ -5334,12 +5548,18 @@ ${SHARED_HELPERS}
       l.appendChild(el('span', '', it.label));
       row.appendChild(l);
       var r = el('span');
-      r.appendChild(el('b', '', share(it.value)));
-      r.appendChild(el('span', 'hint', ' ' + fmtTokens(it.value)));
+      r.appendChild(el('b', '', total > 0 ? pctOf(it.value / total) : '—'));
+      r.appendChild(el('span', 'hint', ' ' + fmt(it.value)));
       row.appendChild(r);
       rows.appendChild(row);
     });
-    wrap.appendChild(rows);
+    host.appendChild(rows);
+  }
+
+  // A share as it reads at a glance: one decimal under 10%, whole above.
+  function pctOf(f) {
+    var p = f * 100;
+    return (p > 0 && p < 10 ? p.toFixed(1) : Math.round(p)) + '%';
   }
 
   function drawRanked(host, items) {
@@ -5356,22 +5576,28 @@ ${SHARED_HELPERS}
       track.appendChild(fill);
       row.appendChild(track);
       row.appendChild(el('span', 'v', it.text != null ? it.text : fmtTokens(it.value)));
-      row.addEventListener('mousemove', function (e) { showInsightsTip(e, it.label, it.tip); });
-      row.addEventListener('mouseleave', hideInsightsTip);
+      row.addEventListener('pointermove', function (e) { showInsightsTip(e, it.label, it.tip); });
+      row.addEventListener('pointerdown', function (e) { showInsightsTip(e, it.label, it.tip); });
+      row.addEventListener('pointerleave', hideInsightsTip);
       host.appendChild(row);
     });
   }
 
+  // A tile's sparkline, drawn at the width the tile has rather than
+  // stretched to it, with a dot on the latest bucket.
   function sparkline(parent, values, color) {
-    var W = 200;
-    var H = 28;
+    var W = Math.max(60, parent.clientWidth - 32 || 180);
+    var H = 26;
     var n = values.length;
-    var max = Math.max.apply(null, values.concat([0])) || 1;
-    var s = svgEl('svg', { class: 'inschart', width: '100%', height: H, viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', 'aria-hidden': 'true' }, parent);
+    var max = Math.max.apply(null, values.map(function (v) { return v || 0; }).concat([0])) || 1;
+    var s = svgEl('svg', { class: 'inschart', width: W, height: H, viewBox: '0 0 ' + W + ' ' + H, 'aria-hidden': 'true' }, parent);
+    var px = function (i) { return n === 1 ? W / 2 : 2 + i * (W - 4) / (n - 1); };
+    var py = function (v) { return H - 3 - (v || 0) / max * (H - 7); };
     var d = '';
-    values.forEach(function (v, i) { d += (i ? 'L' : 'M') + (i * W / (n - 1)).toFixed(1) + ',' + (H - 3 - v / max * (H - 6)).toFixed(1); });
-    paint(svgEl('path', { d: d + 'L' + W + ',' + H + 'L0,' + H + 'Z', 'fill-opacity': 0.14 }, s), color);
-    paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round', 'vector-effect': 'non-scaling-stroke' }, s), null, color);
+    values.forEach(function (v, i) { d += (i ? 'L' : 'M') + px(i).toFixed(1) + ',' + py(v).toFixed(1); });
+    paint(svgEl('path', { d: d + 'L' + px(n - 1).toFixed(1) + ',' + H + 'L' + px(0).toFixed(1) + ',' + H + 'Z', class: 'insfill' }, s), color);
+    paint(svgEl('path', { d: d, fill: 'none', 'stroke-width': 1.5, 'stroke-linejoin': 'round' }, s), null, color);
+    paint(svgEl('circle', { cx: px(n - 1), cy: py(values[n - 1]), r: 2.5 }, s), color);
   }
 
   // A chart card with a Table button: every chart can be read as numbers too,
@@ -5384,11 +5610,11 @@ ${SHARED_HELPERS}
     t.appendChild(el('b', '', title));
     t.appendChild(el('span', 's', sub));
     head.appendChild(t);
-    head.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
+    if (table) head.appendChild(button('btn', ins.tables[key] ? 'Chart' : 'Table', function () { ins.tables[key] = !ins.tables[key]; renderInsights(); }));
     card.appendChild(head);
     var body = el('div');
     card.appendChild(body);
-    if (!ins.tables[key]) { draw(body); return; }
+    if (!table || !ins.tables[key]) { draw(body); return card; }
     var spec = table();
     var wrap = el('div', 'instv');
     var tbl = el('table');
@@ -5402,19 +5628,24 @@ ${SHARED_HELPERS}
     });
     wrap.appendChild(tbl);
     body.appendChild(wrap);
+    return card;
   }
 
   // What the page was last drawn against: whether it could measure itself, and
-  // the accounts the tiles count. The status poll redraws when either changes,
+  // the accounts the panels name. The status poll redraws when either changes,
   // rather than on every poll, which would drop a tooltip being read.
   function insightsDrawnKey() {
     var body = document.getElementById('insBody');
     var accounts = (lastStatus && lastStatus.accounts) || [];
-    return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) { return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : ''); }).join('\\n');
+    return (body.clientWidth > 0 ? 'w' : '-') + '|' + accounts.map(function (a) {
+      var q = a.quota || {};
+      return accountGroup(a) + '/' + a.name + (a.disabled ? '!' : '') + (a.provider === 'grok' ? '@' + q.unified7d + '/' + q.unified7dReset : '');
+    }).join('\\n');
   }
 
   function renderInsights() {
     hideInsightsTip();
+    ins.charts = [];
     ins.drawn = insightsDrawnKey();
     var note = document.getElementById('insNote');
     var body = document.getElementById('insBody');
@@ -5432,25 +5663,31 @@ ${SHARED_HELPERS}
     var accounts = (lastStatus && lastStatus.accounts) || [];
     var when = function (b) { return insightsBucketLabel(b, d.unit, true); };
     var num = function (v) { return Math.round(v).toLocaleString(); };
+    var count = function (v) { return Math.round(v).toLocaleString(); };
     var rangeText = insightsRangeText(d.range);
     var perBucket = d.unit === 'hour' ? 'per hour' : 'per day';
     var tokensPer = d.buckets.map(function (_, i) { return d.kinds.cacheRead[i] + d.kinds.cacheWrite[i] + d.kinds.input[i] + d.kinds.output[i]; });
-
     var usd = function (v) { return v == null ? '—' : fmtUsd(v); };
+    var pct = function (v) { return v == null ? '—' : (v * 100).toFixed(1) + '%'; };
     var cost = d.cost || null;
     var fleet = d.scope === 'all';
+    var hits = cacheHitSeries(d.kinds);
+
     var tiles = el('div', 'inskpis');
-    insightsKpis(d, accounts).forEach(function (k) {
+    // On the page before the sparklines go in: they measure the tile.
+    body.appendChild(tiles);
+    insightsKpis(d).forEach(function (k) {
       var c = el('div', 'inskpi');
       c.appendChild(el('div', 'l', k.label));
       c.appendChild(el('div', 'v', k.value));
       c.appendChild(el('div', 'd', k.sub));
-      if (k.key === 'tokens' && tokensPer.length > 1) sparkline(c, tokensPer, 'var(--is1)');
-      if (k.key === 'cost' && cost && cost.values.length > 1) sparkline(c, cost.values, 'var(--is3)');
-      if (k.key === 'requests' && d.requests.length > 1) sparkline(c, d.requests, 'var(--is7)');
       tiles.appendChild(c);
+      if (tokensPer.length < 2) return;
+      if (k.key === 'tokens') sparkline(c, tokensPer, 'var(--is1)');
+      if (k.key === 'cost' && cost) sparkline(c, cost.values, 'var(--is7)');
+      if (k.key === 'requests') sparkline(c, d.requests, 'var(--is4)');
+      if (k.key === 'cache') sparkline(c, hits.map(function (h) { return h == null ? 0 : h; }), 'var(--ik-cacheRead)');
     });
-    body.appendChild(tiles);
     var missed = fleet ? fleetMissingText(d) : null;
     if (missed) body.appendChild(el('p', 'sub', missed));
     if (d.since == null) return;
@@ -5458,9 +5695,9 @@ ${SHARED_HELPERS}
     var splitKey = insightsSplit();
     var split = INS_SPLITS.filter(function (o) { return o.key === splitKey; })[0];
     var series = insightsSeries(d, splitKey, accounts);
-    insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text, function (host) {
-      drawTimeline(host, d, series);
-      insightsLegend(host, series);
+    insightsCard(body, 'timeline', 'Tokens over time', perBucket + ', stacked by ' + split.text + (series.length > 1 ? ' · click a row to hide it' : ''), function (host) {
+      drawTimeSeries(host, d, series, { type: 'area', height: 220, name: 'Tokens over time', fmt: fmtTokens, fmtTip: fmtTokens });
+      legendTable(host, series, fmtTokens);
     }, function () {
       return {
         cols: ['When'].concat(series.map(function (sr) { return sr.label; }), ['Total']),
@@ -5468,11 +5705,44 @@ ${SHARED_HELPERS}
       };
     });
 
+    // Requests, cost and the cache hit rate under it, on the same time axis.
+    // Requests and cost stack by the same split when they can; token types
+    // and machines have no requests or cost of their own, so those draw the
+    // total in one colour.
+    var three = el('div', 'insgrid three');
+    body.appendChild(three);
+    var reqSeries = insightsSeries(d, splitKey, accounts, 'requests');
+    if (!reqSeries.length) reqSeries = [{ key: 'requests', label: 'Requests', color: 'var(--is4)', values: d.requests, total: d.totals.requests }];
+    insightsCard(three, 'requests', 'Requests', perBucket + (reqSeries.length > 1 ? ', by ' + split.text : ''), function (host) {
+      drawTimeSeries(host, d, reqSeries, { type: 'bars', height: 150, name: 'Requests', count: true, fmt: fmtTokens, fmtTip: count });
+      if (reqSeries.length > 1) insightsLegend(host, reqSeries, count);
+    }, function () {
+      return { cols: ['When', 'Requests'], rows: d.buckets.map(function (b, i) { return [when(b), num(d.requests[i])]; }).reverse() };
+    });
+    if (cost) {
+      var costSeries = insightsSeries(d, splitKey, accounts, 'cost');
+      if (!costSeries.length) costSeries = [{ key: 'cost', label: 'Est. API cost', color: 'var(--is7)', values: cost.values, total: cost.total }];
+      insightsCard(three, 'cost', 'Estimated API cost', perBucket + ', at API list prices', function (host) {
+        drawTimeSeries(host, d, costSeries, { type: 'area', height: 150, name: 'Estimated API cost', fmt: fmtUsd, fmtTip: fmtUsd });
+        if (costSeries.length > 1) insightsLegend(host, costSeries, fmtUsd);
+      }, function () {
+        return { cols: ['When', 'Est. API cost'], rows: d.buckets.map(function (b, i) { return [when(b), fmtUsd(cost.values[i])]; }).reverse() };
+      });
+    }
+    var hitAll = cacheHitRate(d.totals);
+    insightsCard(three, 'cache', 'Cache hit rate', 'cache reads ÷ prompt tokens, ' + perBucket, function (host) {
+      drawTimeSeries(host, d, [{ key: 'hit', label: 'Cache hit rate', color: 'var(--ik-cacheRead)', values: hits.map(function (h) { return h == null ? null : h * 100; }), total: 0 }],
+        { type: 'line', height: 150, name: 'Cache hit rate', top: 100, avg: hitAll == null ? null : hitAll * 100, fmt: function (v) { return Math.round(v) + '%'; },
+          tip: function (i) { return [{ label: 'Hit rate', value: pct(hits[i]), color: 'var(--ik-cacheRead)' }, { label: 'Cache reads', value: fmtTokens(d.kinds.cacheRead[i]) }, { label: 'Prompt tokens', value: fmtTokens(d.kinds.input[i] + d.kinds.cacheRead[i] + d.kinds.cacheWrite[i]) }]; } });
+    }, function () {
+      return { cols: ['When', 'Hit rate', 'Cache reads', 'Prompt tokens'], rows: d.buckets.map(function (b, i) { return [when(b), pct(hits[i]), num(d.kinds.cacheRead[i]), num(d.kinds.input[i] + d.kinds.cacheRead[i] + d.kinds.cacheWrite[i])]; }).reverse() };
+    });
+
     // Every machine at once: what each one spent, across the page, since it
     // is what that view is for.
     if (fleet) {
       var machines = (d.instances || []).filter(function (m) { return m.state === 'ok'; });
-      insightsCard(body, 'machines', 'By machine', 'tokens and estimated API cost, ' + rangeText, function (host) {
+      insightsCard(body, 'machines', 'By machine', machines.length + ' of ' + (d.instances || []).length + ' counted · tokens and estimated API cost, ' + rangeText, function (host) {
         var colors = insightsSeries(d, 'instance', accounts);
         drawRanked(host, machines.map(function (m, i) {
           return { label: m.name + (m.self ? ' (this one)' : ''), value: m.tokens, text: fmtTokens(m.tokens) + ' · ' + usd(m.cost), color: colors[i] ? colors[i].color : 'var(--dim)',
@@ -5482,73 +5752,119 @@ ${SHARED_HELPERS}
         return { cols: ['Machine', 'Requests', 'Tokens', 'Est. API cost'], rows: machines.map(function (m) { return [m.name, num(m.requests), num(m.tokens), usd(m.cost)]; }) };
       });
     }
-    var grid = el('div', 'insgrid');
-    body.appendChild(grid);
-    var t = d.totals;
-    var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
-    var kinds = insightsSeries(d, 'kind', accounts).map(function (k) { return { label: k.label, value: k.total, color: k.color }; });
-    insightsCard(grid, 'mix', 'Token mix', 'what the tokens were', function (host) {
-      drawDonut(host, kinds, fmtTokens(tokens), 'tokens');
+
+    var two = el('div', 'insgrid two');
+    body.appendChild(two);
+    var provs = providerRows(d);
+    insightsCard(two, 'providers', 'Providers', 'share of tokens, ' + rangeText, function (host) {
+      compositionBar(host, provs.map(function (p) { return { label: p.label, value: p.tokens, color: p.color }; }), fmtTokens);
+      var tbl = el('table', 'instab');
+      var hr = el('tr');
+      // Accounts and the per-request cost give way first on a phone.
+      ['Provider', 'Accounts', 'Requests', 'Est. cost', 'Per request', 'Cache hit'].forEach(function (h, i) { hr.appendChild(el('th', i ? 'num' + (i === 1 || i === 4 ? ' opt' : '') : '', h)); });
+      tbl.appendChild(hr);
+      provs.forEach(function (p) {
+        var tr = el('tr');
+        var nm = el('td');
+        var sw = el('i', 'insw');
+        sw.style.background = p.color;
+        nm.appendChild(sw);
+        nm.appendChild(el('span', '', p.label));
+        tr.appendChild(nm);
+        [String(p.accounts), num(p.requests), usd(p.cost), usd(p.perRequest), pct(p.hit)].forEach(function (v, i) { tr.appendChild(el('td', 'num' + (i === 0 || i === 3 ? ' opt' : ''), v)); });
+        tbl.appendChild(tr);
+      });
+      var wrap = el('div', 'instv');
+      wrap.appendChild(tbl);
+      host.appendChild(wrap);
     }, function () {
+      return { cols: ['Provider', 'Tokens', 'Share', 'Input', 'Output', 'Cache read', 'Cache write'],
+        rows: provs.map(function (p) { return [p.label, num(p.tokens), pctOf(p.share), num(p.input), num(p.output), num(p.cacheRead), num(p.cacheWrite)]; }) };
+    });
+    var t = d.totals;
+    var kinds = insightsSeries(d, 'kind', accounts).map(function (k) { return { label: k.label, value: k.total, color: k.color }; });
+    insightsCard(two, 'mix', 'Token mix', 'what the ' + fmtTokens(t.input + t.output + t.cacheRead + t.cacheWrite) + ' tokens were', function (host) {
+      compositionBar(host, kinds, fmtTokens);
+      var ratio = el('p', 'hint insnote');
+      var prompt = t.input + t.cacheRead + t.cacheWrite;
+      ratio.textContent = prompt > 0 ? 'Output is ' + pctOf(t.output / prompt) + ' of prompt tokens; ' + pctOf((t.cacheRead) / prompt) + ' of the prompt came from the cache.' : '';
+      host.appendChild(ratio);
+    }, function () {
+      var tokens = t.input + t.output + t.cacheRead + t.cacheWrite;
       return { cols: ['Type', 'Tokens', 'Share'], rows: kinds.map(function (k) { return [k.label, num(k.value), tokens > 0 ? (k.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
     });
-    var provs = insightsSeries(d, 'provider', accounts).map(function (p) { return { label: p.label, value: p.total, color: p.color }; });
-    insightsCard(grid, 'providers', 'By provider', 'share of tokens', function (host) {
-      drawDonut(host, provs, String(provs.length), provs.length === 1 ? 'provider' : 'providers');
+
+    // Grok: what it spent in the range, its models, and each account's plan
+    // as the last quota reading left it. Shown whenever Grok is in the pool
+    // or in the history.
+    var grok = grokSummary(d, accounts);
+    if (grok) {
+      var gh = grok.history;
+      insightsCard(body, 'grok', 'Grok', 'usage ' + rangeText + ' · plans as last read on this machine', function (host) {
+        var wrap = el('div', 'insgrok');
+        var left = el('div', 'gstats');
+        [['Tokens', gh ? fmtTokens(gh.tokens) : '0'], ['Requests', gh ? num(gh.requests) : '0'], ['Est. API cost', gh ? usd(gh.cost) : '$0'], ['Cache hit', gh ? pct(gh.hit) : '—']].forEach(function (kv) {
+          var st = el('div', 'gstat');
+          st.appendChild(el('div', 'l', kv[0]));
+          st.appendChild(el('div', 'v', kv[1]));
+          left.appendChild(st);
+        });
+        var spark = el('div', 'gspark');
+        left.appendChild(spark);
+        wrap.appendChild(left);
+        var right = el('div', 'gplans');
+        if (!grok.accounts.length) right.appendChild(el('p', 'hint', 'No Grok account on this machine; the usage here is from the history.'));
+        grok.accounts.forEach(function (a) {
+          var row = el('div', 'gplan');
+          var who = el('div', 'gwho');
+          who.appendChild(el('span', 'name', a.name));
+          if (a.plan) who.appendChild(el('span', 'badge plan', a.plan));
+          if (a.disabled) who.appendChild(el('span', 'badge', 'disabled'));
+          row.appendChild(who);
+          if (a.meters.length) a.meters.forEach(function (mt) { row.appendChild(meterEl(mt)); });
+          else row.appendChild(el('p', 'hint', a.text || 'quota unknown'));
+          right.appendChild(row);
+        });
+        wrap.appendChild(right);
+        host.appendChild(wrap);
+        if (grok.values.length > 1 && gh) sparkline(spark, grok.values, 'var(--ip-grok)');
+        if (grok.models.length) {
+          var mlist = el('div', 'gmodels');
+          drawRanked(mlist, grok.models.map(function (mo) {
+            return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-grok)',
+              tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Cache hit', value: pct(cacheHitRate(mo)) }] };
+          }));
+          host.appendChild(mlist);
+        }
+      }, function () {
+        return { cols: ['Model', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
+          rows: grok.models.map(function (mo) { return [mo.label, num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)]; }) };
+      });
+    }
+
+    var lists = el('div', 'insgrid two');
+    body.appendChild(lists);
+    var models = topModels(d.models, 8);
+    var allTokens = t.input + t.output + t.cacheRead + t.cacheWrite;
+    insightsCard(lists, 'models', 'Models', 'tokens and estimated API cost, ' + rangeText + (cost && cost.unpricedTokens > 0 ? ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced' : ''), function (host) {
+      drawRanked(host, models.map(function (mo) {
+        return { label: mo.label, value: mo.tokens, text: fmtTokens(mo.tokens) + ' · ' + usd(mo.cost), color: 'var(--ip-' + providerTone(mo.provider) + ')',
+          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) },
+            { label: 'Cache hit', value: pct(cacheHitRate(mo)) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
+      }));
     }, function () {
-      return { cols: ['Provider', 'Tokens', 'Share'], rows: provs.map(function (p) { return [p.label, num(p.value), tokens > 0 ? (p.value / tokens * 100).toFixed(1) + '%' : '—']; }) };
+      return { cols: ['Model', 'Provider', 'Requests', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
+        rows: topModels(d.models, 1000).map(function (mo) {
+          return [mo.label, groupLabel(mo.provider), num(mo.requests), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)];
+        }) };
     });
-    insightsCard(grid, 'accounts', 'By account', 'tokens, ' + rangeText, function (host) {
+    insightsCard(lists, 'accounts', 'Accounts', 'tokens and share of the range', function (host) {
       drawRanked(host, d.accounts.map(function (a) {
-        return { label: a.account, value: a.tokens, color: 'var(--ip-' + providerTone(a.provider) + ')',
+        return { label: a.account, value: a.tokens, text: fmtTokens(a.tokens) + ' · ' + (allTokens > 0 ? pctOf(a.tokens / allTokens) : '—'), color: 'var(--ip-' + providerTone(a.provider) + ')',
           tip: [{ label: 'Tokens', value: fmtTokens(a.tokens) }, { label: 'Requests', value: num(a.requests) }, { label: 'Est. API cost', value: usd(a.cost) }, { label: 'Provider', value: groupLabel(a.provider) }] };
       }));
     }, function () {
       return { cols: ['Account', 'Provider', 'Requests', 'Tokens', 'Est. API cost'], rows: d.accounts.map(function (a) { return [a.account, groupLabel(a.provider), num(a.requests), num(a.tokens), usd(a.cost)]; }) };
-    });
-
-    var wide = el('div', 'insgrid wide');
-    body.appendChild(wide);
-    insightsCard(wide, 'requests', 'Requests', perBucket, function (host) {
-      drawBars(host, d, d.requests, 'var(--is1)', 'Requests');
-    }, function () {
-      return { cols: ['When', 'Requests'], rows: d.buckets.map(function (b, i) { return [when(b), num(d.requests[i])]; }).reverse() };
-    });
-    var models = topModels(d.models, 6);
-    insightsCard(wide, 'models', 'Top models', 'tokens, ' + rangeText, function (host) {
-      drawRanked(host, models.map(function (mo) {
-        return { label: mo.label, value: mo.tokens, color: 'var(--ip-' + providerTone(mo.provider) + ')',
-          tip: [{ label: 'Tokens', value: fmtTokens(mo.tokens) }, { label: 'Requests', value: num(mo.requests) }, { label: 'Est. API cost', value: usd(mo.cost) }, { label: 'Provider', value: groupLabel(mo.provider) }] };
-      }));
-    }, function () {
-      return { cols: ['Model', 'Provider', 'Requests', 'Tokens'], rows: topModels(d.models, 1000).map(function (mo) { return [mo.label, groupLabel(mo.provider), num(mo.requests), num(mo.tokens)]; }) };
-    });
-
-    // What the same tokens would have cost on an API key: per bucket, and by
-    // model, the dearest first. The table shows the token kinds behind each
-    // figure, since cache reads are most of the tokens and least of the cost.
-    if (!cost) return;
-    var costWide = el('div', 'insgrid wide');
-    body.appendChild(costWide);
-    insightsCard(costWide, 'cost', 'Estimated API cost', perBucket + ', at API list prices', function (host) {
-      drawBars(host, d, cost.values, 'var(--is3)', 'Est. API cost', fmtUsd);
-    }, function () {
-      return { cols: ['When', 'Est. API cost'], rows: d.buckets.map(function (b, i) { return [when(b), fmtUsd(cost.values[i])]; }).reverse() };
-    });
-    var byCost = topModels(d.models, 1000).filter(function (mo) { return mo.cost != null; })
-      .sort(function (x, y) { return y.cost - x.cost; });
-    insightsCard(costWide, 'costModels', 'Cost by model', fmtUsd(cost.total) + ', ' + rangeText + (cost.unpricedTokens > 0 ? ' · ' + fmtTokens(cost.unpricedTokens) + ' tokens unpriced' : ''), function (host) {
-      if (!byCost.length) { host.appendChild(el('p', 'hint', 'No priced models in this range.')); return; }
-      drawRanked(host, byCost.slice(0, 6).map(function (mo) {
-        return { label: mo.label, value: mo.cost, text: fmtUsd(mo.cost), color: 'var(--ip-' + providerTone(mo.provider) + ')',
-          tip: [{ label: 'Est. API cost', value: fmtUsd(mo.cost) }, { label: 'Input', value: fmtTokens(mo.input) }, { label: 'Output', value: fmtTokens(mo.output) },
-            { label: 'Cache read', value: fmtTokens(mo.cacheRead) }, { label: 'Cache write', value: fmtTokens(mo.cacheWrite) }] };
-      }));
-    }, function () {
-      return { cols: ['Model', 'Provider', 'Input', 'Output', 'Cache read', 'Cache write', 'Est. API cost'],
-        rows: topModels(d.models, 1000).sort(function (x, y) { return (y.cost || 0) - (x.cost || 0); }).map(function (mo) {
-          return [mo.label, groupLabel(mo.provider), num(mo.input), num(mo.output), num(mo.cacheRead), num(mo.cacheWrite), mo.cost == null ? 'not priced' : fmtUsd(mo.cost)];
-        }) };
     });
   }
 

@@ -261,3 +261,25 @@ test('the cost of the period before is priced the same way', () => {
   assert.equal(d.cost.previous, 1);
   assert.equal(h.insights('all').cost.previous, null);
 });
+
+test('each provider and account carries its requests, cost and token kinds per bucket', () => {
+  const c = clock();
+  const h = new UsageHistory({ now: c.now });
+  h.record({ provider: 'anthropic', account: 'a', model: 'claude-opus-5-5', usage: usage() });
+  c.add(-24 * HOUR);
+  h.record({ provider: 'anthropic', account: 'a', model: 'claude-opus-5-5', usage: usage() });
+  h.record({ provider: 'grok', account: 'g', model: 'mystery-model', usage: usage() });
+  c.add(24 * HOUR);
+  const ins = h.insights('7d');
+  const claude = ins.providers.find(p => p.provider === 'anthropic');
+  assert.deepEqual(claude?.requestValues.slice(-2), [1, 1]);
+  assert.equal(claude?.requests, 2);
+  assert.equal(claude?.cacheRead, 600);
+  assert.ok((claude?.costValues.at(-1) ?? 0) > 0, 'a priced model has a cost in its bucket');
+  assert.equal(claude?.costValues.reduce((x, y) => x + y, 0), claude?.cost);
+  // An unpriced model counts its requests and costs nothing.
+  const grok = ins.accounts.find(a => a.account === 'g');
+  assert.deepEqual(grok?.requestValues.slice(-2), [1, 0]);
+  assert.deepEqual(grok?.costValues.slice(-2), [0, 0]);
+  assert.equal(grok?.output, 20);
+});

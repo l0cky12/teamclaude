@@ -500,10 +500,18 @@ The Clients page has a table per client key and, with `proxy.usageDimensions` co
 
 The Insights page is graphs of what the accounts have done. A **Range** control picks the last 24 hours, 7, 30 or 90 days, or **All** (everything recorded), and every chart on the page follows it:
 
-- Five tiles: tokens, the [estimated API cost](#estimated-api-cost) and requests in the range, each compared with the period just before it (*▲ 15% vs the previous 30 days*); the accounts configured now and how many are enabled (or, for all machines, how many machines were counted); and the share of the range's tokens that were cache reads.
-- **Tokens over time**, per hour for 24 hours and per day otherwise, stacked by provider, by account or by token type (**Split by**). Hovering shows each series at that point and the total.
-- **Token mix** (cache read, cache write, input, output) and **By provider** as donuts, **By account** and **Top models** as ranked bars, and **Requests** per hour or day.
-- **Estimated API cost** per hour or day, and **Cost by model**, the most expensive first.
+The page is laid out like a monitoring dashboard (Grafana, Zabbix): a row of stat tiles, then charts that share one time axis.
+
+- Six tiles, each with a sparkline where it has one:
+  - tokens, the [estimated API cost](#estimated-api-cost) and requests in the range, each compared with the period just before it (*▲ 15% vs the previous 30 days*)
+  - the **cache hit rate**: cache reads as a share of prompt tokens (input, cache reads and cache writes; output is never cached), against the period before in percentage points
+  - **per request**: the estimated cost, tokens and output tokens of an average request
+  - the **busiest** hour or day, and how many times the average one it was
+- **Tokens over time**, per hour for 24 hours and per day otherwise, stacked by provider, by account or by token type (**Split by**). Each series is a line over a light fill. Under it, the legend is a table of each series' total, average, peak and **Now** (the hour or day still in progress). Click a row to hide or show that series.
+- **Requests** (bars) and **Estimated API cost** per hour or day, stacked by the same split when it is by provider or account, and the **Cache hit rate** per hour or day on a 0–100% axis with its average as a dashed line. Hovering any of these charts, or **Tokens over time**, marks the same hour or day on all four.
+- **Providers**: each provider's share of tokens as one bar, and a table of its accounts, requests, estimated cost, cost per request and cache hit rate. **Token mix**: cache read, cache write, input and output as one bar.
+- **Grok**, when a Grok account is configured or Grok has history: its tokens, requests, estimated cost and cache hit rate for the range, its tokens over time, its models, and each Grok account's plan (**Monthly limit** or **7-day limit**, what is left, and when it resets). The plan is the last reading this machine took, so it is only as fresh as the last **Refresh quota**; the page never asks Grok for it.
+- **Models** and **Accounts** as ranked bars, with each model's estimated cost and each account's share of the range.
 - With all machines shown: **By machine** as ranked bars, and **Machine** under **Split by**.
 
 Every chart has a **Table** button that shows the same numbers as a table. Tokens include cache reads and writes, which are most of a Claude Code request, so the totals are much larger than the input and output counts on the Logs page. A request here is a response that reported usage. Third-party backends are one provider, named for the backend when there is only one. In the account split, each account keeps the same colour for every range; accounts past the eighth, and accounts no longer configured, are grouped as **Other**. Models are grouped by name, so dated releases of one model count together.
@@ -532,9 +540,9 @@ The history is kept by the proxy from the first request this version serves. It 
 - `totals` and `previous` are `{ requests, input, output, cacheRead, cacheWrite }` for the range and for the period before it. `previous` is `null` when the history does not cover that period, and always for `all`.
 - `requests` and each list in `kinds` (`cacheRead`, `cacheWrite`, `input`, `output`) have one number per bucket.
 - `cost` is `{ total, values, previous, unpricedTokens }`: the estimated API cost in US dollars for the range, per bucket, and for the period before (`null` when `previous` is). `unpricedTokens` counts the tokens no figure includes.
-- `providers` (`{ provider, tokens, cost, values }`), `accounts` (`{ provider, account, tokens, requests, cost, values }`) and `models` (`{ provider, model, tokens, requests, input, output, cacheRead, cacheWrite, cost }`) are sorted by tokens, most first, and `values` has one number per bucket. A model's `cost` is `null` when it has no known price.
+- `providers` (`{ provider, tokens, cost, requests, input, output, cacheRead, cacheWrite, values, requestValues, costValues }`), `accounts` (the same, plus `account`) and `models` (`{ provider, model, tokens, requests, input, output, cacheRead, cacheWrite, cost }`) are sorted by tokens, most first. `values`, `requestValues` and `costValues` have one number per bucket: tokens, requests and estimated cost. A model's `cost` is `null` when it has no known price.
 
-Add `&scope=all` for every linked machine at once. The reply has the same fields, summed, plus `scope: "all"` and `instances`: one `{ name, self, state, error?, since, tokens, requests, cost, unpricedTokens, values }` per machine, this one first. `state` is `ok`, `unreachable`, `refused`, `outdated` or `error`, and only `ok` machines are in the sums. Each linked machine is asked for its own history only (no `scope`), in parallel, with 8 seconds to answer. With `scope=all`, a client key gets a 403, as it does for every route that reaches linked instances.
+Add `&scope=all` for every linked machine at once. The reply has the same fields, summed, plus `scope: "all"`, `splitDetail` and `instances`. `splitDetail` is `false` when a machine counted runs a version from before `requestValues` and `costValues`; the page then draws requests and cost as one total. `instances` is one `{ name, self, state, error?, since, tokens, requests, cost, unpricedTokens, values }` per machine, this one first. `state` is `ok`, `unreachable`, `refused`, `outdated` or `error`, and only `ok` machines are in the sums. Each linked machine is asked for its own history only (no `scope`), in parallel, with 8 seconds to answer. With `scope=all`, a client key gets a 403, as it does for every route that reaches linked instances.
 
 A `provider` is `anthropic`, `codex`, or `backend:<host>` for an API key on a third-party backend. It has the same gate as `/teamclaude/status`, so a client key may read it. Accounts are named by their configured name, never an email or a token.
 
