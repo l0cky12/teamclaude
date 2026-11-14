@@ -385,3 +385,19 @@ test('a fleet sum prices only the requests a machine could price', () => {
   // This machine priced 2 of the model's requests; the peer, too old to, sent 8.
   assert.deepEqual(pricedRequests([{ provider: 'grok', model: 'x', requests: 10, cost: 1, pricedRequests: 2 }]), { all: 2, grok: 2 });
 });
+
+test('a reply from the previous version, read on its own, takes provider counts from its models', () => {
+  const old = {
+    ...detailed,
+    providers: detailed.providers.map(p => ({ provider: p.provider, tokens: p.tokens, cost: p.cost, values: p.values })),
+    models: [
+      { provider: 'grok', model: 'grok-4.7', tokens: 300, requests: 1, input: 5, output: 5, cacheRead: 250, cacheWrite: 40, cost: 0.5 },
+      { provider: 'anthropic', model: 'claude-opus-5-5', tokens: 700, requests: 2, input: 5, output: 15, cacheRead: 650, cacheWrite: 30, cost: 3 },
+    ],
+  };
+  const rows = providerRows(old);
+  assert.deepEqual(rows.map(r => [r.label, r.requests, r.cacheRead]), [['Claude', 2, 650], ['Grok', 1, 250]]);
+  assert.equal(rows[1].hit, 250 / 295);
+  const g = /** @type {any} */ (grokSummary(old, []));
+  assert.equal(g.history.requests, 1);
+});

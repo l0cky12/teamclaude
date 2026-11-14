@@ -2477,13 +2477,25 @@ export function providerRows(data) {
   var by = {};
   var total = 0;
   var d = data || {};
+  // A machine on the previous version (read on its own, "This one") sends a
+  // provider's tokens and cost only. Its models carry the requests and token
+  // kinds, as mergeInsights uses for the fleet sum.
+  /** @type {Record<string, Record<string, number>>} */
+  var fromModels = {};
+  (d.models || []).forEach(function (/** @type {any} */ m) {
+    var t = fromModels[m.provider] || (fromModels[m.provider] = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    Object.keys(t).forEach(function (k) { t[k] += Number(m[k]) || 0; });
+  });
   (d.providers || []).forEach(function (/** @type {any} */ p) {
     var tone = providerTone(p.provider);
+    var counts = typeof p.requests === 'number' ? p : (fromModels[p.provider] || {});
     var r = by[tone];
     if (!r) r = by[tone] = { key: tone, label: groupLabel(p.provider), color: 'var(--ip-' + tone + ')', members: 0, accounts: 0, tokens: 0, cost: 0, requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     r.members++;
     if (tone === 'backend' && r.members > 1) r.label = 'Backends';
-    ['tokens', 'cost', 'requests', 'input', 'output', 'cacheRead', 'cacheWrite'].forEach(function (k) { r[k] += Number(p[k]) || 0; });
+    r.tokens += Number(p.tokens) || 0;
+    r.cost += Number(p.cost) || 0;
+    ['requests', 'input', 'output', 'cacheRead', 'cacheWrite'].forEach(function (k) { r[k] += Number(counts[k]) || 0; });
     total += Number(p.tokens) || 0;
   });
   (d.accounts || []).forEach(function (/** @type {any} */ a) {
