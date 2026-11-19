@@ -3163,7 +3163,7 @@ const PAGE = `<!doctype html>
       color-scheme: light;
       --bg: #f6f5f2; --side: #efede9; --panel: #ffffff; --panel2: #f3f1ed; --line: #e2dfd9; --line2: #d3cfc8; --track: #ebe8e3;
       --text: #1b1a18; --dim: #5f5a53; --faint: #6e6962; --accent: #0a62c9; --accent-bg: rgba(10,98,201,.10);
-      --ok: #14895e; --warn: #a86f00; --bad: #cf3b33;
+      --ok: #0f7a52; --warn: #8a5c00; --bad: #b8302a;
       --claude: #b8572f; --codex: #0b7d5f; --grok: #1f6f86; --backend: #7a52cc;
       --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-grok: #3aa3bd; --ip-backend: #6250d6;
       --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
@@ -3175,7 +3175,7 @@ const PAGE = `<!doctype html>
     color-scheme: light;
     --bg: #f6f5f2; --side: #efede9; --panel: #ffffff; --panel2: #f3f1ed; --line: #e2dfd9; --line2: #d3cfc8; --track: #ebe8e3;
     --text: #1b1a18; --dim: #5f5a53; --faint: #6e6962; --accent: #0a62c9; --accent-bg: rgba(10,98,201,.10);
-    --ok: #14895e; --warn: #a86f00; --bad: #cf3b33;
+    --ok: #0f7a52; --warn: #8a5c00; --bad: #b8302a;
     --claude: #b8572f; --codex: #0b7d5f; --grok: #1f6f86; --backend: #7a52cc;
     --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-grok: #3aa3bd; --ip-backend: #6250d6;
     --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
