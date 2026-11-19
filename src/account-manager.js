@@ -26,6 +26,7 @@ import { envVar } from './brand.js';
 import { EventLog } from './event-log.js';
 import { heldCreditExpiries, CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { UsageHistory } from './usage-history.js';
+import { RequestTraffic } from './request-traffic.js';
 import { accountCredit, emptyCreditState, recordCreditUsage, rollCreditCycle, creditView, exportCreditState, restoreCreditState } from './api-credit.js';
 /** @typedef {import('./session-tracker.js').Observation} Observation */
 
@@ -868,6 +869,7 @@ export class AccountManager {
     // What the dashboard's Insights page reads (usage-history.js), booked in
     // recordTokenUsage. One per manager for the same reason as the log.
     this.usageHistory = usageHistory ?? new UsageHistory();
+    this.traffic = new RequestTraffic();
     // The Codex reset-credit expiries already announced in the log, per account,
     // so each credit is said to be expiring once rather than on every read.
     /** @type {WeakMap<object, Set<number>>} */
