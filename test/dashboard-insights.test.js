@@ -23,7 +23,7 @@ test('the page ships every Insights helper it is tested against', () => {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   assert.ok(html.includes('id="page-insights"'), 'the page section');
-  assert.ok(html.includes("{ key: 'insights', label: 'Insights', section: 'Overview' }"), 'the sidebar entry');
+  assert.ok(html.includes("{ key: 'insights', label: 'Insights', section: 'Overview'"), 'the sidebar entry');
 });
 
 test('token counts read at a glance', () => {
