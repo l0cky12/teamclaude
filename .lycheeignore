@@ -1,0 +1,3 @@
+# Example API base URLs in the docs. They are not pages, and they answer
+# 401 to a request without a key, which fails the docs link check.
+^https://api\.deepseek\.com/anthropic$
