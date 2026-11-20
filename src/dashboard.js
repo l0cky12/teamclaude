@@ -2027,6 +2027,65 @@ export function poolSummary(accounts, slot, fable, now) {
   return out;
 }
 
+// The tiles follow the rows' column order (accountMeters slots): Fable
+// weekly, five-hour, weekly for Claude; Codex and Grok put the weekly first.
+// Claude and Codex always get a five-hour tile, unknown until a reading
+// states one, so missing session capacity never reads as full.
+/** @param {any[]} members @param {string} group @param {string} [fable] @param {number} [now] */
+export function quotaTiles(members, group, fable, now) {
+  var order = group === 'codex' || group === 'grok' ? [2, 1] : [0, 1, 2];
+  var session = group === 'anthropic' || group === 'codex';
+  /** @type {Array<ReturnType<typeof poolSummary> & { slot: number, label: string, tone: string }>} */
+  var tiles = [];
+  order.forEach(function (slot) {
+    var p = poolSummary(members, slot, fable, now);
+    if (!p.label && !(session && slot === 1)) return;
+    var tone = p.count ? meterTone(1 - p.left / p.count) : 'unknown';
+    tiles.push(Object.assign({}, p, { slot: slot, label: p.label || '5-hour limit', tone: tone }));
+  });
+  return tiles;
+}
+
+// An account is back only once every spent window has reset, so its time is
+// the latest known reset among them; one with no known reset is left out
+// rather than guessed at.
+/** @param {any[]} accounts @param {number} [now] */
+export function quotaHeadline(accounts, now) {
+  var at = now == null ? Date.now() : now;
+  var list = accounts || [];
+  var enabled = list.filter(function (a) { return a && !a.disabled; });
+  /** @type {{ name: string, room: boolean }[]} */
+  var strip = [];
+  /** @type {Record<string, number>} */
+  var groupRoom = {};
+  /** @type {number|null} */
+  var next = null;
+  enabled.forEach(function (a) {
+    var g = accountGroup(a);
+    if (!(g in groupRoom)) groupRoom[g] = 0;
+    var spent = accountMeters(a, undefined, at).slots.filter(function (m) { return exhaustedMeter(m, at); });
+    strip.push({ name: a.name, room: !spent.length });
+    if (!spent.length) { groupRoom[g]++; return; }
+    var resets = spent.map(function (m) { return m.resetAt; }).filter(function (r) { return typeof r === 'number' && r > at; });
+    if (!resets.length) return;
+    var back = Math.max.apply(null, resets);
+    if (next == null || back < next) next = back;
+  });
+  var room = strip.filter(function (x) { return x.room; }).length;
+  var disabled = list.length - enabled.length;
+  var dry = Object.keys(groupRoom).filter(function (g) { return !groupRoom[g]; }).map(groupLabel);
+  var tone = !enabled.length || !room ? 'bad' : dry.length ? 'warn' : 'ok';
+  var parts = [];
+  if (!enabled.length) parts.push(disabled ? 'Every account is disabled' : 'No accounts yet');
+  else {
+    parts.push(room + ' of ' + enabled.length + ' with room');
+    if (room && dry.length) parts.push('none on ' + dry.join(', '));
+    if (next != null) parts.push('next reset in ' + fmtUntil((next - at) / 1000));
+    if (disabled) parts.push(disabled + ' disabled');
+  }
+  return { room: room, total: enabled.length, nextReset: next, tone: tone, text: parts.join(' · '), strip: strip };
+}
+
 // Which tab an account is listed under: Claude, Codex, or one tab per
 // third-party backend host (status.accounts[].backend), so a DeepSeek key does
 // not sit among the Claude logins it shares a provider with.
@@ -3529,7 +3588,7 @@ const SHARED_HELPERS = [
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome, creditText,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
-  meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
+  meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, quotaTiles, quotaHeadline, accountGroup, groupLabel, providerTabs,
   servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, resolveMaxUsage, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   accountStatusText, accountInState, accountFilter, accountCard,
   mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
@@ -3640,23 +3699,9 @@ const PAGE = `<!doctype html>
   .tab:hover { color: var(--text); }
   .tab.sel { color: var(--text); border-color: var(--accent); background: var(--accent-bg); }
   .sechead h2 { display: flex; align-items: center; gap: 8px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 540px), 1fr)); gap: 12px; margin-bottom: 8px; }
-  .summary-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-  .scard { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
-  .scard .k { display: flex; justify-content: space-between; gap: 8px; font-weight: 600; margin-bottom: 8px; }
-  .scard .k span + span { color: var(--dim); font-weight: 400; font-size: 12px; }
-  .pool + .pool { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-  .pool .pl { font-size: 12px; color: var(--dim); }
-  .pool .v { font-family: var(--mono); font-size: 24px; font-weight: 600; letter-spacing: -.02em; line-height: 1.25; margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
-  .pool .v small { font-family: var(--sans); font-size: 13px; color: var(--dim); font-weight: 400; letter-spacing: 0; }
-  .pool.small .v { font-size: 16px; }
-  .seg { display: flex; gap: 3px; height: 8px; }
-  .seg span { flex: 1; background: var(--track); border-radius: 3px; overflow: hidden; }
-  .seg i, .bar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
-  .seg i.warn, .bar i.warn { background: var(--warn); }
-  .seg i.bad, .bar i.bad { background: var(--bad); }
-  .scard .r { font-size: 12px; color: var(--dim); margin-top: 8px; }
-  .scard .drain { font-size: 12px; color: var(--accent); margin-top: 8px; }
+  .bar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+  .bar i.warn { background: var(--warn); }
+  .bar i.bad { background: var(--bad); }
   .more { font-size: 12px; background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; }
   .sechead { display: flex; align-items: center; gap: 10px; margin: 22px 0 8px; }
   .sechead h2 { margin: 0; }
@@ -3684,6 +3729,75 @@ const PAGE = `<!doctype html>
   .rowx { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; }
   .rowx .more { align-self: flex-start; }
   .xmeters { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 220px)); gap: 8px 20px; margin-top: 4px; }
+  /* The Quota page draws its own header. Hiding the shared one here, not in
+     showPage, keeps the page's restyle out of code every page shares. */
+  .wrap:has(> #page-quota:not([style*="none"])) > #pageTop { display: none; }
+  .qhead { margin-top: 4px; }
+  .qtitle { font-size: 34px; line-height: 1.1; font-weight: 750; letter-spacing: -.035em; }
+  .qsub { margin-top: 12px; padding-left: 12px; border-left: 3px solid var(--ok); font: 13.5px/1.5 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+  .qsub.tone-warn { border-left-color: var(--warn); }
+  .qsub.tone-bad { border-left-color: var(--bad); }
+  .qstrip { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 14px; }
+  .qstrip i { width: 8px; height: 20px; border-radius: 2px; background: var(--track); }
+  .qstrip i.ok { background: var(--ok); }
+  .qmeta { margin-top: 12px; font: 12.5px/1.5 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
+  #page-quota .plist { margin-top: 16px; }
+  .qbar { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 8px 16px; margin: 22px 0 18px; border-bottom: 1px solid var(--line); }
+  #page-quota .tabs { margin: 0; gap: 4px; }
+  #page-quota .tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; margin-bottom: -1px; padding: 10px 12px 11px; font-size: 13.5px; font-weight: 600; }
+  #page-quota .tab.sel { color: var(--text); border-bottom-color: var(--text); }
+  #page-quota .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 6px; }
+  .qvis { display: flex; align-items: center; gap: 10px; padding-bottom: 8px; }
+  .qvis .hint { margin-left: 0; font-family: var(--mono); }
+  .qtiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); gap: 16px; }
+  .qtile { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 16px 20px; min-width: 0; }
+  .qtop { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .qtop .n { font: 11.5px var(--mono); color: var(--dim); white-space: nowrap; }
+  .qtick { width: 30px; height: 3px; border-radius: 2px; background: var(--line2); }
+  .qtick.ok { background: var(--ok); }
+  .qtick.warn { background: var(--warn); }
+  .qtick.bad { background: var(--bad); }
+  .qtile .nm { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; }
+  .qtile .nm .lb { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .qbadge { flex: none; font: 600 11px/1 var(--sans); padding: 4px 8px; border-radius: 999px; }
+  .qbadge.claude { color: var(--claude); background: color-mix(in srgb, var(--ip-claude) 22%, transparent); }
+  .qbadge.codex { color: var(--codex); background: color-mix(in srgb, var(--ip-codex) 22%, transparent); }
+  .qbadge.grok { color: var(--grok); background: color-mix(in srgb, var(--ip-grok) 22%, transparent); }
+  .qbadge.backend { color: var(--backend); background: color-mix(in srgb, var(--ip-backend) 22%, transparent); }
+  .qtile .v { font: 600 28px/1.2 var(--mono); letter-spacing: -.03em; margin-top: 8px; }
+  .qtile .v small { font-size: 13px; color: var(--dim); letter-spacing: 0; font-weight: 400; }
+  .qseg { display: flex; gap: 2px; height: 4px; margin-top: 12px; }
+  .qseg span { flex: 1; background: var(--track); border-radius: 2px; overflow: hidden; }
+  .qseg i { display: block; height: 100%; background: var(--ok); }
+  .qseg i.warn { background: var(--warn); }
+  .qseg i.bad { background: var(--bad); }
+  .qtile .nt { font-size: 12.5px; color: var(--dim); margin-top: 10px; overflow-wrap: anywhere; }
+  .qtile .nt + .nt { margin-top: 4px; }
+  .qtile .nt.who { font: 12px var(--mono); color: var(--faint); }
+  .qtile .nt.drain { color: var(--accent); }
+  #page-quota .sechead { margin: 30px 0 12px; gap: 10px; flex-wrap: wrap; }
+  #page-quota .sechead h2 { font-size: 19px; font-weight: 700; letter-spacing: -.02em; text-transform: none; color: var(--text); }
+  #page-quota .sechead .tag { font-family: var(--mono); }
+  #page-quota .rows { border: 1px solid var(--line); border-radius: 16px; }
+  #page-quota .arow { padding: 16px 20px; gap: 10px 24px; }
+  #page-quota .who .name { font-size: 14px; }
+  #page-quota .who .usage, #page-quota .rowx .usage, #page-quota .rowx .blocked { font-family: var(--mono); }
+  #page-quota .meter .mt b { font: 600 12.5px var(--mono); }
+  #page-quota .meter .mt b.ok { color: var(--text); }
+  #page-quota .bar { height: 4px; border-radius: 2px; margin: 8px 0 6px; }
+  #page-quota .bar i { border-radius: 2px; }
+  #page-quota .meter .rs { font-family: var(--mono); color: var(--faint); }
+  #page-quota .meter.none { opacity: .4; }
+  #page-quota .ctl .btn { border-radius: 10px; padding: 6px 12px; font-weight: 600; }
+  @media (max-width: 560px) {
+    .qtitle { font-size: 30px; }
+    #page-quota .tabs { flex-wrap: nowrap; overflow-x: auto; gap: 0; min-width: 0; max-width: 100%; }
+    #page-quota .tab { flex: none; gap: 6px; padding: 10px 5px 11px; font-size: 13px; }
+    #page-quota .arow { grid-template-columns: minmax(0, 1fr); padding: 14px 16px; }
+    #page-quota .meter.none { display: none; }
+    .qtile { padding: 14px 16px; }
+    .qtile .v { font-size: 24px; }
+  }
   .empty { color: var(--dim); padding: 18px 16px; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 16px; margin-bottom: 10px; }
   .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -4249,10 +4363,18 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-quota" style="display:none">
-      <div id="tabs" class="tabs"></div>
+      <div class="qhead">
+        <h1 class="qtitle">Quota</h1>
+        <p id="qSub" class="qsub"></p>
+        <div id="qStrip" class="qstrip" role="img"></div>
+        <p id="qMeta" class="qmeta"></p>
+      </div>
       <div id="resetAlerts" class="plist"></div>
-      <div id="summaryCards" class="cards"></div>
-      <div id="quotaVisibility" class="filters"></div>
+      <div class="qbar">
+        <div id="tabs" class="tabs"></div>
+        <div id="quotaVisibility" class="qvis"></div>
+      </div>
+      <div id="summaryCards" class="qtiles"></div>
       <div id="accounts"></div>
     </section>
 
@@ -4711,80 +4833,60 @@ ${SHARED_HELPERS}
     return members.some(function (a) { return a.name === name; }) ? name : null;
   }
 
-  function poolBlock(p, small) {
-    var box = el('div', small ? 'pool small' : 'pool');
-    box.appendChild(el('div', 'pl', p.label));
-    var v = el('div', 'v');
-    v.appendChild(el('span', '', p.count ? pctText(p.left) : '?'));
-    v.appendChild(el('small', '', p.count ? ' of ' + (p.count * 100) + '% left' : ' no reading yet'));
-    box.appendChild(v);
-    var seg = el('div', 'seg');
-    p.segments.forEach(function (sg) {
-      var cell = el('span');
-      cell.title = sg.name + ': ' + pctText(sg.left) + ' left';
-      var fill = el('i', sg.tone === 'warn' || sg.tone === 'bad' ? sg.tone : '');
-      fill.style.width = (sg.left * 100) + '%';
-      cell.appendChild(fill);
-      seg.appendChild(cell);
-    });
-    box.appendChild(seg);
-    var line = p.soonest ? 'soonest reset: ' + p.soonest.name + ' · ' + resetText(p.soonest.resetAt).replace('resets ', '') : '';
-    if (p.unknown) line += (line ? ' · ' : '') + p.unknown + ' without a reading';
-    if (line) box.appendChild(el('div', 'r', line));
-    return box;
+  // A null tile stands for a group with no reading in any column.
+  function quotaTileEl(group, count, t, extra) {
+    var tile = el('div', 'qtile');
+    var top = el('div', 'qtop');
+    top.appendChild(el('div', 'qtick' + (t && t.tone !== 'unknown' ? ' ' + t.tone : '')));
+    top.appendChild(el('span', 'n', count + (count === 1 ? ' account' : ' accounts')));
+    tile.appendChild(top);
+    var nm = el('div', 'nm');
+    nm.appendChild(el('span', 'qbadge ' + providerTone(group), groupLabel(group)));
+    nm.appendChild(el('span', 'lb', t ? t.label : 'Quota'));
+    tile.appendChild(nm);
+    if (!t) {
+      tile.appendChild(el('div', 'nt', 'no quota reading yet'));
+    } else {
+      var v = el('div', 'v');
+      v.appendChild(el('span', '', t.count ? pctText(t.left) : '?'));
+      v.appendChild(el('small', '', t.count ? ' of ' + (t.count * 100) + '% left' : ' no reading yet'));
+      tile.appendChild(v);
+      var seg = el('div', 'qseg');
+      t.segments.forEach(function (sg) {
+        var cell = el('span');
+        cell.title = sg.name + ': ' + pctText(sg.left) + ' left';
+        var fill = el('i', sg.tone === 'warn' || sg.tone === 'bad' ? sg.tone : '');
+        fill.style.width = (sg.left * 100) + '%';
+        cell.appendChild(fill);
+        seg.appendChild(cell);
+      });
+      if (!t.segments.length) seg.appendChild(el('span'));
+      tile.appendChild(seg);
+      if (t.soonest) {
+        tile.appendChild(el('div', 'nt', 'soonest reset ' + resetText(t.soonest.resetAt).replace('resets ', '')));
+        tile.appendChild(el('div', 'nt who', t.soonest.name));
+      }
+      if (t.unknown) tile.appendChild(el('div', 'nt', t.unknown + ' without a reading'));
+    }
+    extra.forEach(function (x) { tile.appendChild(el('div', 'nt ' + x.cls, x.text)); });
+    return tile;
   }
 
-  // A provider's summary card: its headline column pooled across its accounts
-  // (Fable weekly for Claude, the weekly limit for Codex), and the rest behind
-  // Show, the way the rows put the less used buckets behind theirs. The
-  // adjacent session card uses the same display for just the five-hour pool.
-  function summaryCard(s, group, members, fable, session) {
-    var card = el('div', 'scard');
-    var head = el('div', 'k');
-    var title = el('span', '', groupLabel(group));
-    title.insertBefore(el('span', 'pdot ' + providerTone(group)), title.firstChild);
-    title.style.display = 'flex';
-    title.style.alignItems = 'center';
-    title.style.gap = '8px';
-    head.appendChild(title);
-    head.appendChild(el('span', '', members.length + (members.length === 1 ? ' account' : ' accounts')));
-    card.appendChild(head);
-    var order = session ? [1] : (group === 'codex' || group === 'grok' ? [2, 1] : [0, 1, 2]);
-    var pools = order.map(function (i) { return poolSummary(members, i, fable); }).filter(function (p) { return p.label; });
-    if (!pools.length) {
-      if (session) card.appendChild(poolBlock({ label: '5-hour limit', count: 0, segments: [] }, false));
-      else card.appendChild(el('div', 'r', 'no quota reading yet'));
-    } else {
-      card.appendChild(poolBlock(pools[0], false));
-      var rest = pools.slice(1);
-      if (rest.length) {
-        var k = 'card:' + group;
-        var open = !!expanded[k];
-        var line = el('div', 'r');
-        line.appendChild(el('span', '', rest.map(function (p) { return p.label + ' ' + (p.count ? pctText(p.left) + ' left' : '?'); }).join(' · ') + '  '));
-        line.appendChild(button('more', open ? 'Hide' : 'Show', function () {
-          expanded[k] = !open;
-          if (lastStatus) render(lastStatus);
-        }));
-        card.appendChild(line);
-        if (open) rest.forEach(function (p) { card.appendChild(poolBlock(p, true)); });
-      }
-    }
-    // The free resets the Codex accounts hold between them: what could be
-    // spent to clear a spent limit rather than wait it out.
-    var resets = !session && group === 'codex' ? codexResetsSummary(members) : null;
-    if (resets) card.appendChild(el('div', 'r', 'Resets left: ' + resets.left + ' across ' + resets.accounts + (resets.accounts === 1 ? ' account' : ' accounts')));
-    // Drain mode's queue, when the server reports one: the account being spent
-    // first and when it resets, so "why this account" reads off the card.
+  // The free Codex resets could clear a spent limit rather than wait it out,
+  // and the drain queue's head answers "why this account" from the tile.
+  function groupExtras(s, group, members, fable) {
+    var out = [];
+    var resets = group === 'codex' ? codexResetsSummary(members) : null;
+    if (resets) out.push({ cls: 'resets', text: 'Resets left: ' + resets.left + ' across ' + resets.accounts + (resets.accounts === 1 ? ' account' : ' accounts') });
     var provider = group === 'codex' || group === 'grok' ? group : 'anthropic';
-    var queue = !session && s.drainQueue && s.drainQueue[provider];
+    var queue = s.drainQueue && s.drainQueue[provider];
     var head0 = queue && queue.length ? members.filter(function (a) { return a.name === queue[0]; })[0] : null;
     if (head0) {
       var weekly = accountMeters(head0, fable).slots[2];
       var when = weekly ? resetText(weekly.resetAt) : '';
-      card.appendChild(el('div', 'drain', 'Draining: ' + head0.name + (when ? ' · ' + when : '')));
+      out.push({ cls: 'drain', text: 'Draining: ' + head0.name + (when ? ' · ' + when : '') });
     }
-    return card;
+    return out;
   }
 
   // Dismissed reset-credit alerts, by event key (resetCreditAlerts). Kept in
@@ -4811,8 +4913,27 @@ ${SHARED_HELPERS}
     });
   }
 
+  // The shared header is hidden on this page, so its summary line is carried
+  // over to keep that reading. render() fills it before it calls renderQuota.
+  function renderQuotaHead(accounts) {
+    var head = quotaHeadline(accounts, Date.now());
+    var sub = document.getElementById('qSub');
+    sub.textContent = head.text;
+    sub.className = 'qsub tone-' + head.tone;
+    var strip = document.getElementById('qStrip');
+    strip.textContent = '';
+    strip.setAttribute('aria-label', head.room + ' of ' + head.total + ' accounts with room');
+    head.strip.forEach(function (x) {
+      var block = el('i', x.room ? 'ok' : '');
+      block.title = x.name + (x.room ? ': has room' : ': a limit is spent');
+      strip.appendChild(block);
+    });
+    document.getElementById('qMeta').textContent = document.getElementById('summary').textContent;
+  }
+
   function renderQuota(s) {
     var accounts = s.accounts || [];
+    renderQuotaHead(accounts);
     var tabs = providerTabs(accounts);
     if (!tabs.some(function (t) { return t.key === currentTab; })) currentTab = 'all';
     var tabBox = document.getElementById('tabs');
@@ -4822,6 +4943,7 @@ ${SHARED_HELPERS}
         currentTab = t.key;
         if (lastStatus) render(lastStatus);
       });
+      b.setAttribute('aria-pressed', String(t.key === currentTab));
       if (t.key !== 'all') b.insertBefore(el('span', 'pdot ' + providerTone(t.key)), b.firstChild);
       b.appendChild(el('span', 'count', String(t.count)));
       tabBox.appendChild(b);
@@ -4856,12 +4978,10 @@ ${SHARED_HELPERS}
       var members = [];
       accounts.forEach(function (a, i) { if (accountGroup(a) === g) members.push({ a: a, i: i }); });
       var list = members.map(function (m) { return m.a; });
-      if (g === 'anthropic' || g === 'codex') {
-        var pair = el('div', 'summary-pair');
-        pair.appendChild(summaryCard(s, g, list, fable));
-        pair.appendChild(summaryCard(s, g, list, fable, true));
-        cards.appendChild(pair);
-      } else cards.appendChild(summaryCard(s, g, list, fable));
+      var tiles = quotaTiles(list, g, fable);
+      var extra = groupExtras(s, g, list, fable);
+      if (!tiles.length) cards.appendChild(quotaTileEl(g, list.length, null, extra));
+      tiles.forEach(function (t, i) { cards.appendChild(quotaTileEl(g, list.length, t, i ? [] : extra)); });
       var head = el('div', 'sechead');
       head.appendChild(groupHeading(g, groupLabel(g)));
       var visible = members.filter(function (m) { return showAllAccounts || !accountQuotaExhausted(m.a, at); });
