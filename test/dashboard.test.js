@@ -18,7 +18,7 @@ import {
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   overviewHeadline, overviewTiles, trafficScale, requestStrip,
   ACCOUNT_STATES, accountStatusText, accountFilter, accountCard,
-  LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
+  LOG_KINDS, mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
@@ -280,10 +280,90 @@ test('log filters combine kind, provider and account', () => {
   assert.deepEqual(filterLogEvents(events, { kind: 'usage', account: 'b' }).map(e => e.id), [3]);
 });
 
-test('a log row\'s details say what a request carried, or the reason code', () => {
-  assert.equal(logEventDetail({ model: 'claude-fable-5-1', status: 200, inputTokens: 1500, outputTokens: 7, ms: 1234 }),
-    'Fable 5.1 \u00b7 200 \u00b7 1.5k in / 7 out \u00b7 1.2s');
-  assert.equal(logEventDetail({ reason: 'refresh_rejected' }), 'refresh_rejected');
+test('log filters add the search and Errors only to kind, provider and account', () => {
+  const events = [
+    { id: 1, kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', status: 200, message: 'POST /v1/messages' },
+    { id: 2, kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', status: 529, message: 'POST /v1/messages' },
+    { id: 3, kind: 'auth', type: 'signed_out', provider: 'codex', account: 'home', message: 'Signed out' },
+    { id: 4, kind: 'usage', type: 'request', provider: 'codex', account: 'home', status: 200, message: 'POST /v1/responses' },
+  ];
+  assert.deepEqual(filterLogEvents(events, { errors: true }).map(e => e.id), [2, 3]);
+  assert.deepEqual(filterLogEvents(events, { errors: true, kind: 'usage' }).map(e => e.id), [2]);
+  assert.deepEqual(filterLogEvents(events, { query: 'home' }).map(e => e.id), [3, 4]);
+  assert.deepEqual(filterLogEvents(events, { query: 'home', errors: true }).map(e => e.id), [3]);
+  assert.deepEqual(filterLogEvents(events, { query: '  ' }).map(e => e.id), [1, 2, 3, 4], 'a blank search keeps everything');
+});
+
+test('Errors only keeps failed requests and the events that lost a sign-in, an account or the pool', () => {
+  const failed = [
+    ['usage', 'request', 400], ['usage', 'request', 401], ['usage', 'request', 429], ['usage', 'request', 500], ['usage', 'request', 529],
+    ['usage', 'request', null], ['usage', 'request', undefined],
+    ['signin', 'signin_failed'], ['signin', 'signin_timeout'],
+    ['auth', 'credential_rejected'], ['auth', 'signed_out'],
+    ['rotation', 'exhausted'], ['rotation', 'hold'],
+  ];
+  const fine = [
+    ['usage', 'request', 200], ['usage', 'request', 201], ['usage', 'request', 304],
+    ['signin', 'signin_started'], ['signin', 'signin_succeeded'], ['signin', 'signin_cancelled'], ['signin', 'credentials_updated'],
+    ['rotation', 'switch'], ['rotation', 'rate_limited'],
+    ['control', 'switch'], ['control', 'threshold'], ['control', 'account_added'], ['control', 'account_removed'],
+    ['control', 'enabled'], ['control', 'disabled'], ['control', 'priority'],
+    ['credits', 'credit_granted'], ['credits', 'credit_expiring'],
+  ];
+  for (const [kind, type, status] of failed) assert.equal(logEventFailed({ kind, type, status }), true, `${kind}/${type}/${status} is a failure`);
+  for (const [kind, type, status] of fine) assert.equal(logEventFailed({ kind, type, status }), false, `${kind}/${type}/${status} is not a failure`);
+});
+
+test('a request\'s status chip says the code, green for 2xx, amber for 4xx, red for 5xx and for none', () => {
+  assert.deepEqual(logStatusChip(200), { text: '200', tone: 'ok' });
+  assert.deepEqual(logStatusChip(204), { text: '204', tone: 'ok' });
+  assert.deepEqual(logStatusChip(400), { text: '400', tone: 'warn' });
+  assert.deepEqual(logStatusChip(429), { text: '429', tone: 'warn' });
+  assert.deepEqual(logStatusChip(500), { text: '500', tone: 'bad' });
+  assert.deepEqual(logStatusChip(529), { text: '529', tone: 'bad' });
+  assert.deepEqual(logStatusChip(null), { text: 'none', tone: 'bad' });
+  assert.deepEqual(logStatusChip(undefined), { text: 'none', tone: 'bad' });
+  assert.deepEqual(logStatusChip(304), { text: '304', tone: '' });
+});
+
+test('the log search needs every word somewhere in what the row shows, ignoring case', () => {
+  const e = { message: 'POST /v1/messages', account: 'Work', model: 'claude-fable-5-1', client: 'laptop', agent: 'claude-cli/2.1.3', reason: null, status: 529 };
+  for (const q of ['work', 'WORK', '/v1/messages', 'fable 5.1', 'claude-fable', 'laptop', 'claude-cli', '529', 'work 529', '']) {
+    assert.equal(logSearchMatch(e, q), true, `matches "${q}"`);
+  }
+  for (const q of ['home', 'work home', '200', 'codex']) assert.equal(logSearchMatch(e, q), false, `does not match "${q}"`);
+  assert.equal(logSearchMatch({ message: 'Signed out', reason: 'refresh_rejected' }, 'refresh'), true, 'the reason code');
+  assert.equal(logSearchMatch({ message: 'x', prompt: 'secret words' }, 'secret'), false, 'the prompt is not searched');
+});
+
+test('a log row\'s time is its local date and time to the second', () => {
+  assert.equal(logTime(new Date(2026, 0, 5, 9, 3, 7).toISOString()), '2026-01-05 09:03:07');
+  assert.equal(logTime(new Date(2026, 10, 19, 16, 48, 26).toISOString()), '2026-11-19 16:48:26');
+  assert.equal(logTime('not a time'), '');
+});
+
+test('a log row puts a request\'s status, latency, model and tokens in columns, and another event\'s reason by its message', () => {
+  const at = new Date(2026, 10, 19, 16, 48, 26).toISOString();
+  assert.deepEqual(logRow({
+    at, kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', model: 'claude-fable-5-1', status: 529,
+    inputTokens: 1500, outputTokens: 7, ms: 1234, client: 'laptop', agent: 'claude-cli/2.1.3', message: 'POST /v1/messages', prompt: 'hello',
+  }), {
+    when: '2026-11-19 16:48:26', kind: 'Usage', provider: 'Claude', status: { text: '529', tone: 'bad' }, ms: '1.2s',
+    account: 'work', model: 'Fable 5.1', client: 'laptop \u00b7 claude-cli/2.1.3', tokens: '1.5k / 7', message: 'POST /v1/messages',
+    reason: '', prompt: 'hello', failed: true, tone: 'bad',
+  });
+  const out = logRow({ at, kind: 'auth', type: 'signed_out', provider: 'codex', account: 'home', message: 'Signed out', reason: 'refresh_rejected' });
+  assert.equal(out.status, null, 'no status chip off a request');
+  assert.equal(out.reason, 'refresh_rejected');
+  assert.equal(out.kind, 'Auth');
+  assert.equal(out.failed, true);
+  assert.equal(out.ms, '');
+  assert.equal(out.tokens, '');
+  assert.equal(logRow({ kind: 'usage', type: 'request', status: 200, ms: 850 }).ms, '850ms');
+  assert.equal(logRow({ kind: 'usage', type: 'request', status: 200 }).failed, false);
+});
+
+test('a log row\'s message is toned by what the event did', () => {
   assert.equal(logEventTone({ type: 'signed_out' }), 'bad');
   assert.equal(logEventTone({ type: 'rate_limited' }), 'warn');
   assert.equal(logEventTone({ type: 'request', status: 529 }), 'bad');
@@ -1168,7 +1248,7 @@ test('the page ships the same helper implementations it is tested against', () =
   // (closes over module scope), the page would silently ReferenceError.
   const html = renderDashboardHtml();
   for (const fn of [scopedWeeklyRows, accountTokens, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted, switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor, callerCan, callerNotice, cardNoteKey, cardNoteFor, canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
-    meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventDetail, logEventTone,
+    meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs, mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventTone,
     providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
     peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
@@ -1854,11 +1934,11 @@ test('the Logs page fetches the event log only while it is open, and from where 
     ],
   }) });
   await new Promise(r => setImmediate(r));
-  assert.equal(page.byId('logCount').textContent, '2 of 2 events');
+  assert.equal(page.byId('logCount').textContent, '2 events loaded, 2 shown');
   // Narrowing to one kind is a re-render, not a re-fetch.
   page.click('Sign-in');
   assert.equal(page.requests.length, 0);
-  assert.equal(page.byId('logCount').textContent, '1 of 2 events');
+  assert.equal(page.byId('logCount').textContent, '2 events loaded, 1 shown');
   // The next status poll brings the log along, asking only for what is newer.
   page.click('Logs');
   assert.equal(page.requests.shift().url, '/teamclaude/logs?after=2');
@@ -1882,7 +1962,82 @@ test('the Logs page reads a restarted server\'s log again from its start', async
   again.resolve({ status: 200, ok: true, json: async () => ({ generation: 'new', lastId: 3, capacity: 2000, events: [ev(1, 'new one'), ev(2, 'new two'), ev(3, 'new three')] }) });
   await new Promise(r => setImmediate(r));
   // Only the new log's three: the old process's two are gone.
-  assert.equal(page.byId('logCount').textContent, '3 of 3 events');
+  assert.equal(page.byId('logCount').textContent, '3 events loaded, 3 shown');
+});
+
+const LOG_EVENTS = () => {
+  const at = new Date().toISOString();
+  return [
+    { id: 1, at, kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
+    { id: 2, at, kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 529 },
+    { id: 3, at, kind: 'usage', type: 'request', provider: 'codex', account: 'home', message: 'POST /v1/responses', status: null },
+    { id: 4, at, kind: 'signin', type: 'signin_failed', provider: 'codex', account: 'home', message: 'Sign-in failed (dashboard): HTTP 400' },
+    { id: 5, at, kind: 'control', type: 'switch', provider: 'anthropic', account: 'work', message: 'Switched to this account' },
+  ];
+};
+
+async function openLogs() {
+  const page = bootPage();
+  await page.answer(200, { accounts: [] });
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=0', 200, { generation: 'g', lastId: 5, events: LOG_EVENTS() });
+  return page;
+}
+
+test('the Logs search and Errors only narrow the table, and stay through the next poll', async () => {
+  const page = await openLogs();
+  assert.equal(page.byId('logCount').textContent, '5 events loaded, 5 shown');
+  assert.match(page.byId('logLive').textContent, /^Live · last read /);
+  const search = page.byId('logSearch');
+  search.value = 'home';
+  search.fire('input');
+  assert.equal(page.byId('logCount').textContent, '5 events loaded, 2 shown');
+  page.byId('logErrors').fire('click');
+  assert.equal(page.byId('logErrors').className, 'chip sel');
+  assert.equal(page.byId('logCount').textContent, '5 events loaded, 2 shown', 'both of home\'s rows failed');
+  search.value = '';
+  search.fire('input');
+  assert.equal(page.byId('logCount').textContent, '5 events loaded, 3 shown', 'the 529, the request with no status and the failed sign-in');
+  assert.equal(page.requests.length, 0, 'narrowing is a re-render, not a re-fetch');
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=5', 200, { generation: 'g', lastId: 6, events: [
+    { id: 6, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
+  ] });
+  assert.equal(page.byId('logCount').textContent, '6 events loaded, 3 shown', 'Errors only still on after the poll');
+  page.byId('logErrors').fire('click');
+  assert.equal(page.byId('logErrors').className, 'chip');
+  assert.equal(page.byId('logCount').textContent, '6 events loaded, 6 shown');
+});
+
+test('a paused Logs page keeps reading but leaves the table as it was until Resume', async () => {
+  const page = await openLogs();
+  page.byId('logPause').fire('click');
+  assert.equal(page.byId('logPause').textContent, 'Resume');
+  assert.match(page.byId('logLive').textContent, /^Paused · last read /);
+  page.click('Logs');
+  const built = page.built.length;
+  await page.answerTo('/teamclaude/logs?after=5', 200, { generation: 'g', lastId: 7, events: [
+    { id: 6, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
+    { id: 7, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
+  ] });
+  assert.equal(page.built.length, built, 'no row drawn while paused');
+  assert.equal(page.byId('logCount').textContent, '7 events loaded, 5 shown');
+  assert.match(page.byId('logLive').textContent, /^Paused · 2 new waiting · last read /);
+  page.click('Logs');
+  assert.equal(page.requests.shift().url, '/teamclaude/logs?after=7', 'polling went on from the newest event read');
+  page.byId('logPause').fire('click');
+  assert.equal(page.byId('logPause').textContent, 'Pause');
+  assert.equal(page.byId('logCount').textContent, '7 events loaded, 7 shown');
+  assert.match(page.byId('logLive').textContent, /^Live · /);
+});
+
+test('a log read that fails says so in the Logs footer', async () => {
+  const page = await openLogs();
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=5', 500, {});
+  assert.match(page.byId('logLive').textContent, /^Live · cannot read the log: status 500 · last read /);
+  assert.equal(page.byId('logLive').className, 'err');
+  assert.equal(page.byId('logCount').textContent, '5 events loaded, 5 shown', 'what was read stays');
 });
 
 test('a provider tab narrows the quota page to that provider\'s accounts', async () => {

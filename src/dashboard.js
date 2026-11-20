@@ -2382,31 +2382,75 @@ export function mergeLogEvents(held, page, cap) {
   return { generation: gen || h.generation, events: merged.length > max ? merged.slice(merged.length - max) : merged, refetch: false };
 }
 
-/** @param {any[]} events @param {{ kind?: string, provider?: string, account?: string }} filters */
+/** @param {any[]} events @param {{ kind?: string, provider?: string, account?: string, query?: string, errors?: boolean }} filters */
 export function filterLogEvents(events, filters) {
   var f = filters || {};
   return (events || []).filter(function (e) {
     if (f.kind && f.kind !== 'all' && e.kind !== f.kind) return false;
     if (f.provider && e.provider !== f.provider) return false;
     if (f.account && e.account !== f.account) return false;
-    return true;
+    if (f.errors && !logEventFailed(e)) return false;
+    return logSearchMatch(e, f.query || '');
   });
 }
 
-// The Details column of a log row: what a request carried — model, status,
-// tokens, latency — or, for any other event, its reason code.
 /** @param {any} event */
-export function logEventDetail(event) {
+export function logEventFailed(event) {
+  var e = event || {};
+  var endedUnanswered = typeof e.status !== 'number';
+  if (e.kind === 'usage') return endedUnanswered || e.status >= 400;
+  var lostSignInAccountOrPool = ['signin_failed', 'signin_timeout', 'credential_rejected', 'signed_out', 'exhausted', 'hold'];
+  return lostSignInAccountOrPool.indexOf(e.type) >= 0;
+}
+
+/** @param {any} status @returns {{ text: string, tone: string }} */
+export function logStatusChip(status) {
+  if (typeof status !== 'number') return { text: 'none', tone: 'bad' };
+  return { text: String(status), tone: status >= 500 ? 'bad' : status >= 400 ? 'warn' : status >= 200 && status < 300 ? 'ok' : '' };
+}
+
+/** @param {any} event @param {string} query */
+export function logSearchMatch(event, query) {
+  var e = event || {};
+  var words = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  var text = [e.message, e.account, e.model, e.model ? modelLabel(e.model) : null, e.client, e.agent, e.reason, e.status]
+    .filter(function (v) { return v != null; }).join('\n').toLowerCase();
+  return words.every(function (w) { return text.indexOf(w) >= 0; });
+}
+
+/** @param {string} iso */
+export function logTime(iso) {
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  /** @param {number} n */
+  var two = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+}
+
+/** @param {any} event */
+export function logRow(event) {
   var e = event || {};
   /** @param {number} n */
   var tok = function (n) { return n >= 1e6 ? (n / 1e6).toFixed(1) + 'm' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n); };
-  var parts = [];
-  if (e.model) parts.push(modelLabel(e.model));
-  if (e.status != null) parts.push(String(e.status));
-  if (e.inputTokens != null || e.outputTokens != null) parts.push(tok(e.inputTokens || 0) + ' in / ' + tok(e.outputTokens || 0) + ' out');
-  if (e.ms != null) parts.push(e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + 's' : e.ms + 'ms');
-  if (!parts.length && e.reason) parts.push(e.reason);
-  return parts.join(' · ');
+  var kind = LOG_KINDS.filter(function (k) { return k.key === e.kind; })[0];
+  var usage = e.kind === 'usage';
+  return {
+    when: logTime(e.at),
+    kind: kind ? kind.label : String(e.kind || ''),
+    provider: e.provider ? providerLabel(e.provider) : '',
+    status: usage ? logStatusChip(e.status) : null,
+    ms: e.ms == null ? '' : e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + 's' : e.ms + 'ms',
+    account: e.account || '',
+    model: e.model ? modelLabel(e.model) : '',
+    client: logEventClient(e),
+    tokens: e.inputTokens == null && e.outputTokens == null ? '' : tok(e.inputTokens || 0) + ' / ' + tok(e.outputTokens || 0),
+    message: e.message || '',
+    reason: usage ? '' : e.reason || '',
+    prompt: e.prompt || '',
+    failed: logEventFailed(e),
+    tone: logEventTone(e),
+  };
 }
 
 // The Client column of a log row: the client key that sent a request and the
@@ -3385,7 +3429,7 @@ const SHARED_HELPERS = [
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   weeklyWindowName, servingOnExtraUsage, overviewHeadline, overviewTiles, trafficScale, requestStrip,
   accountStatusText, accountInState, accountFilter, accountCard,
-  mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
+  mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   connectRequest, connectRowView, connectOutcome,
@@ -3698,15 +3742,35 @@ const PAGE = `<!doctype html>
   .pin { color: var(--accent); font-size: 12px; }
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
-  .logbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
-  .logbar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-  td.when { color: var(--dim); white-space: nowrap; font-size: 12px; }
-  td.kind { white-space: nowrap; font-size: 12px; color: var(--dim); }
-  tr.bad td.ev { color: var(--bad); } tr.warn td.ev { color: var(--warn); } tr.ok td.ev { color: var(--ok); }
-  td.detail { color: var(--dim); font-size: 12px; }
-  td.client { color: var(--dim); font-size: 12px; }
-  td.ev .prompt { color: var(--dim); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+  .logcard { padding: 0; overflow: hidden; }
+  .logbar { display: flex; gap: 8px 10px; flex-wrap: wrap; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  .logbar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .logbar select { max-width: 150px; }
+  .logbar .chip { padding: 4px 8px; }
+  .logbar input { flex: 1 1 140px; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: 13px; padding: 5px 10px; }
+  .logbar input:focus-visible, .logbar select:focus-visible, .logbar .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .logscroll { overflow: auto; max-height: max(320px, calc(100vh - 220px)); }
+  .logscroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #logs { min-width: 1040px; font: 12px/1.45 var(--mono); }
+  #logs th { font-family: var(--sans); padding: 6px 10px; background: var(--panel2); position: sticky; top: 0; z-index: 1; }
+  #logs td { padding: 4px 10px; white-space: nowrap; color: var(--dim); }
+  #logs td.ev { white-space: normal; overflow-wrap: anywhere; min-width: 260px; color: var(--text); }
+  #logs td.num { text-align: right; }
+  #logs td.acct { color: var(--text); }
+  #logs tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+  #logs tr.bad td.ev { color: var(--bad); } #logs tr.warn td.ev { color: var(--warn); } #logs tr.ok td.ev { color: var(--ok); }
+  #logs td.ev .reason { color: var(--faint); margin-left: 8px; }
+  #logs td.ev .prompt { color: var(--dim); margin-top: 2px; }
+  #logs td.kind .prov { color: var(--faint); margin-left: 6px; }
+  .lchip { display: inline-block; font: 600 11px/16px var(--mono); padding: 0 6px; border-radius: 4px; border: 1px solid var(--line2); color: var(--dim); }
+  .lchip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .lchip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .lchip.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+  .logfoot { display: flex; justify-content: space-between; gap: 4px 16px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  #logLive::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 7px; vertical-align: 1px; }
+  #logLive.paused::before { background: var(--warn); }
+  #logLive.err { color: var(--bad); } #logLive.err::before { background: var(--bad); }
   .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
   .plist .bad { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); color: var(--bad); }
   .plist .warn { background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px solid var(--warn); color: var(--warn); }
@@ -4134,13 +4198,18 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-logs" style="display:none">
-      <div class="logbar">
-        <div id="logKinds" class="chips"></div>
-        <label>Provider <select id="logProvider"></select></label>
-        <label>Account <select id="logAccount"></select></label>
-        <span class="hint" id="logCount"></span>
+      <div class="card logcard">
+        <div class="logbar">
+          <input id="logSearch" type="search" placeholder="Search message, account, model, client, status" aria-label="Search the loaded events" autocomplete="off">
+          <div id="logKinds" class="chips" role="group" aria-label="Kind"></div>
+          <label>Provider <select id="logProvider"></select></label>
+          <label>Account <select id="logAccount"></select></label>
+          <button id="logErrors" class="chip" type="button" aria-pressed="false">Errors only</button>
+          <button id="logPause" class="chip" type="button">Pause</button>
+        </div>
+        <div class="logscroll" tabindex="0" role="region" aria-label="Events, newest first"><table id="logs"></table></div>
+        <div class="logfoot"><span id="logLive"></span><span id="logCount"></span></div>
       </div>
-      <div class="card" style="padding:4px 6px"><table id="logs"></table></div>
       <p class="hint">Requests, sign-ins, sign-outs, rotation, changes and Codex reset credits, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
     </section>
 
@@ -4317,7 +4386,10 @@ const PAGE = `<!doctype html>
   var logState = { generation: null, events: [] };
   var logsRead = false;
   var logsRefused = false;
-  var logFilters = { kind: 'all', provider: '', account: '' };
+  var logFilters = { kind: 'all', provider: '', account: '', query: '', errors: false };
+  var logFrozen = null;
+  var logReadAt = 0;
+  var logShown = { drawn: 0, matched: 0 };
   var logChips = [];
   var logError = null;
   var logsInFlight = false;
@@ -6157,52 +6229,75 @@ ${SHARED_HELPERS}
     });
     provider.addEventListener('change', function () { logFilters.provider = this.value; renderLogs(); });
     document.getElementById('logAccount').addEventListener('change', function () { logFilters.account = this.value; renderLogs(); });
-  }
-
-  function fmtWhen(iso) {
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return '';
-    var time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    return d.toDateString() === new Date().toDateString() ? time : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + time;
+    document.getElementById('logSearch').addEventListener('input', function () { logFilters.query = this.value; renderLogs(); });
+    document.getElementById('logErrors').addEventListener('click', function () { logFilters.errors = !logFilters.errors; renderLogs(); });
+    document.getElementById('logPause').addEventListener('click', function () { logFrozen = logFrozen ? null : logState; renderLogs(); });
   }
 
   // Newest first, and at most the newest 500 drawn: the page holds the whole
   // log, but a table of thousands of rows rebuilt every few seconds would make
   // the page the slowest thing on the machine.
   function renderLogs() {
+    var view = logFrozen || logState;
     logChips.forEach(function (c) { c.btn.className = c.key === logFilters.kind ? 'chip sel' : 'chip'; });
+    var errBtn = document.getElementById('logErrors');
+    errBtn.className = logFilters.errors ? 'chip sel' : 'chip';
+    errBtn.setAttribute('aria-pressed', String(logFilters.errors));
     var accSel = document.getElementById('logAccount');
-    fillFilter(accSel, uniqSorted(logState.events.map(function (e) { return e.account; })), logFilters.account);
+    fillFilter(accSel, uniqSorted(view.events.map(function (e) { return e.account; })), logFilters.account);
     logFilters.account = accSel.value;
-    var rows = filterLogEvents(logState.events, logFilters).slice().reverse();
-    document.getElementById('logCount').textContent = (logError ? 'cannot read the log: ' + logError + ' · ' : '')
-      + rows.length + ' of ' + logState.events.length + ' events';
+    var matched = filterLogEvents(view.events, logFilters).slice().reverse();
+    var rows = matched.slice(0, 500);
+    logShown = { drawn: rows.length, matched: matched.length };
+    var heads = ['Time', 'Kind', 'Status', 'Latency', 'Account', 'Model', 'Client', 'Tokens in / out', 'Event'];
     var table = document.getElementById('logs');
     table.textContent = '';
     var hr = el('tr');
-    ['Time', 'Kind', 'Account', 'Client', 'Event', 'Details'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    heads.forEach(function (h) { hr.appendChild(el('th', h === 'Latency' || h === 'Tokens in / out' ? 'num' : '', h)); });
     table.appendChild(hr);
     if (!rows.length) {
       var tr0 = el('tr');
-      var td0 = el('td', 'dim', logState.events.length ? 'No events match these filters.' : 'No events yet.');
-      td0.colSpan = 6;
+      var td0 = el('td', 'dim', view.events.length ? 'No events match these filters.' : 'No events yet.');
+      td0.colSpan = heads.length;
       tr0.appendChild(td0);
       table.appendChild(tr0);
-      return;
     }
-    rows.slice(0, 500).forEach(function (e) {
-      var tr = el('tr', logEventTone(e));
-      tr.appendChild(el('td', 'when', fmtWhen(e.at)));
-      var kind = LOG_KINDS.filter(function (k) { return k.key === e.kind; })[0];
-      tr.appendChild(el('td', 'kind', (kind ? kind.label : e.kind) + (e.provider ? ' · ' + providerLabel(e.provider) : '')));
-      tr.appendChild(el('td', '', e.account || '—'));
-      tr.appendChild(el('td', 'client', logEventClient(e) || '—'));
-      var ev = el('td', 'ev', e.message);
-      if (e.prompt) ev.appendChild(el('div', 'prompt', '“' + e.prompt + '”'));
+    rows.forEach(function (e) {
+      var r = logRow(e);
+      var tr = el('tr', [r.tone, r.failed ? 'fail' : ''].filter(Boolean).join(' '));
+      tr.appendChild(el('td', 'when', r.when));
+      var kind = el('td', 'kind');
+      kind.appendChild(el('span', 'lchip', r.kind));
+      if (r.provider) kind.appendChild(el('span', 'prov', r.provider));
+      tr.appendChild(kind);
+      var st = el('td', 'st');
+      if (r.status) st.appendChild(el('span', 'lchip ' + r.status.tone, r.status.text));
+      tr.appendChild(st);
+      tr.appendChild(el('td', 'num', r.ms));
+      tr.appendChild(el('td', 'acct', r.account || '—'));
+      tr.appendChild(el('td', '', r.model));
+      tr.appendChild(el('td', '', r.client));
+      tr.appendChild(el('td', 'num', r.tokens));
+      var ev = el('td', 'ev', r.message);
+      if (r.reason) ev.appendChild(el('span', 'reason', r.reason));
+      if (r.prompt) ev.appendChild(el('div', 'prompt', '“' + r.prompt + '”'));
       tr.appendChild(ev);
-      tr.appendChild(el('td', 'detail', logEventDetail(e)));
       table.appendChild(tr);
     });
+    renderLogFoot();
+  }
+
+  function renderLogFoot() {
+    var top = logFrozen && logFrozen.events.length ? logFrozen.events[logFrozen.events.length - 1].id : 0;
+    var waiting = logFrozen ? logState.events.filter(function (e) { return logState.generation !== logFrozen.generation || e.id > top; }).length : 0;
+    var read = logReadAt ? 'last read ' + new Date(logReadAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'not read yet';
+    var live = document.getElementById('logLive');
+    live.className = logError ? 'err' : logFrozen ? 'paused' : '';
+    live.textContent = (logFrozen ? 'Paused' + (waiting ? ' · ' + waiting + ' new waiting' : '') : 'Live')
+      + ' · ' + (logError ? 'cannot read the log: ' + logError + ' · ' : '') + read;
+    document.getElementById('logCount').textContent = logState.events.length + ' events loaded, ' + logShown.drawn + ' shown'
+      + (logShown.matched > logShown.drawn ? ' (the newest of ' + logShown.matched + ' that match)' : '');
+    document.getElementById('logPause').textContent = logFrozen ? 'Resume' : 'Pause';
   }
 
   function pollLogs() {
@@ -6225,6 +6320,7 @@ ${SHARED_HELPERS}
           logState = mergeLogEvents(logState, page, LOG_CAP);
           again = logState.refetch;
           logError = null;
+          logReadAt = Date.now();
           logsRead = true;
           logsRefused = false;
         }
@@ -6241,7 +6337,7 @@ ${SHARED_HELPERS}
   }
 
   function renderLogEvents() {
-    if (currentPage === 'logs') renderLogs();
+    if (currentPage === 'logs') { if (logFrozen) renderLogFoot(); else renderLogs(); }
     else if (currentPage === 'overview' && lastStatus) renderOverviewAccounts(lastStatus);
     else if (currentPage === 'accounts' && lastStatus) renderAccountsPage(lastStatus);
   }
