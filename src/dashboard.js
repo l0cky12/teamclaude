@@ -2542,7 +2542,7 @@ export function logRow(event) {
     when: logTime(e.at),
     kind: kind ? kind.label : String(e.kind || ''),
     provider: e.provider ? providerLabel(e.provider) : '',
-    status: usage ? logStatusChip(e.status) : null,
+    status: usage ? (logEventFailed(e) ? { text: logStatusChip(e.status).text, tone: 'bad' } : logStatusChip(e.status)) : null,
     ms: e.ms == null ? '' : e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + 's' : e.ms + 'ms',
     account: e.account || '',
     model: e.model ? modelLabel(e.model) : '',
@@ -2553,6 +2553,7 @@ export function logRow(event) {
     prompt: e.prompt || '',
     failed: logEventFailed(e),
     tone: logEventTone(e),
+    tint: usage ? '' : logEventTone(e),
   };
 }
 
@@ -2575,6 +2576,24 @@ export function logEventTone(event) {
   if (e.type === 'signin_succeeded' || e.type === 'credit_granted') return 'ok';
   if (typeof e.status === 'number') return e.status >= 500 ? 'bad' : e.status >= 400 ? 'warn' : '';
   return '';
+}
+
+/** @param {{ paused: boolean, waiting: number, error: string|null, readAt: string }} state @returns {{ tone: string, text: string }} */
+export function logReading(state) {
+  return {
+    tone: state.error ? 'err' : state.paused ? 'paused' : 'live',
+    text: [
+      state.paused ? 'Reading paused' : 'Reading live',
+      state.paused && state.waiting ? state.waiting + ' new waiting' : '',
+      state.error ? 'cannot read the log: ' + state.error : '',
+      state.readAt ? 'Last successful update: ' + state.readAt : 'Not read yet',
+    ].filter(Boolean).join(' · '),
+  };
+}
+
+/** @param {number} loaded @param {number} drawn @param {number} matched */
+export function logCountText(loaded, drawn, matched) {
+  return loaded + ' events loaded, ' + drawn + ' shown' + (matched > drawn ? ' (the newest of ' + matched + ' that match)' : '');
 }
 
 // The usage views the page offers, derived from the windows the tracker
@@ -3532,7 +3551,7 @@ const SHARED_HELPERS = [
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, resolveMaxUsage, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   accountStatusText, accountInState, accountFilter, accountCard,
-  mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
+  mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone, logReading, logCountText,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   connectRequest, connectRowView, connectOutcome,
@@ -3828,34 +3847,70 @@ const PAGE = `<!doctype html>
   .warnt { color: var(--warn); font-size: 12px; }
   .badt { color: var(--bad); }
   .chips { display: flex; gap: 6px; flex-wrap: wrap; }
-  .logcard { padding: 0; overflow: hidden; }
-  .logbar { display: flex; gap: 8px 10px; flex-wrap: wrap; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--line); }
-  .logbar label { color: var(--dim); font-size: 12px; display: flex; align-items: center; gap: 6px; }
-  .logbar select { max-width: 150px; }
-  .logbar .chip { padding: 4px 8px; }
-  .logbar input { flex: 1 1 140px; min-width: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: 13px; padding: 5px 10px; }
-  .logbar input:focus-visible, .logbar select:focus-visible, .logbar .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .logscroll { overflow: auto; max-height: max(320px, calc(100vh - 220px)); }
-  .logscroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-  #logs { min-width: 1040px; font: 12px/1.45 var(--mono); }
-  #logs th { font-family: var(--sans); padding: 6px 10px; background: var(--panel2); position: sticky; top: 0; z-index: 1; }
-  #logs td { padding: 4px 10px; white-space: nowrap; color: var(--dim); }
-  #logs td.ev { white-space: normal; overflow-wrap: anywhere; min-width: 260px; color: var(--text); }
-  #logs td.num { text-align: right; }
-  #logs td.acct { color: var(--text); }
-  #logs tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
-  #logs tr.bad td.ev { color: var(--bad); } #logs tr.warn td.ev { color: var(--warn); } #logs tr.ok td.ev { color: var(--ok); }
-  #logs td.ev .reason { color: var(--faint); margin-left: 8px; }
-  #logs td.ev .prompt { color: var(--dim); margin-top: 2px; }
-  #logs td.kind .prov { color: var(--faint); margin-left: 6px; }
-  .lchip { display: inline-block; font: 600 11px/16px var(--mono); padding: 0 6px; border-radius: 4px; border: 1px solid var(--line2); color: var(--dim); }
-  .lchip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 12%, transparent); }
-  .lchip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, transparent); }
-  .lchip.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); background: color-mix(in srgb, var(--bad) 12%, transparent); }
-  .logfoot { display: flex; justify-content: space-between; gap: 4px 16px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
-  #logLive::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--ok); margin-right: 7px; vertical-align: 1px; }
-  #logLive.paused::before { background: var(--warn); }
+  .wrap:has(> #page-logs:not([style*="none"])) > #pageTop { display: none; }
+  .lghead { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; margin: 8px 0 22px; }
+  .lgtitle { font-size: 32px; line-height: 1.1; font-weight: 700; letter-spacing: -.03em; }
+  .lgseg { display: inline-flex; gap: 2px; padding: 4px; border-radius: 12px; background: var(--panel2); border: 1px solid var(--line); }
+  .lgseg button { font-size: 13.5px; font-weight: 500; padding: 7px 14px; border-radius: 9px; border: 1px solid transparent; background: transparent; color: var(--dim); cursor: pointer; }
+  .lgseg button:hover { color: var(--text); }
+  .lgseg button.sel { background: var(--bg); border-color: var(--line2); color: var(--text); }
+  .lgcard { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; margin-bottom: 10px; }
+  .lgbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; padding: 18px 20px; border-bottom: 1px solid var(--line); }
+  .lgsearch, .lgsel, .lgicon { height: 42px; border-radius: 10px; border: 1px solid var(--line2); background: var(--bg); color: var(--text); }
+  .lgsearch { position: relative; flex: 1 1 260px; min-width: 0; display: flex; }
+  .lgsearch input { flex: 1; min-width: 0; height: 100%; padding: 0 40px 0 14px; border: 0; border-radius: inherit; background: transparent; color: inherit; font: inherit; font-size: 13.5px; }
+  .lgsearch input::placeholder { color: var(--faint); }
+  .lgsearch svg { position: absolute; right: 13px; top: 50%; width: 17px; height: 17px; margin-top: -8.5px; fill: none; stroke: var(--dim); stroke-width: 1.8; stroke-linecap: round; pointer-events: none; }
+  .lgsel { display: flex; align-items: center; gap: 8px; padding: 0 6px 0 14px; font-size: 13.5px; }
+  .lgsel span { color: var(--dim); }
+  .lgsel select { height: 100%; min-width: 0; max-width: 150px; border: 0; background: transparent; color: var(--text); font: inherit; font-weight: 500; cursor: pointer; }
+  .lgsel select option { background: var(--panel); color: var(--text); }
+  .lgacct select { max-width: 210px; }
+  .lgicon { width: 42px; flex: none; display: grid; place-items: center; padding: 0; cursor: pointer; }
+  .lgicon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
+  .lgicon:hover, .lgsel:hover { border-color: var(--dim); }
+  .lgicon.on { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+  .lgseg button:focus-visible, .lgicon:focus-visible, .lgsel:focus-within, .lgsearch:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .lgsel select:focus-visible, .lgsearch input:focus-visible { outline: none; }
+  .lgscroll { overflow-y: auto; max-height: max(320px, calc(100vh - 290px)); padding: 8px 0; }
+  .lgscroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #logs { font: 13px/1.6 var(--mono); }
+  .lgrow { display: grid; grid-template-columns: 19ch 9ch minmax(0, 23ch) minmax(0, 1fr); column-gap: 14px; align-items: baseline; padding: 4px 20px; box-shadow: inset 2px 0 0 transparent; }
+  .lgrow:hover { background: color-mix(in srgb, var(--panel2) 55%, transparent); }
+  .lgrow.lgfail { box-shadow: inset 2px 0 0 var(--bad); }
+  .lgrow .lgwhen { color: color-mix(in srgb, var(--text) 82%, var(--panel)); white-space: nowrap; }
+  .lgtag { justify-self: start; font: 600 11px/18px var(--mono); text-transform: uppercase; letter-spacing: .02em; padding: 0 6px; border-radius: 4px; background: var(--panel2); color: var(--faint); white-space: nowrap; }
+  .lgtag.bad { background: color-mix(in srgb, var(--bad) 24%, transparent); color: var(--bad); }
+  .lgrow .lgwho { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lgrow .lgrest { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0; color: var(--dim); }
+  .lgprov, .lgchip { font: 600 11.5px/18px var(--mono); padding: 0 6px; border-radius: 4px; white-space: nowrap; }
+  .lgprov { font-weight: 500; border: 1px solid var(--line2); color: var(--dim); }
+  .lgchip { background: var(--panel2); color: var(--dim); }
+  .lgchip.ok { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
+  .lgchip.warn { background: color-mix(in srgb, var(--warn) 20%, transparent); color: var(--warn); }
+  .lgchip.bad { background: color-mix(in srgb, var(--bad) 22%, transparent); color: var(--bad); }
+  .lgrow .lgmsg { color: var(--text); font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+  .lgrow.t-bad .lgmsg { color: var(--bad); } .lgrow.t-warn .lgmsg { color: var(--warn); } .lgrow.t-ok .lgmsg { color: var(--ok); }
+  .lgrow .lgreason { color: var(--faint); }
+  .lgrow .lgprompt { flex-basis: 100%; overflow-wrap: anywhere; }
+  .lgempty { padding: 28px 20px; color: var(--dim); font-family: var(--sans); }
+  .lgfoot { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 16px; padding: 10px 20px; border-top: 1px solid var(--line); font-size: 12px; color: var(--dim); }
+  #logLive::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-right: 8px; vertical-align: 1px; }
+  #logLive.paused::before { background: var(--dim); }
   #logLive.err { color: var(--bad); } #logLive.err::before { background: var(--bad); }
+  @media (max-width: 760px) {
+    .lghead { margin-bottom: 16px; }
+    .lgtitle { font-size: 28px; }
+    .lgbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 42px; gap: 10px; padding: 14px; }
+    .lgsearch { grid-column: 1 / -1; }
+    .lgsel { min-width: 0; padding-left: 12px; gap: 6px; }
+    .lgsel + .lgsel { grid-column: 2 / -1; }
+    .lgsel.lgacct { grid-column: 1 / 3; }
+    .lgsel select { flex: 1; max-width: none; }
+    .lgrow { grid-template-columns: auto auto minmax(0, 1fr); column-gap: 10px; padding: 6px 14px; }
+    .lgrow .lgrest { grid-column: 1 / -1; }
+    .lgfoot { padding: 10px 14px; }
+  }
   .plist div { border-radius: 8px; padding: 8px 12px; margin-bottom: 6px; font-size: 13px; }
   .plist .bad { background: color-mix(in srgb, var(--bad) 12%, transparent); border: 1px solid var(--bad); color: var(--bad); }
   .plist .warn { background: color-mix(in srgb, var(--warn) 12%, transparent); border: 1px solid var(--warn); color: var(--warn); }
@@ -4320,17 +4375,26 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-logs" style="display:none">
-      <div class="card logcard">
-        <div class="logbar">
-          <input id="logSearch" type="search" placeholder="Search message, account, model, client, status" aria-label="Search the loaded events" autocomplete="off">
-          <div id="logKinds" class="chips" role="group" aria-label="Kind"></div>
-          <label>Provider <select id="logProvider"></select></label>
-          <label>Account <select id="logAccount"></select></label>
-          <button id="logErrors" class="chip" type="button" aria-pressed="false">Errors only</button>
-          <button id="logPause" class="chip" type="button">Pause</button>
+      <div class="lghead">
+        <h1 class="lgtitle">Logs</h1>
+        <div class="lgseg" role="group" aria-label="Which events">
+          <button id="logAll" type="button" aria-pressed="true">All events</button>
+          <button id="logErrors" type="button" aria-pressed="false">Errors</button>
         </div>
-        <div class="logscroll" tabindex="0" role="region" aria-label="Events, newest first"><table id="logs"></table></div>
-        <div class="logfoot"><span id="logLive"></span><span id="logCount"></span></div>
+      </div>
+      <div class="lgcard">
+        <div class="lgbar">
+          <label class="lgsearch">
+            <input id="logSearch" type="search" placeholder="Search message, account, model, client, status" aria-label="Search the loaded events" autocomplete="off">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+          </label>
+          <label class="lgsel"><span>Kind</span><select id="logKind"></select></label>
+          <label class="lgsel"><span>Provider</span><select id="logProvider"></select></label>
+          <label class="lgsel lgacct"><span>Account</span><select id="logAccount"></select></label>
+          <button id="logPause" class="lgicon" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="logPauseIcon" d=""/></svg></button>
+        </div>
+        <div class="lgscroll" tabindex="0" role="region" aria-label="Events, newest first"><div id="logs" role="list"></div></div>
+        <div class="lgfoot"><span id="logLive"></span><span id="logCount"></span></div>
       </div>
       <p class="hint">Requests, sign-ins, sign-outs, rotation, changes and Codex reset credits, newest first. Kept in the proxy's memory (the last ${EVENT_LOG_CAPACITY} events); a restart starts a fresh log.</p>
     </section>
@@ -4512,7 +4576,9 @@ const PAGE = `<!doctype html>
   var logFrozen = null;
   var logReadAt = 0;
   var logShown = { drawn: 0, matched: 0 };
-  var logChips = [];
+  var LOG_TABS = [{ id: 'logAll', errors: false }, { id: 'logErrors', errors: true }];
+  var LOG_ROWS_DRAWN_PER_RENDER = 500;
+  var LOG_PAUSE = { live: { label: 'Pause', icon: 'M9 6v12M15 6v12' }, paused: { label: 'Resume', icon: 'M8 5.5v13l10.5-6.5z' } };
   var logError = null;
   var logsInFlight = false;
 
@@ -6323,15 +6389,13 @@ ${SHARED_HELPERS}
   }
 
   function buildLogFilters() {
-    var box = document.getElementById('logKinds');
+    var kind = document.getElementById('logKind');
     LOG_KINDS.forEach(function (k) {
-      var chip = button('chip', k.label, function () {
-        logFilters.kind = k.key;
-        renderLogs();
-      });
-      box.appendChild(chip);
-      logChips.push({ key: k.key, btn: chip });
+      var option = el('option', '', k.label);
+      option.value = k.key;
+      kind.appendChild(option);
     });
+    kind.addEventListener('change', function () { logFilters.kind = this.value; renderLogs(); });
     var provider = document.getElementById('logProvider');
     fillFilter(provider, [], '');
     [['anthropic', 'Claude'], ['codex', 'Codex'], ['grok', 'Grok']].forEach(function (p) {
@@ -6342,59 +6406,57 @@ ${SHARED_HELPERS}
     provider.addEventListener('change', function () { logFilters.provider = this.value; renderLogs(); });
     document.getElementById('logAccount').addEventListener('change', function () { logFilters.account = this.value; renderLogs(); });
     document.getElementById('logSearch').addEventListener('input', function () { logFilters.query = this.value; renderLogs(); });
-    document.getElementById('logErrors').addEventListener('click', function () { logFilters.errors = !logFilters.errors; renderLogs(); });
+    LOG_TABS.forEach(function (t) {
+      document.getElementById(t.id).addEventListener('click', function () { logFilters.errors = t.errors; renderLogs(); });
+    });
     document.getElementById('logPause').addEventListener('click', function () { logFrozen = logFrozen ? null : logState; renderLogs(); });
   }
 
-  // Newest first, and at most the newest 500 drawn: the page holds the whole
-  // log, but a table of thousands of rows rebuilt every few seconds would make
-  // the page the slowest thing on the machine.
   function renderLogs() {
     var view = logFrozen || logState;
-    logChips.forEach(function (c) { c.btn.className = c.key === logFilters.kind ? 'chip sel' : 'chip'; });
-    var errBtn = document.getElementById('logErrors');
-    errBtn.className = logFilters.errors ? 'chip sel' : 'chip';
-    errBtn.setAttribute('aria-pressed', String(logFilters.errors));
+    LOG_TABS.forEach(function (t) {
+      var b = document.getElementById(t.id);
+      b.className = t.errors === logFilters.errors ? 'sel' : '';
+      b.setAttribute('aria-pressed', String(t.errors === logFilters.errors));
+    });
     var accSel = document.getElementById('logAccount');
     fillFilter(accSel, uniqSorted(view.events.map(function (e) { return e.account; })), logFilters.account);
     logFilters.account = accSel.value;
     var matched = filterLogEvents(view.events, logFilters).slice().reverse();
-    var rows = matched.slice(0, 500);
+    var rows = matched.slice(0, LOG_ROWS_DRAWN_PER_RENDER);
     logShown = { drawn: rows.length, matched: matched.length };
-    var heads = ['Time', 'Kind', 'Status', 'Latency', 'Account', 'Model', 'Client', 'Tokens in / out', 'Event'];
-    var table = document.getElementById('logs');
-    table.textContent = '';
-    var hr = el('tr');
-    heads.forEach(function (h) { hr.appendChild(el('th', h === 'Latency' || h === 'Tokens in / out' ? 'num' : '', h)); });
-    table.appendChild(hr);
-    if (!rows.length) {
-      var tr0 = el('tr');
-      var td0 = el('td', 'dim', view.events.length ? 'No events match these filters.' : 'No events yet.');
-      td0.colSpan = heads.length;
-      tr0.appendChild(td0);
-      table.appendChild(tr0);
-    }
+    var list = document.getElementById('logs');
+    list.textContent = '';
+    if (!rows.length) list.appendChild(el('div', 'lgempty', view.events.length ? 'No events match these filters.' : 'No events yet.'));
     rows.forEach(function (e) {
       var r = logRow(e);
-      var tr = el('tr', [r.tone, r.failed ? 'fail' : ''].filter(Boolean).join(' '));
-      tr.appendChild(el('td', 'when', r.when));
-      var kind = el('td', 'kind');
-      kind.appendChild(el('span', 'lchip', r.kind));
-      if (r.provider) kind.appendChild(el('span', 'prov', r.provider));
-      tr.appendChild(kind);
-      var st = el('td', 'st');
-      if (r.status) st.appendChild(el('span', 'lchip ' + r.status.tone, r.status.text));
-      tr.appendChild(st);
-      tr.appendChild(el('td', 'num', r.ms));
-      tr.appendChild(el('td', 'acct', r.account || '—'));
-      tr.appendChild(el('td', '', r.model));
-      tr.appendChild(el('td', '', r.client));
-      tr.appendChild(el('td', 'num', r.tokens));
-      var ev = el('td', 'ev', r.message);
-      if (r.reason) ev.appendChild(el('span', 'reason', r.reason));
-      if (r.prompt) ev.appendChild(el('div', 'prompt', '“' + r.prompt + '”'));
-      tr.appendChild(ev);
-      table.appendChild(tr);
+      var row = el('div', ['lgrow', r.tint ? 't-' + r.tint : '', r.failed ? 'lgfail' : ''].filter(Boolean).join(' '));
+      row.setAttribute('role', 'listitem');
+      row.appendChild(el('span', 'lgwhen', r.when));
+      row.appendChild(el('span', r.failed ? 'lgtag bad' : 'lgtag', r.kind));
+      var who = el('span', 'lgwho', r.account || r.provider || '—');
+      who.title = r.account || r.provider;
+      row.appendChild(who);
+      var rest = el('span', 'lgrest');
+      var fields = [
+        { cls: 'lgprov', text: r.account ? r.provider : '', hoverLabel: 'Provider' },
+        { cls: 'lgchip ' + (r.status ? r.status.tone : ''), text: r.status ? r.status.text : '', hoverLabel: 'Status' },
+        { cls: '', text: r.ms, hoverLabel: 'Latency' },
+        { cls: '', text: r.model, hoverLabel: 'Model' },
+        { cls: '', text: r.client, hoverLabel: 'Client' },
+        { cls: '', text: r.tokens ? r.tokens + ' tok' : '', hoverLabel: 'Tokens in / out' },
+        { cls: 'lgmsg', text: r.message, hoverLabel: '' },
+        { cls: 'lgreason', text: r.reason, hoverLabel: '' },
+        { cls: 'lgprompt', text: r.prompt ? '“' + r.prompt + '”' : '', hoverLabel: '' },
+      ];
+      fields.forEach(function (f) {
+        if (!f.text) return;
+        var span = el('span', f.cls, f.text);
+        if (f.hoverLabel) span.title = f.hoverLabel;
+        rest.appendChild(span);
+      });
+      row.appendChild(rest);
+      list.appendChild(row);
     });
     renderLogFoot();
   }
@@ -6402,14 +6464,20 @@ ${SHARED_HELPERS}
   function renderLogFoot() {
     var top = logFrozen && logFrozen.events.length ? logFrozen.events[logFrozen.events.length - 1].id : 0;
     var waiting = logFrozen ? logState.events.filter(function (e) { return logState.generation !== logFrozen.generation || e.id > top; }).length : 0;
-    var read = logReadAt ? 'last read ' + new Date(logReadAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'not read yet';
+    var reading = logReading({
+      paused: !!logFrozen, waiting: waiting, error: logError,
+      readAt: logReadAt ? new Date(logReadAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' }) : '',
+    });
     var live = document.getElementById('logLive');
-    live.className = logError ? 'err' : logFrozen ? 'paused' : '';
-    live.textContent = (logFrozen ? 'Paused' + (waiting ? ' · ' + waiting + ' new waiting' : '') : 'Live')
-      + ' · ' + (logError ? 'cannot read the log: ' + logError + ' · ' : '') + read;
-    document.getElementById('logCount').textContent = logState.events.length + ' events loaded, ' + logShown.drawn + ' shown'
-      + (logShown.matched > logShown.drawn ? ' (the newest of ' + logShown.matched + ' that match)' : '');
-    document.getElementById('logPause').textContent = logFrozen ? 'Resume' : 'Pause';
+    live.className = reading.tone;
+    live.textContent = reading.text;
+    document.getElementById('logCount').textContent = logCountText(logState.events.length, logShown.drawn, logShown.matched);
+    var pause = LOG_PAUSE[logFrozen ? 'paused' : 'live'];
+    var btn = document.getElementById('logPause');
+    btn.title = pause.label;
+    btn.setAttribute('aria-label', pause.label);
+    btn.className = logFrozen ? 'lgicon on' : 'lgicon';
+    document.getElementById('logPauseIcon').setAttribute('d', pause.icon);
   }
 
   function pollLogs() {
