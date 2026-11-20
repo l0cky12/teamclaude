@@ -545,7 +545,16 @@ The Logs page is what happened to the accounts, newest first:
 | **Changes** | An account enabled, disabled, reprioritized or switched to by hand, the switch threshold changed, accounts added or removed by a reload. Recorded wherever the change came from: the dashboard, the CLI, the TUI, MCP or a hand edit of the config file. |
 | **Resets** | A Codex account getting a free reset credit (green), and a credit that expires within three days (amber, once per credit). See [Being told about a credit](accounts.md#being-told-about-a-credit). |
 
-Chips narrow it to one kind, and two selectors to one provider or one account. The page asks for the log only while it is open.
+Each event is one row of a table: its date and time, its kind and provider, the status of a request, its latency, the account, the model, the client, the input and output tokens, and the message. Another event's reason code follows its message. A request's status is a chip with the code as its text: green for 2xx, amber for 4xx (429 among them), red for 5xx, and red reading `none` for a request that ended with no status, because the stream broke or the client went away first. A row that failed has a red bar on its left edge. The rows scroll inside the table's own box, under a header row that stays put, so the toolbar and the footer stay on screen. On a narrow window the box also scrolls sideways.
+
+The toolbar above the table narrows what it shows:
+
+- **Search** keeps the rows where every word you type appears, ignoring case, in the message, account, model, client, User-Agent, reason or status. It searches the events the page has loaded, not the proxy's file logs. The prompt is not searched.
+- Chips narrow it to one kind, and two selectors to one provider or one account.
+- **Errors only** keeps the failures: a request that came back 400 or worse or with no status, a sign-in that failed or timed out, an account that lost its credentials (**Auth**), and every account exhausted (a 429 answered, a request held, or a rate-limited account tried again because nothing else could serve).
+- **Pause** stops the table changing, so a row stays put while you read it. The page goes on reading the log underneath, and **Resume** shows what arrived meanwhile.
+
+The footer says whether the table is live or paused (and how many new events are waiting), when the log was last read, and how many events are loaded and how many of them are shown. At most the newest 500 rows that match are drawn. A failed read is shown in red in the footer, and the rows already read stay. The page asks for the log only while it is open.
 
 The log lives in the proxy's memory: the last 2000 events, and a restart begins a fresh one. The file logs (`--activity-log`, `logDir`, see [Request logging](#request-logging)) stay the durable record.
 
