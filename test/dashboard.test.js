@@ -3868,6 +3868,8 @@ test('accountState: a cooldown is back when it ends, and an account needing a pe
   assert.deepEqual(accountState({ name: 'e', unavailable: 'error', quota: {} }, {}, T0), { state: 'resting', backAt: null, limited: false });
   assert.deepEqual(accountState({ name: 'tw', unavailable: 'throttled', rateLimitedUntil: until, quota: { unified7d: 1, unified7dReset: T0 + 24 * HOUR } }, {}, T0),
     { state: 'resting', backAt: T0 + 24 * HOUR, limited: true }, 'a spent week outlasts the throttle on top of it');
+  const capped = { name: 'ct', unavailable: 'capped', maxUsage: { unified7d: 0.5 }, rateLimitedUntil: new Date(T0 + HOUR).toISOString(), quota: { unified7d: 0.6, unified7dReset: T0 + 5 * MIN } };
+  assert.deepEqual(accountState(capped, {}, T0), { state: 'resting', backAt: T0 + HOUR, limited: true }, 'a throttle outlasts the capped window it hides');
 });
 
 const FLEET_STATUS = () => ({

@@ -2133,13 +2133,14 @@ export function accountState(account, status, now) {
     return typeof q[bucket] === 'number' && q[bucket] >= (cap != null && cap < limit ? cap : limit);
   };
   var gate = spent('unified7d') ? 'unified7dReset' : spent('unified5h') ? 'unified5hReset' : null;
-  if (LIMITED.indexOf(why) >= 0) return { state: 'resting', backAt: future(q[gate || 'unified5hReset']), limited: true };
-  if (!COOLDOWN_UNTIL[why]) return { state: 'resting', backAt: null, limited: false };
-  var until = future(a[COOLDOWN_UNTIL[why]]);
-  if (!gate) return { state: 'resting', backAt: until, limited: false };
-  // A spent window keeps the account out after a shorter cooldown on top of it ends.
-  var reset = future(q[gate]);
-  return { state: 'resting', backAt: reset == null ? null : Math.max(until || 0, reset), limited: true };
+  if (LIMITED.indexOf(why) < 0 && !COOLDOWN_UNTIL[why]) return { state: 'resting', backAt: null, limited: false };
+  var limited = LIMITED.indexOf(why) >= 0 || gate != null;
+  var reset = limited ? future(q[gate || 'unified5hReset']) : 0;
+  if (reset == null) return { state: 'resting', backAt: null, limited: true };
+  // Status names one reason, but every block still running holds the account:
+  // a spent window outlasts a shorter cooldown, and a cooldown a reset.
+  var latest = Math.max.apply(null, [reset].concat(Object.keys(COOLDOWN_UNTIL).map(function (k) { return future(a[COOLDOWN_UNTIL[k]]) || 0; })));
+  return { state: 'resting', backAt: latest || null, limited: limited };
 }
 
 /**
