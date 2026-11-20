@@ -3859,12 +3859,15 @@ test('accountState: a resting account is back when the window it spent resets, 7
   assert.equal(accountState({ ...out, quota: quota(1, 0.9) }, { switchThresholds: { default: 0.98, unified7d: 0.85 } }, T0).backAt, T0 + 50 * HOUR, 'a weekly entry in the fleet table');
   assert.equal(accountState({ ...out, switchThreshold: 0.98, quota: quota(1, 0.9) }, { switchThresholds: { unified7d: 0.85 } }, T0).backAt, T0 + 57 * MIN, "the account's own default outranks the fleet's weekly entry");
   assert.equal(accountState({ ...out, unavailable: 'exhausted', quota: { unified7d: 1, unified7dReset: T0 - MIN } }, {}, T0).backAt, null, 'a reset already past is not a return time');
+  assert.equal(accountState({ ...out, unavailable: 'capped', maxUsage: { unified7d: 0.5 }, quota: quota(0.2, 0.6) }, {}, T0).backAt, T0 + 50 * HOUR, 'a weekly usage cap below the threshold is the limit');
 });
 
 test('accountState: a cooldown is back when it ends, and an account needing a person has no return time', () => {
   const until = new Date(T0 + 3 * MIN).toISOString();
   assert.deepEqual(accountState({ name: 't', unavailable: 'throttled', rateLimitedUntil: until }, {}, T0), { state: 'resting', backAt: T0 + 3 * MIN, limited: false });
   assert.deepEqual(accountState({ name: 'e', unavailable: 'error', quota: {} }, {}, T0), { state: 'resting', backAt: null, limited: false });
+  assert.deepEqual(accountState({ name: 'tw', unavailable: 'throttled', rateLimitedUntil: until, quota: { unified7d: 1, unified7dReset: T0 + 24 * HOUR } }, {}, T0),
+    { state: 'resting', backAt: T0 + 24 * HOUR, limited: true }, 'a spent week outlasts the throttle on top of it');
 });
 
 const FLEET_STATUS = () => ({

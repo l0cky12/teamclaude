@@ -20,7 +20,7 @@ import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
 import { CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { logoDataUrl, logoMarkup } from './logo.js';
-import { resolveSwitchThreshold, resolveFleetThreshold } from './model.js';
+import { resolveSwitchThreshold, resolveFleetThreshold, resolveMaxUsage } from './model.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -2094,9 +2094,10 @@ export function fmtUntil(sec) {
  * requests, `resting` when it cannot. The serving rule is the Accounts page's:
  * a cordoned account still serves its own conversations, and one past its
  * plan on extra usage serves too. `limited` is true when a spent quota window
- * is why it rests, and `backAt` (epoch ms, or null when unknown) is when it
+ * keeps it resting, and `backAt` (epoch ms, or null when unknown) is when it
  * returns: the 7-day reset when that window is at or above the account's
- * switch threshold, the 5-hour reset otherwise, or the end of a cooldown.
+ * limit (its switch threshold, or its usage cap when lower), the 5-hour reset
+ * otherwise, or the end of a cooldown unless a spent window outlasts it.
  *
  * @param {any} account  one entry of status.accounts
  * @param {any} status  the GET /teamclaude/status reply it came from
@@ -2124,11 +2125,21 @@ export function accountState(account, status, now) {
     billing: 'billingRejectedUntil', credential: 'credentialRejectedUntil',
   };
   var LIMITED = ['quota', 'exhausted', 'upstream-rejected', 'capped', 'advisor-quota', 'advisor-capped'];
-  if (LIMITED.indexOf(why) < 0) return { state: 'resting', backAt: COOLDOWN_UNTIL[why] ? future(a[COOLDOWN_UNTIL[why]]) : null, limited: false };
   var q = a.quota || {};
-  var limit7d = resolveSwitchThreshold(a.switchThreshold, 'unified7d', resolveFleetThreshold(s.switchThreshold, s.switchThresholds, 'unified7d'));
-  var weekSpent = typeof q.unified7d === 'number' && q.unified7d >= limit7d;
-  return { state: 'resting', backAt: future(weekSpent ? q.unified7dReset : q.unified5hReset), limited: true };
+  /** @param {string} bucket */
+  var spent = function (bucket) {
+    var limit = resolveSwitchThreshold(a.switchThreshold, bucket, resolveFleetThreshold(s.switchThreshold, s.switchThresholds, bucket));
+    var cap = resolveMaxUsage(a.maxUsage, bucket);
+    return typeof q[bucket] === 'number' && q[bucket] >= (cap != null && cap < limit ? cap : limit);
+  };
+  var gate = spent('unified7d') ? 'unified7dReset' : spent('unified5h') ? 'unified5hReset' : null;
+  if (LIMITED.indexOf(why) >= 0) return { state: 'resting', backAt: future(q[gate || 'unified5hReset']), limited: true };
+  if (!COOLDOWN_UNTIL[why]) return { state: 'resting', backAt: null, limited: false };
+  var until = future(a[COOLDOWN_UNTIL[why]]);
+  if (!gate) return { state: 'resting', backAt: until, limited: false };
+  // A spent window keeps the account out after a shorter cooldown on top of it ends.
+  var reset = future(q[gate]);
+  return { state: 'resting', backAt: reset == null ? null : Math.max(until || 0, reset), limited: true };
 }
 
 /**
@@ -3518,7 +3529,7 @@ const SHARED_HELPERS = [
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
+  servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, resolveMaxUsage, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   accountStatusText, accountInState, accountFilter, accountCard,
   mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -8553,6 +8564,8 @@ ${SHARED_HELPERS}
         var err = document.getElementById('err');
         err.style.display = 'block';
         err.textContent = 'Cannot reach the proxy: ' + e.message;
+        ovReachable = false;
+        renderOverviewMeta();
         if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
         return false;
       });
