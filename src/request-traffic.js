@@ -6,7 +6,9 @@
 // entries cover minutes, not hours. This keeps a fixed number of time slots
 // instead, so the span is the same however busy the proxy is.
 //
-// Memory only, like the event log: a restart starts every slot at zero.
+// The slots ride along in the state file (teamclaude.state.json) on its
+// regular save, so a restart keeps the chart: read() is what is saved, and
+// restore() takes it back at startup.
 
 export const TRAFFIC_BUCKET_MS = 10 * 60 * 1000;
 
@@ -60,4 +62,36 @@ export class RequestTraffic {
     }
     return { bucketMs: TRAFFIC_BUCKET_MS, buckets };
   }
+
+  /**
+   * Take back slots saved from read() by an earlier run. The saved value comes
+   * from a file, so it is checked here: a different slot size or a value that
+   * is not the saved shape is ignored whole, and a slot that is malformed or
+   * outside the current 3h 20m is dropped. A kept slot replaces what this
+   * instance holds for that time rather than adding to it, so restoring the
+   * same value twice counts it once.
+   * @param {unknown} saved
+   */
+  restore(saved) {
+    if (!saved || typeof saved !== 'object') return;
+    const { bucketMs, buckets } = /** @type {{ bucketMs?: unknown, buckets?: unknown }} */ (saved);
+    if (bucketMs !== TRAFFIC_BUCKET_MS || !Array.isArray(buckets)) return;
+    const current = Math.floor(this.now() / TRAFFIC_BUCKET_MS);
+    for (const b of buckets) {
+      if (!b || typeof b !== 'object') continue;
+      const { at, ok, failed } = /** @type {Record<string, unknown>} */ (b);
+      if (!isCount(ok) || !isCount(failed) || typeof at !== 'number' || at % TRAFFIC_BUCKET_MS !== 0) continue;
+      const n = at / TRAFFIC_BUCKET_MS;
+      if (n > current || n <= current - TRAFFIC_BUCKETS) continue;
+      this.slots[n % TRAFFIC_BUCKETS] = { at, ok, failed };
+    }
+  }
+}
+
+/**
+ * @param {unknown} v
+ * @returns {v is number}
+ */
+function isCount(v) {
+  return Number.isSafeInteger(v) && /** @type {number} */ (v) >= 0;
 }
