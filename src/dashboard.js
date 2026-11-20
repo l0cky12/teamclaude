@@ -3568,7 +3568,7 @@ const PAGE = `<!doctype html>
     .ctl { flex-direction: row; flex-wrap: wrap; }
   }
   @media (max-width: 900px) {
-    .shell { grid-template-columns: 1fr; }
+    .shell { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
     .side { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 12px; }
     .brand { border-bottom: 0; padding-bottom: 8px; }
     #nav { flex-direction: row; flex-wrap: wrap; gap: 4px; }
