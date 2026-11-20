@@ -106,7 +106,7 @@ You can also set a priority order, send certain models to certain accounts (`tea
 
 Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`. To use it from another machine, set `proxy.host` to `0.0.0.0` (or a Tailscale or LAN address), open the same page at that address, and sign in with the username and password set under **Settings**, **Dashboard password** (or enter the proxy key).
 
-- **Overview:** the page the dashboard opens on. It says in one line whether every account is serving, names any account near a limit, and charts the requests of the last 3h 20m, with each account's last 24 requests and its 5-hour and 7-day quota.
+- **Overview:** the page the dashboard opens on, on one screen. A calm headline says whether every provider is serving and requests succeed, a sentence counts the accounts resting until a reset, and it charts the requests of the last 3h 20m beside a square for each account and the ones back next.
 - **Quota:** how much is left on every account, as 5-hour, weekly and Fable bars with reset times. Tabs for Claude, Codex, Grok and each backend, plus pooled summary cards. Accounts that are out of quota are hidden until you ask to see them. Enabled accounts whose quota can be read get a **Refresh quota** button, which checks it without spending any.
 - **Accounts:** **Sign in to Claude** and **Sign in to Codex** buttons add accounts from the browser, including from a phone or another computer. You can also sign an account in again, remove it, switch to it, disable it, or move it up or down the priority order.
 - **Insights:** what your accounts would have cost on the API, and the tokens they spent, over the last 24 hours, 7, 30 or 90 days, or since you started. Both are compared with the period before, and the month is projected from your recent pace. Below them are a chart split by provider, account, machine or token type (per day, or as a running total against the previous period), a calendar of busy and quiet days with weekday averages, totals by month, and a ranked list of where the cost or tokens went by model, account or provider. With linked instances it adds up every machine. Each chart can also be shown as a table.
@@ -115,7 +115,7 @@ Open `http://localhost:3456/teamclaude/dashboard`, or run `teamclaude dashboard`
 - **Sessions, Routing and Settings:** what each conversation spent, which account each model goes to, the switch threshold, and the background quota check (off, or every 5 to 120 seconds).
 - **Linked instances:** run TeamRouter on more than one machine (a desktop and a server, say) and link them from **Settings**. One dashboard can then show and control all of them. Linking a machine to one that is already linked to others links it to those too. Off until you link something.
 
-Light and dark themes follow your system, and the layout fits a phone. Full tour: [docs/usage.md](docs/usage.md#status-dashboard-browser).
+The dashboard is dark by default, with a light theme one click away, and the layout fits a phone. Full tour: [docs/usage.md](docs/usage.md#status-dashboard-browser).
 
 <table>
   <tr>

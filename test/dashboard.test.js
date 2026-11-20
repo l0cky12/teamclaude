@@ -16,7 +16,7 @@ import {
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep, REDEEM_UNCERTAIN_TEXT,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  overviewHeadline, overviewTiles, trafficScale, requestStrip,
+  fmtUntil, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   ACCOUNT_STATES, accountStatusText, accountFilter, accountCard,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -1713,35 +1713,35 @@ test('Show all reveals exhausted quota rows, survives polls and tabs, and can hi
     { name: 'quota-unknown-demo', provider: 'codex', quota: {} },
   ] };
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-ready-demo'), 3);
-  assert.equal(page.labelled('quota-spent-demo'), 2);
-  assert.equal(page.labelled('quota-unknown-demo'), 3);
+  assert.equal(page.labelled('quota-ready-demo'), 2);
+  assert.equal(page.labelled('quota-spent-demo'), 1);
+  assert.equal(page.labelled('quota-unknown-demo'), 2);
   assert.equal(page.labelled('1 exhausted account hidden'), 1);
   assert.equal(page.labelled('100%'), 2, 'both summaries exclude the weekly-exhausted session capacity');
   assert.equal(page.labelled('200%'), 0);
   page.click('Show all');
-  assert.equal(page.labelled('quota-spent-demo'), 3);
+  assert.equal(page.labelled('quota-spent-demo'), 2);
   assert.equal(page.labelled('Weekly limit empty'), 2, 'on the quota row and on the account\'s card');
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-spent-demo'), 3, 'a poll keeps Show all');
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'a poll keeps Show all');
   page.click('Claude');
-  assert.equal(page.labelled('quota-spent-demo'), 3, 'provider tabs keep Show all');
-  assert.equal(page.labelled('quota-unknown-demo'), 2, 'provider tab still filters Quota');
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'provider tabs keep Show all');
+  assert.equal(page.labelled('quota-unknown-demo'), 1, 'provider tab still filters Quota');
   page.click('Hide exhausted');
-  assert.equal(page.labelled('quota-spent-demo'), 2);
+  assert.equal(page.labelled('quota-spent-demo'), 1);
   fleet.accounts[0].quota.unified7d = 1;
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-ready-demo'), 2, 'new exhaustion hides automatically');
+  assert.equal(page.labelled('quota-ready-demo'), 1, 'new exhaustion hides automatically');
   assert.equal(page.labelled('All accounts in this group have an exhausted limit. Use Show all to see them.'), 1);
   fleet.accounts[1].quota.unified7d = 0;
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-spent-demo'), 3, 'recovered quota returns automatically');
+  assert.equal(page.labelled('quota-spent-demo'), 2, 'recovered quota returns automatically');
   const fresh = bootPage();
   await fresh.answer(200, fleet);
-  assert.equal(fresh.labelled('quota-ready-demo'), 2, 'a new page defaults to hiding');
+  assert.equal(fresh.labelled('quota-ready-demo'), 1, 'a new page defaults to hiding');
   assert.equal(fresh.labelled('Show all'), 1);
 });
 
@@ -2051,11 +2051,11 @@ test('a provider tab narrows the quota page to that provider\'s accounts', async
   });
   page.click('Codex');
   // A quota row for the Codex account and none for Claude.
-  assert.equal(page.labelled('codex-one'), 4);
-  assert.equal(page.labelled('claude-one'), 3);
-  page.click('Claude');
-  assert.equal(page.labelled('claude-one'), 4);
   assert.equal(page.labelled('codex-one'), 3);
+  assert.equal(page.labelled('claude-one'), 2);
+  page.click('Claude');
+  assert.equal(page.labelled('claude-one'), 3);
+  assert.equal(page.labelled('codex-one'), 2);
 });
 
 test('a disabled account offers only Enable: no Switch to on its row or in the Accounts table', async () => {
@@ -2190,24 +2190,23 @@ test('GET /teamclaude/dashboard serves HTML without a key; other methods are a l
   }
 });
 
-test('the theme starts from what was stored, and system means no attribute', () => {
-  // No stored choice: the attribute is absent, so the media query decides and a
-  // viewer who never touches this keeps following their desktop.
-  assert.equal(bootPage().rootAttrs.get('data-theme'), undefined);
+test('the theme is dark unless light was stored, whatever the system prefers', () => {
+  // The page has no rule that reads the system's preference, so a light
+  // desktop with nothing stored still gets the dark palette.
+  assert.doesNotMatch(renderDashboardHtml(), /prefers-color-scheme/);
+  assert.equal(bootPage().rootAttrs.get('data-theme'), 'dark');
+  assert.equal(bootPage().byId('theme').textContent, 'Theme: dark');
   assert.equal(bootPage({ storedTheme: 'light' }).rootAttrs.get('data-theme'), 'light');
   assert.equal(bootPage({ storedTheme: 'dark' }).rootAttrs.get('data-theme'), 'dark');
-  // Junk in storage is not a theme; fall back to following the system rather
-  // than writing an attribute no stylesheet matches.
-  assert.equal(bootPage({ storedTheme: 'neon' }).rootAttrs.get('data-theme'), undefined);
+  // A value from the old three-way switch, or junk, is not a choice of light.
+  assert.equal(bootPage({ storedTheme: 'system' }).rootAttrs.get('data-theme'), 'dark');
+  assert.equal(bootPage({ storedTheme: 'neon' }).rootAttrs.get('data-theme'), 'dark');
 });
 
-test('the theme button cycles system -> light -> dark and persists each step', () => {
+test('the theme button switches between dark and light and stores each choice', () => {
   const page = bootPage();
   const click = () => page.byId('theme').fire('click');
   const stored = () => page.store.get('teamclaude-dashboard-theme');
-
-  assert.equal(page.byId('theme').textContent, 'Theme: system');
-  assert.equal(stored(), undefined, 'following the system stores nothing');
 
   click();
   assert.equal(page.rootAttrs.get('data-theme'), 'light');
@@ -2217,24 +2216,16 @@ test('the theme button cycles system -> light -> dark and persists each step', (
   click();
   assert.equal(page.rootAttrs.get('data-theme'), 'dark');
   assert.equal(stored(), 'dark');
-
-  // Back to system: the attribute goes away AND the stored value is removed,
-  // so the page does not keep re-applying a choice the viewer just dropped.
-  click();
-  assert.equal(page.rootAttrs.get('data-theme'), undefined);
-  assert.equal(stored(), undefined);
-  assert.equal(page.byId('theme').textContent, 'Theme: system');
+  assert.equal(page.byId('theme').textContent, 'Theme: dark');
 });
 
-test('a stored dark choice survives a reload', () => {
+test('a stored light choice survives a reload', () => {
   const first = bootPage();
   first.byId('theme').fire('click');
-  first.byId('theme').fire('click');
-  assert.equal(first.store.get('teamclaude-dashboard-theme'), 'dark');
-  // A fresh page with that storage comes up dark without another click.
+  assert.equal(first.store.get('teamclaude-dashboard-theme'), 'light');
   const reloaded = bootPage({ storedTheme: first.store.get('teamclaude-dashboard-theme') });
-  assert.equal(reloaded.rootAttrs.get('data-theme'), 'dark');
-  assert.equal(reloaded.byId('theme').textContent, 'Theme: dark');
+  assert.equal(reloaded.rootAttrs.get('data-theme'), 'light');
+  assert.equal(reloaded.byId('theme').textContent, 'Theme: light');
 });
 
 test('accountControlRequest picks the endpoint and body from the spec', () => {
@@ -3844,223 +3835,209 @@ test('Account sync: a cancel that does not take is reported', async () => {
   }, { autoAnswer: null, manualTimers: true });
 });
 
-const reset = () => Date.now() + 2 * 3600 * 1000;
+const T0 = 1_800_000_000_000;
+const MIN = 60 * 1000;
+const HOUR = 60 * MIN;
 
-test('overviewHeadline says every account is healthy when none is blocked or near a limit', () => {
-  const h = overviewHeadline([
-    { name: 'a', quota: { unified5h: 0.4, unified7d: 0.5 } },
-    { name: 'b', quota: {} },
-    { name: 'off', disabled: true, unavailable: 'disabled' },
-  ]);
-  assert.deepEqual({ text: h.text, tone: h.tone, total: h.total, serving: h.serving, attention: h.attention },
-    { text: 'All 2 accounts healthy', tone: 'ok', total: 2, serving: 2, attention: [] });
-  assert.equal(overviewHeadline([{ name: 'solo', quota: {} }]).text, 'The only account is healthy');
+test('accountState: the route target is routing, any other account that can take requests is serving', () => {
+  const status = { defaultTargets: { anthropic: 'a', codex: 'same' }, currentAccounts: { anthropic: 'b' } };
+  assert.deepEqual(accountState({ name: 'a', provider: 'anthropic', quota: {} }, status, T0), { state: 'routing', backAt: null, limited: false });
+  assert.equal(accountState({ name: 'b', provider: 'anthropic', quota: {} }, status, T0).state, 'serving', 'the cursor is not where requests go');
+  assert.equal(accountState({ name: 'same', provider: 'anthropic', quota: {} }, status, T0).state, 'serving', 'a namesake under another provider');
+  assert.equal(accountState({ name: 'c', provider: 'anthropic', unavailable: 'cordoned' }, status, T0).state, 'serving', 'a cordoned account still serves its conversations');
+  assert.equal(accountState({ name: 'p', provider: 'anthropic', unavailable: 'quota', onExtraUsage: true }, status, T0).state, 'serving', 'past its plan on extra usage');
+  assert.equal(accountState({ name: 'p', provider: 'anthropic', unavailable: 'throttled', onExtraUsage: true }, status, T0).state, 'resting', 'extra usage does not lift a throttle');
+  assert.equal(accountState({ name: 'old', quota: {} }, { currentAccount: 'old' }, T0).state, 'routing', 'a proxy that names one current account');
 });
 
-test('overviewHeadline names each serving account at 90% or more of a window, by its fuller window', () => {
-  const at = reset();
-  const h = overviewHeadline([
-    { name: 'near5h', quota: { unified5h: 0.97, unified5hReset: at, unified7d: 0.2 } },
-    { name: 'near7d', quota: { unified5h: 0.91, unified7d: 0.95, unified7dReset: at } },
-    { name: 'fine', quota: { unified5h: 0.89, unified7d: 0.1 } },
-  ]);
-  assert.equal(h.text, 'All 3 accounts serving');
-  assert.equal(h.tone, 'warn');
-  assert.deepEqual(h.attention, [
-    { name: 'near5h', window: '5-hour', used: 0.97, resetAt: at },
-    { name: 'near7d', window: '7-day', used: 0.95, resetAt: at },
-  ]);
-  assert.equal(overviewHeadline([{ name: 'm', quota: { planPeriod: 'monthly', unified7d: 0.93 } }]).attention[0].window, 'monthly');
+test('accountState: a resting account is back when the window it spent resets, 7-day first', () => {
+  const quota = (u5, u7) => ({ unified5h: u5, unified5hReset: T0 + 57 * MIN, unified7d: u7, unified7dReset: T0 + 50 * HOUR });
+  const out = { name: 'x', provider: 'anthropic', unavailable: 'quota' };
+  assert.deepEqual(accountState({ ...out, quota: quota(0.4, 0.99) }, {}, T0), { state: 'resting', backAt: T0 + 50 * HOUR, limited: true });
+  assert.equal(accountState({ ...out, quota: quota(1, 0.6) }, {}, T0).backAt, T0 + 57 * MIN, 'the 5-hour window when the week has room');
+  assert.equal(accountState({ ...out, quota: quota(1, 0.9) }, { switchThreshold: 0.85 }, T0).backAt, T0 + 50 * HOUR, 'the fleet threshold is the limit');
+  assert.equal(accountState({ ...out, quota: quota(1, 0.9) }, { switchThresholds: { default: 0.98, unified7d: 0.85 } }, T0).backAt, T0 + 50 * HOUR, 'a weekly entry in the fleet table');
+  assert.equal(accountState({ ...out, switchThreshold: 0.98, quota: quota(1, 0.9) }, { switchThresholds: { unified7d: 0.85 } }, T0).backAt, T0 + 57 * MIN, "the account's own default outranks the fleet's weekly entry");
+  assert.equal(accountState({ ...out, unavailable: 'exhausted', quota: { unified7d: 1, unified7dReset: T0 - MIN } }, {}, T0).backAt, null, 'a reset already past is not a return time');
 });
 
-test('overviewHeadline counts blocked accounts by reason in plain words', () => {
-  const h = overviewHeadline([
-    { name: 'a', unavailable: 'throttled' },
-    { name: 'b', unavailable: 'quota' },
-    { name: 'c', unavailable: 'exhausted' },
-    { name: 'd', unavailable: 'cordoned', quota: {} },
-    { name: 'e', unavailable: 'error', errorReason: { code: 'refresh_rejected' } },
-    { name: 'f', unavailable: 'error', errorReason: { code: 'account_suspended' } },
-    { name: 'g', unavailable: 'something-new' },
+test('accountState: a cooldown is back when it ends, and an account needing a person has no return time', () => {
+  const until = new Date(T0 + 3 * MIN).toISOString();
+  assert.deepEqual(accountState({ name: 't', unavailable: 'throttled', rateLimitedUntil: until }, {}, T0), { state: 'resting', backAt: T0 + 3 * MIN, limited: false });
+  assert.deepEqual(accountState({ name: 'e', unavailable: 'error', quota: {} }, {}, T0), { state: 'resting', backAt: null, limited: false });
+});
+
+const FLEET_STATUS = () => ({
+  defaultTargets: { anthropic: 'c1', codex: 'x2', grok: 'g1' },
+  accounts: [
+    { name: 'c1', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.4 } },
+    { name: 'c2', provider: 'anthropic', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: T0 + 2 * HOUR, unified7d: 0.5 } },
+    { name: 'c3', provider: 'anthropic', unavailable: 'quota', quota: { unified5h: 0.3, unified7d: 1, unified7dReset: T0 + 30 * HOUR } },
+    { name: 'c4', provider: 'anthropic', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: T0 + 57 * MIN, unified7d: 0.7 } },
+    { name: 'c5', provider: 'anthropic', unavailable: 'throttled', rateLimitedUntil: new Date(T0 + 5 * MIN).toISOString() },
+    { name: 'c6', provider: 'anthropic', unavailable: 'error' },
+    { name: 'paid', provider: 'anthropic', unavailable: 'quota', onExtraUsage: true, quota: { unified5h: 1, unified7d: 1 } },
+    { name: 'off', provider: 'anthropic', disabled: true, unavailable: 'disabled' },
+    { name: 'x1', provider: 'codex', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: T0 + 3 * HOUR } },
+    { name: 'x2', provider: 'codex', quota: { unified5h: 0.1, unified7d: 0.2 } },
+    { name: 'g1', provider: 'grok', quota: { planPeriod: 'monthly', unified7d: 0.9 } },
+  ],
+});
+
+test('overviewFleet groups the enabled accounts by provider and counts them as the Accounts page does', () => {
+  const f = overviewFleet(FLEET_STATUS(), T0);
+  assert.deepEqual(f.groups.map(g => [g.label, g.tone, g.accounts.map(a => a.name + ':' + a.state)]), [
+    ['Claude', 'claude', ['c1:routing', 'c2:resting', 'c3:resting', 'c4:resting', 'c5:resting', 'c6:resting', 'paid:serving']],
+    ['Codex', 'codex', ['x1:resting', 'x2:routing']],
+    ['Grok', 'grok', ['g1:routing']],
   ]);
-  assert.equal(h.text, '1 throttled, 2 out of quota, 1 needing a re-login, 1 refused by upstream, 1 something-new');
-  assert.equal(h.tone, 'warn', 'a cordoned account still serves its conversations');
-  assert.equal(h.serving, 1);
-  const none = overviewHeadline([{ name: 'a', unavailable: 'throttled' }, { name: 'b', unavailable: 'throttled' }]);
-  assert.deepEqual([none.text, none.tone], ['2 throttled', 'bad']);
+  assert.deepEqual([f.total, f.disabled, f.serving, f.limited, f.blocked], [10, 1, 4, 4, 2]);
+  assert.deepEqual(f.uncovered, []);
+  assert.deepEqual(f.billing, ['paid']);
 });
 
-test('overviewHeadline counts an account serving on extra usage as serving, and names it as billed', () => {
-  const h = overviewHeadline([{ name: 'paid', unavailable: 'quota', onExtraUsage: true, quota: { unified5h: 1 } }]);
-  assert.equal(h.serving, 1);
-  assert.deepEqual(h.billing, ['paid']);
-  assert.equal(h.text, 'The only account is serving');
-  assert.equal(h.tone, 'warn');
-  const throttled = overviewHeadline([{ name: 'paid', unavailable: 'throttled', onExtraUsage: true, quota: {} }]);
-  assert.equal(throttled.serving, 0, 'extra usage does not lift a throttle');
-  assert.deepEqual(throttled.billing, []);
-  assert.equal(throttled.text, '1 throttled');
-  const rejected = overviewHeadline([{ name: 'paid', unavailable: 'upstream-rejected', onExtraUsage: true, quota: {} }]);
-  assert.deepEqual([rejected.serving, rejected.billing], [1, ['paid']], 'a plan upstream refused, now billed, is serving');
+test('overviewFleet says who is back next, and the weekly room the serving accounts have left', () => {
+  const f = overviewFleet(FLEET_STATUS(), T0);
+  assert.equal(f.nextBack, T0 + 57 * MIN, 'the soonest spent window, not the throttle');
+  assert.deepEqual(f.backNext, [
+    { name: 'c5', backAt: T0 + 5 * MIN },
+    { name: 'c4', backAt: T0 + 57 * MIN },
+    { name: 'c2', backAt: T0 + 2 * HOUR },
+  ]);
+  assert.equal(f.weekly?.count, 3, 'g1 is on a monthly plan');
+  assert.ok(Math.abs((f.weekly?.left ?? 0) - (0.6 + 0.8 + 0) / 3) < 1e-9);
+  assert.equal(overviewFleet({ accounts: [{ name: 'a', quota: {} }] }, T0).weekly, null);
 });
 
-test('requestStrip keeps a Claude and a Codex account with one name apart', () => {
-  const events = [
-    { kind: 'usage', account: 'same', provider: 'anthropic', status: 200 },
-    { kind: 'usage', account: 'same', provider: 'codex', status: 500 },
-  ];
-  assert.deepEqual(requestStrip(events, 'same', 2, 'anthropic').slots, [null, 'ok']);
-  assert.deepEqual(requestStrip(events, 'same', 2, 'codex').slots, [null, 'failed']);
+test('overviewHeadline stays calm while accounts rest, as long as every provider serves and requests succeed', () => {
+  const f = overviewFleet(FLEET_STATUS(), T0);
+  assert.deepEqual(overviewHeadline(f, 0.97), { text: 'All systems steady', tone: 'ok' });
+  assert.deepEqual(overviewHeadline(f, 0.95), { text: 'All systems steady', tone: 'ok' });
+  assert.deepEqual(overviewHeadline(f, null), { text: 'All systems steady', tone: 'ok' }, 'no traffic is not a failure');
+  assert.deepEqual(overviewHeadline(f, 0.94), { text: 'Some requests are failing', tone: 'warn' });
+  assert.deepEqual(overviewHeadline(f, 0.79), { text: 'Requests are failing', tone: 'bad' });
+});
+
+test('overviewHeadline names a provider left with no account serving', () => {
+  const s = FLEET_STATUS();
+  s.accounts = s.accounts.map(a => (a.provider === 'codex' ? { ...a, unavailable: 'quota' } : a));
+  assert.deepEqual(overviewHeadline(overviewFleet(s, T0), 1), { text: 'Codex has no account serving', tone: 'warn' });
+  assert.deepEqual(overviewHeadline(overviewFleet(s, T0), 0.5), { text: 'Requests are failing', tone: 'bad' }, 'failing requests come first');
+  s.accounts = s.accounts.map(a => (a.provider === 'grok' ? { ...a, unavailable: 'throttled' } : a));
+  assert.equal(overviewHeadline(overviewFleet(s, T0), 1).text, 'Codex and Grok have no account serving');
+  s.accounts = s.accounts.map(a => ({ ...a, onExtraUsage: false, unavailable: a.disabled ? 'disabled' : 'quota' }));
+  assert.deepEqual(overviewHeadline(overviewFleet(s, T0), null), { text: 'No account can serve', tone: 'bad' });
 });
 
 test('overviewHeadline with every account disabled, or none at all, says so', () => {
-  const h = overviewHeadline([{ name: 'a', disabled: true }, { name: 'b', disabled: true }]);
-  assert.deepEqual([h.text, h.tone, h.total, h.serving], ['Every account is disabled', 'bad', 0, 0]);
-  assert.equal(overviewHeadline([]).text, 'No accounts yet');
-  assert.equal(overviewHeadline(undefined).tone, 'bad');
+  assert.deepEqual(overviewHeadline(overviewFleet({ accounts: [{ name: 'a', disabled: true }] }, T0), null), { text: 'Every account is disabled', tone: 'bad' });
+  assert.deepEqual(overviewHeadline(overviewFleet({ accounts: [] }, T0), 1), { text: 'No accounts yet', tone: 'bad' });
+  assert.equal(overviewHeadline(overviewFleet(undefined, T0), null).text, 'No accounts yet');
 });
 
-test('overviewTiles has no success rate with no traffic, and none counted for an old proxy', () => {
-  const zero = overviewTiles({ traffic: { bucketMs: 600000, buckets: [{ at: 0, ok: 0, failed: 0 }, { at: 600000, ok: 0, failed: 0 }] }, accounts: [] });
-  assert.deepEqual([zero.traffic, zero.ok, zero.failed, zero.rate], [true, 0, 0, null]);
-  const old = overviewTiles({ accounts: [] });
-  assert.deepEqual([old.traffic, old.rate], [false, null]);
+test('restingText counts the accounts waiting on a reset and says when the first is back', () => {
+  const s = FLEET_STATUS();
+  assert.equal(restingText(overviewFleet(s, T0), T0), '4 accounts are resting until their limits reset. The next is back in 57m. 2 more cannot serve right now.');
+  const one = { accounts: [{ name: 'a', quota: {} }, { name: 'b', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: T0 + 2 * HOUR } }] };
+  assert.equal(restingText(overviewFleet(one, T0), T0), '1 account is resting until its limits reset. It is back in 2h 0m.');
+  const blocked = { accounts: [{ name: 'a', quota: {} }, { name: 'b', unavailable: 'error' }, { name: 'c', unavailable: 'error' }] };
+  assert.equal(restingText(overviewFleet(blocked, T0), T0), '2 accounts cannot serve right now.');
+  assert.equal(restingText(overviewFleet({ accounts: [{ name: 'a', quota: {} }] }, T0), T0), 'Every account has room.');
+  assert.equal(restingText(overviewFleet({ accounts: [] }, T0), T0), '');
 });
 
-test('overviewTiles adds up the traffic, the serving accounts and the 5-hour quota left', () => {
-  const t = overviewTiles({
-    traffic: { buckets: [{ at: 0, ok: 30, failed: 2 }, { at: 600000, ok: 18, failed: 0 }] },
-    sessions: { active: 3, known: 7 },
-    accounts: [
-      { name: 'a', quota: { unified5h: 0.2 } },
-      { name: 'b', unavailable: 'throttled', quota: { unified5h: 0.9 } },
-      { name: 'c', quota: {} },
-      { name: 'off', disabled: true, quota: { unified5h: 1 } },
-    ],
-  });
-  assert.deepEqual([t.ok, t.failed, t.rate], [48, 2, 48 / 50]);
-  assert.deepEqual([t.serving, t.total, t.active, t.known], [2, 3, 3, 7]);
-  assert.equal(t.quota5h?.count, 2, 'only accounts with a reading, disabled ones left out');
-  assert.ok(Math.abs((t.quota5h?.left ?? 0) - 0.45) < 1e-9);
-  assert.equal(t.quota5h?.lowest.name, 'b');
-  assert.equal(overviewTiles({ accounts: [{ name: 'a', quota: {} }] }).quota5h, null);
+test('fmtUntil rounds to whole minutes before it splits off the hours', () => {
+  assert.equal(fmtUntil(57 * 60), '57m');
+  assert.equal(fmtUntil(2 * 3600 - 20), '2h 0m', 'never 1h 60m');
+  assert.equal(fmtUntil(3 * 3600 + 21 * 60), '3h 21m');
+  assert.equal(fmtUntil(3 * 86400), '3 days');
 });
 
-test('trafficScale with every bucket empty draws nothing and still has a usable axis', () => {
-  const sc = trafficScale(Array.from({ length: 20 }, (_, i) => ({ at: i * 600000, ok: 0, failed: 0 })));
-  assert.equal(sc.empty, true);
-  assert.equal(sc.peak, -1);
-  assert.equal(sc.bars.length, 20);
-  assert.ok(sc.top > 0, 'no division by zero');
-  assert.equal(sc.ticks[0], 0);
-  assert.equal(trafficScale(null).empty, true);
+test('trafficScale gives the share of requests that succeeded, and none with no requests', () => {
+  assert.equal(trafficScale([{ at: 0, ok: 30, failed: 2 }, { at: 1, ok: 18, failed: 0 }]).rate, 48 / 50);
+  assert.equal(trafficScale([{ at: 0, ok: 0, failed: 0 }]).rate, null);
+  assert.equal(trafficScale(null).rate, null);
 });
 
-test('trafficScale stacks the counts under a whole-number axis and finds the busiest bucket', () => {
-  const sc = trafficScale([{ at: 1, ok: 20, failed: 3 }, { at: 2, ok: 50, failed: 1 }, { at: 3, ok: 51, failed: 0 }, { at: 4, ok: 0, failed: 2 }]);
-  assert.deepEqual([sc.ok, sc.failed, sc.peak, sc.empty], [121, 6, 1, false]);
-  assert.deepEqual(sc.bars[0], { at: 1, ok: 20, failed: 3, total: 23 });
-  assert.ok(sc.top >= 51);
-  assert.equal(sc.ticks.at(-1), sc.top);
-  assert.ok(sc.ticks.every(v => Number.isInteger(v)));
-  assert.deepEqual(trafficScale([{ at: 0, ok: 1, failed: 0 }]).ticks, [0, 1]);
-});
-
-test('requestStrip pads an account with fewer requests than slots at the start, oldest first', () => {
-  const events = [
-    { kind: 'usage', account: 'a', status: 200 },
-    { kind: 'usage', account: 'b', status: 500 },
-    { kind: 'rotation', account: 'a' },
-    { kind: 'usage', account: 'a', status: 429 },
-    { kind: 'usage', account: 'a', status: null },
-    { kind: 'usage', account: 'a', status: 201 },
-  ];
-  const st = requestStrip(events, 'a', 6);
-  assert.deepEqual(st.slots, [null, null, 'ok', 'failed', 'failed', 'ok']);
-  assert.deepEqual([st.count, st.ok, st.rate], [4, 2, 0.5]);
-  assert.deepEqual(requestStrip(events, 'a', 2).slots, ['failed', 'ok'], 'only the last n');
-  assert.deepEqual(requestStrip([], 'a', 3), { slots: [null, null, null], rate: null, count: 0, ok: 0 });
+test('wavePath runs through every value, the busiest at the top and zero on the floor, without overshooting', () => {
+  const values = [20, 19, 0, 44, 43, 0, 30];
+  const p = wavePath(values, 600, 100, 10);
+  const nums = p.line.slice(1).split(/[ C,]+/).filter(Boolean).map(Number);
+  // M x0,y0 then three points per segment: two controls and the next value.
+  const points = [[nums[0], nums[1]]];
+  for (let i = 2; i < nums.length; i += 6) points.push([nums[i], nums[i + 1]], [nums[i + 2], nums[i + 3]], [nums[i + 4], nums[i + 5]]);
+  const anchors = points.filter((_, i) => i % 3 === 0);
+  assert.deepEqual(anchors.map(a => a[0]), [0, 100, 200, 300, 400, 500, 600]);
+  assert.equal(anchors[3][1], 10, 'the busiest slot touches the top');
+  assert.equal(anchors[2][1], 100, 'an empty slot sits on the floor');
+  for (let s = 0; s < values.length - 1; s++) {
+    const [a, c1, c2, b] = points.slice(s * 3, s * 3 + 4);
+    const lo = Math.min(a[1], b[1]), hi = Math.max(a[1], b[1]);
+    for (const c of [c1, c2]) assert.ok(c[1] >= lo - 1e-9 && c[1] <= hi + 1e-9, `segment ${s} stays between its ends`);
+  }
+  assert.equal(p.end.x, 600);
+  assert.ok(Math.abs(p.end.y - (100 - 30 / 44 * 90)) < 1e-9, 'the dot sits on the latest slot');
+  assert.ok(p.area.startsWith(p.line) && p.area.endsWith(' L600,100 L0,100 Z'));
+  assert.equal(wavePath([0, 0], 10, 10, 2).line, 'M0,10 C3.33,10 6.67,10 10,10', 'no traffic is a flat line on the floor');
 });
 
 test('the Overview helpers run in the page\'s own scope', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function(`${bundle}; return { overviewHeadline, overviewTiles, trafficScale };`)();
-  const status = { traffic: { buckets: [{ at: 0, ok: 3, failed: 1 }] }, accounts: [{ name: 'a', quota: { unified5h: 0.95, unified7d: 0.1 } }] };
-  assert.deepEqual(isolated.overviewHeadline(status.accounts), overviewHeadline(status.accounts));
-  assert.deepEqual(isolated.overviewTiles(status), overviewTiles(status));
-  assert.deepEqual(isolated.trafficScale(status.traffic.buckets), trafficScale(status.traffic.buckets));
+  const isolated = new Function(`${bundle}; return { accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath };`)();
+  const status = FLEET_STATUS();
+  const fleet = overviewFleet(status, T0);
+  assert.deepEqual(isolated.overviewFleet(status, T0), fleet);
+  assert.deepEqual(isolated.accountState(status.accounts[2], status, T0), accountState(status.accounts[2], status, T0));
+  assert.deepEqual(isolated.overviewHeadline(fleet, 0.9), overviewHeadline(fleet, 0.9));
+  assert.equal(isolated.restingText(fleet, T0), restingText(fleet, T0));
+  assert.deepEqual(isolated.wavePath([1, 4, 2], 100, 50, 5), wavePath([1, 4, 2], 100, 50, 5));
 });
 
 const OV_STATUS = () => ({
   server: { version: '9.9.9', uptimeSeconds: 120 },
-  currentAccount: 'a',
-  traffic: { bucketMs: 600000, buckets: [{ at: Date.now(), ok: 2, failed: 1 }] },
-  sessions: { active: 0, known: 0 },
-  accounts: [{ name: 'a', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.3 } }],
+  defaultTargets: { anthropic: 'a' },
+  traffic: { bucketMs: 600000, buckets: [{ at: Date.now() - 600000, ok: 40, failed: 1 }, { at: Date.now(), ok: 19, failed: 0 }] },
+  sessions: { active: 1, known: 2 },
+  accounts: [
+    { name: 'a', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.3 } },
+    { name: 'b', provider: 'anthropic', unavailable: 'quota', quota: { unified5h: 1, unified5hReset: Date.now() + 57 * MIN, unified7d: 0.5 } },
+  ],
 });
 
-test('the Overview is the landing page, and reads the event log after status and only while open', async () => {
+test('the Overview is the landing page and reads status alone', async () => {
   const page = bootPage({ hash: '' });
-  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/status'], 'no log before status has accepted the key');
   await page.answer(200, OV_STATUS());
   assert.equal(page.byId('page-overview').style.display, '');
   assert.equal(page.byId('page-quota').style.display, 'none');
-  assert.equal(page.byId('ovTitle').textContent, 'The only account is healthy');
-  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · up 2m · routing to a');
-  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=0']);
-  await page.answer(200, { generation: 'g', lastId: 2, events: [
-    { id: 1, kind: 'usage', account: 'a', status: 200 },
-    { id: 2, kind: 'usage', account: 'a', status: 500 },
-  ] });
-  assert.equal(page.labelled('50.0%'), 1, 'the account\'s share of its logged requests');
-  page.click('Quota');
-  page.poll();
-  await page.answer(200, OV_STATUS());
-  assert.equal(page.requests.length, 0, 'another page reads status alone');
-  page.click('Overview');
-  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=2'], 'back on the Overview, only what is newer');
+  assert.equal(page.byId('ovTitle').textContent, 'All systems steady');
+  assert.ok(page.findLast(e => e.className === 'ovdot' && e.textContent === '.'), 'the headline ends in its coloured period');
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · Connected · up 2m');
+  assert.equal(page.byId('ovRest').textContent, '1 account is resting until its limits reset. It is back in 57m.');
+  assert.equal(page.byId('ovTotal').textContent, '60');
+  assert.deepEqual(page.requests, [], 'no event log: the Overview draws no per-account strips');
 });
 
-test('a key the event log refuses keeps the Overview, without the strips and without asking again', async () => {
-  const page = bootPage({ hash: '', storedKey: 'tc-client' });
-  await page.answer(200, OV_STATUS());
-  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
-  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client', 'the key is kept');
-  assert.equal(page.byId('keybox').style.display, 'none');
-  assert.equal(page.labelled('This key may not read the request log, so recent requests are not shown.'), 1);
-  page.poll();
-  await page.answer(200, OV_STATUS());
-  assert.equal(page.requests.length, 0);
-});
-
-test('the Overview names the account requests go to, not a throttled cursor', async () => {
+test('the Overview names each account in the fleet by its state, and lists who is back next', async () => {
   const page = bootPage({ hash: '' });
-  await page.answer(200, { ...OV_STATUS(), currentAccounts: { anthropic: 'a' }, defaultTargets: { anthropic: 'b' } });
-  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · up 2m · routing to b');
+  await page.answer(200, OV_STATUS());
+  assert.ok(page.findLast(e => e.title === 'a, routing now'));
+  assert.ok(page.findLast(e => e.title === 'b, resting, back in 57m'));
+  assert.ok(page.findLast(e => e.textContent === '1 of 2 serving'));
+  assert.ok(page.findLast(e => e.textContent === 'in 57m'));
 });
 
-test('leaving the Overview before the event log refuses its key keeps the key', async () => {
-  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+test('a failed status read marks the Overview as no longer live', async () => {
+  const page = bootPage({ hash: '' });
   await page.answer(200, OV_STATUS());
-  page.click('Quota');
-  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
-  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
-  assert.equal(page.byId('keybox').style.display, 'none');
-});
-
-test('a successful log read after a refusal brings the Overview strips back', async () => {
-  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  assert.equal(page.byId('ovLive').textContent, 'Live');
+  page.poll();
+  await page.answer(500, { error: 'boom' });
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · Not reachable');
+  assert.equal(page.byId('ovLive').textContent, 'Offline');
+  page.poll();
   await page.answer(200, OV_STATUS());
-  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
-  const note = 'This key may not read the request log, so recent requests are not shown.';
-  assert.equal(page.labelled(note), 1);
-  page.click('Logs');
-  await page.answerTo('/teamclaude/logs?after=0', 200, { generation: 'g', lastId: 1, events: [{ id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 }] });
-  page.click('Overview');
-  await page.answerTo('/teamclaude/logs?after=1', 200, { generation: 'g', lastId: 1, events: [] });
-  assert.equal(page.labelled(note), 0);
-  assert.ok(page.labelled('100.0%') >= 1, 'the strip and its share are back');
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · Connected · up 2m');
 });
 
 test('the Overview\'s buttons open the Accounts and Logs pages', async () => {
@@ -4081,6 +4058,31 @@ test('the Overview says when the traffic window is empty', async () => {
   await page.answer(200, s);
   assert.equal(page.labelled('No requests in the last 3h 20m.'), 1);
   assert.equal(page.byId('ovTableWrap').style.display, 'none');
+});
+
+test('requestStrip keeps a Claude and a Codex account with one name apart', () => {
+  const events = [
+    { kind: 'usage', account: 'same', provider: 'anthropic', status: 200 },
+    { kind: 'usage', account: 'same', provider: 'codex', status: 500 },
+  ];
+  assert.deepEqual(requestStrip(events, 'same', 2, 'anthropic').slots, [null, 'ok']);
+  assert.deepEqual(requestStrip(events, 'same', 2, 'codex').slots, [null, 'failed']);
+});
+
+test('requestStrip pads an account with fewer requests than slots at the start, oldest first', () => {
+  const events = [
+    { kind: 'usage', account: 'a', status: 200 },
+    { kind: 'usage', account: 'b', status: 500 },
+    { kind: 'rotation', account: 'a' },
+    { kind: 'usage', account: 'a', status: 429 },
+    { kind: 'usage', account: 'a', status: null },
+    { kind: 'usage', account: 'a', status: 201 },
+  ];
+  const st = requestStrip(events, 'a', 6);
+  assert.deepEqual(st.slots, [null, null, 'ok', 'failed', 'failed', 'ok']);
+  assert.deepEqual([st.count, st.ok, st.rate], [4, 2, 0.5]);
+  assert.deepEqual(requestStrip(events, 'a', 2).slots, ['failed', 'ok'], 'only the last n');
+  assert.deepEqual(requestStrip([], 'a', 3), { slots: [null, null, null], rate: null, count: 0, ok: 0 });
 });
 
 test('accountFilter counts each tab under the status and search, and each status under the tab', () => {
@@ -4214,6 +4216,28 @@ test('a key the event log refuses keeps the Accounts page and its key, without t
   page.poll();
   await page.answer(200, AC_STATUS());
   assert.equal(page.requests.length, 0, 'and the log is not asked again');
+});
+
+test('leaving the Accounts page before the event log refuses its key keeps the key', async () => {
+  const page = bootPage({ hash: '#accounts', storedKey: 'tc-client' });
+  await page.answer(200, AC_STATUS());
+  page.click('Quota');
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  assert.equal(page.byId('keybox').style.display, 'none');
+});
+
+test('a successful log read after a refusal brings the Accounts strips back', async () => {
+  const page = bootPage({ hash: '#accounts', storedKey: 'tc-client' });
+  await page.answer(200, AC_STATUS());
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.byId('acNote').style.display, '');
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=0', 200, { generation: 'g', lastId: 1, events: [{ id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 }] });
+  page.click('Accounts');
+  await page.answerTo('/teamclaude/logs?after=1', 200, { generation: 'g', lastId: 1, events: [] });
+  assert.equal(page.byId('acNote').style.display, 'none');
+  assert.ok(page.findLast(e => e.textContent === '100.0%'), 'the strip and its share are back');
 });
 
 test('the Accounts filters narrow the cards and survive the poll', async () => {

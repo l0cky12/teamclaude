@@ -468,15 +468,25 @@ curl -X POST http://localhost:3456/teamclaude/undrain -H "x-api-key: $KEY"
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Overview, Quota, Sessions, Clients, Insights), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). Each page has an icon beside its name. On a narrow window the sidebar becomes a row of buttons above the page. The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it. An address with no fragment opens the Overview page. The dashboard uses the TeamRouter name and a mark of three red bars on a dark red tile in its sidebar and browser tab. The icon is embedded in the page and needs no asset request. Both `/teamclaude/dashboard` and `/teamrouter/dashboard` work.
 
-`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The **Theme** button at the foot of the sidebar cycles system → light → dark; the choice is kept in the browser's localStorage, and "system" follows the browser's `prefers-color-scheme`. Dark is what a browser that states no preference gets.
+`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page is dark, whatever the system prefers. The **Theme** button at the foot of the sidebar switches between dark and light, and the browser's localStorage keeps the choice.
 
 ### Overview
 
-The Overview page answers whether the fleet is working. Its headline says whether every enabled account is healthy. If any account cannot serve, the headline counts them by reason, for example *1 throttled, 1 out of quota*. If an account is at 90% or more of its 5-hour or 7-day limit, a line under the headline names it, with the percentage and when the limit resets. The line under the headline gives the version, the uptime and the account that requests go to now. **Open accounts** and **Open logs** go to those pages.
+The Overview page answers whether the fleet is working, and fits one screen on a laptop. Its headline stays calm while requests succeed and every provider with accounts has one serving:
 
-Four tiles follow: the share of requests that succeeded and how many failed, how many accounts are serving, the active conversations, and the 5-hour quota left on average, with the account that has the least. The chart shows the requests in each 10-minute slot of the last 3h 20m, succeeded and failed, with the same numbers in **Data table**. The proxy keeps these counts in memory, so the chart starts empty after a restart.
+- *All systems steady*: every provider has an account serving, and at least 95% of the requests in the last 3h 20m succeeded (or there were none).
+- *Codex has no account serving* (or the providers it names): a provider has accounts, but none of them can take a request.
+- *No account can serve*: no provider has an account serving.
+- *Some requests are failing*: under 95% succeeded.
+- *Requests are failing*: under 80% succeeded. This one comes first.
 
-Beside the chart, each enabled account has its provider, the share of its logged requests that succeeded, a strip of its last 24 requests, and the 5-hour and 7-day quota left. The strips come from the same event log as the **Logs** page, which the page reads only while Overview, Accounts or Logs is open.
+Accounts out of quota are ordinary rotation, so they never change the headline. The sentence under it counts them instead, for example *17 accounts are resting until their limits reset. The next is back in 57m.*, and adds how many more cannot serve for another reason. A line names each account serving on extra usage, which is billed. The meta line gives the version, whether the page can reach the proxy, and its uptime. **Open accounts** and **Inspect logs** go to those pages.
+
+Beside the headline, **Requests handled** has the requests of the last 3h 20m, the share that succeeded and failed, and a **Live** badge that reads **Offline** while the proxy cannot be reached. A line under them draws the requests in each 10-minute slot, with a dot on the latest. Point at it for a slot's numbers.
+
+Four tiles follow: the share of requests that succeeded and how many failed, how many accounts are serving, the active conversations, and the 7-day room left on average across the serving accounts on a weekly plan. The chart shows the requests in each 10-minute slot, succeeded and failed, with the same numbers in **Data table**. The proxy keeps these counts in memory, so the chart starts empty after a restart.
+
+Beside the chart, **Fleet** has a square for each enabled account, grouped by provider. A filled square serves, a ringed one is where its provider's requests go now, and a hollow one rests. Point at a square for the account's name and state. **Back next** lists the three resting accounts that return soonest. An account out of quota returns when its 7-day window resets if that window is at or above its switch threshold, and when its 5-hour window resets otherwise. "Serving" is counted as on the Accounts page: a cordoned account still serves its own conversations, and one past its quota on extra usage serves.
 
 ### Quota
 
@@ -513,7 +523,7 @@ Each account is a card, in a grid that holds three across on a wide window and o
 - The provider's badge and the account's name.
 - A line with its type and plan (`oauth · max`, `apikey`), its organization, and, when the account has been renamed away from its email, that email.
 - Badges for its state: **current**, **cordoned** (the reason is on hover), **disabled**, **extra usage**, or **blocked** with the reason on the line under it.
-- **Recent requests**: how many of its requests in the event log succeeded and failed, a strip of its last 30, and the share that succeeded. The log is the one the **Logs** page shows. The page reads it only while Accounts, Overview or Logs is open. If the key may not read the log, the page says so once and draws no strips.
+- **Recent requests**: how many of its requests in the event log succeeded and failed, a strip of its last 30, and the share that succeeded. The log is the one the **Logs** page shows. The page reads it only while Accounts or Logs is open. If the key may not read the log, the page says so once and draws no strips.
 - Its priority, conversations (active / known), requests, tokens and last request. A Codex card also has the resets left and when they expire.
 - The 5-hour and 7-day quota left, with the reset times. An account metered another way shows its own reading: a token budget, a backend's probed windows, or prepaid credit.
 - Its controls.

@@ -20,6 +20,7 @@ import { USAGE_WINDOWS } from './client-usage.js';
 import { EVENT_LOG_CAPACITY } from './event-log.js';
 import { CREDIT_EXPIRY_WINDOW_MS } from './codex-reset-credits.js';
 import { logoDataUrl, logoMarkup } from './logo.js';
+import { resolveSwitchThreshold, resolveFleetThreshold } from './model.js';
 
 export function renderDashboardHtml() {
   return PAGE;
@@ -2075,122 +2076,174 @@ export function servingOnExtraUsage(account) {
   return a.onExtraUsage === true && pastPlan;
 }
 
-/** @param {any} quota */
-function weeklyWindowName(quota) {
-  return quota && quota.planPeriod === 'monthly' ? 'monthly' : '7-day';
+// How long until a reset, the way the rows say it: "40m", "3h 20m", "1 day",
+// "2.5 days".
+/** @param {number} sec */
+export function fmtUntil(sec) {
+  var s = Math.max(0, Math.round(sec));
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + 'm';
+  var m = Math.round(s / 60);
+  if (s < 86400) return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+  var d = Math.round(s / 8640) / 10;
+  return d + (d === 1 ? ' day' : ' days');
 }
 
 /**
- * The Overview page's headline. Disabled accounts are left out, since nothing
- * routes to them, and a cordoned one still serves its own conversations. When
- * some account cannot serve, the headline counts them by reason; otherwise it
- * says whether every account is clear of its limits. `attention` names each
- * serving account at 90% or more of its 5-hour or weekly window, the fuller one.
- * An account past its plan but serving on extra usage counts as serving, and
- * `billing` names it, since every request it takes is billed.
+ * Where one enabled account stands on the Overview: `routing` when it is the
+ * account its provider's next request goes to, `serving` when it could take
+ * requests, `resting` when it cannot. The serving rule is the Accounts page's:
+ * a cordoned account still serves its own conversations, and one past its
+ * plan on extra usage serves too. `limited` is true when a spent quota window
+ * is why it rests, and `backAt` (epoch ms, or null when unknown) is when it
+ * returns: the 7-day reset when that window is at or above the account's
+ * switch threshold, the 5-hour reset otherwise, or the end of a cooldown.
  *
- * @param {any[]} accounts  status.accounts
- * @returns {{ text: string, tone: 'ok'|'warn'|'bad', total: number, serving: number, attention: { name: string, window: string, used: number, resetAt: any }[], billing: string[] }}
+ * @param {any} account  one entry of status.accounts
+ * @param {any} status  the GET /teamclaude/status reply it came from
+ * @param {number} [now]
+ * @returns {{ state: 'routing'|'serving'|'resting', backAt: number|null, limited: boolean }}
  */
-export function overviewHeadline(accounts) {
-  /** @type {Record<string, string>} */
-  var SHORT_REASON = {
-    throttled: 'throttled', quota: 'out of quota', exhausted: 'out of quota', 'upstream-rejected': 'out of quota',
-    'advisor-quota': 'out of quota', capped: 'capped', 'advisor-capped': 'capped', 'spend-capped': 'spend-capped',
-    error: 'needing a re-login', entitlement: 'refused by upstream', billing: 'refused for billing',
-    credential: 'with a rejected key', routing: 'unreachable', route: 'unrouted', 'advisor-route': 'unrouted',
-  };
-  var enabled = (accounts || []).filter(function (a) { return a && !a.disabled; });
-  /** @type {Record<string, number>} */
-  var counts = Object.create(null);
-  /** @type {string[]} */
-  var order = [];
-  /** @type {{ name: string, window: string, used: number, resetAt: any }[]} */
-  var attention = [];
-  /** @type {string[]} */
-  var billing = [];
-  var serving = 0;
-  enabled.forEach(function (a) {
-    if (servingOnExtraUsage(a)) { serving++; billing.push(a.name); return; }
-    var why = a.unavailable && a.unavailable !== 'cordoned' ? String(a.unavailable) : null;
-    if (why) {
-      var word = refusedUpstream(a) ? 'refused by upstream' : SHORT_REASON[why] || why;
-      if (!counts[word]) { counts[word] = 0; order.push(word); }
-      counts[word]++;
-      return;
-    }
-    serving++;
-    var q = a.quota || {};
-    var five = quotaMeter('5-hour', q.unified5h, q.unified5hReset);
-    var week = quotaMeter(weeklyWindowName(q), q.unified7d, q.unified7dReset);
-    var worst = (week.used || 0) > (five.used || 0) ? week : five;
-    if (worst.used != null && worst.used >= 0.9) attention.push({ name: a.name, window: worst.label, used: worst.used, resetAt: worst.resetAt });
-  });
-  var n = enabled.length;
-  /** @param {string} state */
-  var all = function (state) { return n === 1 ? 'The only account is ' + state : 'All ' + n + ' accounts ' + state; };
-  /** @type {'ok'|'warn'|'bad'} */
-  var tone = 'ok';
-  var text;
-  if (!n) {
-    text = (accounts || []).length ? 'Every account is disabled' : 'No accounts yet';
-    tone = 'bad';
-  } else if (order.length) {
-    text = order.map(function (w) { return counts[w] + ' ' + w; }).join(', ');
-    tone = serving ? 'warn' : 'bad';
-  } else if (attention.length || billing.length) {
-    text = all('serving');
-    tone = 'warn';
-  } else {
-    text = all('healthy');
+export function accountState(account, status, now) {
+  var a = account || {};
+  var s = status || {};
+  var at = now == null ? Date.now() : now;
+  var why = a.unavailable && a.unavailable !== 'cordoned' && !servingOnExtraUsage(a) ? String(a.unavailable) : null;
+  if (!why) {
+    var targets = s.defaultTargets || s.currentAccounts || null;
+    var routing = targets ? targets[a.provider] === a.name : a.name === (s.defaultTarget || s.currentAccount);
+    return { state: routing ? 'routing' : 'serving', backAt: null, limited: false };
   }
-  return { text: text, tone: tone, total: n, serving: serving, attention: attention, billing: billing };
+  /** @param {any} v */
+  var future = function (v) {
+    var t = typeof v === 'number' ? v : typeof v === 'string' ? Date.parse(v) : NaN;
+    return isFinite(t) && t > at ? t : null;
+  };
+  /** @type {Record<string, string>} */
+  var COOLDOWN_UNTIL = {
+    throttled: 'rateLimitedUntil', entitlement: 'entitlementDeniedUntil', routing: 'routingFailedUntil',
+    billing: 'billingRejectedUntil', credential: 'credentialRejectedUntil',
+  };
+  var LIMITED = ['quota', 'exhausted', 'upstream-rejected', 'capped', 'advisor-quota', 'advisor-capped'];
+  if (LIMITED.indexOf(why) < 0) return { state: 'resting', backAt: COOLDOWN_UNTIL[why] ? future(a[COOLDOWN_UNTIL[why]]) : null, limited: false };
+  var q = a.quota || {};
+  var limit7d = resolveSwitchThreshold(a.switchThreshold, 'unified7d', resolveFleetThreshold(s.switchThreshold, s.switchThresholds, 'unified7d'));
+  var weekSpent = typeof q.unified7d === 'number' && q.unified7d >= limit7d;
+  return { state: 'resting', backAt: future(weekSpent ? q.unified7dReset : q.unified5hReset), limited: true };
 }
 
 /**
- * The Overview page's four tiles: requests over the traffic window and the
- * share that succeeded (null with none), accounts serving, conversations, and
- * the 5-hour quota left averaged over the enabled accounts that have a
- * reading, with the lowest of them. `traffic` is false for a proxy too old to
- * report status.traffic.
+ * The Overview's picture of the fleet, from accountState for every enabled
+ * account: the accounts grouped as the Accounts page's tabs are, how many
+ * serve, rest on a spent window (`limited`) or rest for another reason
+ * (`blocked`), the groups with no account serving, when the next limited
+ * account is back, the three resting accounts that return soonest, the
+ * serving accounts billed on extra usage, and the 7-day room left averaged
+ * over the serving accounts on a weekly plan. Disabled accounts are left out,
+ * since nothing routes to them, and only counted.
  *
  * @param {any} status  a GET /teamclaude/status reply
- * @returns {{ traffic: boolean, ok: number, failed: number, rate: number|null, serving: number, total: number, active: number, known: number, quota5h: { left: number, count: number, lowest: { name: string, left: number } }|null }}
+ * @param {number} [now]
  */
-export function overviewTiles(status) {
+export function overviewFleet(status, now) {
   var s = status || {};
-  var buckets = s.traffic && Array.isArray(s.traffic.buckets) ? s.traffic.buckets : null;
-  var ok = 0;
-  var failed = 0;
-  (buckets || []).forEach(function (/** @type {any} */ b) { ok += Number(b.ok) || 0; failed += Number(b.failed) || 0; });
-  var head = overviewHeadline(s.accounts);
-  var sum = 0;
-  var count = 0;
-  /** @type {{ name: string, left: number }|null} */
-  var lowest = null;
-  (s.accounts || []).forEach(function (/** @type {any} */ a) {
-    if (!a || a.disabled) return;
-    var m = quotaMeter('5-hour', (a.quota || {}).unified5h, null);
-    if (m.left == null) return;
-    count++;
-    sum += m.left;
-    if (!lowest || m.left < lowest.left) lowest = { name: a.name, left: m.left };
+  var at = now == null ? Date.now() : now;
+  var all = s.accounts || [];
+  var enabled = all.filter(function (/** @type {any} */ a) { return a && !a.disabled; });
+  /** @type {{ key: string, label: string, tone: string, accounts: { name: string, state: string, backAt: number|null, limited: boolean }[] }[]} */
+  var groups = providerTabs(enabled).slice(1).map(function (t) {
+    return { key: t.key, label: t.label, tone: providerTone(t.key), accounts: [] };
   });
-  var sessions = s.sessions || {};
+  var serving = 0;
+  var limited = 0;
+  var blocked = 0;
+  /** @type {{ name: string, backAt: number, limited: boolean }[]} */
+  var back = [];
+  /** @type {string[]} */
+  var billing = [];
+  var roomSum = 0;
+  var roomCount = 0;
+  enabled.forEach(function (/** @type {any} */ a) {
+    var st = accountState(a, s, at);
+    var group = accountGroup(a);
+    groups.filter(function (g) { return g.key === group; })[0].accounts.push({ name: a.name, state: st.state, backAt: st.backAt, limited: st.limited });
+    if (st.state !== 'resting') {
+      serving++;
+      if (servingOnExtraUsage(a)) billing.push(a.name);
+      var q = a.quota || {};
+      var week = quotaMeter('7-day', q.unified7d, null);
+      if (q.planPeriod !== 'monthly' && week.left != null) { roomSum += week.left; roomCount++; }
+      return;
+    }
+    if (st.limited) limited++;
+    else blocked++;
+    if (st.backAt != null) back.push({ name: a.name, backAt: st.backAt, limited: st.limited });
+  });
+  back.sort(function (x, y) { return x.backAt - y.backAt; });
+  var nextLimited = back.filter(function (b) { return b.limited; })[0];
   return {
-    traffic: !!buckets, ok: ok, failed: failed, rate: ok + failed > 0 ? ok / (ok + failed) : null,
-    serving: head.serving, total: head.total, active: Number(sessions.active) || 0, known: Number(sessions.known) || 0,
-    quota5h: lowest ? { left: sum / count, count: count, lowest: lowest } : null,
+    total: enabled.length, disabled: all.length - enabled.length, serving: serving, limited: limited, blocked: blocked,
+    groups: groups,
+    uncovered: groups.filter(function (g) { return !g.accounts.some(function (x) { return x.state !== 'resting'; }); }).map(function (g) { return g.label; }),
+    nextBack: nextLimited ? nextLimited.backAt : null,
+    backNext: back.slice(0, 3).map(function (b) { return { name: b.name, backAt: b.backAt }; }),
+    billing: billing,
+    weekly: roomCount ? { left: roomSum / roomCount, count: roomCount } : null,
   };
 }
 
 /**
- * The Overview chart's scale: each bucket's counts, the totals, a y axis of
- * whole-number ticks from 0 to `top`, and the busiest bucket (`peak`, -1 when
- * every bucket is empty, which is when `empty` is true).
+ * The Overview's headline, calm unless something needs a person: requests
+ * failing (under 80% succeeded over the traffic window), a provider with no
+ * account serving, or some requests failing (under 95%). Accounts resting on
+ * a spent window are ordinary rotation and are left to restingText.
+ *
+ * @param {ReturnType<typeof overviewFleet>} fleet
+ * @param {number|null} rate  the share of requests that succeeded, null with none
+ * @returns {{ text: string, tone: 'ok'|'warn'|'bad' }}
+ */
+export function overviewHeadline(fleet, rate) {
+  if (!fleet.total) return { text: fleet.disabled ? 'Every account is disabled' : 'No accounts yet', tone: 'bad' };
+  if (rate != null && rate < 0.8) return { text: 'Requests are failing', tone: 'bad' };
+  var gone = fleet.uncovered;
+  if (gone.length && gone.length === fleet.groups.length) return { text: 'No account can serve', tone: 'bad' };
+  if (gone.length) {
+    var names = gone.length === 1 ? gone[0] : gone.slice(0, -1).join(', ') + ' and ' + gone[gone.length - 1];
+    return { text: names + (gone.length === 1 ? ' has' : ' have') + ' no account serving', tone: 'warn' };
+  }
+  if (rate != null && rate < 0.95) return { text: 'Some requests are failing', tone: 'warn' };
+  return { text: 'All systems steady', tone: 'ok' };
+}
+
+/**
+ * The sentence under the headline: how many accounts rest until a window
+ * resets and when the first is back, then how many cannot serve for another
+ * reason.
+ *
+ * @param {ReturnType<typeof overviewFleet>} fleet
+ * @param {number} [now]
+ */
+export function restingText(fleet, now) {
+  var at = now == null ? Date.now() : now;
+  var out = [];
+  var n = fleet.limited;
+  if (n) {
+    out.push(n === 1 ? '1 account is resting until its limits reset.' : n + ' accounts are resting until their limits reset.');
+    if (fleet.nextBack != null) out.push((n === 1 ? 'It is' : 'The next is') + ' back in ' + fmtUntil((fleet.nextBack - at) / 1000) + '.');
+  }
+  var b = fleet.blocked;
+  if (b) out.push((n ? b + ' more' : b + (b === 1 ? ' account' : ' accounts')) + ' cannot serve right now.');
+  if (!out.length && fleet.total) out.push('Every account has room.');
+  return out.join(' ');
+}
+
+/**
+ * The Overview chart's scale: each bucket's counts, the totals and the share
+ * that succeeded (`rate`, null with none), a y axis of whole-number ticks from
+ * 0 to `top`, and the busiest bucket (`peak`, -1 when every bucket is empty,
+ * which is when `empty` is true).
  *
  * @param {any[]|null|undefined} buckets  status.traffic.buckets
- * @returns {{ bars: { at: number, ok: number, failed: number, total: number }[], ok: number, failed: number, top: number, ticks: number[], peak: number, empty: boolean }}
+ * @returns {{ bars: { at: number, ok: number, failed: number, total: number }[], ok: number, failed: number, rate: number|null, top: number, ticks: number[], peak: number, empty: boolean }}
  */
 export function trafficScale(buckets) {
   var bars = (buckets || []).map(function (/** @type {any} */ b) {
@@ -2213,7 +2266,45 @@ export function trafficScale(buckets) {
   /** @type {number[]} */
   var ticks = [];
   for (var v = 0; v <= top; v += step) ticks.push(v);
-  return { bars: bars, ok: ok, failed: failed, top: top, ticks: ticks, peak: peak, empty: max === 0 };
+  return { bars: bars, ok: ok, failed: failed, rate: ok + failed > 0 ? ok / (ok + failed) : null, top: top, ticks: ticks, peak: peak, empty: max === 0 };
+}
+
+/**
+ * The Overview's traffic line as SVG path data in a `w` by `h` box: one point
+ * per value, evenly spaced from edge to edge, the largest touching `top` and
+ * zero on the bottom edge. Between points the curve keeps each slope's sign
+ * (Fritsch-Butland tangents), so it never rises above a peak or dips below
+ * zero the way a plain spline does. `area` is the line closed along the
+ * bottom for the fill under it, and `end` the last point, for its dot.
+ *
+ * @param {number[]} values  two or more
+ * @param {number} w
+ * @param {number} h
+ * @param {number} top
+ * @returns {{ line: string, area: string, end: { x: number, y: number } }}
+ */
+export function wavePath(values, w, h, top) {
+  var max = Math.max.apply(null, values.concat([0])) || 1;
+  var n = values.length;
+  var dx = w / (n - 1);
+  var pts = values.map(function (v, i) { return { x: i * dx, y: top + (1 - v / max) * (h - top) }; });
+  /** @param {number} v */
+  var r = function (v) { return Math.round(v * 100) / 100; };
+  /** @type {number[]} */
+  var d = [];
+  for (var i = 0; i < pts.length - 1; i++) d.push((pts[i + 1].y - pts[i].y) / dx);
+  var m = pts.map(function (_, i) {
+    if (i === 0) return d[0];
+    if (i === pts.length - 1) return d[i - 1];
+    return d[i - 1] * d[i] > 0 ? 2 * d[i - 1] * d[i] / (d[i - 1] + d[i]) : 0;
+  });
+  var line = 'M' + r(pts[0].x) + ',' + r(pts[0].y);
+  for (var j = 0; j < pts.length - 1; j++) {
+    var a = pts[j], b = pts[j + 1];
+    line += ' C' + r(a.x + dx / 3) + ',' + r(a.y + m[j] * dx / 3) + ' ' + r(b.x - dx / 3) + ',' + r(b.y - m[j + 1] * dx / 3) + ' ' + r(b.x) + ',' + r(b.y);
+  }
+  var end = pts[pts.length - 1];
+  return { line: line, area: line + ' L' + r(w) + ',' + r(h) + ' L0,' + r(h) + ' Z', end: { x: end.x, y: end.y } };
 }
 
 /**
@@ -3427,7 +3518,7 @@ const SHARED_HELPERS = [
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  weeklyWindowName, servingOnExtraUsage, overviewHeadline, overviewTiles, trafficScale, requestStrip,
+  servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   accountStatusText, accountInState, accountFilter, accountCard,
   mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
@@ -3472,11 +3563,6 @@ const PAGE = `<!doctype html>
 <title>TeamRouter</title>
 <link rel="icon" type="image/svg+xml" href="${logoDataUrl()}">
 <style>
-  /* Dark is the default, and stays the default for a viewer whose system says
-     nothing. The light palette is applied two ways: by the media query when no
-     choice has been stored (data-theme absent), and by the attribute when one
-     has. The media rule excludes an explicit dark choice, so choosing dark on a
-     light desktop is honoured rather than overridden by the system. */
   :root {
     color-scheme: dark;
     --bg: #141312; --side: #181716; --panel: #1c1b19; --panel2: #24221f; --line: #2d2b28; --line2: #3a3733; --track: #2a2825;
@@ -3493,19 +3579,6 @@ const PAGE = `<!doctype html>
     --ik-cacheRead: #3987e5; --ik-cacheWrite: #c98500; --ik-input: #d55181; --ik-output: #008300;
     --is1: #3987e5; --is2: #d95926; --is3: #199e70; --is4: #c98500; --is5: #d55181; --is6: #008300; --is7: #9085e9; --is8: #e66767;
     --igrid: #282623; --iaxis: #3a3733;
-  }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      color-scheme: light;
-      --bg: #f6f5f2; --side: #efede9; --panel: #ffffff; --panel2: #f3f1ed; --line: #e2dfd9; --line2: #d3cfc8; --track: #ebe8e3;
-      --text: #1b1a18; --dim: #5f5a53; --faint: #6e6962; --accent: #0a62c9; --accent-bg: rgba(10,98,201,.10);
-      --ok: #0f7a52; --warn: #8a5c00; --bad: #b8302a;
-      --claude: #b8572f; --codex: #0b7d5f; --grok: #1f6f86; --backend: #7a52cc;
-      --ip-claude: #eb6834; --ip-codex: #1baf7a; --ip-grok: #3aa3bd; --ip-backend: #6250d6;
-      --ik-cacheRead: #2a78d6; --ik-cacheWrite: #eda100; --ik-input: #e87ba4; --ik-output: #008300;
-      --is1: #2a78d6; --is2: #eb6834; --is3: #1baf7a; --is4: #eda100; --is5: #e87ba4; --is6: #008300; --is7: #6250d6; --is8: #e34948;
-      --igrid: #efede9; --iaxis: #cdc9c2;
-    }
   }
   :root[data-theme="light"] {
     color-scheme: light;
@@ -3860,7 +3933,6 @@ const PAGE = `<!doctype html>
      solid). Dark is the default theme, and on its dark idle squares the
      faintest needs more colour to stand apart from them. */
   .inscal, .inskey { --ish1: .42; --ish2: .6; --ish3: .8; }
-  @media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) .inscal, :root:not([data-theme="dark"]) .inskey { --ish1: .22; --ish2: .45; --ish3: .7; } }
   :root[data-theme="light"] .inscal, :root[data-theme="light"] .inskey { --ish1: .22; --ish2: .45; --ish3: .7; }
   .inscal svg rect.day { cursor: default; }
   .inswk { display: grid; grid-template-columns: auto minmax(60px, 1fr) auto; gap: 3px 8px; align-items: center; font-size: 11.5px; flex: 1 1 180px; min-width: 0; max-width: 300px; }
@@ -3941,46 +4013,63 @@ const PAGE = `<!doctype html>
     .links td .btn.rm { min-width: 0; }
     #linkList th, #linkList td { padding-left: 5px; padding-right: 5px; }
   }
-  .ovhead { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px 24px; flex-wrap: wrap; margin-top: 6px; }
-  .ovhead > div { min-width: 0; }
-  .ovtitle { font-size: clamp(30px, 4.4vw, 52px); line-height: 1.05; font-weight: 750; letter-spacing: -.045em; }
-  .ovdot { display: inline-block; width: .16em; height: .16em; border-radius: 50%; background: var(--ok); margin-left: .06em; }
-  .ovtitle.warn .ovdot { background: var(--warn); }
-  .ovtitle.bad .ovdot { background: var(--bad); }
-  .ovsub { margin-top: 14px; font: 13px/1.6 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
-  .ovattn { margin-top: 8px; display: flex; gap: 8px; align-items: baseline; }
+  .ovhero { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px 32px; align-items: start; margin-top: 4px; }
+  .ovhero::before { content: ""; position: absolute; inset: -40px 0 -90px 35%; background: radial-gradient(55% 65% at 55% 60%, color-mix(in srgb, var(--ok) 9%, transparent), transparent 70%); pointer-events: none; }
+  .ovhero > * { position: relative; min-width: 0; }
+  .ovtitle { font-size: clamp(42px, 4.6vw, 64px); line-height: 1; font-weight: 750; letter-spacing: -.045em; }
+  .ovdot { color: var(--ok); }
+  .ovtitle.tone-warn .ovdot { color: var(--warn); }
+  .ovtitle.tone-bad .ovdot { color: var(--bad); }
+  .ovsub { margin-top: 16px; font: 13.5px/1.5 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
+  .ovrest { margin-top: 6px; color: var(--dim); max-width: 64ch; }
+  .ovattn { margin-top: 6px; display: flex; gap: 8px; align-items: baseline; }
   .ovattn::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--warn); flex: none; transform: translateY(-1px); }
-  .ovactions { display: flex; gap: 18px; align-items: center; }
-  .ovpill { background: var(--text); color: var(--bg); border: 0; border-radius: 999px; padding: 11px 20px; font-weight: 650; cursor: pointer; }
+  .ovactions { display: flex; gap: 8px 20px; align-items: center; flex-wrap: wrap; margin-top: 18px; }
+  .ovpill { background: var(--text); color: var(--bg); border: 0; border-radius: 999px; padding: 10px 20px; font-weight: 650; cursor: pointer; }
   .ovpill:hover { filter: brightness(1.08); }
   .ovlink { background: none; border: 0; padding: 4px 2px; font-weight: 600; color: var(--text); cursor: pointer; }
   .ovlink:hover { text-decoration: underline; }
   .ovpill:focus-visible, .ovlink:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .ovtiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 28px; }
   .ovcard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; min-width: 0; }
-  .ovtile { padding: 22px 24px 20px; }
-  .ovtick { width: 30px; height: 3px; border-radius: 2px; background: var(--line2); margin-bottom: 16px; }
+  .ovhandled { padding: 18px 22px; background: color-mix(in srgb, var(--panel) 88%, transparent); }
+  .ovhtop { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .ovlabel { font: 600 11.5px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+  .ovlive { display: inline-flex; align-items: center; gap: 6px; font: 700 11px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ok); border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 999px; padding: 4px 10px; }
+  .ovlive::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .ovlive.off { color: var(--dim); border-color: var(--line2); }
+  .ovbig { font: 600 46px/1.1 var(--mono); letter-spacing: -.03em; margin: 6px 0 2px; font-variant-numeric: tabular-nums; }
+  .ovwin { font: 12.5px/1.5 var(--mono); color: var(--dim); }
+  .ovratio { display: flex; gap: 2px; height: 6px; margin: 14px 0 12px; }
+  .ovratio i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+  .ovratio i.bad { min-width: 6px; }
+  .ovratio i.none { flex: 1; background: var(--track); }
+  .ovwave { position: relative; height: 84px; }
+  .ovwave svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .ovwdot { position: absolute; right: -5px; width: 10px; height: 10px; margin-top: -5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--bg); pointer-events: none; }
+  .ovtiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 14px; }
+  .ovtile { padding: 16px 20px; }
+  .ovtick { width: 30px; height: 3px; border-radius: 2px; background: var(--line2); margin-bottom: 12px; }
   .ovtick.ok { background: var(--ok); }
   .ovtick.warn { background: var(--warn); }
   .ovtick.bad { background: var(--bad); }
-  .ovtile .nm { font-size: 13px; font-weight: 600; color: var(--dim); }
-  .ovtile .v { font: 600 30px/1.2 var(--mono); letter-spacing: -.03em; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .ovtile .nm { font-size: 13.5px; font-weight: 600; }
+  .ovtile .v { font: 600 28px/1.2 var(--mono); letter-spacing: -.03em; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .ovtile .v small { font-size: 15px; color: var(--dim); letter-spacing: 0; margin-left: 2px; }
   .ovtile .nt { font-size: 12.5px; color: var(--dim); margin-top: 8px; overflow-wrap: anywhere; }
-  .ovmeter { height: 4px; border-radius: 2px; background: var(--track); margin-top: 14px; overflow: hidden; }
+  .ovmeter { height: 4px; border-radius: 2px; background: var(--track); margin-top: 12px; overflow: hidden; }
   .ovmeter i { display: block; height: 100%; border-radius: 2px; background: var(--ok); }
   .ovmeter i.warn { background: var(--warn); }
   .ovmeter i.bad { background: var(--bad); }
-  .ovgrid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
-  .ovchart { padding: 22px 24px 18px; overflow: hidden; }
-  .ovchead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 14px; }
-  .ovchead h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.02em; text-transform: none; color: var(--text); }
+  .ovgrid { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; margin-top: 16px; align-items: start; }
+  .ovchart { padding: 18px 24px 14px; overflow: hidden; }
+  .ovchart h2, .ovfhead h2 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -.02em; text-transform: none; color: var(--text); }
+  .ovchart > .ovlegend { margin: 10px 0 18px; }
   .ovlegend { display: flex; gap: 18px; flex-wrap: wrap; font: 12.5px/1 var(--mono); color: var(--dim); }
   .ovlegend b { color: var(--text); font-weight: 600; }
   .ovkey { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--ok); }
-  .ovkey.bad, .ovstrip i.bad { background: var(--bad) repeating-linear-gradient(135deg, transparent 0 2px, rgba(0,0,0,.35) 2px 3px); }
+  .ovkey.bad, .ovratio i.bad, .ovstrip i.bad { background: var(--bad) repeating-linear-gradient(135deg, transparent 0 2px, rgba(0,0,0,.35) 2px 3px); }
   .ovplot, .ovx { position: relative; margin-left: 30px; }
-  .ovplot svg { display: block; width: 100%; height: 260px; }
+  .ovplot svg { display: block; width: 100%; height: 176px; }
   .ovy { position: absolute; right: calc(100% + 6px); transform: translateY(-50%); font: 11px var(--mono); color: var(--faint); }
   .ovpeak { position: absolute; transform: translate(-50%, -130%); font: 600 11.5px var(--mono); }
   .ovx { height: 18px; margin-top: 6px; }
@@ -3988,33 +4077,42 @@ const PAGE = `<!doctype html>
   .ovx span.first { left: 0; transform: none; }
   .ovx span.last { right: 0; transform: none; }
   .ovempty { color: var(--dim); padding: 48px 0; text-align: center; }
-  .ovtable { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; }
-  .ovtable summary { padding: 11px 14px; font-weight: 600; cursor: pointer; }
+  .ovtable { margin-top: 10px; border: 1px solid var(--line); border-radius: 10px; }
+  .ovtable summary { padding: 8px 14px; font-weight: 600; cursor: pointer; }
   .ovtable summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 10px; }
   .ovtable table { width: 100%; border-collapse: collapse; font: 12.5px/1.4 var(--mono); }
   .ovtable td, .ovtable th { padding: 7px 14px; border-top: 1px solid var(--line); text-align: right; }
   .ovtable th:first-child, .ovtable td:first-child { text-align: left; }
   .ovtable th { color: var(--dim); font-weight: 600; }
-  .ovaccts { padding: 8px 0; }
-  .ovacct { padding: 14px 20px; border-top: 1px solid var(--line); }
-  .ovacct:first-child { border-top: 0; }
-  .ovtop { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
-  .ovname { display: flex; align-items: baseline; gap: 8px; min-width: 0; font-weight: 600; }
-  .ovname > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ovpct { font: 600 12.5px/1 var(--mono); }
   .ovbadge { flex: none; font: 600 11px/1 var(--sans); padding: 4px 8px; border-radius: 999px; }
   .ovbadge.claude { color: var(--claude); background: color-mix(in srgb, var(--ip-claude) 22%, transparent); }
   .ovbadge.codex { color: var(--codex); background: color-mix(in srgb, var(--ip-codex) 22%, transparent); }
   .ovbadge.grok { color: var(--grok); background: color-mix(in srgb, var(--ip-grok) 22%, transparent); }
   .ovbadge.backend { color: var(--backend); background: color-mix(in srgb, var(--ip-backend) 22%, transparent); }
-  .ovwhy { font-size: 12px; color: var(--warn); margin-top: 4px; }
   .ovstrip { display: flex; gap: 2px; margin-top: 10px; }
   .ovstrip i { flex: 1; height: 14px; border-radius: 2px; background: var(--track); }
   .ovstrip i.ok { background: var(--ok); }
-  .ovq { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; font: 11.5px/1 var(--mono); color: var(--dim); }
-  .ovq .mt { display: flex; justify-content: space-between; gap: 6px; }
-  .ovq .ovmeter { margin-top: 6px; }
-  .ovnote { padding: 10px 20px 4px; font-size: 12px; color: var(--dim); }
+  .ovpct { font: 600 12.5px/1 var(--mono); }
+  .ovfleet { padding: 18px 22px; }
+  .ovfhead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .ovfcount { font: 12.5px/1 var(--mono); color: var(--dim); }
+  .ovgroups { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+  .ovgroup { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; align-items: start; }
+  .ovgroup .ovbadge { justify-self: start; }
+  .ovcells { display: flex; flex-wrap: wrap; gap: 5px; padding-top: 1px; }
+  .ovcell { flex: none; width: 18px; height: 18px; border-radius: 4px; border: 1.5px solid var(--line2); }
+  .ovcell.serving, .ovcell.routing { background: var(--ok); border-color: var(--ok); }
+  .ovcell.routing { outline: 2px solid var(--text); outline-offset: 1px; }
+  .ovfkey { display: flex; gap: 6px 16px; flex-wrap: wrap; margin-top: 16px; font-size: 12px; color: var(--dim); }
+  .ovfkey span { display: inline-flex; align-items: center; gap: 7px; }
+  .ovfkey .ovcell { width: 11px; height: 11px; border-radius: 3px; }
+  .ovfkey .ovcell.routing { outline-width: 1.5px; }
+  .ovnext { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .ovnext .ovlabel { margin-bottom: 6px; font-size: 11px; }
+  .ovnrow { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 3px 0; }
+  .ovnrow span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ovnrow span:last-child { flex: none; font-family: var(--mono); color: var(--dim); }
+  .ovnote { padding: 10px 0 4px; font-size: 12px; color: var(--dim); }
   .acsum { font: 13px/1.6 var(--mono); color: var(--dim); margin: -8px 0 14px; }
   .actabs { margin: 4px 0 12px; }
   .acbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
@@ -4044,13 +4142,15 @@ const PAGE = `<!doctype html>
     .ovtiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ovgrid { grid-template-columns: minmax(0, 1fr); }
   }
+  @media (max-width: 900px) {
+    .ovhero { grid-template-columns: minmax(0, 1fr); }
+  }
   @media (max-width: 760px) {
-    .ovtiles { gap: 10px; margin-top: 22px; }
+    .ovtiles { gap: 10px; }
     .ovtile { padding: 16px; }
     .ovtile .v { font-size: 24px; }
-    .ovchart { padding: 16px; }
-    .ovplot svg { height: 200px; }
-    .ovacct { padding: 12px 16px; }
+    .ovchart, .ovfleet { padding: 16px; }
+    .ovbig { font-size: 40px; }
   }
 </style>
 <script>
@@ -4058,7 +4158,7 @@ const PAGE = `<!doctype html>
   try {
     var t = localStorage.getItem('teamclaude-dashboard-theme');
     if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
-  } catch (e) { /* storage disabled: the media query still decides */ }
+  } catch (e) {}
 })();
 </script>
 </head>
@@ -4087,7 +4187,7 @@ const PAGE = `<!doctype html>
     </div>
     <nav id="nav"></nav>
     <div class="sidefoot">
-      <button id="theme" class="more" type="button" title="Switch between following the system, light and dark"></button>
+      <button id="theme" class="more" type="button" title="Switch between dark and light"></button>
       <span id="foot"></span>
     </div>
   </aside>
@@ -4104,25 +4204,35 @@ const PAGE = `<!doctype html>
     <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="more" type="button">Change key</button></div>
 
     <section id="page-overview">
-      <div class="ovhead">
-        <div>
+      <div class="ovhero">
+        <div class="ovlead">
           <h1 id="ovTitle" class="ovtitle"></h1>
           <p id="ovSub" class="ovsub"></p>
+          <p id="ovRest" class="ovrest"></p>
           <div id="ovAttention"></div>
+          <div class="ovactions">
+            <button id="ovOpenAccounts" class="ovpill" type="button">Open accounts</button>
+            <button id="ovOpenLogs" class="ovlink" type="button">Inspect logs</button>
+          </div>
         </div>
-        <div class="ovactions">
-          <button id="ovOpenAccounts" class="ovpill" type="button">Open accounts</button>
-          <button id="ovOpenLogs" class="ovlink" type="button">Open logs</button>
+        <div class="ovcard ovhandled">
+          <div class="ovhtop"><span class="ovlabel">Requests handled</span><span id="ovLive" class="ovlive">Live</span></div>
+          <div id="ovTotal" class="ovbig"></div>
+          <div class="ovwin">Rolling 3h 20m window · 10-minute buckets</div>
+          <div id="ovRatio" class="ovratio"></div>
+          <div id="ovHandled" class="ovlegend"></div>
         </div>
       </div>
+      <div id="ovWave" class="ovwave"></div>
       <div id="ovTiles" class="ovtiles"></div>
       <div class="ovgrid">
         <div class="ovcard ovchart">
-          <div class="ovchead"><h2>Requests every ten minutes</h2><div id="ovLegend" class="ovlegend"></div></div>
+          <h2>Throughput, ten minutes at a time</h2>
+          <div id="ovLegend" class="ovlegend"></div>
           <div id="ovChart"></div>
           <details id="ovTableWrap" class="ovtable"><summary>Data table</summary><table id="ovTable"></table></details>
         </div>
-        <div id="ovAccounts" class="ovcard ovaccts"></div>
+        <div id="ovFleet" class="ovcard ovfleet"></div>
       </div>
     </section>
 
@@ -4445,16 +4555,6 @@ ${SHARED_HELPERS}
     if (s < 3600) return Math.round(s / 60) + 'm';
     if (s < 86400) return (s / 3600).toFixed(1) + 'h';
     return (s / 86400).toFixed(1) + 'd';
-  }
-
-  // How long until a reset, the way the rows say it: "40m", "3h 20m", "1 day",
-  // "2.5 days".
-  function fmtUntil(sec) {
-    var s = Math.max(0, Math.round(sec));
-    if (s < 3600) return Math.max(1, Math.round(s / 60)) + 'm';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
-    var d = Math.round(s / 8640) / 10;
-    return d + (d === 1 ? ' day' : ' days');
   }
 
   // Absolute wall-clock of a future timestamp: "17:30" today, "Wed 09:00"
@@ -4795,7 +4895,7 @@ ${SHARED_HELPERS}
     var canRemove = callerCan(s.caller, '/teamclaude/remove');
     renderAddBar(canSignIn);
     var accounts = s.accounts || [];
-    var serving = overviewHeadline(accounts).serving;
+    var serving = overviewFleet(s).serving;
     document.getElementById('acSummary').textContent = accounts.length + (accounts.length === 1 ? ' account' : ' accounts') + ' · ' + serving + ' serving';
     var view = accountFilter(accounts, accountFilters);
     accountFilters.tab = view.tab;
@@ -6333,16 +6433,13 @@ ${SHARED_HELPERS}
   }
 
   function drawsRequestStrips(key) {
-    return key === 'overview' || key === 'accounts';
+    return key === 'accounts';
   }
 
   function renderLogEvents() {
     if (currentPage === 'logs') { if (logFrozen) renderLogFoot(); else renderLogs(); }
-    else if (currentPage === 'overview' && lastStatus) renderOverviewAccounts(lastStatus);
     else if (currentPage === 'accounts' && lastStatus) renderAccountsPage(lastStatus);
   }
-
-  var OV_STRIP = 24;
 
   function stripEl(st) {
     var strip = el('div', 'ovstrip');
@@ -6356,54 +6453,132 @@ ${SHARED_HELPERS}
   }
 
   function stripPct(st) {
-    var pct = el('span', 'ovpct', st.rate == null ? '\u2014' : (st.rate * 100).toFixed(1) + '%');
+    var pct = el('span', 'ovpct', st.rate == null ? '—' : (st.rate * 100).toFixed(1) + '%');
     pct.title = st.rate == null ? 'No requests in the log' : 'Succeeded, of ' + st.count + ' requests in the log';
     return pct;
   }
 
   function renderOverview(s) {
-    renderOverviewHead(s);
-    renderOverviewTiles(s);
-    renderOverviewChart(s.traffic);
-    renderOverviewAccounts(s);
+    var now = Date.now();
+    var fleet = overviewFleet(s, now);
+    var buckets = s.traffic && Array.isArray(s.traffic.buckets) ? s.traffic.buckets : null;
+    var bucketMs = (s.traffic && s.traffic.bucketMs) || 10 * 60 * 1000;
+    var sc = trafficScale(buckets);
+    renderOverviewHead(fleet, sc, now);
+    renderOverviewHandled(buckets, sc);
+    renderOverviewWave(buckets, sc, bucketMs);
+    renderOverviewTiles(s, fleet, buckets, sc);
+    renderOverviewChart(buckets, sc, bucketMs);
+    renderOverviewFleet(fleet, now);
   }
 
-  // Where the next request goes, per provider: the route target, which skips
-  // a cursor account that is throttled or out of quota. Older servers send
-  // only the cursor.
-  function currentAccountsText(s) {
-    var target = s.defaultTargets || s.currentAccounts || {};
-    var providers = Object.keys(target).filter(function (p) { return target[p]; });
-    if (providers.length > 1) return providers.map(function (p) { return providerLabel(p) + ' ' + target[p]; }).join(', ');
-    if (providers.length) return target[providers[0]];
-    return s.defaultTargets ? '' : s.defaultTarget || s.currentAccount || '';
-  }
+  var ovReachable = true;
 
-  function renderOverviewHead(s) {
-    var h = overviewHeadline(s.accounts);
-    var title = document.getElementById('ovTitle');
-    title.className = 'ovtitle ' + h.tone;
-    title.textContent = h.text;
-    var dot = el('span', 'ovdot');
-    dot.setAttribute('aria-hidden', 'true');
-    title.appendChild(dot);
-    var server = s.server || {};
+  function renderOverviewMeta() {
+    var server = (lastStatus && lastStatus.server) || {};
     var parts = [];
     if (server.version) parts.push('v' + server.version);
-    if (server.uptimeSeconds != null) parts.push('up ' + fmtUntil(server.uptimeSeconds));
-    var routing = currentAccountsText(s);
-    if (routing) parts.push('routing to ' + routing);
+    parts.push(ovReachable ? 'Connected' : 'Not reachable');
+    if (ovReachable && server.uptimeSeconds != null) parts.push('up ' + fmtUntil(server.uptimeSeconds));
     document.getElementById('ovSub').textContent = parts.join(' · ');
+    var live = document.getElementById('ovLive');
+    live.className = ovReachable ? 'ovlive' : 'ovlive off';
+    live.textContent = ovReachable ? 'Live' : 'Offline';
+  }
+
+  function renderOverviewHead(fleet, sc, now) {
+    var h = overviewHeadline(fleet, sc.rate);
+    var title = document.getElementById('ovTitle');
+    title.className = 'ovtitle tone-' + h.tone;
+    title.textContent = h.text;
+    title.appendChild(el('span', 'ovdot', '.'));
+    renderOverviewMeta();
+    document.getElementById('ovRest').textContent = restingText(fleet, now);
     var box = document.getElementById('ovAttention');
     box.textContent = '';
-    h.attention.forEach(function (x) {
-      var t = parseTs(x.resetAt);
-      box.appendChild(el('p', 'ovattn', x.name + ' is at ' + pctText(x.used) + ' of its ' + x.window + ' limit.'
-        + (t > Date.now() ? ' It resets in ' + fmtUntil((t - Date.now()) / 1000) + '.' : '')));
-    });
-    h.billing.forEach(function (name) {
+    fleet.billing.forEach(function (name) {
       box.appendChild(el('p', 'ovattn', name + ' is past its plan and serving on extra usage, which is billed.'));
     });
+  }
+
+  function ovKey(cls, label, value) {
+    var k = el('span');
+    k.appendChild(el('span', 'ovkey ' + cls));
+    k.appendChild(el('span', '', label + ' '));
+    k.appendChild(el('b', '', String(value)));
+    return k;
+  }
+
+  function ovLegend(id, buckets, sc) {
+    var legend = document.getElementById(id);
+    legend.textContent = '';
+    if (!buckets) return;
+    legend.appendChild(ovKey('ok', 'Succeeded', sc.ok));
+    legend.appendChild(ovKey('bad', 'Failed', sc.failed));
+  }
+
+  function renderOverviewHandled(buckets, sc) {
+    var total = sc.ok + sc.failed;
+    document.getElementById('ovTotal').textContent = buckets ? total.toLocaleString() : '—';
+    var ratio = document.getElementById('ovRatio');
+    ratio.textContent = '';
+    ratio.setAttribute('role', 'img');
+    ratio.setAttribute('aria-label', sc.rate == null ? 'No requests' : (sc.rate * 100).toFixed(1) + '% succeeded');
+    if (!total) ratio.appendChild(el('i', 'none'));
+    [['ok', sc.ok], ['bad', sc.failed]].forEach(function (seg) {
+      if (!seg[1]) return;
+      var i = el('i', seg[0]);
+      i.style.flex = String(seg[1]);
+      ratio.appendChild(i);
+    });
+    ovLegend('ovHandled', buckets, sc);
+  }
+
+  function ovClock(ms) {
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function ovSlotTip(b, bucketMs) {
+    return function (e) {
+      showInsightsTip(e, ovClock(b.at) + '–' + ovClock(b.at + bucketMs), [
+        { label: 'Succeeded', value: String(b.ok), color: 'var(--ok)' },
+        { label: 'Failed', value: String(b.failed), color: 'var(--bad)' },
+      ]);
+    };
+  }
+
+  function renderOverviewWave(buckets, sc, bucketMs) {
+    var box = document.getElementById('ovWave');
+    box.textContent = '';
+    var n = sc.bars.length;
+    box.style.display = buckets && n > 1 ? '' : 'none';
+    if (!buckets || n < 2) return;
+    var W = 1000, H = 100;
+    var p = wavePath(sc.bars.map(function (b) { return b.total; }), W, H, 10);
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
+      'aria-label': 'Requests per ten minutes over the last 3h 20m, ' + sc.bars[n - 1].total + ' in the latest. The chart below lists each slot.' }, box);
+    var defs = svgEl('defs', {}, svg);
+    svgEl('path', { d: p.area, fill: gradient(defs, 'var(--ok)', 0.2, 0) }, svg);
+    paint(svgEl('path', { d: p.line, fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round', 'vector-effect': 'non-scaling-stroke' }, svg), null, 'var(--ok)');
+    var cross = paint(svgEl('line', { y1: 0, y2: H, 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke', visibility: 'hidden' }, svg), null, 'var(--line2)');
+    var step = W / (n - 1);
+    sc.bars.forEach(function (b, i) {
+      var hit = svgEl('rect', { x: Math.max(0, (i - 0.5) * step), y: 0, width: i === 0 || i === n - 1 ? step / 2 : step, height: H, fill: 'transparent' }, svg);
+      var tip = ovSlotTip(b, bucketMs);
+      var show = function (e) {
+        cross.setAttribute('x1', String(i * step));
+        cross.setAttribute('x2', String(i * step));
+        cross.setAttribute('visibility', 'visible');
+        tip(e);
+      };
+      hit.addEventListener('mousemove', show);
+      hit.addEventListener('click', show);
+      hit.addEventListener('mouseleave', function () { cross.setAttribute('visibility', 'hidden'); hideInsightsTip(); });
+    });
+    var dot = el('i', 'ovwdot');
+    dot.setAttribute('aria-hidden', 'true');
+    dot.style.top = (p.end.y / H * 100) + '%';
+    box.appendChild(dot);
   }
 
   function ovTile(name, value, unit, note, tone, fill) {
@@ -6426,48 +6601,30 @@ ${SHARED_HELPERS}
     return bar;
   }
 
-  function renderOverviewTiles(s) {
-    var t = overviewTiles(s);
+  function renderOverviewTiles(s, fleet, buckets, sc) {
     var box = document.getElementById('ovTiles');
     box.textContent = '';
-    var rateTone = t.rate == null ? '' : t.rate >= 0.95 ? 'ok' : t.rate >= 0.8 ? 'warn' : 'bad';
-    box.appendChild(t.traffic
-      ? ovTile('Success rate', t.rate == null ? '—' : (t.rate * 100).toFixed(1), t.rate == null ? '' : '%',
-        t.rate == null ? 'no requests in 3h 20m' : t.failed + ' failed in 3h 20m', rateTone, t.rate)
+    var rate = sc.rate;
+    var rateTone = rate == null ? '' : rate >= 0.95 ? 'ok' : rate >= 0.8 ? 'warn' : 'bad';
+    box.appendChild(buckets
+      ? ovTile('Success rate', rate == null ? '—' : (rate * 100).toFixed(1), rate == null ? '' : '%',
+        rate == null ? 'no requests in 3h 20m' : sc.failed + ' failed in 3h 20m', rateTone, rate)
       : ovTile('Success rate', '—', '', 'not counted by this version', '', null));
-    var servingTone = !t.total || !t.serving ? 'bad' : t.serving < t.total ? 'warn' : 'ok';
-    box.appendChild(ovTile('Accounts serving', String(t.serving), ' of ' + t.total,
-      t.serving < t.total ? (t.total - t.serving) + ' paused or blocked' : 'none paused or blocked', servingTone, t.total ? t.serving / t.total : null));
-    box.appendChild(ovTile('Active conversations', String(t.active), '', t.known + ' known', '', null));
-    var q = t.quota5h;
-    var qTone = q ? meterTone(1 - q.left) : '';
-    box.appendChild(q
-      ? ovTile('5-hour quota left', String(Math.round(q.left * 100)), '%', 'lowest: ' + q.lowest.name + ' at ' + pctText(q.lowest.left), qTone === 'unknown' ? '' : qTone, q.left)
-      : ovTile('5-hour quota left', '—', '', 'no readings yet', '', null));
+    var resting = fleet.total - fleet.serving;
+    var servingTone = !fleet.serving ? 'bad' : fleet.uncovered.length ? 'warn' : 'ok';
+    box.appendChild(ovTile('Accounts serving', String(fleet.serving), ' of ' + fleet.total,
+      resting ? resting + ' resting' : 'none resting', servingTone, fleet.total ? fleet.serving / fleet.total : null));
+    var sessions = s.sessions || {};
+    box.appendChild(ovTile('Active conversations', String(Number(sessions.active) || 0), '', (Number(sessions.known) || 0) + ' known', '', null));
+    var w = fleet.weekly;
+    var wTone = w ? meterTone(1 - w.left) : '';
+    box.appendChild(w
+      ? ovTile('Weekly room left', String(Math.round(w.left * 100)), '%', 'across ' + w.count + ' serving ' + (w.count === 1 ? 'account' : 'accounts'), wTone, w.left)
+      : ovTile('Weekly room left', '—', '', 'no weekly readings yet', '', null));
   }
 
-  function ovClock(ms) {
-    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  }
-
-  function ovKey(cls, label, value) {
-    var k = el('span');
-    k.appendChild(el('span', 'ovkey ' + cls));
-    k.appendChild(el('span', '', label + ' '));
-    k.appendChild(el('b', '', String(value)));
-    return k;
-  }
-
-  function renderOverviewChart(traffic) {
-    var buckets = traffic && Array.isArray(traffic.buckets) ? traffic.buckets : null;
-    var bucketMs = (traffic && traffic.bucketMs) || 10 * 60 * 1000;
-    var sc = trafficScale(buckets);
-    var legend = document.getElementById('ovLegend');
-    legend.textContent = '';
-    if (buckets) {
-      legend.appendChild(ovKey('ok', 'Succeeded', sc.ok));
-      legend.appendChild(ovKey('bad', 'Failed', sc.failed));
-    }
+  function renderOverviewChart(buckets, sc, bucketMs) {
+    ovLegend('ovLegend', buckets, sc);
     var box = document.getElementById('ovChart');
     box.textContent = '';
     document.getElementById('ovTableWrap').style.display = buckets && !sc.empty ? '' : 'none';
@@ -6475,7 +6632,7 @@ ${SHARED_HELPERS}
       box.appendChild(el('p', 'ovempty', buckets ? 'No requests in the last 3h 20m.' : 'This instance runs a version that does not count its requests over time.'));
       return;
     }
-    var W = 1000, H = 260, padT = 24, GAP = 2, MIN_BAR = 2;
+    var W = 1000, H = 176, padT = 22, GAP = 2, MIN_BAR = 2;
     var y = function (v) { return padT + (1 - v / sc.top) * (H - padT); };
     var plot = el('div', 'ovplot');
     var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
@@ -6496,12 +6653,7 @@ ${SHARED_HELPERS}
       if (b.ok) paint(svgEl('rect', { x: x, y: y(b.ok), width: bw, height: y(0) - y(b.ok), rx: 3 }, svg), 'var(--ok)');
       if (b.failed) svgEl('rect', { x: x, y: y(b.total), width: bw, height: Math.max(MIN_BAR, y(b.ok) - y(b.total) - (b.ok ? GAP : 0)), rx: 3, fill: 'url(#ovhatch)' }, svg);
       var hit = svgEl('rect', { x: i * slot, y: 0, width: slot, height: H, fill: 'transparent' }, svg);
-      var show = function (e) {
-        showInsightsTip(e, ovClock(b.at) + '–' + ovClock(b.at + bucketMs), [
-          { label: 'Succeeded', value: String(b.ok), color: 'var(--ok)' },
-          { label: 'Failed', value: String(b.failed), color: 'var(--bad)' },
-        ]);
-      };
+      var show = ovSlotTip(b, bucketMs);
       hit.addEventListener('mousemove', show);
       hit.addEventListener('click', show);
       hit.addEventListener('mouseleave', hideInsightsTip);
@@ -6531,45 +6683,56 @@ ${SHARED_HELPERS}
     });
   }
 
-  function ovQuota(m) {
-    var d = el('div');
-    var top = el('div', 'mt');
-    top.appendChild(el('span', '', m.label));
-    top.appendChild(el('span', '', m.left == null ? '—' : pctText(m.left) + ' left'));
-    d.appendChild(top);
-    d.appendChild(ovMeterBar(m.left || 0, m.used != null && m.used >= 0.9 ? 'warn' : ''));
-    return d;
-  }
+  var FLEET_STATES = [{ key: 'serving', label: 'serving' }, { key: 'routing', label: 'routing now' }, { key: 'resting', label: 'resting' }];
 
-  function renderOverviewAccounts(s) {
-    var box = document.getElementById('ovAccounts');
+  function renderOverviewFleet(fleet, now) {
+    var box = document.getElementById('ovFleet');
     box.textContent = '';
-    var list = (s.accounts || []).filter(function (a) { return !a.disabled; });
-    var strips = logsRead && !logsRefused;
-    if (!list.length) box.appendChild(el('p', 'ovnote', 'No enabled accounts.'));
-    list.forEach(function (a) {
-      var row = el('div', 'ovacct');
-      var top = el('div', 'ovtop');
-      var name = el('div', 'ovname');
-      var group = accountGroup(a);
-      name.appendChild(el('span', 'ovbadge ' + providerTone(group), groupLabel(group)));
-      var nm = el('span', '', a.name);
-      nm.title = a.name;
-      name.appendChild(nm);
-      top.appendChild(name);
-      var st = strips ? requestStrip(logState.events, a.name, OV_STRIP, a.provider) : null;
-      if (st) top.appendChild(stripPct(st));
-      row.appendChild(top);
-      if (a.unavailable && a.unavailable !== 'cordoned') row.appendChild(el('div', 'ovwhy', UNAVAILABLE_TEXT[a.unavailable] || a.unavailable));
-      if (st) row.appendChild(stripEl(st));
-      var q = a.quota || {};
-      var bars = el('div', 'ovq');
-      bars.appendChild(ovQuota(quotaMeter('5-hour', q.unified5h, q.unified5hReset)));
-      bars.appendChild(ovQuota(quotaMeter(weeklyWindowName(q), q.unified7d, q.unified7dReset)));
-      row.appendChild(bars);
-      box.appendChild(row);
+    var head = el('div', 'ovfhead');
+    head.appendChild(el('h2', '', 'Fleet'));
+    head.appendChild(el('span', 'ovfcount', fleet.serving + ' of ' + fleet.total + ' serving'));
+    box.appendChild(head);
+    if (!fleet.total) { box.appendChild(el('p', 'ovnote', 'No enabled accounts.')); return; }
+    var groups = el('div', 'ovgroups');
+    fleet.groups.forEach(function (g) {
+      var row = el('div', 'ovgroup');
+      row.appendChild(el('span', 'ovbadge ' + g.tone, g.label));
+      var cells = el('div', 'ovcells');
+      cells.setAttribute('role', 'group');
+      cells.setAttribute('aria-label', g.label + ' accounts');
+      g.accounts.forEach(function (a) {
+        var c = el('span', 'ovcell ' + a.state);
+        var word = FLEET_STATES.filter(function (st) { return st.key === a.state; })[0].label;
+        var label = a.name + ', ' + word + (a.backAt != null ? ', back in ' + fmtUntil((a.backAt - now) / 1000) : '');
+        c.setAttribute('role', 'img');
+        c.setAttribute('aria-label', label);
+        c.title = label;
+        cells.appendChild(c);
+      });
+      row.appendChild(cells);
+      groups.appendChild(row);
     });
-    if (logsRefused) box.appendChild(el('p', 'ovnote', 'This key may not read the request log, so recent requests are not shown.'));
+    box.appendChild(groups);
+    var key = el('div', 'ovfkey');
+    FLEET_STATES.forEach(function (st) {
+      var k = el('span');
+      k.appendChild(el('span', 'ovcell ' + st.key)).setAttribute('aria-hidden', 'true');
+      k.appendChild(el('span', '', st.label));
+      key.appendChild(k);
+    });
+    box.appendChild(key);
+    if (!fleet.backNext.length) return;
+    var next = el('div', 'ovnext');
+    next.appendChild(el('h3', 'ovlabel', 'Back next'));
+    fleet.backNext.forEach(function (b) {
+      var row = el('div', 'ovnrow');
+      var name = el('span', '', b.name);
+      name.title = b.name;
+      row.appendChild(name);
+      row.appendChild(el('span', '', 'in ' + fmtUntil((b.backAt - now) / 1000)));
+      next.appendChild(row);
+    });
+    box.appendChild(next);
   }
 
   // ---- Insights page -------------------------------------------------------
@@ -8462,6 +8625,7 @@ ${SHARED_HELPERS}
         document.getElementById('keybox').style.display = 'none';
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
+        ovReachable = true;
         render(s);
         if (currentPage === 'logs' || (drawsRequestStrips(currentPage) && !logsRefused)) pollLogs();
         if (currentPage === 'insights') {
@@ -8473,6 +8637,8 @@ ${SHARED_HELPERS}
         var err = document.getElementById('err');
         err.style.display = 'block';
         err.textContent = peer ? e.message : 'Cannot reach the proxy: ' + e.message;
+        ovReachable = false;
+        renderOverviewMeta();
         // The banner lives inside #app, which stays hidden until a first
         // status lands; without this a first poll that fails is a blank page.
         if (document.getElementById('keybox').style.display !== 'block') document.getElementById('app').style.display = '';
@@ -8552,38 +8718,30 @@ ${SHARED_HELPERS}
     doDashboardLogin(user, pass, document.getElementById('pwSet'));
   });
   document.getElementById('pwOff').addEventListener('click', function () { doDashboardLogin('', '', this); });
-  // Theme: system → light → dark → system. "system" is the absence of a
-  // stored choice, so a viewer who never touches this keeps following their
-  // desktop, and one who does is not re-decided for by it later.
-  var THEMES = ['system', 'light', 'dark'];
   function readTheme() {
     try {
-      var t = localStorage.getItem(THEME_KEY);
-      return t === 'light' || t === 'dark' ? t : 'system';
-    } catch (e) { return 'system'; }
+      return localStorage.getItem(THEME_KEY) === 'light' ? 'light' : 'dark';
+    } catch (e) { return 'dark'; }
   }
   function applyTheme(theme) {
-    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
-    else document.documentElement.setAttribute('data-theme', theme);
-    var btn = document.getElementById('theme');
+    document.documentElement.setAttribute('data-theme', theme);
     // Name the state, not the action: a button reading "Dark" while the page is
     // light is the ambiguity every theme toggle has, and this one says where it
     // is rather than where it would go.
-    btn.textContent = theme === 'system' ? 'Theme: system' : theme === 'light' ? 'Theme: light' : 'Theme: dark';
+    document.getElementById('theme').textContent = theme === 'light' ? 'Theme: light' : 'Theme: dark';
   }
   function storeTheme(theme) {
     try {
-      if (theme === 'system') localStorage.removeItem(THEME_KEY);
-      else localStorage.setItem(THEME_KEY, theme);
+      localStorage.setItem(THEME_KEY, theme);
     } catch (e) { /* storage disabled: the choice lasts for this page only */ }
   }
   // The current theme lives in a variable rather than being re-read from
   // storage on each click: with storage blocked, readTheme() would always say
-  // 'system' and the button would be stuck on 'light' instead of cycling.
+  // 'dark' and the button would be stuck instead of switching.
   var theme = readTheme();
   applyTheme(theme);
   document.getElementById('theme').addEventListener('click', function () {
-    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    theme = theme === 'light' ? 'dark' : 'light';
     storeTheme(theme);
     applyTheme(theme);
   });
