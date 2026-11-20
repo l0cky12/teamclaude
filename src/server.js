@@ -1475,6 +1475,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
           // The share at or below which the "outside" read-out leaves a window
           // out (outside-spend.js). A display setting, so a client key reads it too.
           outsideSpendHidePercent: outsideSpendHidePercent(config),
+          traffic: accountManager.traffic?.read(),
           // The dashboard's instance picker. Names and addresses only, never
           // the keys, and only for the operator, who is the one who may use them.
           // `instance` is what the picker calls this machine and what the
@@ -3678,6 +3679,7 @@ export function withRequestEvents(hooks, accountManager) {
     const account = label ? null : name;
     const served = account ? accountManager.accounts?.find((/** @type {any} */ a) => a.name === account) : null;
     const path = eventPath(info.path);
+    accountManager.traffic?.record(info.status);
     events.add({
       kind: 'usage', type: 'request',
       provider: info.provider ?? (served ? providerOf(served) : null),
