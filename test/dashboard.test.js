@@ -3734,6 +3734,8 @@ test('overviewHeadline counts an account serving on extra usage as serving, and 
   assert.equal(throttled.serving, 0, 'extra usage does not lift a throttle');
   assert.deepEqual(throttled.billing, []);
   assert.equal(throttled.text, '1 throttled');
+  const rejected = overviewHeadline([{ name: 'paid', unavailable: 'upstream-rejected', onExtraUsage: true, quota: {} }]);
+  assert.deepEqual([rejected.serving, rejected.billing], [1, ['paid']], 'a plan upstream refused, now billed, is serving');
 });
 
 test('requestStrip keeps a Claude and a Codex account with one name apart', () => {

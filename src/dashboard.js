@@ -2104,7 +2104,7 @@ export function overviewHeadline(accounts) {
   var billing = [];
   var serving = 0;
   enabled.forEach(function (a) {
-    var pastPlan = !a.unavailable || a.unavailable === 'quota' || a.unavailable === 'exhausted';
+    var pastPlan = !a.unavailable || a.unavailable === 'quota' || a.unavailable === 'exhausted' || a.unavailable === 'upstream-rejected';
     if (a.onExtraUsage === true && pastPlan) { serving++; billing.push(a.name); return; }
     var why = a.unavailable && a.unavailable !== 'cordoned' ? String(a.unavailable) : null;
     if (why) {
