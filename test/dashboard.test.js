@@ -17,7 +17,7 @@ import {
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep, REDEEM_UNCERTAIN_TEXT,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   fmtUntil, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
-  ACCOUNT_STATES, accountStatusText, accountFilter, accountCard,
+  ACCOUNT_STATES, accountStatusText, accountFilter, accountCard, accountCardControls,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -2058,7 +2058,7 @@ test('a provider tab narrows the quota page to that provider\'s accounts', async
   assert.equal(page.labelled('codex-one'), 2);
 });
 
-test('a disabled account offers only Enable: no Switch to on its row or in the Accounts table', async () => {
+test('a disabled account offers only its Enabled switch: no Switch to on its row or its card', async () => {
   const page = bootPage();
   await page.answer(200, {
     currentAccounts: { anthropic: 'a' },
@@ -2070,7 +2070,7 @@ test('a disabled account offers only Enable: no Switch to on its row or in the A
   });
   // Only c: a is current and b is disabled, on both the quota row and the table.
   assert.equal(page.labelled('Switch to'), 2);
-  assert.equal(page.labelled('Enable'), 1);
+  assert.deepEqual(page.built.filter(e => /^acswitch\b/.test(e.className)).map(e => e.className), ['acswitch on', 'acswitch', 'acswitch on'], 'b\'s switch is off');
 });
 
 test('a cordoned account\'s status badge in the Accounts table is short, with the reason on hover', async () => {
@@ -4171,13 +4171,40 @@ test('accountCard: type and plan, state badges, and why it cannot serve', () => 
   assert.equal(accountStatusText({ unavailable: 'throttled' }), UNAVAILABLE_TEXT.throttled);
 });
 
+test('accountCardControls lists what each card can do, in order, with the Enabled switch apart', () => {
+  const keys = (a, o = {}) => accountCardControls(a, o).actions.map(c => c.key);
+  assert.deepEqual(keys({ name: 'a' }), ['switch', 'prioritize', 'deprioritize', 'cordon', 'remove']);
+  assert.deepEqual(keys({ name: 'a' }, { current: true }), ['prioritize', 'deprioritize', 'cordon', 'remove'], 'no Switch to on the current account');
+  assert.deepEqual(keys({ name: 'a', disabled: true }), ['cordon', 'remove'], 'a disabled account keeps cordon, so an enable can bring it back cordoned');
+  const cordoned = accountCardControls({ name: 'a', cordoned: true }, {});
+  assert.deepEqual(cordoned.actions.map(c => c.key), ['switch', 'cordon', 'remove'], 'no priority move on a cordoned account');
+  assert.deepEqual(cordoned.actions[1], { key: 'cordon', label: 'Uncordon', tone: null, pressed: true, title: 'Send new conversations to this account again' });
+
+  const signedOut = { name: 'me', type: 'oauth', provider: 'codex', status: 'error' };
+  assert.deepEqual(accountCardControls(signedOut, {}).actions[0], { key: 'signin', label: 'Sign in again', title: null, tone: 'codex', pressed: null });
+
+  assert.deepEqual(accountCardControls({ name: 'a' }, {}).toggle, { on: true, title: 'Take this account out of rotation' });
+  assert.deepEqual(accountCardControls({ name: 'a', disabled: true }, {}).toggle, { on: false, title: 'Put this account back into rotation' });
+
+  const remove = (o) => accountCardControls({ name: 'a' }, o).actions.at(-1);
+  assert.equal(remove({}).label, 'Remove');
+  assert.equal(remove({ removeArmed: true }).label, 'Confirm remove');
+  assert.equal(remove({ removeArmed: true }).title, 'Click again to sign a out of TeamClaude');
+
+  const refused = { refused: ['/teamclaude/login/start', '/teamclaude/priority', '/teamclaude/account-cordon', '/teamclaude/remove', '/teamclaude/disable'] };
+  const narrow = accountCardControls(signedOut, { caller: refused });
+  assert.deepEqual(narrow.actions.map(c => c.key), ['switch'], 'a control the key would be refused is not offered');
+  assert.equal(narrow.toggle, null);
+});
+
 test('the Accounts helpers run in the page\'s own scope', () => {
   const script = inlineScripts(renderDashboardHtml()).at(-1);
   const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
-  const isolated = new Function('UNAVAILABLE_TEXT', `${bundle}; return { accountFilter, accountCard };`)(UNAVAILABLE_TEXT);
+  const isolated = new Function('UNAVAILABLE_TEXT', `${bundle}; return { accountFilter, accountCard, accountCardControls };`)(UNAVAILABLE_TEXT);
   const accounts = [{ name: 'a', provider: 'codex', unavailable: 'throttled', quota: { unified5h: 0.5 } }, { name: 'b', provider: 'anthropic' }];
   assert.deepEqual(isolated.accountFilter(accounts, { state: 'problem' }), accountFilter(accounts, { state: 'problem' }));
   assert.deepEqual(isolated.accountCard(accounts[0], false, 0), accountCard(accounts[0], false, 0));
+  assert.deepEqual(isolated.accountCardControls(accounts[0], { now: 0 }), accountCardControls(accounts[0], { now: 0 }));
 });
 
 const AC_STATUS = () => ({
@@ -4193,15 +4220,16 @@ const cardNames = (page) => page.built.filter(e => e.className === 'acname').map
 test('the Accounts page reads the event log while open, and draws each card\'s recent requests', async () => {
   const page = bootPage({ hash: '#accounts' });
   await page.answer(200, AC_STATUS());
-  assert.equal(page.byId('acSummary').textContent, '3 accounts · 1 serving');
+  assert.equal(page.byId('acCount').textContent, '3 accounts');
+  assert.equal(page.byId('acServing').textContent, '1 serving');
   assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=0']);
   await page.answer(200, { generation: 'g', lastId: 3, events: [
     { id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 },
     { id: 2, kind: 'usage', account: 'a', provider: 'anthropic', status: 500 },
     { id: 3, kind: 'usage', account: 'a', provider: 'codex', status: 200 },
   ] });
-  assert.ok(page.findLast(e => e.textContent === '1 ok'), "the Claude account's own requests, not a namesake's");
-  assert.ok(page.findLast(e => e.textContent === '1 failed' && e.className === 'bad'));
+  assert.ok(page.findLast(e => e.textContent === 'Success 1'), "the Claude account's own requests, not a namesake's");
+  assert.ok(page.findLast(e => e.textContent === 'Failure 1' && e.className === 'bad'));
   assert.ok(page.findLast(e => e.textContent === '50.0%'));
   page.click('Quota');
   page.poll();
@@ -4276,10 +4304,17 @@ test('the Accounts filters narrow the cards and survive the poll', async () => {
 test('each card keeps the controls its Accounts row had', async () => {
   const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, AC_STATUS());
-  page.findLast(e => e.textContent === 'Disable' && e.listens('click')).fire('click');
-  assert.equal(page.requests[0].url, '/teamclaude/disable');
-  assert.equal(JSON.parse(page.requests[0].init.body).account, 'b');
-  for (const label of ['Enable', 'Cordon', 'Prioritize', 'Deprioritize', 'Remove']) {
+  const switches = page.built.filter(e => /^acswitch\b/.test(e.className));
+  assert.deepEqual(switches.map(e => e.className), ['acswitch on', 'acswitch on', 'acswitch'], 'one Enabled switch per card, off on the disabled one');
+  switches[1].fire('click');
+  switches[2].fire('click');
+  assert.deepEqual(page.requests.filter(r => r.url === '/teamclaude/disable').map(r => JSON.parse(r.init.body)),
+    [{ account: 'b', disabled: true }, { account: 'c', disabled: false }], 'the on switch disables and the off one enables');
+  for (const label of ['Switch to', 'Cordon', 'Prioritize', 'Deprioritize', 'Remove']) {
     assert.ok(page.findLast(e => e.textContent === label && e.listens('click')), label);
   }
+  page.findLast(e => e.textContent === 'Prioritize' && e.listens('click')).fire('click');
+  const move = page.requests.find(r => r.url === '/teamclaude/priority');
+  assert.ok(move, 'Prioritize posts a priority move');
+  assert.deepEqual(JSON.parse(move.init.body), { account: 'b', place: 'first' });
 });

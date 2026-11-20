@@ -2452,6 +2452,52 @@ export function accountCard(account, current, now) {
   };
 }
 
+/**
+ * The controls in an Accounts card's footer, in the order they are drawn, and
+ * the Enabled switch at its right. A control the caller's key would be refused
+ * is left out, and so is one that would do nothing here: no Switch to on the
+ * current or a disabled account, and no priority move on a disabled or
+ * cordoned one, which nothing new is sent to anyway. A signed-out login leads
+ * with Sign in again, the one thing that brings it back. Cordon stays on a
+ * disabled account, so an enable can bring it back cordoned.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @param {{ current?: boolean, caller?: any, removeArmed?: boolean, now?: number }} opts
+ * @returns {{ actions: { key: 'signin'|'switch'|'reset'|'prioritize'|'deprioritize'|'cordon'|'remove', label: string, title: string|null, tone: string|null, pressed: boolean|null }[], toggle: { on: boolean, title: string }|null }}
+ */
+export function accountCardControls(account, opts) {
+  var a = account || {};
+  var o = opts || {};
+  var caller = o.caller;
+  /** @type {{ key: 'signin'|'switch'|'reset'|'prioritize'|'deprioritize'|'cordon'|'remove', label: string, title: string|null, tone: string|null, pressed: boolean|null }[]} */
+  var actions = [];
+  var again = needsSignIn(a);
+  if (again && callerCan(caller, '/teamclaude/login/start')) actions.push({ key: 'signin', label: 'Sign in again', title: null, tone: again, pressed: null });
+  if (!o.current && !a.disabled) actions.push({ key: 'switch', label: 'Switch to', title: null, tone: null, pressed: null });
+  if (canRedeemReset(a, caller, o.now)) actions.push({ key: 'reset', label: 'Reset usage', title: null, tone: 'codex', pressed: null });
+  var cordoned = a.cordoned === true;
+  if (!a.disabled && !cordoned && callerCan(caller, '/teamclaude/priority')) {
+    actions.push({ key: 'prioritize', label: 'Prioritize', title: 'Move to the front of the rotation', tone: null, pressed: null });
+    actions.push({ key: 'deprioritize', label: 'Deprioritize', title: 'Move to the back of the rotation', tone: null, pressed: null });
+  }
+  if (callerCan(caller, '/teamclaude/account-cordon')) {
+    actions.push({
+      key: 'cordon', label: cordoned ? 'Uncordon' : 'Cordon', tone: null, pressed: cordoned,
+      title: cordoned ? 'Send new conversations to this account again' : 'Send no new conversations to this account; the ones on it stay until they finish',
+    });
+  }
+  if (callerCan(caller, '/teamclaude/remove')) {
+    actions.push({
+      key: 'remove', label: o.removeArmed ? 'Confirm remove' : 'Remove', tone: 'bad', pressed: null,
+      title: (o.removeArmed ? 'Click again to sign ' : 'Sign ') + a.name + ' out of TeamClaude',
+    });
+  }
+  var toggle = callerCan(caller, '/teamclaude/disable')
+    ? { on: !a.disabled, title: a.disabled ? 'Put this account back into rotation' : 'Take this account out of rotation' }
+    : null;
+  return { actions: actions, toggle: toggle };
+}
+
 // The Logs page's filter chips: one per event kind the proxy records
 // (event-log.js EVENT_KINDS), under the names the page shows them by.
 export var LOG_KINDS = [
@@ -3531,7 +3577,7 @@ const SHARED_HELPERS = [
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   servingOnExtraUsage, fmtUntil, resolveSwitchThreshold, resolveFleetThreshold, resolveMaxUsage, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
-  accountStatusText, accountInState, accountFilter, accountCard,
+  accountStatusText, accountInState, accountFilter, accountCard, accountCardControls,
   mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -4125,31 +4171,82 @@ const PAGE = `<!doctype html>
   .ovnrow span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ovnrow span:last-child { flex: none; font-family: var(--mono); color: var(--dim); }
   .ovnote { padding: 10px 0 4px; font-size: 12px; color: var(--dim); }
-  .acsum { font: 13px/1.6 var(--mono); color: var(--dim); margin: -8px 0 14px; }
-  .actabs { margin: 4px 0 12px; }
-  .acbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
-  .acbar input { flex: 1 1 240px; max-width: 420px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: 13px; padding: 7px 12px; }
-  .acbar input:focus-visible, .actabs .tab:focus-visible, #acStates .chip:focus-visible, .acard .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .wrap:has(> #page-accounts:not([style*="none"])) > #pageTop { display: none; }
+  .acphead { display: flex; justify-content: space-between; align-items: center; gap: 14px 24px; flex-wrap: wrap; padding: 6px 0 18px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+  .aclead { min-width: 0; }
+  .actitle { font-size: 32px; line-height: 1.15; font-weight: 700; letter-spacing: -.03em; }
+  .acsum { margin-top: 10px; padding-left: 12px; border-left: 3px solid var(--ok); font: 14px/1.5 var(--mono); color: var(--text); }
+  .acserving { color: var(--ok); }
+  .acserving::before { content: " · "; color: var(--dim); }
+  .acticks { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 14px; max-width: 420px; }
+  .acticks i { width: 7px; height: 22px; border-radius: 2px; background: var(--track); }
+  .acticks i.on { background: var(--ok); }
+  .acphead .addbar { margin: 0; gap: 4px 18px; }
+  .aclink { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; padding: 6px 2px; font-size: 14px; font-weight: 550; color: var(--text); cursor: pointer; }
+  .aclink:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .actabs { gap: 2px; margin: 0 0 16px; border-bottom: 1px solid var(--line); }
+  .actabs .tab { border: 0; border-radius: 0; background: transparent; padding: 10px 14px 11px; font-size: 14px; font-weight: 550; color: var(--dim); box-shadow: inset 0 -2px 0 transparent; }
+  .actabs .tab:hover { color: var(--text); }
+  .actabs .tab.sel { color: var(--text); background: transparent; box-shadow: inset 0 -2px 0 var(--text); }
+  .actabs .tglyph { width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .actabs .tglyph.claude { stroke: var(--claude); } .actabs .tglyph.codex { stroke: var(--codex); }
+  .actabs .tglyph.grok { stroke: var(--grok); } .actabs .tglyph.backend { stroke: var(--backend); }
+  .acbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  .acsearch { position: relative; flex: 1 1 260px; max-width: 420px; min-width: 0; }
+  .acsearch input { width: 100%; height: 40px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; color: var(--text); font: inherit; font-size: 13.5px; padding: 0 38px 0 14px; }
+  .acsearch svg { position: absolute; right: 12px; top: 50%; width: 16px; height: 16px; margin-top: -8px; fill: none; stroke: var(--dim); stroke-width: 1.8; stroke-linecap: round; pointer-events: none; }
+  .acseg { display: flex; flex-wrap: wrap; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  #acStates .chip { border: 0; border-radius: 7px; background: transparent; padding: 6px 12px; font-size: 13px; font-weight: 550; color: var(--dim); }
+  #acStates .chip:hover { color: var(--text); }
+  #acStates .chip.sel { background: var(--panel2); color: var(--text); box-shadow: inset 0 0 0 1px var(--line2); }
+  .acsearch input:focus-visible, .actabs .tab:focus-visible, #acStates .chip:focus-visible, .aclink:focus-visible, .acard .btn:focus-visible, .acswitch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .chip .n { margin-left: 6px; font: 600 11px var(--mono); color: var(--faint); }
   .acnote { font-size: 12px; color: var(--dim); margin: 0 0 12px; }
-  .acgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 14px; align-items: start; }
-  .acard { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .acgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 16px; align-items: start; }
+  .acard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 18px 18px 16px; container-type: inline-size; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
   .acard.acempty { border-style: dashed; background: transparent; }
   .acard.acempty .empty { padding: 0; }
   .achead { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .acname { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .acsub { font: 12px/1.4 var(--mono); color: var(--dim); overflow-wrap: anywhere; margin-top: -4px; }
+  .achead .ovbadge { font-size: 12px; padding: 5px 10px; }
+  .acname { font-weight: 650; font-size: 16px; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .acsub { font: 12.5px/1.4 var(--mono); color: var(--dim); overflow-wrap: anywhere; margin-top: -4px; }
   .acard .badges { display: flex; gap: 6px; flex-wrap: wrap; }
   .actop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-  .aclbl { font: 600 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
+  .aclbl { font: 600 11px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
   .acn { display: flex; gap: 10px; font: 600 12px var(--mono); color: var(--dim); }
   .acn b { font-weight: 600; } .acn b.ok { color: var(--ok); } .acn b.bad { color: var(--bad); }
-  .acstrip { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
-  .acstrip .ovstrip { flex: 1; min-width: 0; margin-top: 0; }
-  .acmeta { font: 12px/1.5 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
-  .acbars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-  .acact { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); }
-  .acact .btn.rm { margin-left: auto; }
+  .acstrip { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .acstrip .ovstrip { flex: 1; min-width: 0; margin-top: 0; gap: 4px; }
+  .acstrip .ovstrip i { height: 16px; border-radius: 3px; }
+  .acstrip .ovpct { flex: none; }
+  .acmeta { font: 12.5px/1.5 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
+  .acquota { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px 8px; background: color-mix(in srgb, var(--bg) 55%, var(--panel)); display: flex; flex-direction: column; gap: 6px; }
+  .acbars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .acfoot { display: flex; align-items: center; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .acact { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+  .acact .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; padding: 0 10px; border-radius: 8px; border-color: var(--line2); font-size: 12.5px; font-weight: 550; }
+  .acact .btn.acico { width: 30px; padding: 0; font-size: 0; }
+  .acact .btn.acico svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+  .acact .btn.acico[aria-pressed="true"] { color: var(--warn); border-color: var(--warn); }
+  .acact .btn.bad { color: var(--bad); }
+  .acact .btn.bad:hover { border-color: var(--bad); }
+  .acact .btn.acico.armed, .acact .btn.acico.armed:hover { color: #fff; background: var(--bad); border-color: var(--bad); }
+  .actoggle { margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); }
+  @container (max-width: 330px) { .actoggle > span { display: none; } }
+  .acswitch { position: relative; width: 40px; height: 24px; border-radius: 999px; border: 0; padding: 0; background: var(--track); cursor: pointer; }
+  .acswitch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--faint); transition: transform .15s; }
+  .acswitch.on { background: color-mix(in srgb, var(--text) 55%, var(--track)); }
+  .acswitch.on::after { transform: translateX(16px); background: #fff; }
+  .acswitch:disabled { opacity: .5; cursor: default; }
+  @media (max-width: 560px) {
+    .actitle { font-size: 28px; }
+    .acard { padding: 16px; }
+    .actabs .tab { padding: 8px 8px 9px; font-size: 13.5px; gap: 6px; }
+    .actabs .tglyph { display: none; }
+    .acseg { width: 100%; flex-wrap: nowrap; }
+    #acStates .chip { flex: 1 1 auto; padding: 6px 6px; font-size: 12.5px; }
+    #acStates .chip .n { margin-left: 4px; }
+  }
   @media (max-width: 1080px) {
     .ovtiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ovgrid { grid-template-columns: minmax(0, 1fr); }
@@ -4307,13 +4404,22 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-accounts" style="display:none">
-      <p id="acSummary" class="acsum"></p>
-      <div id="addBar" class="addbar"></div>
+      <div class="acphead">
+        <div class="aclead">
+          <h1 class="actitle">Accounts</h1>
+          <p class="acsum"><span id="acCount"></span><span id="acServing" class="acserving"></span></p>
+          <div id="acTicks" class="acticks" role="img"></div>
+        </div>
+        <div id="addBar" class="addbar" role="group" aria-label="Add an account"></div>
+      </div>
       <div id="signIn" class="signin" style="display:none"></div>
       <div id="acTabs" class="tabs actabs"></div>
       <div class="acbar">
-        <input id="acSearch" type="search" placeholder="Search name, provider or status" aria-label="Search accounts by name, provider or status" autocomplete="off">
-        <div id="acStates" class="chips"></div>
+        <label class="acsearch">
+          <input id="acSearch" type="search" placeholder="Search name, provider or status" aria-label="Search accounts by name, provider or status" autocomplete="off">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4"/></svg>
+        </label>
+        <div id="acStates" class="chips acseg" role="group" aria-label="Status"></div>
       </div>
       <p id="acNote" class="acnote" style="display:none"></p>
       <div id="accountCards" class="acgrid"></div>
@@ -4898,17 +5004,39 @@ ${SHARED_HELPERS}
   // The search box is in the page's markup rather than rebuilt, so a poll
   // never takes the text or the cursor from under someone typing.
   var accountFilters = { tab: 'all', state: 'all', query: '' };
-  var CARD_STRIP = 30;
+  var CARD_STRIP = 20;
+
+  var TAB_GLYPHS = {
+    all: 'M5 5h5v5H5zM14 5h5v5h-5zM5 14h5v5H5zM14 14h5v5h-5z',
+    anthropic: 'M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6L5.6 18.4',
+    codex: 'M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z',
+    grok: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM6 18L18 6',
+    backend: 'M4 6h16v5H4zM4 13h16v5H4zM8 8.5h.01M8 15.5h.01',
+  };
+
+  var CARD_ICONS = {
+    prioritize: 'M12 20V8M6 13l6-6 6 6M5 4h14',
+    deprioritize: 'M12 4v12M6 11l6 6 6-6M5 20h14',
+    cordon: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM5.6 5.6l12.8 12.8',
+    remove: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+  };
+
+  function glyph(d) {
+    var icon = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    svgEl('path', { d: d }, icon);
+    return icon;
+  }
 
   // A control this key would be refused is not drawn at all; the line at the
   // top of the page says why, once (callerNotice).
   function renderAccountsPage(s) {
     var canSignIn = callerCan(s.caller, '/teamclaude/login/start');
-    var canRemove = callerCan(s.caller, '/teamclaude/remove');
     renderAddBar(canSignIn);
     var accounts = s.accounts || [];
-    var serving = overviewFleet(s).serving;
-    document.getElementById('acSummary').textContent = accounts.length + (accounts.length === 1 ? ' account' : ' accounts') + ' · ' + serving + ' serving';
+    var fleet = overviewFleet(s);
+    document.getElementById('acCount').textContent = accounts.length + (accounts.length === 1 ? ' account' : ' accounts');
+    document.getElementById('acServing').textContent = fleet.serving + ' serving';
+    renderAccountTicks(fleet);
     var view = accountFilter(accounts, accountFilters);
     accountFilters.tab = view.tab;
     accountFilters.state = view.state;
@@ -4920,7 +5048,9 @@ ${SHARED_HELPERS}
         if (lastStatus) renderAccountsPage(lastStatus);
       });
       b.setAttribute('aria-pressed', String(t.key === view.tab));
-      if (t.key !== 'all') b.insertBefore(el('span', 'pdot ' + providerTone(t.key)), b.firstChild);
+      var icon = glyph(TAB_GLYPHS[t.key] || TAB_GLYPHS.backend);
+      icon.setAttribute('class', 'tglyph ' + (t.key === 'all' ? 'all' : providerTone(t.key)));
+      b.insertBefore(icon, b.firstChild);
       b.appendChild(el('span', 'count', String(t.count)));
       tabBox.appendChild(b);
     });
@@ -4941,7 +5071,7 @@ ${SHARED_HELPERS}
     note.style.display = logsRefused ? '' : 'none';
     var box = document.getElementById('accountCards');
     box.textContent = '';
-    view.shown.forEach(function (a) { box.appendChild(accountCardEl(a, s, canSignIn, canRemove, strips)); });
+    view.shown.forEach(function (a) { box.appendChild(accountCardEl(a, s, strips)); });
     view.empty.forEach(function (g) {
       var card = el('div', 'acard acempty');
       card.appendChild(el('div', 'achead')).appendChild(el('span', 'ovbadge ' + providerTone(g), groupLabel(g)));
@@ -4954,9 +5084,24 @@ ${SHARED_HELPERS}
     if (!view.shown.length && accounts.length) box.appendChild(el('div', 'acard acempty')).appendChild(el('div', 'empty', 'No accounts match these filters.'));
   }
 
-  function accountCardEl(a, s, canSignIn, canRemove, strips) {
+  function renderAccountTicks(fleet) {
+    var box = document.getElementById('acTicks');
+    box.textContent = '';
+    var ticks = [];
+    fleet.groups.forEach(function (g) { g.accounts.forEach(function (x) { ticks.push(x); }); });
+    box.setAttribute('aria-label', fleet.serving + ' of ' + ticks.length + ' enabled accounts serving');
+    ticks.forEach(function (x) {
+      var on = x.state !== 'resting';
+      var tick = el('i', on ? 'on' : '');
+      tick.title = x.name + (on ? ': serving' : ': resting');
+      box.appendChild(tick);
+    });
+  }
+
+  function accountCardEl(a, s, strips) {
     var key = cardNoteKey(a);
-    var model = accountCard(a, isCurrentAccount(a, s));
+    var current = isCurrentAccount(a, s);
+    var model = accountCard(a, current);
     var card = el('div', 'acard ' + model.tone);
     var head = el('div', 'achead');
     head.appendChild(el('span', 'ovbadge ' + model.tone, model.provider));
@@ -4985,10 +5130,10 @@ ${SHARED_HELPERS}
       var st = requestStrip(logState.events, a.name, CARD_STRIP, a.provider);
       var req = el('div', 'acreq');
       var top = el('div', 'actop');
-      top.appendChild(el('span', 'aclbl', 'Recent requests'));
+      top.appendChild(el('span', 'aclbl', 'Requests'));
       var counts = el('span', 'acn');
-      counts.appendChild(el('b', 'ok', st.ok + ' ok'));
-      counts.appendChild(el('b', st.count - st.ok ? 'bad' : '', (st.count - st.ok) + ' failed'));
+      counts.appendChild(el('b', 'ok', 'Success ' + st.ok));
+      counts.appendChild(el('b', st.count - st.ok ? 'bad' : '', 'Failure ' + (st.count - st.ok)));
       top.appendChild(counts);
       req.appendChild(top);
       var line = el('div', 'acstrip');
@@ -5008,86 +5153,79 @@ ${SHARED_HELPERS}
     }
     card.appendChild(el('div', 'acmeta', meta.join(' · ')));
 
-    if (model.meters.length) {
-      var bars = el('div', 'acbars');
-      model.meters.forEach(function (m) { bars.appendChild(meterEl(m)); });
-      card.appendChild(bars);
+    if (model.meters.length || model.text) {
+      var quota = el('div', 'acquota');
+      if (model.meters.length) {
+        var bars = el('div', 'acbars');
+        model.meters.forEach(function (m) { bars.appendChild(meterEl(m)); });
+        quota.appendChild(bars);
+      }
+      if (model.text) quota.appendChild(el('div', 'usage', model.text));
+      card.appendChild(quota);
     }
-    if (model.text) card.appendChild(el('div', 'usage', model.text));
 
-    card.appendChild(accountActions(a, s, key, canSignIn, canRemove));
+    card.appendChild(accountFooter(a, s, key, current));
     return card;
   }
 
-  function accountActions(a, s, key, canSignIn, canRemove) {
+  function accountFooter(a, s, key, current) {
+    var foot = el('div', 'acfoot');
     var act = el('div', 'acact');
-    // Signed out upstream: the one thing that brings it back is a sign-in,
-    // so it comes first. The tokens go to whichever account the browser
-    // signs in as, which the panel says.
-    var again = needsSignIn(a);
-    if (again && canSignIn) {
-      act.appendChild(button('btn ' + again, 'Sign in again', function () { startSignIn(again, a.email || a.name); }));
+    var armedAt = removeArmed[key];
+    var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
+    var controls = accountCardControls(a, { current: current, caller: s.caller, removeArmed: armed });
+    controls.actions.forEach(function (c) {
+      if (c.key === 'reset') { act.appendChild(resetButton(a, key)); return; }
+      var icon = CARD_ICONS[c.key];
+      var cls = 'btn' + (icon ? ' acico' : '') + (c.tone ? ' ' + c.tone : '') + (c.key === 'remove' && armed ? ' armed' : '');
+      var b = button(cls, c.label, function () { runCardControl(c.key, a, key, b); });
+      if (c.title) b.title = c.title;
+      if (icon) {
+        b.insertBefore(glyph(icon), b.firstChild);
+        b.setAttribute('aria-label', c.label);
+      }
+      if (c.pressed != null) b.setAttribute('aria-pressed', String(c.pressed));
+      act.appendChild(b);
+    });
+    foot.appendChild(act);
+    if (controls.toggle) {
+      var t = controls.toggle;
+      var wrap = el('span', 'actoggle');
+      wrap.appendChild(el('span', '', 'Enabled'));
+      var sw = button(t.on ? 'acswitch on' : 'acswitch', null, function () { doControlAccount(a.name, key, { disabled: t.on }, sw); });
+      sw.setAttribute('role', 'switch');
+      sw.setAttribute('aria-checked', String(t.on));
+      sw.setAttribute('aria-label', 'Enabled');
+      sw.title = t.title;
+      wrap.appendChild(sw);
+      foot.appendChild(wrap);
     }
-    if (!isCurrentAccount(a, s) && !a.disabled) {
-      var ctlSwitch = button('btn', 'Switch to', function () { doSwitch(a.name, key, ctlSwitch); });
-      act.appendChild(ctlSwitch);
-    }
-    if (canRedeemReset(a, s.caller)) act.appendChild(resetButton(a, key));
-    if (callerCan(s.caller, '/teamclaude/disable')) {
-      var ctlDisable = button('btn', a.disabled ? 'Enable' : 'Disable', function () { doControlAccount(a.name, key, { disabled: !a.disabled }, ctlDisable); });
-      act.appendChild(ctlDisable);
-    }
-    // Cordon it, or put it back: no new conversation goes to it while the
-    // ones already on it stay, the graceful step before a disable or a
-    // removal. Drawn for a disabled account too, so an enable can bring it
-    // back cordoned.
-    if (callerCan(s.caller, '/teamclaude/account-cordon')) {
-      var cordoned = a.cordoned === true;
-      var ctlCordon = button('btn', cordoned ? 'Uncordon' : 'Cordon', function () { doControlAccount(a.name, key, { cordoned: !cordoned }, ctlCordon); });
-      ctlCordon.title = cordoned ? 'Send new conversations to this account again'
-        : 'Send no new conversations to this account; the ones on it stay until they finish';
-      act.appendChild(ctlCordon);
-    }
-    // Only enable/disable (and cordon) for a disabled account: the rest would
-    // move an account that nothing will select anyway. Not for a cordoned one
-    // either: nothing new goes there, so a move would read as doing something
-    // and would not, until the uncordon.
-    if (!a.disabled && a.cordoned !== true && callerCan(s.caller, '/teamclaude/priority')) {
-      var ctlFirst = button('btn', 'Prioritize', function () { doControlAccount(a.name, key, { place: 'first' }, ctlFirst); });
-      act.appendChild(ctlFirst);
-      var ctlLast = button('btn', 'Deprioritize', function () { doControlAccount(a.name, key, { place: 'last' }, ctlLast); });
-      act.appendChild(ctlLast);
-    }
-    // Two clicks: the first arms the button for a few seconds, the second
-    // removes. There is no undo short of signing in again. Arming changes
-    // nothing but this button, which keeps its width, so no other control
-    // slides under the pointer between the clicks; and a second click too
-    // soon after the first is a double-click, not a decision.
-    if (canRemove) {
-      var armedAt = removeArmed[key];
-      var armed = armedAt != null && Date.now() - armedAt < REMOVE_CONFIRM_MS;
-      var ctlRemove = button(armed ? 'btn rm danger' : 'btn rm', armed ? 'Confirm remove' : 'Remove', function () {
-        if (!armed) { removeArmed[key] = Date.now(); if (lastStatus) render(lastStatus); return; }
-        if (Date.now() - armedAt < REMOVE_DOUBLE_CLICK_MS) return;
-        delete removeArmed[key];
-        doRemove(a, key, ctlRemove);
-      });
-      ctlRemove.title = armed ? 'Click again to sign ' + a.name + ' out of TeamClaude' : 'Sign ' + a.name + ' out of TeamClaude';
-      act.appendChild(ctlRemove);
-    }
-    return act;
+    return foot;
   }
 
-  // The buttons that add an account. Rebuilt with the page; the sign-in
-  // panel under them is not, so a paste being typed survives the poll.
+  function runCardControl(k, a, key, btn) {
+    if (k === 'signin') startSignIn(needsSignIn(a), a.email || a.name);
+    else if (k === 'switch') doSwitch(a.name, key, btn);
+    else if (k === 'prioritize') doControlAccount(a.name, key, { place: 'first' }, btn);
+    else if (k === 'deprioritize') doControlAccount(a.name, key, { place: 'last' }, btn);
+    else if (k === 'cordon') doControlAccount(a.name, key, { cordoned: a.cordoned !== true }, btn);
+    else if (k === 'remove') {
+      var now = Date.now();
+      var step = resetClickStep(removeArmed[key], now, REMOVE_CONFIRM_MS, REMOVE_DOUBLE_CLICK_MS);
+      if (step === 'wait') return;
+      if (step === 'arm') { removeArmed[key] = now; if (lastStatus) render(lastStatus); return; }
+      delete removeArmed[key];
+      doRemove(a, key, btn);
+    }
+  }
+
   function renderAddBar(canSignIn) {
     var bar = document.getElementById('addBar');
     bar.textContent = '';
     bar.style.display = canSignIn ? '' : 'none';
     if (!canSignIn) return;
-    bar.appendChild(el('span', 'lbl', 'Add an account:'));
     [['claude', 'Sign in to Claude', 'Sign in with a Claude Pro or Max account'], ['codex', 'Sign in to Codex', 'Sign in with a ChatGPT account, for the Codex CLI'], ['grok', 'Sign in to Grok', 'Sign in with an xAI account, for Grok Build']].forEach(function (p) {
-      var b = button('btn ' + p[0], p[1], function () { startSignIn(p[0], null); });
+      var b = button('aclink', p[1], function () { startSignIn(p[0], null); });
       b.title = p[2];
       b.insertBefore(el('span', 'pdot ' + p[0]), b.firstChild);
       bar.appendChild(b);
