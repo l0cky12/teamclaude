@@ -243,6 +243,10 @@ test('the Quota headline counts the accounts with room and dates the next one ba
     { name: 'ready', room: true }, { name: 'week', room: false }, { name: 'session', room: false }, { name: 'codex', room: false },
   ]);
   assert.equal(quotaHeadline([accounts[1]], T0).nextReset, T0 + 48 * H, 'the latest spent window decides');
+  const both = { name: 'both', quota: { unified5h: 1, unified5hReset: T0 + 5 * H, unified7d: 1, unified7dReset: T0 + H } };
+  assert.equal(quotaHeadline([both], T0).nextReset, T0 + 5 * H, 'a spent session behind an empty week keeps its own reset');
+  const fable = { name: 'fable', quota: { unified5h: 0.2, unified7dFable: 1, unified7d: 1, unified7dReset: T0 + H } };
+  assert.equal(quotaHeadline([fable], T0).nextReset, null, 'a spent window with no reset gives no time');
   assert.equal(quotaHeadline([accounts[0]], T0).text, '1 of 1 with room');
   assert.equal(quotaHeadline([accounts[0]], T0).tone, 'ok');
   assert.equal(quotaHeadline(accounts.slice(1, 3), T0).tone, 'bad');

@@ -2047,8 +2047,11 @@ export function quotaTiles(members, group, fable, now) {
 }
 
 // An account is back only once every spent window has reset, so its time is
-// the latest known reset among them; one with no known reset is left out
-// rather than guessed at.
+// the latest reset among them, and an account with any spent window whose
+// reset is unknown gets no time rather than a guess. The five-hour meter that
+// accountMeters marks spent because a weekly bucket is empty (it carries a
+// note) is read from the account's own five-hour reading here: it counts only
+// when that window is spent too, and then with its own reset.
 /** @param {any[]} accounts @param {number} [now] */
 export function quotaHeadline(accounts, now) {
   var at = now == null ? Date.now() : now;
@@ -2066,9 +2069,14 @@ export function quotaHeadline(accounts, now) {
     var spent = accountMeters(a, undefined, at).slots.filter(function (m) { return exhaustedMeter(m, at); });
     strip.push({ name: a.name, room: !spent.length });
     if (!spent.length) { groupRoom[g]++; return; }
-    var resets = spent.map(function (m) { return m.resetAt; }).filter(function (r) { return typeof r === 'number' && r > at; });
-    if (!resets.length) return;
-    var back = Math.max.apply(null, resets);
+    var q = a.quota || {};
+    var windows = spent.map(function (m) {
+      if (!m.note) return m;
+      var own = quotaMeter(m.label, q.unified5h, q.unified5hReset);
+      return exhaustedMeter(own, at) ? own : null;
+    }).filter(function (m) { return m; });
+    if (windows.some(function (m) { return typeof m.resetAt !== 'number'; })) return;
+    var back = Math.max.apply(null, windows.map(function (m) { return m.resetAt; }));
     if (next == null || back < next) next = back;
   });
   var room = strip.filter(function (x) { return x.room; }).length;
