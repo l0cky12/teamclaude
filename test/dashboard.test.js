@@ -24,6 +24,7 @@ import {
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
+  showsSyncCard, showsLinksCard, settingsView, SETTINGS_SECTIONS,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
 import { UNAVAILABLE_TEXT } from '../src/status-renderer.js';
@@ -1322,6 +1323,64 @@ test('the page carries the quota refresh picker and wires it', () => {
   assert.ok(html.includes("getElementById('probeEvery').addEventListener('change'"), 'the change handler');
 });
 
+const CURRENT_PROXY_STATUS = {
+  instance: { name: 'demo-host', custom: true, host: 'demo-host', address: 'http://demo-host.example:3456' },
+  outsideSpendHidePercent: 5, dashboardLogin: null, peers: [],
+};
+
+test('settingsView shows every Settings tab and row to the operator of a current proxy', () => {
+  const v = settingsView(CURRENT_PROXY_STATUS, 'access');
+  assert.deepEqual(v.tabs.map(t => t.key), ['instance', 'rotation', 'access', 'sync', 'links']);
+  assert.equal(v.selected, 'access');
+  assert.deepEqual(v.rows, {
+    name: 'span', addr: 'span', threshold: 'half', refresh: 'half', osp: 'half', probe: 'half',
+    password: 'span', key: 'span', sync: 'span', links: 'span',
+  });
+  assert.deepEqual(v.meta, [{ text: '6 settings' }, { text: 'demo-host' }, { text: 'Editable', tone: 'ok' }],
+    'six rows save to the config file; Probe quotas and Change key are actions');
+});
+
+test('settingsView drops what an older proxy cannot save, and a tab left empty', () => {
+  const v = settingsView({}, 'instance');
+  assert.deepEqual(v.tabs.map(t => t.key), ['rotation', 'access', 'sync'], 'no instance name or address, and no peers to link');
+  assert.equal(v.selected, 'rotation', 'a tab with nothing in it falls back to the first one there');
+  assert.equal(v.rows.osp, 'hidden');
+  assert.equal(v.rows.probe, 'span', 'the odd row out takes the full width instead of sitting beside an empty cell');
+  assert.deepEqual(v.meta, [{ text: '2 settings' }, { text: 'Editable', tone: 'ok' }]);
+});
+
+test('settingsView reads as read-only to a client key, without the operator-only rows', () => {
+  const refused = ['/teamclaude/threshold', '/teamclaude/dashboard-login', '/teamclaude/account-sync/start', '/teamclaude/peer-links/add'];
+  const v = settingsView({ ...CURRENT_PROXY_STATUS, dashboardLogin: 'ops', caller: { client: 'laptop', refused } }, 'links');
+  assert.deepEqual(v.tabs.map(t => t.key), ['instance', 'rotation', 'access']);
+  assert.equal(v.selected, 'instance');
+  assert.equal(v.rows.password, 'hidden');
+  assert.equal(v.rows.key, 'span');
+  assert.deepEqual(v.meta.at(-1), { text: 'Read-only', tone: 'dim' });
+});
+
+test('every Settings row names an element the page has', () => {
+  const html = renderDashboardHtml();
+  for (const sec of SETTINGS_SECTIONS) {
+    assert.ok(html.includes(`id="stPane-${sec.key}"`), `the ${sec.key} pane`);
+    for (const r of sec.rows) assert.ok(html.includes(`id="${r.id}"`), `the ${r.key} row`);
+  }
+});
+
+test('a Settings tab shows its own pane and stays picked across the poll', async () => {
+  const page = bootPage({ hash: '#settings' });
+  await page.answerTo('/teamclaude/status', 200, CURRENT_PROXY_STATUS);
+  assert.equal(page.byId('stPane-instance').style.display, '', 'the first tab is open at first');
+  assert.equal(page.byId('stPane-access').style.display, 'none');
+  page.click('Access');
+  assert.equal(page.byId('stPane-access').style.display, '');
+  assert.equal(page.byId('stPane-instance').style.display, 'none');
+  page.poll();
+  await page.answerTo('/teamclaude/status', 200, CURRENT_PROXY_STATUS);
+  assert.equal(page.byId('stPane-access').style.display, '', 'a poll does not move the operator back to the first tab');
+  assert.equal(page.byId('pageTop').style.display, 'none', 'the page draws its own header');
+});
+
 test('the page ships the same helper implementations it is tested against', () => {
   // The serialization is the contract: if a helper stops being self-contained
   // (closes over module scope), the page would silently ReferenceError.
@@ -1332,7 +1391,8 @@ test('the page ships the same helper implementations it is tested against', () =
     clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
     peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
     instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress,
-    accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome]) {
+    accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
+    showsSyncCard, showsLinksCard, settingsView]) {
     assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
   }
   // parseInstanceLink reads it from page scope.
@@ -3568,7 +3628,7 @@ test('the Instance address row saves what is typed, and the link handed out then
     await page.answer(200, { ok: true, key: 'tc-hub' });
     const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
     assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
-    assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address above)'), 'and says it is no guess');
+    assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address on the Instance tab)'), 'and says it is no guess');
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 
@@ -3836,7 +3896,10 @@ test('Account sync: a linked instance that is off is set up from this page, thro
     await page.answerTo('/teamclaude/account-sync', 200, SIGNED_IN);
     await page.answerTo('/teamclaude/peers/desk/account-sync', 200, SIGNED_OUT);
     assert.ok(shown(page, /^off$/), 'the row says sync is off there');
+    page.click('Linked instances');
     page.click('Set up');
+    assert.equal(page.byId('stPane-sync').style.display, '', 'the sign-in opens on the Account sync tab, where it is drawn');
+    assert.equal(page.byId('stPane-links').style.display, 'none');
     assert.ok(page.requests.some(r => r.url === '/teamclaude/peers/desk/account-sync/start' && r.init.method === 'POST'));
     await page.answerTo('/teamclaude/peers/desk/account-sync/start', 200, { ok: true, id: 'p1', url: 'https://oid.jp/DESK' });
     assert.ok(shown(page, /^Turn on account sync for desk$/));
