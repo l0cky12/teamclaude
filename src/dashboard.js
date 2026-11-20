@@ -3966,7 +3966,7 @@ const PAGE = `<!doctype html>
   #page-settings .stctl input.num { width: 84px; text-align: right; }
   #page-settings .stctl input.pw { width: 180px; }
   #page-settings .stctl select { width: 150px; }
-  #page-settings .stcard .btn { height: 36px; padding: 0 14px; border-radius: 8px; border-color: var(--line2); font-size: 13px; font-weight: 600; }
+  #page-settings .stcard .btn { display: inline-flex; align-items: center; height: 36px; padding: 0 14px; border-radius: 8px; border-color: var(--line2); font-size: 13px; font-weight: 600; }
   #page-settings .stcard .btn.primary { background: var(--text); border-color: var(--text); color: var(--bg); }
   #page-settings .stcard .btn.primary:hover { opacity: .88; }
   #page-settings .stcard td .btn { height: auto; padding: 2px 6px; border: 0; background: none; color: var(--text); }
@@ -5882,7 +5882,7 @@ ${SHARED_HELPERS}
           var link = opts.length ? instanceLink(opts[0], j.key) : '';
           if (link) snippet(box, 'Link (the address below and the key): paste it under Its link on the other machine', link, 0);
           var addrSet = !!(linkSelf && linkSelf.address && linkSelf.address === opts[0]);
-          if (opts.length) snippet(box, addrSet ? 'Address (set under Instance address above)' : 'Address (a best guess: use one the other machine can reach, or set Instance address above)', opts[0], 0);
+          if (opts.length) snippet(box, addrSet ? 'Address (set under Instance address on the Instance tab)' : 'Address (a best guess: use one the other machine can reach, or set Instance address on the Instance tab)', opts[0], 0);
           snippet(box, 'Proxy key', j.key, 0);
         }
         box.style.display = '';
@@ -6051,7 +6051,7 @@ ${SHARED_HELPERS}
   function ownSyncBox(inst) {
     var box = el('div', 'ownsync');
     box.appendChild(el('div', 'sub2', 'Or keep them on one of your own machines'));
-    box.appendChild(el('p', 'hint', 'No account needed. One machine keeps the sign-ins; each of your other machines follows it over its link (Linked instances, below).'));
+    box.appendChild(el('p', 'hint', 'No account needed. One machine keeps the sign-ins; each of your other machines follows it over its link (the Linked instances tab).'));
     var acts = el('div', 'row acts');
     var host = button('btn', syncBusy === 'mode' ? 'Turning on…' : 'Keep them on ' + syncWhere(''), function () { doSync('mode', { mode: 'host' }); });
     host.disabled = !!syncBusy || !inst.canHost;
@@ -6158,6 +6158,7 @@ ${SHARED_HELPERS}
     var me = { target: target, id: null, url: null, done: false, abandoned: false, seq: seq, status: { kind: '', text: 'Asking callback.net for a sign-in link…' } };
     syncSignIn = me;
     syncNote = null;
+    showSettingsTab('sync');
     renderSyncSignIn();
     if (lastStatus) { renderSync(lastStatus); renderLinks(lastStatus); }
     var card = document.getElementById('acctSync');
@@ -7999,10 +8000,7 @@ ${SHARED_HELPERS}
   function buildSettingsTabs() {
     var bar = document.getElementById('stTabs');
     SETTINGS_SECTIONS.forEach(function (sec) {
-      var b = button('sttab', sec.label, function () {
-        settingsTab = sec.key;
-        if (lastStatus) renderSettingsFrame(settingsView(lastStatus, settingsTab));
-      });
+      var b = button('sttab', sec.label, function () { showSettingsTab(sec.key); });
       b.setAttribute('role', 'tab');
       b.setAttribute('aria-controls', 'stPane-' + sec.key);
       b.prepend(settingsIcon(sec.icon));
@@ -8010,6 +8008,11 @@ ${SHARED_HELPERS}
       settingsTabButtons[sec.key] = b;
       document.getElementById('stHd-' + sec.key).prepend(settingsIcon(sec.icon));
     });
+  }
+
+  function showSettingsTab(key) {
+    settingsTab = key;
+    if (lastStatus) renderSettingsFrame(settingsView(lastStatus, settingsTab));
   }
 
   function settingsIcon(d) {

@@ -3508,7 +3508,7 @@ test('the Instance address row saves what is typed, and the link handed out then
     await page.answer(200, { ok: true, key: 'tc-hub' });
     const link = page.findLast(e => String(e.value).startsWith('teamrouter://link?'));
     assert.deepEqual(parseInstanceLink(link.value), { url: 'http://100.64.0.9:3456', apiKey: 'tc-hub' });
-    assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address above)'), 'and says it is no guess');
+    assert.ok(page.findLast(e => e.textContent === 'Address (set under Instance address on the Instance tab)'), 'and says it is no guess');
   }, { origin: 'http://localhost:3456', storedKey: 'tc-operator' });
 });
 
@@ -3776,7 +3776,10 @@ test('Account sync: a linked instance that is off is set up from this page, thro
     await page.answerTo('/teamclaude/account-sync', 200, SIGNED_IN);
     await page.answerTo('/teamclaude/peers/desk/account-sync', 200, SIGNED_OUT);
     assert.ok(shown(page, /^off$/), 'the row says sync is off there');
+    page.click('Linked instances');
     page.click('Set up');
+    assert.equal(page.byId('stPane-sync').style.display, '', 'the sign-in opens on the Account sync tab, where it is drawn');
+    assert.equal(page.byId('stPane-links').style.display, 'none');
     assert.ok(page.requests.some(r => r.url === '/teamclaude/peers/desk/account-sync/start' && r.init.method === 'POST'));
     await page.answerTo('/teamclaude/peers/desk/account-sync/start', 200, { ok: true, id: 'p1', url: 'https://oid.jp/DESK' });
     assert.ok(shown(page, /^Turn on account sync for desk$/));
