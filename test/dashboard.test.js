@@ -17,6 +17,7 @@ import {
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep, REDEEM_UNCERTAIN_TEXT,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
   overviewHeadline, overviewTiles, trafficScale, requestStrip,
+  ACCOUNT_STATES, accountStatusText, accountFilter, accountCard,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -24,6 +25,7 @@ import {
   accountSyncRequest, accountSyncUser, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
 } from '../src/dashboard.js';
 import { logoDataUrl, logoMarkup } from '../src/logo.js';
+import { UNAVAILABLE_TEXT } from '../src/status-renderer.js';
 import { EVENT_KINDS } from '../src/event-log.js';
 import { USAGE_WINDOWS } from '../src/client-usage.js';
 
@@ -1286,6 +1288,8 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   return { byId, store, requests, answer, answerTo, runTimers, rootAttrs, click, labelled, findLast, built, focused, poll: () => { mark = built.length; poll(); } };
 }
 
+const EMPTY_LOG_FOR_SIGN_IN = (url) => (url.includes('/logs?') ? { status: 200, body: { generation: 'g', lastId: 0, events: [] } } : null);
+
 // The Insights page reads /teamclaude/insights only while it is open, like the
 // log; a status poll does not ask again while the copy is fresh, a new range
 // asks at once, and a linked instance too old to keep history says so.
@@ -1343,7 +1347,9 @@ test('the Insights headlines pick the metric and remember it; the views redraw w
   assert.equal(page.store.get('teamclaude-insights-metric'), 'tokens');
   assert.equal(heads().slice(-1)[0].className, 'inshead sel', 'the tokens headline is now the one drawn');
   page.click('Running total');
-  page.click('Accounts');
+  // The fake DOM keeps no tree, so the "Where it went" segment is told from the
+  // sidebar's Accounts button by being built later.
+  page.findLast(e => e.textContent === 'Accounts' && e.listens('click')).fire('click');
   page.click('Providers');
   assert.deepEqual(page.requests, [], 'a view or a tab is drawn from the copy in hand');
 
@@ -1635,7 +1641,7 @@ test('Show all reveals exhausted quota rows, survives polls and tabs, and can hi
   assert.equal(page.labelled('200%'), 0);
   page.click('Show all');
   assert.equal(page.labelled('quota-spent-demo'), 3);
-  assert.equal(page.labelled('Weekly limit empty'), 1);
+  assert.equal(page.labelled('Weekly limit empty'), 2, 'on the quota row and on the account\'s card');
   page.poll();
   await page.answer(200, fleet);
   assert.equal(page.labelled('quota-spent-demo'), 3, 'a poll keeps Show all');
@@ -1677,7 +1683,7 @@ test('Claude and Codex get adjacent five-hour cards without changing existing su
   assert.equal(page.labelled('40%'), 1, 'the original Claude headline stays Fable');
   assert.equal(page.labelled('90%'), 1, 'the original Codex headline stays weekly');
   page.click('Codex');
-  assert.equal(page.labelled('5-hour limit'), 2, 'the filtered group has its session card and row');
+  assert.equal(page.labelled('5-hour limit'), 4, 'the filtered Quota group has its session card and row, and each Accounts card its own bar');
   assert.equal(page.labelled('80%'), 0, 'Claude cards are filtered out');
 });
 
@@ -2373,7 +2379,7 @@ test('Remove names the card\'s provider and org, so a namesake is never the one 
 });
 
 test('Sign in to Codex starts the flow, shows the link, and a pasted address finishes it', async () => {
-  const page = bootPage();
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, { accounts: [] });
   assert.equal(page.labelled('Sign in to Claude'), 1);
   page.click('Sign in to Codex');
@@ -2402,7 +2408,7 @@ test('Sign in to Codex starts the flow, shows the link, and a pasted address fin
 });
 
 test('a paste the server refuses is shown in the panel, which keeps waiting', async () => {
-  const page = bootPage();
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, { accounts: [] });
   page.click('Sign in to Claude');
   await page.answer(200, { ok: true, id: 'abc', provider: 'claude', url: 'https://claude.ai/x', browserUrl: 'http://localhost:9/x', listening: true });
@@ -2453,7 +2459,7 @@ test('Remove asks for a second click, then sends the card\'s provider', async ()
   assert.match(page.byId('note').textContent, /Removed me@example\.com/);
 });
 
-test('the Accounts page lists Claude and Codex apart, each under its own heading', async () => {
+test('the Accounts page tells Claude and Codex apart by tab and by card colour', async () => {
   const page = bootPage();
   await page.answer(200, {
     accounts: [
@@ -2461,14 +2467,19 @@ test('the Accounts page lists Claude and Codex apart, each under its own heading
       { name: 'codex-one', provider: 'codex', quota: {} },
     ],
   });
-  assert.equal(page.labelled('Claude accounts'), 1);
-  assert.equal(page.labelled('Codex (ChatGPT) accounts'), 1);
-  assert.ok(page.findLast(e => e.className === 'pcard claude'), 'the Claude section wears the Claude colour');
-  assert.ok(page.findLast(e => e.className === 'pcard codex'), 'and the Codex one its own');
+  assert.ok(page.findLast(e => e.className === 'acard claude'), 'the Claude card wears the Claude colour');
+  assert.ok(page.findLast(e => e.className === 'acard codex'), 'and the Codex one its own');
+  assert.equal(page.findLast(e => e.className === 'ovbadge codex').textContent, 'Codex');
+  // The fake DOM keeps no tree: the Accounts tabs are told from the Quota
+  // page's by being built after them.
+  page.findLast(e => e.textContent === 'Codex' && e.listens('click')).fire('click');
+  assert.equal(page.findLast(e => /^tab\b/.test(e.className) && e.textContent === 'Codex').className, 'tab sel');
+  assert.ok(page.findLast(e => e.textContent === 'codex-one' && e.className === 'acname'));
+  assert.equal(page.findLast(e => e.className === 'acname').textContent, 'codex-one', 'only the Codex card is drawn');
 });
 
 test('an account signed out upstream offers Sign in again for its own provider', async () => {
-  const page = bootPage();
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, { accounts: [{ name: 'work', email: 'me@example.com', provider: 'anthropic', type: 'oauth', status: 'error', quota: {} }] });
   page.click('Sign in again');
   assert.deepEqual(JSON.parse(page.requests[0].init.body), { provider: 'claude' });
@@ -2539,7 +2550,7 @@ test('status says whether an account reads its sign-in from a file, and never wh
 
 // A panel with a Codex sign-in the server has started, id 'abc'.
 async function pageWithSignIn() {
-  const page = bootPage();
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, { accounts: [] });
   page.click('Sign in to Codex');
   await page.answer(200, { ok: true, id: 'abc', provider: 'codex', url: 'https://auth.openai.com/oauth/authorize?x=1', browserUrl: null, listening: true });
@@ -2887,7 +2898,7 @@ test('a picked name that is gone from the config is never asked for', async () =
 });
 
 test('a linked instance at a loopback address still signs in the remote way', async () => {
-  const page = bootPage({ storedInstance: 'tunnel' });
+  const page = bootPage({ storedInstance: 'tunnel', autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
   await page.answer(200, { peers: [{ name: 'tunnel', url: 'http://127.0.0.1:9999', state: 'online' }] });
   await page.answer(200, { accounts: [] });
   page.click('Sign in to Claude');
@@ -3811,9 +3822,9 @@ test('requestStrip pads an account with fewer requests than slots at the start, 
   ];
   const st = requestStrip(events, 'a', 6);
   assert.deepEqual(st.slots, [null, null, 'ok', 'failed', 'failed', 'ok']);
-  assert.deepEqual([st.count, st.rate], [4, 0.5]);
+  assert.deepEqual([st.count, st.ok, st.rate], [4, 2, 0.5]);
   assert.deepEqual(requestStrip(events, 'a', 2).slots, ['failed', 'ok'], 'only the last n');
-  assert.deepEqual(requestStrip([], 'a', 3), { slots: [null, null, null], rate: null, count: 0 });
+  assert.deepEqual(requestStrip([], 'a', 3), { slots: [null, null, null], rate: null, count: 0, ok: 0 });
 });
 
 test('the Overview helpers run in the page\'s own scope', () => {
@@ -3915,4 +3926,167 @@ test('the Overview says when the traffic window is empty', async () => {
   await page.answer(200, s);
   assert.equal(page.labelled('No requests in the last 3h 20m.'), 1);
   assert.equal(page.byId('ovTableWrap').style.display, 'none');
+});
+
+test('accountFilter counts each tab under the status and search, and each status under the tab', () => {
+  const accounts = [
+    { name: 'c1', provider: 'anthropic' },
+    { name: 'c2', provider: 'anthropic', disabled: true },
+    { name: 'x1', provider: 'codex', unavailable: 'throttled' },
+    { name: 'd1', provider: 'anthropic', backend: 'api.deepseek.com', unavailable: 'cordoned' },
+  ];
+  const all = accountFilter(accounts, {});
+  assert.deepEqual(all.tabs.map(t => [t.key, t.count]), [['all', 4], ['anthropic', 2], ['codex', 1], ['backend:api.deepseek.com', 1]]);
+  assert.deepEqual(all.states.map(st => [st.key, st.count]), [['all', 4], ['enabled', 3], ['disabled', 1], ['problem', 1]]);
+  assert.deepEqual(all.empty, ['grok'], 'a sign-in provider with no account is named while nothing is filtered');
+
+  const problems = accountFilter(accounts, { state: 'problem' });
+  assert.deepEqual(problems.shown.map(a => a.name), ['x1'], 'a cordon is not a problem');
+  assert.deepEqual(problems.tabs.map(t => t.count), [1, 0, 1, 0]);
+  assert.deepEqual(problems.empty, []);
+
+  const claude = accountFilter(accounts, { tab: 'anthropic' });
+  assert.deepEqual(claude.states.map(st => st.count), [2, 1, 1, 0]);
+  assert.deepEqual(claude.shown.map(a => a.name), ['c1', 'c2']);
+});
+
+test('accountFilter searches the name, provider and status text, and falls back to All', () => {
+  const accounts = [
+    { name: 'work', provider: 'codex' },
+    { name: 'home', provider: 'anthropic', unavailable: 'throttled' },
+    { name: 'spare', provider: 'anthropic', disabled: true },
+  ];
+  assert.deepEqual(accountFilter(accounts, { query: ' WOR ' }).shown.map(a => a.name), ['work']);
+  assert.deepEqual(accountFilter(accounts, { query: 'claude' }).shown.map(a => a.name), ['home', 'spare'], 'by the tab name');
+  assert.deepEqual(accountFilter(accounts, { query: '429' }).shown.map(a => a.name), ['home'], 'by the blocked reason');
+  assert.deepEqual(accountFilter(accounts, { query: 'disabled' }).shown.map(a => a.name), ['spare']);
+  const gone = accountFilter(accounts, { tab: 'grok', state: 'nonsense' });
+  assert.equal(gone.tab, 'all', 'a tab the fleet no longer has');
+  assert.equal(gone.state, 'all');
+  assert.deepEqual(accountFilter(accounts, {}).shown.map(a => a.name), ['home', 'spare', 'work'], 'Claude first, then Codex');
+  assert.deepEqual(ACCOUNT_STATES.map(st => st.label), ['All', 'Enabled', 'Disabled', 'Problem']);
+});
+
+test('accountCard: type and plan, state badges, and why it cannot serve', () => {
+  const now = Date.now();
+  const card = accountCard({ name: 'a', provider: 'anthropic', type: 'oauth', plan: 'max', quota: { unified5h: 0.25, unified5hReset: now + 3600e3, unified7d: 0.5 } }, true, now);
+  assert.equal(card.sub, 'oauth · max');
+  assert.equal(card.provider, 'Claude');
+  assert.equal(card.tone, 'claude');
+  assert.deepEqual(card.badges.map(b => b.text), ['current']);
+  assert.equal(card.why, null);
+  assert.deepEqual(card.meters.map(m => [m.label, m.left]), [['5-hour limit', 0.75], ['7-day limit', 0.5]]);
+
+  const cordoned = accountCard({ name: 'b', type: 'apikey', cordoned: true, unavailable: 'cordoned', quota: {} }, false, now);
+  assert.equal(cordoned.sub, 'apikey');
+  assert.deepEqual(cordoned.badges, [{ cls: 'cordoned', text: 'cordoned', title: UNAVAILABLE_TEXT.cordoned }]);
+  assert.equal(cordoned.why, null, 'a cordon keeps its reason on hover');
+  assert.match(cordoned.text, /quota unknown/);
+
+  const blocked = accountCard({ name: 'c', provider: 'codex', unavailable: 'throttled', quota: {} }, false, now);
+  assert.deepEqual(blocked.badges.map(b => b.text), ['blocked']);
+  assert.equal(blocked.why, UNAVAILABLE_TEXT.throttled);
+  assert.equal(accountCard({ name: 'd', disabled: true, unavailable: 'disabled' }, false, now).badges.map(b => b.text).join(), 'disabled');
+
+  const billed = accountCard({ name: 'e', unavailable: 'quota', onExtraUsage: true, quota: {} }, false, now);
+  assert.deepEqual(billed.badges.map(b => b.text), ['extra usage'], 'serving on extra usage is not blocked');
+  assert.equal(billed.why, null);
+  const throttled = accountCard({ name: 'g', unavailable: 'throttled', onExtraUsage: true, quota: {} }, false, now);
+  assert.deepEqual(throttled.badges.map(b => b.text), ['blocked'], 'extra usage lifts only a quota block');
+  assert.deepEqual(accountCard({ name: 'h', unavailable: 'upstream-rejected', onExtraUsage: true, quota: {} }, false, now).badges.map(b => b.text), ['extra usage'],
+    'upstream refusing the plan is a spent plan too');
+  assert.deepEqual(accountCard({ name: 'f', backend: 'api.deepseek.com', quota: { tokensLimit: 100, tokensRemaining: 40 } }, false, now).meters.map(m => m.label), ['Tokens'],
+    'an account metered another way shows what it has');
+  assert.equal(accountStatusText({ unavailable: 'throttled' }), UNAVAILABLE_TEXT.throttled);
+});
+
+test('the Accounts helpers run in the page\'s own scope', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function('UNAVAILABLE_TEXT', `${bundle}; return { accountFilter, accountCard };`)(UNAVAILABLE_TEXT);
+  const accounts = [{ name: 'a', provider: 'codex', unavailable: 'throttled', quota: { unified5h: 0.5 } }, { name: 'b', provider: 'anthropic' }];
+  assert.deepEqual(isolated.accountFilter(accounts, { state: 'problem' }), accountFilter(accounts, { state: 'problem' }));
+  assert.deepEqual(isolated.accountCard(accounts[0], false, 0), accountCard(accounts[0], false, 0));
+});
+
+const AC_STATUS = () => ({
+  currentAccounts: { anthropic: 'a' },
+  accounts: [
+    { name: 'a', provider: 'anthropic', type: 'oauth', plan: 'max', quota: { unified5h: 0.2, unified7d: 0.3 } },
+    { name: 'b', provider: 'anthropic', type: 'apikey', unavailable: 'throttled', quota: {} },
+    { name: 'c', provider: 'codex', type: 'oauth', disabled: true, unavailable: 'disabled', quota: {} },
+  ],
+});
+const cardNames = (page) => page.built.filter(e => e.className === 'acname').map(e => e.textContent);
+
+test('the Accounts page reads the event log while open, and draws each card\'s recent requests', async () => {
+  const page = bootPage({ hash: '#accounts' });
+  await page.answer(200, AC_STATUS());
+  assert.equal(page.byId('acSummary').textContent, '3 accounts · 1 serving');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=0']);
+  await page.answer(200, { generation: 'g', lastId: 3, events: [
+    { id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 },
+    { id: 2, kind: 'usage', account: 'a', provider: 'anthropic', status: 500 },
+    { id: 3, kind: 'usage', account: 'a', provider: 'codex', status: 200 },
+  ] });
+  assert.ok(page.findLast(e => e.textContent === '1 ok'), "the Claude account's own requests, not a namesake's");
+  assert.ok(page.findLast(e => e.textContent === '1 failed' && e.className === 'bad'));
+  assert.ok(page.findLast(e => e.textContent === '50.0%'));
+  page.click('Quota');
+  page.poll();
+  await page.answer(200, AC_STATUS());
+  assert.equal(page.requests.length, 0, 'another page reads status alone');
+});
+
+test('a key the event log refuses keeps the Accounts page and its key, without the strips', async () => {
+  const page = bootPage({ hash: '#accounts', storedKey: 'tc-client' });
+  await page.answer(200, AC_STATUS());
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  assert.equal(page.byId('keybox').style.display, 'none');
+  assert.equal(page.byId('acNote').textContent, 'This key may not read the request log, so recent requests are not shown.');
+  assert.equal(page.byId('acNote').style.display, '');
+  assert.equal(page.findLast(e => e.className === 'acreq'), undefined, 'no strip is drawn');
+  page.poll();
+  await page.answer(200, AC_STATUS());
+  assert.equal(page.requests.length, 0, 'and the log is not asked again');
+});
+
+test('the Accounts filters narrow the cards and survive the poll', async () => {
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
+  await page.answer(200, AC_STATUS());
+  assert.deepEqual(cardNames(page), ['a', 'b', 'c']);
+  assert.ok(page.built.some(e => e.textContent === 'No Grok accounts yet. Use Sign in to Grok above to add one.'), 'a provider with none still says where a sign-in lands');
+
+  page.findLast(e => e.textContent === 'Problem' && e.listens('click')).fire('click');
+  const since = page.built.length;
+  page.poll();
+  await page.answer(200, AC_STATUS());
+  const drawn = page.built.slice(since).filter(e => e.className === 'acname').map(e => e.textContent);
+  assert.deepEqual(drawn, ['b'], 'the status filter holds across a poll');
+  assert.ok(page.built.slice(since).some(e => e.className === 'blocked' && e.textContent === UNAVAILABLE_TEXT.throttled));
+  assert.equal(page.findLast(e => e.textContent === 'Problem' && e.listens('click')).className, 'chip sel');
+
+  page.findLast(e => e.textContent === 'All' && /^chip/.test(e.className)).fire('click');
+  const search = page.byId('acSearch');
+  search.value = 'Codex';
+  search.fire('input');
+  const at = page.built.length;
+  page.poll();
+  await page.answer(200, AC_STATUS());
+  assert.deepEqual(page.built.slice(at).filter(e => e.className === 'acname').map(e => e.textContent), ['c'], 'the search holds across a poll');
+  search.value = 'nobody';
+  search.fire('input');
+  assert.ok(page.findLast(e => e.textContent === 'No accounts match these filters.'));
+});
+
+test('each card keeps the controls its Accounts row had', async () => {
+  const page = bootPage({ autoAnswer: EMPTY_LOG_FOR_SIGN_IN });
+  await page.answer(200, AC_STATUS());
+  page.findLast(e => e.textContent === 'Disable' && e.listens('click')).fire('click');
+  assert.equal(page.requests[0].url, '/teamclaude/disable');
+  assert.equal(JSON.parse(page.requests[0].init.body).account, 'b');
+  for (const label of ['Enable', 'Cordon', 'Prioritize', 'Deprioritize', 'Remove']) {
+    assert.ok(page.findLast(e => e.textContent === label && e.listens('click')), label);
+  }
 });

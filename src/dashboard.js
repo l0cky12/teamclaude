@@ -2068,6 +2068,13 @@ export function providerTabs(accounts) {
   }));
 }
 
+/** @param {any} account */
+export function servingOnExtraUsage(account) {
+  var a = account || {};
+  var pastPlan = !a.unavailable || a.unavailable === 'quota' || a.unavailable === 'exhausted' || a.unavailable === 'upstream-rejected';
+  return a.onExtraUsage === true && pastPlan;
+}
+
 /** @param {any} quota */
 function weeklyWindowName(quota) {
   return quota && quota.planPeriod === 'monthly' ? 'monthly' : '7-day';
@@ -2104,8 +2111,7 @@ export function overviewHeadline(accounts) {
   var billing = [];
   var serving = 0;
   enabled.forEach(function (a) {
-    var pastPlan = !a.unavailable || a.unavailable === 'quota' || a.unavailable === 'exhausted' || a.unavailable === 'upstream-rejected';
-    if (a.onExtraUsage === true && pastPlan) { serving++; billing.push(a.name); return; }
+    if (servingOnExtraUsage(a)) { serving++; billing.push(a.name); return; }
     var why = a.unavailable && a.unavailable !== 'cordoned' ? String(a.unavailable) : null;
     if (why) {
       var word = refusedUpstream(a) ? 'refused by upstream' : SHORT_REASON[why] || why;
@@ -2213,15 +2219,16 @@ export function trafficScale(buckets) {
 /**
  * One account's last `n` requests from the event log, oldest first, with the
  * slots it has not filled yet (null) at the start, and the share of all its
- * logged requests that succeeded (null with none). A request fails as
- * request-traffic.js counts it: no status, or 400 and up.
+ * logged requests that succeeded (null with none), out of `count` logged, `ok`
+ * of them succeeded. A request fails as request-traffic.js counts it: no
+ * status, or 400 and up.
  *
  * @param {any[]} events  the event log, oldest first
  * @param {string} name  the account
  * @param {number} n
  * @param {string|null} [provider]  the account's provider, so a Claude and a
  *   Codex account with one name keep apart
- * @returns {{ slots: Array<'ok'|'failed'|null>, rate: number|null, count: number }}
+ * @returns {{ slots: Array<'ok'|'failed'|null>, rate: number|null, count: number, ok: number }}
  */
 export function requestStrip(events, name, n, provider) {
   /** @type {Array<'ok'|'failed'>} */
@@ -2236,7 +2243,105 @@ export function requestStrip(events, name, n, provider) {
   /** @type {Array<'ok'|'failed'|null>} */
   var slots = [];
   for (var i = last.length; i < n; i++) slots.push(null);
-  return { slots: slots.concat(last), rate: mine.length ? ok / mine.length : null, count: mine.length };
+  return { slots: slots.concat(last), rate: mine.length ? ok / mine.length : null, count: mine.length, ok: ok };
+}
+
+/** @param {any} account */
+export function accountStatusText(account) {
+  var a = account || {};
+  if (a.disabled) return 'disabled';
+  /** @type {Record<string, string>} */
+  var text = UNAVAILABLE_TEXT;
+  if (a.unavailable) return text[a.unavailable] || a.unavailable;
+  return a.status || 'unknown';
+}
+
+export var ACCOUNT_STATES = [
+  { key: 'all', label: 'All' }, { key: 'enabled', label: 'Enabled' },
+  { key: 'disabled', label: 'Disabled' }, { key: 'problem', label: 'Problem' },
+];
+
+/** @param {any} account @param {string} state  an ACCOUNT_STATES key */
+function accountInState(account, state) {
+  if (state === 'enabled') return !account.disabled;
+  if (state === 'disabled') return !!account.disabled;
+  if (state === 'problem') return !account.disabled && !servingOnExtraUsage(account) && !!account.unavailable && account.unavailable !== 'cordoned';
+  return true;
+}
+
+/**
+ * What the Accounts page shows for its filters. A tab's count is what it would
+ * show under the status filter and search, a status's count what it would show
+ * under the tab and search. A tab or status the fleet no longer offers falls
+ * back to All. `empty` names the sign-in providers with no account at all,
+ * listed only while nothing is filtered, so the page still says where a
+ * sign-in will land. The search matches the name, the provider and the status
+ * text, ignoring case.
+ *
+ * @param {any[]} accounts  status.accounts
+ * @param {{ tab?: string, state?: string, query?: string }} filters
+ * @returns {{ tab: string, state: string, tabs: { key: string, label: string, count: number }[], states: { key: string, label: string, count: number }[], shown: any[], empty: string[] }}
+ */
+export function accountFilter(accounts, filters) {
+  var list = accounts || [];
+  var f = filters || {};
+  var query = String(f.query || '').trim().toLowerCase();
+  var found = list.filter(function (a) {
+    var group = accountGroup(a);
+    return !query || [a.name, groupLabel(group), a.provider || '', accountStatusText(a)].join('\n').toLowerCase().indexOf(query) >= 0;
+  });
+  /** @param {any} a @param {string} tab */
+  var inTab = function (a, tab) { return tab === 'all' || accountGroup(a) === tab; };
+  var askedState = ACCOUNT_STATES.some(function (st) { return st.key === f.state; }) ? String(f.state) : 'all';
+  var tabs = providerTabs(list).map(function (t) {
+    return { key: t.key, label: t.label, count: found.filter(function (a) { return inTab(a, t.key) && accountInState(a, askedState); }).length };
+  });
+  var tab = tabs.some(function (t) { return t.key === f.tab; }) ? String(f.tab) : 'all';
+  var states = ACCOUNT_STATES.map(function (st) {
+    return { key: st.key, label: st.label, count: found.filter(function (a) { return inTab(a, tab) && accountInState(a, st.key); }).length };
+  });
+  var filtered = tab !== 'all' || askedState !== 'all' || !!query;
+  var order = tabs.map(function (t) { return t.key; });
+  return {
+    tab: tab, state: askedState, tabs: tabs, states: states,
+    shown: found.filter(function (a) { return inTab(a, tab) && accountInState(a, askedState); })
+      .sort(function (x, y) { return order.indexOf(accountGroup(x)) - order.indexOf(accountGroup(y)); }),
+    empty: filtered ? [] : ['anthropic', 'codex', 'grok'].filter(function (g) { return !list.some(function (a) { return accountGroup(a) === g; }); }),
+  };
+}
+
+/**
+ * One card on the Accounts page, less its controls and request strip: the
+ * provider badge, a line with the account's type and plan, its state badges,
+ * why it cannot serve, and its quota bars. The bars are the five-hour and
+ * weekly windows; an account metered another way (a token budget, a backend's
+ * own reading, prepaid credit) shows whichever it has, and `text` says what
+ * there is to say when no bar can be drawn.
+ *
+ * @param {any} account  one entry of status.accounts
+ * @param {boolean} current  whether it holds its provider's cursor
+ * @param {number} [now]
+ * @returns {{ tone: string, provider: string, sub: string, badges: { cls: string, text: string, title: string|null }[], why: string|null, meters: any[], text: string|null }}
+ */
+export function accountCard(account, current, now) {
+  var a = account || {};
+  var group = accountGroup(a);
+  /** @type {{ cls: string, text: string, title: string|null }[]} */
+  var badges = [];
+  if (current) badges.push({ cls: 'current', text: 'current', title: null });
+  if (a.disabled) badges.push({ cls: 'disabled', text: 'disabled', title: null });
+  if (a.cordoned === true || a.unavailable === 'cordoned') badges.push({ cls: 'cordoned', text: 'cordoned', title: UNAVAILABLE_TEXT.cordoned });
+  if (!a.disabled && servingOnExtraUsage(a)) badges.push({ cls: 'extra-usage billing', text: 'extra usage', title: 'Serving on extra usage, which is billed' });
+  var blocked = accountInState(a, 'problem');
+  if (blocked) badges.push({ cls: 'error', text: 'blocked', title: null });
+  var m = accountMeters(a, undefined, now);
+  var bars = [m.slots[1], m.slots[2]].filter(Boolean);
+  return {
+    tone: providerTone(group), provider: groupLabel(group),
+    sub: [a.type, a.plan].filter(Boolean).join(' \u00b7 '),
+    badges: badges, why: blocked ? accountStatusText(a) : null,
+    meters: bars.length ? bars : m.slots.filter(Boolean), text: m.text,
+  };
 }
 
 // The Logs page's filter chips: one per event kind the proxy records
@@ -3273,7 +3378,8 @@ const SHARED_HELPERS = [
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
-  weeklyWindowName, overviewHeadline, overviewTiles, trafficScale, requestStrip,
+  weeklyWindowName, servingOnExtraUsage, overviewHeadline, overviewTiles, trafficScale, requestStrip,
+  accountStatusText, accountInState, accountFilter, accountCard,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -3301,6 +3407,7 @@ const SHARED_CONSTS = [
   `var CARD_NOTE_MAX_AGE_MS = ${CARD_NOTE_MAX_AGE_MS};`,
   `var REDEEM_UNCERTAIN_TEXT = ${JSON.stringify(REDEEM_UNCERTAIN_TEXT)};`,
   `var LOG_KINDS = ${JSON.stringify(LOG_KINDS)};`,
+  `var ACCOUNT_STATES = ${JSON.stringify(ACCOUNT_STATES)};`,
   `var LOG_CAP = ${EVENT_LOG_CAPACITY};`,
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
   `var PEER_LINK_FAILED = ${JSON.stringify(PEER_LINK_FAILED)};`,
@@ -3839,6 +3946,31 @@ const PAGE = `<!doctype html>
   .ovq .mt { display: flex; justify-content: space-between; gap: 6px; }
   .ovq .ovmeter { margin-top: 6px; }
   .ovnote { padding: 10px 20px 4px; font-size: 12px; color: var(--dim); }
+  .acsum { font: 13px/1.6 var(--mono); color: var(--dim); margin: -8px 0 14px; }
+  .actabs { margin: 4px 0 12px; }
+  .acbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .acbar input { flex: 1 1 240px; max-width: 420px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; color: var(--text); font: inherit; font-size: 13px; padding: 7px 12px; }
+  .acbar input:focus-visible, .actabs .tab:focus-visible, #acStates .chip:focus-visible, .acard .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .chip .n { margin-left: 6px; font: 600 11px var(--mono); color: var(--faint); }
+  .acnote { font-size: 12px; color: var(--dim); margin: 0 0 12px; }
+  .acgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 14px; align-items: start; }
+  .acard { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .acard.acempty { border-style: dashed; background: transparent; }
+  .acard.acempty .empty { padding: 0; }
+  .achead { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .acname { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .acsub { font: 12px/1.4 var(--mono); color: var(--dim); overflow-wrap: anywhere; margin-top: -4px; }
+  .acard .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .actop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .aclbl { font: 600 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
+  .acn { display: flex; gap: 10px; font: 600 12px var(--mono); color: var(--dim); }
+  .acn b { font-weight: 600; } .acn b.ok { color: var(--ok); } .acn b.bad { color: var(--bad); }
+  .acstrip { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .acstrip .ovstrip { flex: 1; min-width: 0; margin-top: 0; }
+  .acmeta { font: 12px/1.5 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
+  .acbars { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .acact { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .acact .btn.rm { margin-left: auto; }
   @media (max-width: 1080px) {
     .ovtiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .ovgrid { grid-template-columns: minmax(0, 1fr); }
@@ -3984,9 +4116,16 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-accounts" style="display:none">
+      <p id="acSummary" class="acsum"></p>
       <div id="addBar" class="addbar"></div>
       <div id="signIn" class="signin" style="display:none"></div>
-      <div id="accountGroups"></div>
+      <div id="acTabs" class="tabs actabs"></div>
+      <div class="acbar">
+        <input id="acSearch" type="search" placeholder="Search name, provider or status" aria-label="Search accounts by name, provider or status" autocomplete="off">
+        <div id="acStates" class="chips"></div>
+      </div>
+      <p id="acNote" class="acnote" style="display:none"></p>
+      <div id="accountCards" class="acgrid"></div>
     </section>
 
     <section id="page-logs" style="display:none">
@@ -4553,13 +4692,6 @@ ${SHARED_HELPERS}
     });
   }
 
-  function statusText(a) {
-    if (a.disabled) return 'disabled';
-    if (a.unavailable) return UNAVAILABLE_TEXT[a.unavailable] || a.unavailable;
-    return a.status || 'unknown';
-  }
-
-  // What each provider section on the Accounts page says it holds.
   var GROUP_BLURB = {
     anthropic: 'Claude Pro and Max sign-ins, and Anthropic API keys. Claude Code uses these.',
     codex: 'ChatGPT sign-ins (Plus, Pro, Business). The Codex CLI uses these.',
@@ -4574,85 +4706,132 @@ ${SHARED_HELPERS}
     return h;
   }
 
-  // The accounts, one section per provider, with the controls that change
-  // where rotation may reach each one. A control this key would be refused is
-  // not drawn at all; the line at the top of the page says why, once
-  // (callerNotice). Claude, Codex and Grok always get a section, empty or not, so
-  // the page says where a sign-in will land before there is one.
+  // The search box is in the page's markup rather than rebuilt, so a poll
+  // never takes the text or the cursor from under someone typing.
+  var accountFilters = { tab: 'all', state: 'all', query: '' };
+  var CARD_STRIP = 30;
+
+  // A control this key would be refused is not drawn at all; the line at the
+  // top of the page says why, once (callerNotice).
   function renderAccountsPage(s) {
     var canSignIn = callerCan(s.caller, '/teamclaude/login/start');
     var canRemove = callerCan(s.caller, '/teamclaude/remove');
     renderAddBar(canSignIn);
-    var box = document.getElementById('accountGroups');
-    box.textContent = '';
     var accounts = s.accounts || [];
-    var groups = ['anthropic', 'codex', 'grok'].concat(providerTabs(accounts).slice(1).map(function (t) { return t.key; })
-      .filter(function (g) { return g !== 'anthropic' && g !== 'codex' && g !== 'grok'; }));
-    groups.forEach(function (g) {
-      var members = accounts.filter(function (a) { return accountGroup(a) === g; });
-      var head = el('div', 'phead');
-      head.appendChild(groupHeading(g, g === 'codex' ? 'Codex (ChatGPT) accounts' : groupLabel(g) + ' accounts'));
-      head.appendChild(el('span', 'count', String(members.length)));
-      head.appendChild(el('span', 'tag', GROUP_BLURB[g] || 'A third-party backend, reached with an API key.'));
-      box.appendChild(head);
-      var card = el('div', 'pcard ' + providerTone(g));
-      box.appendChild(card);
-      if (!members.length) {
-        card.appendChild(el('div', 'empty', canSignIn
-          ? 'No ' + groupLabel(g) + ' accounts yet. Use Sign in to ' + groupLabel(g) + ' above to add one.'
-          : 'No ' + groupLabel(g) + ' accounts yet.'));
-        return;
-      }
-      var table = el('table');
-      card.appendChild(table);
-      var hr = el('tr');
-      // Codex accounts carry a free-reset count the others do not.
-      var heads = ['Account', 'Plan', 'Status', 'Priority', 'Conversations', 'Requests', 'Tokens', 'Last request'];
-      if (g === 'codex') heads.push('Resets left');
-      heads.push('');
-      heads.forEach(function (h, i) {
-        hr.appendChild(el('th', i >= 3 && i < heads.length - 1 ? 'num' : '', h));
+    var serving = overviewHeadline(accounts).serving;
+    document.getElementById('acSummary').textContent = accounts.length + (accounts.length === 1 ? ' account' : ' accounts') + ' · ' + serving + ' serving';
+    var view = accountFilter(accounts, accountFilters);
+    accountFilters.tab = view.tab;
+    accountFilters.state = view.state;
+    var tabBox = document.getElementById('acTabs');
+    tabBox.textContent = '';
+    view.tabs.forEach(function (t) {
+      var b = button(t.key === view.tab ? 'tab sel' : 'tab', t.label, function () {
+        accountFilters.tab = t.key;
+        if (lastStatus) renderAccountsPage(lastStatus);
       });
-      table.appendChild(hr);
-      members.forEach(function (a) { table.appendChild(accountTableRow(a, s, canSignIn, canRemove, g === 'codex')); });
+      b.setAttribute('aria-pressed', String(t.key === view.tab));
+      if (t.key !== 'all') b.insertBefore(el('span', 'pdot ' + providerTone(t.key)), b.firstChild);
+      b.appendChild(el('span', 'count', String(t.count)));
+      tabBox.appendChild(b);
     });
+    var stateBox = document.getElementById('acStates');
+    stateBox.textContent = '';
+    view.states.forEach(function (st) {
+      var b = button(st.key === view.state ? 'chip sel' : 'chip', st.label, function () {
+        accountFilters.state = st.key;
+        if (lastStatus) renderAccountsPage(lastStatus);
+      });
+      b.setAttribute('aria-pressed', String(st.key === view.state));
+      b.appendChild(el('span', 'n', String(st.count)));
+      stateBox.appendChild(b);
+    });
+    var strips = logsRead && !logsRefused;
+    var note = document.getElementById('acNote');
+    note.textContent = logsRefused ? 'This key may not read the request log, so recent requests are not shown.' : '';
+    note.style.display = logsRefused ? '' : 'none';
+    var box = document.getElementById('accountCards');
+    box.textContent = '';
+    view.shown.forEach(function (a) { box.appendChild(accountCardEl(a, s, canSignIn, canRemove, strips)); });
+    view.empty.forEach(function (g) {
+      var card = el('div', 'acard acempty');
+      card.appendChild(el('div', 'achead')).appendChild(el('span', 'ovbadge ' + providerTone(g), groupLabel(g)));
+      card.appendChild(el('div', 'empty', canSignIn
+        ? 'No ' + groupLabel(g) + ' accounts yet. Use Sign in to ' + groupLabel(g) + ' above to add one.'
+        : 'No ' + groupLabel(g) + ' accounts yet.'));
+      card.appendChild(el('div', 'tag', GROUP_BLURB[g]));
+      box.appendChild(card);
+    });
+    if (!view.shown.length && accounts.length) box.appendChild(el('div', 'acard acempty')).appendChild(el('div', 'empty', 'No accounts match these filters.'));
   }
 
-  function accountTableRow(a, s, canSignIn, canRemove, withResets) {
+  function accountCardEl(a, s, canSignIn, canRemove, strips) {
     var key = cardNoteKey(a);
-    var tr = el('tr');
-    var name = el('td');
-    name.appendChild(el('div', 'name', a.name));
-    if (a.orgName) name.appendChild(el('div', 'tag', a.orgName));
-    var emailLine = accountEmailLine(a);
-    if (emailLine) name.appendChild(el('div', 'tag', emailLine));
-    var cn = cardNoteFor(cardNotes, key, Date.now());
-    if (cn) name.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-    var fileHint = fileSignInHint(a);
-    if (fileHint) name.appendChild(el('div', 'cardnote warn', fileHint));
-    tr.appendChild(name);
-    tr.appendChild(el('td', '', a.plan || a.type || '—'));
-    var st = el('td');
-    // A cordon is a routine state, so its badge stays one word: the full reason
-    // would widen the Status column until the row's controls overflow the card.
-    var cordonBadge = !a.disabled && a.unavailable === 'cordoned';
-    var badge = el('span', 'badge ' + (a.disabled ? 'disabled' : cordonBadge ? 'cordoned' : (a.status || '')), cordonBadge ? 'cordoned' : statusText(a));
-    if (cordonBadge) badge.title = statusText(a);
-    st.appendChild(badge);
-    if (isCurrentAccount(a, s)) { st.appendChild(el('span', '', ' ')); st.appendChild(el('span', 'badge current', 'current')); }
-    tr.appendChild(st);
-    tr.appendChild(el('td', 'num', String(a.priority || 0)));
-    tr.appendChild(el('td', 'num', (a.sessions || 0) + ' / ' + (a.knownSessions || 0)));
-    var u = a.usage || {};
-    tr.appendChild(el('td', 'num', fmtNum(u.totalRequests)));
-    tr.appendChild(el('td', 'num', fmtNum(accountTokens(u))));
-    tr.appendChild(el('td', 'num', u.lastUsed ? fmtAgo(u.lastUsed) : '—'));
-    if (withResets) {
-      var left = codexResetsLeft(a);
-      var expiry = codexResetExpiry(a);
-      tr.appendChild(el('td', 'num', left == null ? '—' : String(left) + (expiry == null ? '' : ' \u00b7 expires ' + shortDate(expiry))));
+    var model = accountCard(a, isCurrentAccount(a, s));
+    var card = el('div', 'acard ' + model.tone);
+    var head = el('div', 'achead');
+    head.appendChild(el('span', 'ovbadge ' + model.tone, model.provider));
+    var name = el('span', 'acname', a.name);
+    name.title = a.name;
+    head.appendChild(name);
+    card.appendChild(head);
+    var sub = [model.sub, a.orgName, accountEmailLine(a)].filter(Boolean).join(' · ');
+    if (sub) card.appendChild(el('div', 'acsub', sub));
+    if (model.badges.length) {
+      var badges = el('div', 'badges');
+      model.badges.forEach(function (b) {
+        var badge = el('span', 'badge ' + b.cls, b.text);
+        if (b.title) badge.title = b.title;
+        badges.appendChild(badge);
+      });
+      card.appendChild(badges);
     }
-    var act = el('td', 'num');
+    if (model.why) card.appendChild(el('div', 'blocked', model.why));
+    var cn = cardNoteFor(cardNotes, key, Date.now());
+    if (cn) card.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+    var fileHint = fileSignInHint(a);
+    if (fileHint) card.appendChild(el('div', 'cardnote warn', fileHint));
+
+    if (strips) {
+      var st = requestStrip(logState.events, a.name, CARD_STRIP, a.provider);
+      var req = el('div', 'acreq');
+      var top = el('div', 'actop');
+      top.appendChild(el('span', 'aclbl', 'Recent requests'));
+      var counts = el('span', 'acn');
+      counts.appendChild(el('b', 'ok', st.ok + ' ok'));
+      counts.appendChild(el('b', st.count - st.ok ? 'bad' : '', (st.count - st.ok) + ' failed'));
+      top.appendChild(counts);
+      req.appendChild(top);
+      var line = el('div', 'acstrip');
+      line.appendChild(stripEl(st));
+      line.appendChild(stripPct(st));
+      req.appendChild(line);
+      card.appendChild(req);
+    }
+
+    var u = a.usage || {};
+    var meta = ['priority ' + (a.priority || 0), (a.sessions || 0) + ' / ' + (a.knownSessions || 0) + ' conversations',
+      fmtNum(u.totalRequests) + ' req', fmtNum(accountTokens(u)) + ' tok', 'last request ' + (u.lastUsed ? fmtAgo(u.lastUsed) : '—')];
+    var left = codexResetsLeft(a);
+    if (left != null) {
+      var expiry = codexResetExpiry(a);
+      meta.push(left + (left === 1 ? ' reset left' : ' resets left') + (expiry == null ? '' : ' · expires ' + shortDate(expiry)));
+    }
+    card.appendChild(el('div', 'acmeta', meta.join(' · ')));
+
+    if (model.meters.length) {
+      var bars = el('div', 'acbars');
+      model.meters.forEach(function (m) { bars.appendChild(meterEl(m)); });
+      card.appendChild(bars);
+    }
+    if (model.text) card.appendChild(el('div', 'usage', model.text));
+
+    card.appendChild(accountActions(a, s, key, canSignIn, canRemove));
+    return card;
+  }
+
+  function accountActions(a, s, key, canSignIn, canRemove) {
+    var act = el('div', 'acact');
     // Signed out upstream: the one thing that brings it back is a sign-in,
     // so it comes first. The tokens go to whichever account the browser
     // signs in as, which the panel says.
@@ -4707,8 +4886,7 @@ ${SHARED_HELPERS}
       ctlRemove.title = armed ? 'Click again to sign ' + a.name + ' out of TeamClaude' : 'Sign ' + a.name + ' out of TeamClaude';
       act.appendChild(ctlRemove);
     }
-    tr.appendChild(act);
-    return tr;
+    return act;
   }
 
   // The buttons that add an account. Rebuilt with the page; the sign-in
@@ -6032,7 +6210,7 @@ ${SHARED_HELPERS}
     var again = false;
     fetch(at('/teamclaude/logs?after=' + after), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
-        if (res.status === 403 && askedOn === 'overview') { logsRefused = true; return null; }
+        if (res.status === 403 && drawsRequestStrips(askedOn)) { logsRefused = true; return null; }
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         if (!res.ok) throw new Error('status ' + res.status);
         return res.json();
@@ -6053,12 +6231,34 @@ ${SHARED_HELPERS}
       .finally(function () { logsInFlight = false; if (again) pollLogs(); });
   }
 
+  function drawsRequestStrips(key) {
+    return key === 'overview' || key === 'accounts';
+  }
+
   function renderLogEvents() {
     if (currentPage === 'logs') renderLogs();
     else if (currentPage === 'overview' && lastStatus) renderOverviewAccounts(lastStatus);
+    else if (currentPage === 'accounts' && lastStatus) renderAccountsPage(lastStatus);
   }
 
   var OV_STRIP = 24;
+
+  function stripEl(st) {
+    var strip = el('div', 'ovstrip');
+    var filled = st.slots.filter(function (x) { return x; });
+    var bad = filled.filter(function (x) { return x === 'failed'; }).length;
+    strip.title = 'Last ' + st.slots.length + ' requests, oldest first';
+    strip.setAttribute('role', 'img');
+    strip.setAttribute('aria-label', filled.length ? 'Last ' + filled.length + ' requests: ' + (filled.length - bad) + ' succeeded, ' + bad + ' failed' : 'No requests in the log');
+    st.slots.forEach(function (x) { strip.appendChild(el('i', x === 'ok' ? 'ok' : x === 'failed' ? 'bad' : '')); });
+    return strip;
+  }
+
+  function stripPct(st) {
+    var pct = el('span', 'ovpct', st.rate == null ? '\u2014' : (st.rate * 100).toFixed(1) + '%');
+    pct.title = st.rate == null ? 'No requests in the log' : 'Succeeded, of ' + st.count + ' requests in the log';
+    return pct;
+  }
 
   function renderOverview(s) {
     renderOverviewHead(s);
@@ -6257,23 +6457,10 @@ ${SHARED_HELPERS}
       name.appendChild(nm);
       top.appendChild(name);
       var st = strips ? requestStrip(logState.events, a.name, OV_STRIP, a.provider) : null;
-      if (st) {
-        var pct = el('span', 'ovpct', st.rate == null ? '—' : (st.rate * 100).toFixed(1) + '%');
-        pct.title = st.rate == null ? 'No requests in the log' : 'Succeeded, of ' + st.count + ' requests in the log';
-        top.appendChild(pct);
-      }
+      if (st) top.appendChild(stripPct(st));
       row.appendChild(top);
       if (a.unavailable && a.unavailable !== 'cordoned') row.appendChild(el('div', 'ovwhy', UNAVAILABLE_TEXT[a.unavailable] || a.unavailable));
-      if (st) {
-        var strip = el('div', 'ovstrip');
-        var filled = st.slots.filter(function (x) { return x; });
-        var bad = filled.filter(function (x) { return x === 'failed'; }).length;
-        strip.title = 'Last ' + OV_STRIP + ' requests, oldest first';
-        strip.setAttribute('role', 'img');
-        strip.setAttribute('aria-label', filled.length ? 'Last ' + filled.length + ' requests: ' + (filled.length - bad) + ' succeeded, ' + bad + ' failed' : 'No requests in the log');
-        st.slots.forEach(function (x) { strip.appendChild(el('i', x === 'ok' ? 'ok' : x === 'failed' ? 'bad' : '')); });
-        row.appendChild(strip);
-      }
+      if (st) row.appendChild(stripEl(st));
       var q = a.quota || {};
       var bars = el('div', 'ovq');
       bars.appendChild(ovQuota(quotaMeter('5-hour', q.unified5h, q.unified5hReset)));
@@ -8175,7 +8362,7 @@ ${SHARED_HELPERS}
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
         render(s);
-        if (currentPage === 'logs' || (currentPage === 'overview' && !logsRefused)) pollLogs();
+        if (currentPage === 'logs' || (drawsRequestStrips(currentPage) && !logsRefused)) pollLogs();
         if (currentPage === 'insights') {
           if (ins.data && ins.drawn !== insightsDrawnKey()) renderInsights();
           pollInsights(false);
@@ -8234,7 +8421,7 @@ ${SHARED_HELPERS}
     }
     if (lastStatus) renderProblems(lastStatus);
     if (page.key === 'logs') { renderLogs(); pollLogs(); }
-    if (page.key === 'overview' && lastStatus && !logsRefused) pollLogs();
+    if (drawsRequestStrips(currentPage) && lastStatus && !logsRefused) pollLogs();
     hideInsightsTip();
     if (page.key === 'insights') { renderInsights(); pollInsights(false); }
     if (page.key === 'settings' && lastStatus) { renderLinks(lastStatus); renderSync(lastStatus); }
@@ -8321,6 +8508,10 @@ ${SHARED_HELPERS}
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }
   document.getElementById('changeKey').addEventListener('click', forgetKey);
   document.getElementById('ovOpenAccounts').addEventListener('click', function () { showPage('accounts'); });
+  document.getElementById('acSearch').addEventListener('input', function () {
+    accountFilters.query = this.value;
+    if (lastStatus) renderAccountsPage(lastStatus);
+  });
   document.getElementById('ovOpenLogs').addEventListener('click', function () { showPage('logs'); });
   document.getElementById('instance').addEventListener('change', function () { pickInstance(this.value); });
   document.getElementById('instanceBack').addEventListener('click', function () { pickInstance(''); });
