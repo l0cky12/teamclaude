@@ -2542,7 +2542,7 @@ export function logRow(event) {
     when: logTime(e.at),
     kind: kind ? kind.label : String(e.kind || ''),
     provider: e.provider ? providerLabel(e.provider) : '',
-    status: usage ? logStatusChip(e.status) : null,
+    status: usage ? (logEventFailed(e) ? { text: logStatusChip(e.status).text, tone: 'bad' } : logStatusChip(e.status)) : null,
     ms: e.ms == null ? '' : e.ms >= 1000 ? (e.ms / 1000).toFixed(1) + 's' : e.ms + 'ms',
     account: e.account || '',
     model: e.model ? modelLabel(e.model) : '',

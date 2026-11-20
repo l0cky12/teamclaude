@@ -365,6 +365,13 @@ test('a log row puts a request\'s status, latency, model and tokens in columns, 
   assert.equal(logRow({ kind: 'usage', type: 'request', status: 200 }).failed, false);
 });
 
+test('a log row\'s status chip is green for 2xx and red for every failed request, 4xx included', () => {
+  const chip = (/** @type {any} */ status) => logRow({ kind: 'usage', type: 'request', status }).status;
+  assert.deepEqual(chip(200), { text: '200', tone: 'ok' });
+  for (const s of [400, 401, 429, 500, 529]) assert.deepEqual(chip(s), { text: String(s), tone: 'bad' }, `HTTP ${s}`);
+  assert.deepEqual(chip(null), { text: 'none', tone: 'bad' });
+});
+
 test('a log row\'s message is toned by what the event did', () => {
   assert.equal(logEventTone({ type: 'signed_out' }), 'bad');
   assert.equal(logEventTone({ type: 'rate_limited' }), 'warn');
