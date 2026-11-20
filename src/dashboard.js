@@ -2335,12 +2335,17 @@ export function accountCard(account, current, now) {
   var blocked = accountInState(a, 'problem');
   if (blocked) badges.push({ cls: 'error', text: 'blocked', title: null });
   var m = accountMeters(a, undefined, now);
-  var bars = [m.slots[1], m.slots[2]].filter(Boolean);
+  // A plan's slots are fixed (0 Fable or credit, 1 five-hour, 2 weekly), so
+  // the card leads with its two windows. Token, backend and credit readings
+  // are packed from slot 0, so every one is kept in order.
+  var q = a.quota || {};
+  var order = q.unified5h != null || q.unified7d != null ? [1, 2, 0] : [0, 1, 2];
+  var bars = order.map(function (i) { return m.slots[i]; }).filter(Boolean);
   return {
     tone: providerTone(group), provider: groupLabel(group),
     sub: [a.type, a.plan].filter(Boolean).join(' \u00b7 '),
     badges: badges, why: blocked ? accountStatusText(a) : null,
-    meters: bars.length ? bars : m.slots.filter(Boolean), text: m.text,
+    meters: bars, text: m.text,
   };
 }
 

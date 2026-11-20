@@ -3995,6 +3995,15 @@ test('accountCard: type and plan, state badges, and why it cannot serve', () => 
   assert.deepEqual(throttled.badges.map(b => b.text), ['blocked'], 'extra usage lifts only a quota block');
   assert.deepEqual(accountCard({ name: 'h', unavailable: 'upstream-rejected', onExtraUsage: true, quota: {} }, false, now).badges.map(b => b.text), ['extra usage'],
     'upstream refusing the plan is a spent plan too');
+  const twoWindows = { name: 'w', backend: 'api.z.ai', quota: { backend: { label: 'Plan', text: '5h 40%', utilization: 0.6, at: now,
+    windows: { fiveHour: { utilization: 0.4, resetAt: null }, weekly: { utilization: 0.6, resetAt: null } } } } };
+  const packed = accountMeters(twoWindows, undefined, now).slots.filter(Boolean).map(m => m.label);
+  assert.equal(packed.length, 2, 'the fixture reports two backend windows');
+  assert.deepEqual(accountCard(twoWindows, false, now).meters.map(m => m.label), packed, 'a backend\'s session and weekly readings both show');
+  const credit = { name: 'k', type: 'apikey', credit: { usedFraction: 0.3, cycleEnd: now + 864e5 }, quota: { tokensLimit: 100, tokensRemaining: 40 } };
+  assert.deepEqual(accountCard(credit, false, now).meters.map(m => m.label), ['Tokens', 'Prepaid credit']);
+  const planCredit = { name: 'p', type: 'apikey', credit: { usedFraction: 0.3, cycleEnd: now + 864e5 }, quota: { unified5h: 0.2, unified7d: 0.4 } };
+  assert.deepEqual(accountCard(planCredit, false, now).meters.map(m => m.label), ['5-hour limit', '7-day limit', 'Prepaid credit']);
   assert.deepEqual(accountCard({ name: 'f', backend: 'api.deepseek.com', quota: { tokensLimit: 100, tokensRemaining: 40 } }, false, now).meters.map(m => m.label), ['Tokens'],
     'an account metered another way shows what it has');
   assert.equal(accountStatusText({ unavailable: 'throttled' }), UNAVAILABLE_TEXT.throttled);
