@@ -3730,6 +3730,10 @@ test('overviewHeadline counts an account serving on extra usage as serving, and 
   assert.deepEqual(h.billing, ['paid']);
   assert.equal(h.text, 'The only account is serving');
   assert.equal(h.tone, 'warn');
+  const throttled = overviewHeadline([{ name: 'paid', unavailable: 'throttled', onExtraUsage: true, quota: {} }]);
+  assert.equal(throttled.serving, 0, 'extra usage does not lift a throttle');
+  assert.deepEqual(throttled.billing, []);
+  assert.equal(throttled.text, '1 throttled');
 });
 
 test('requestStrip keeps a Claude and a Codex account with one name apart', () => {
