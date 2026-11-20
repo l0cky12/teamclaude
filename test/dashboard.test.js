@@ -16,6 +16,7 @@ import {
   canRefreshQuota, refreshQuotaRequest, refreshQuotaOutcome,
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep, REDEEM_UNCERTAIN_TEXT,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
+  overviewHeadline, overviewTiles, trafficScale, requestStrip,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -1190,7 +1191,7 @@ test('the page ships the same helper implementations it is tested against', () =
 // response, or null to queue), for a test about one card that should not
 // have to answer another's reads. `manualTimers` hands the page's setTimeout
 // to the test (`page.runTimers()`), for a poll it would otherwise wait out.
-function bootPage({ storedKey = null, storedTheme = null, storedInstance = null, autoAnswer = null, manualTimers = false } = {}) {
+function bootPage({ storedKey = null, storedTheme = null, storedInstance = null, autoAnswer = null, manualTimers = false, hash = '#quota' } = {}) {
   const els = new Map();
   // Listeners are recorded rather than absorbed, and every element built is
   // kept, so a test can drive a control the page created for itself — the
@@ -1252,8 +1253,9 @@ function bootPage({ storedKey = null, storedTheme = null, storedInstance = null,
   const html = renderDashboardHtml();
   const script = inlineScripts(html).at(-1);
   let poll;
-  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', script)(
-    document, localStorage, fetch, fn => { poll = fn; return 1; }, () => {}, ...timerFns);
+  const location = globalThis.location ?? { hash, hostname: '', origin: '', reload() {} };
+  new Function('document', 'localStorage', 'fetch', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', 'location', script)(
+    document, localStorage, fetch, fn => { poll = fn; return 1; }, () => {}, ...timerFns, location);
   const answer = async (status, body = {}) => {
     requests.shift().resolve({ status, ok: status >= 200 && status < 300, json: async () => body });
     await new Promise(r => setImmediate(r));
@@ -1625,36 +1627,35 @@ test('Show all reveals exhausted quota rows, survives polls and tabs, and can hi
     { name: 'quota-unknown-demo', provider: 'codex', quota: {} },
   ] };
   await page.answer(200, fleet);
-  // Management always builds one name; Quota builds a second only if visible.
-  assert.equal(page.labelled('quota-ready-demo'), 2);
-  assert.equal(page.labelled('quota-spent-demo'), 1);
-  assert.equal(page.labelled('quota-unknown-demo'), 2);
+  assert.equal(page.labelled('quota-ready-demo'), 3);
+  assert.equal(page.labelled('quota-spent-demo'), 2);
+  assert.equal(page.labelled('quota-unknown-demo'), 3);
   assert.equal(page.labelled('1 exhausted account hidden'), 1);
   assert.equal(page.labelled('100%'), 2, 'both summaries exclude the weekly-exhausted session capacity');
   assert.equal(page.labelled('200%'), 0);
   page.click('Show all');
-  assert.equal(page.labelled('quota-spent-demo'), 2);
+  assert.equal(page.labelled('quota-spent-demo'), 3);
   assert.equal(page.labelled('Weekly limit empty'), 1);
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-spent-demo'), 2, 'a poll keeps Show all');
+  assert.equal(page.labelled('quota-spent-demo'), 3, 'a poll keeps Show all');
   page.click('Claude');
-  assert.equal(page.labelled('quota-spent-demo'), 2, 'provider tabs keep Show all');
-  assert.equal(page.labelled('quota-unknown-demo'), 1, 'provider tab still filters Quota');
+  assert.equal(page.labelled('quota-spent-demo'), 3, 'provider tabs keep Show all');
+  assert.equal(page.labelled('quota-unknown-demo'), 2, 'provider tab still filters Quota');
   page.click('Hide exhausted');
-  assert.equal(page.labelled('quota-spent-demo'), 1);
+  assert.equal(page.labelled('quota-spent-demo'), 2);
   fleet.accounts[0].quota.unified7d = 1;
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-ready-demo'), 1, 'new exhaustion hides automatically');
+  assert.equal(page.labelled('quota-ready-demo'), 2, 'new exhaustion hides automatically');
   assert.equal(page.labelled('All accounts in this group have an exhausted limit. Use Show all to see them.'), 1);
   fleet.accounts[1].quota.unified7d = 0;
   page.poll();
   await page.answer(200, fleet);
-  assert.equal(page.labelled('quota-spent-demo'), 2, 'recovered quota returns automatically');
+  assert.equal(page.labelled('quota-spent-demo'), 3, 'recovered quota returns automatically');
   const fresh = bootPage();
   await fresh.answer(200, fleet);
-  assert.equal(fresh.labelled('quota-ready-demo'), 1, 'a new page defaults to hiding');
+  assert.equal(fresh.labelled('quota-ready-demo'), 2, 'a new page defaults to hiding');
   assert.equal(fresh.labelled('Show all'), 1);
 });
 
@@ -1888,14 +1889,12 @@ test('a provider tab narrows the quota page to that provider\'s accounts', async
     ],
   });
   page.click('Codex');
-  // A quota row for the Codex account and none for Claude. Both names are
-  // still drawn twice elsewhere: the Accounts page lists every account, and
-  // the header names each provider's current account.
-  assert.equal(page.labelled('codex-one'), 3);
-  assert.equal(page.labelled('claude-one'), 2);
-  page.click('Claude');
+  // A quota row for the Codex account and none for Claude.
+  assert.equal(page.labelled('codex-one'), 4);
   assert.equal(page.labelled('claude-one'), 3);
-  assert.equal(page.labelled('codex-one'), 2);
+  page.click('Claude');
+  assert.equal(page.labelled('claude-one'), 4);
+  assert.equal(page.labelled('codex-one'), 3);
 });
 
 test('a disabled account offers only Enable: no Switch to on its row or in the Accounts table', async () => {
@@ -3677,4 +3676,243 @@ test('Account sync: a cancel that does not take is reported', async () => {
     await page.answerTo('/teamclaude/account-sync/cancel', 200, { ok: true, cancelled: false, state: 'finishing' });
     assert.ok(shown(page, /^The sign-in on this machine had already been approved, so it went through\./));
   }, { autoAnswer: null, manualTimers: true });
+});
+
+const reset = () => Date.now() + 2 * 3600 * 1000;
+
+test('overviewHeadline says every account is healthy when none is blocked or near a limit', () => {
+  const h = overviewHeadline([
+    { name: 'a', quota: { unified5h: 0.4, unified7d: 0.5 } },
+    { name: 'b', quota: {} },
+    { name: 'off', disabled: true, unavailable: 'disabled' },
+  ]);
+  assert.deepEqual({ text: h.text, tone: h.tone, total: h.total, serving: h.serving, attention: h.attention },
+    { text: 'All 2 accounts healthy', tone: 'ok', total: 2, serving: 2, attention: [] });
+  assert.equal(overviewHeadline([{ name: 'solo', quota: {} }]).text, 'The only account is healthy');
+});
+
+test('overviewHeadline names each serving account at 90% or more of a window, by its fuller window', () => {
+  const at = reset();
+  const h = overviewHeadline([
+    { name: 'near5h', quota: { unified5h: 0.97, unified5hReset: at, unified7d: 0.2 } },
+    { name: 'near7d', quota: { unified5h: 0.91, unified7d: 0.95, unified7dReset: at } },
+    { name: 'fine', quota: { unified5h: 0.89, unified7d: 0.1 } },
+  ]);
+  assert.equal(h.text, 'All 3 accounts serving');
+  assert.equal(h.tone, 'warn');
+  assert.deepEqual(h.attention, [
+    { name: 'near5h', window: '5-hour', used: 0.97, resetAt: at },
+    { name: 'near7d', window: '7-day', used: 0.95, resetAt: at },
+  ]);
+  assert.equal(overviewHeadline([{ name: 'm', quota: { planPeriod: 'monthly', unified7d: 0.93 } }]).attention[0].window, 'monthly');
+});
+
+test('overviewHeadline counts blocked accounts by reason in plain words', () => {
+  const h = overviewHeadline([
+    { name: 'a', unavailable: 'throttled' },
+    { name: 'b', unavailable: 'quota' },
+    { name: 'c', unavailable: 'exhausted' },
+    { name: 'd', unavailable: 'cordoned', quota: {} },
+    { name: 'e', unavailable: 'error', errorReason: { code: 'refresh_rejected' } },
+    { name: 'f', unavailable: 'error', errorReason: { code: 'account_suspended' } },
+    { name: 'g', unavailable: 'something-new' },
+  ]);
+  assert.equal(h.text, '1 throttled, 2 out of quota, 1 needing a re-login, 1 refused by upstream, 1 something-new');
+  assert.equal(h.tone, 'warn', 'a cordoned account still serves its conversations');
+  assert.equal(h.serving, 1);
+  const none = overviewHeadline([{ name: 'a', unavailable: 'throttled' }, { name: 'b', unavailable: 'throttled' }]);
+  assert.deepEqual([none.text, none.tone], ['2 throttled', 'bad']);
+});
+
+test('overviewHeadline counts an account serving on extra usage as serving, and names it as billed', () => {
+  const h = overviewHeadline([{ name: 'paid', unavailable: 'quota', onExtraUsage: true, quota: { unified5h: 1 } }]);
+  assert.equal(h.serving, 1);
+  assert.deepEqual(h.billing, ['paid']);
+  assert.equal(h.text, 'The only account is serving');
+  assert.equal(h.tone, 'warn');
+  const throttled = overviewHeadline([{ name: 'paid', unavailable: 'throttled', onExtraUsage: true, quota: {} }]);
+  assert.equal(throttled.serving, 0, 'extra usage does not lift a throttle');
+  assert.deepEqual(throttled.billing, []);
+  assert.equal(throttled.text, '1 throttled');
+  const rejected = overviewHeadline([{ name: 'paid', unavailable: 'upstream-rejected', onExtraUsage: true, quota: {} }]);
+  assert.deepEqual([rejected.serving, rejected.billing], [1, ['paid']], 'a plan upstream refused, now billed, is serving');
+});
+
+test('requestStrip keeps a Claude and a Codex account with one name apart', () => {
+  const events = [
+    { kind: 'usage', account: 'same', provider: 'anthropic', status: 200 },
+    { kind: 'usage', account: 'same', provider: 'codex', status: 500 },
+  ];
+  assert.deepEqual(requestStrip(events, 'same', 2, 'anthropic').slots, [null, 'ok']);
+  assert.deepEqual(requestStrip(events, 'same', 2, 'codex').slots, [null, 'failed']);
+});
+
+test('overviewHeadline with every account disabled, or none at all, says so', () => {
+  const h = overviewHeadline([{ name: 'a', disabled: true }, { name: 'b', disabled: true }]);
+  assert.deepEqual([h.text, h.tone, h.total, h.serving], ['Every account is disabled', 'bad', 0, 0]);
+  assert.equal(overviewHeadline([]).text, 'No accounts yet');
+  assert.equal(overviewHeadline(undefined).tone, 'bad');
+});
+
+test('overviewTiles has no success rate with no traffic, and none counted for an old proxy', () => {
+  const zero = overviewTiles({ traffic: { bucketMs: 600000, buckets: [{ at: 0, ok: 0, failed: 0 }, { at: 600000, ok: 0, failed: 0 }] }, accounts: [] });
+  assert.deepEqual([zero.traffic, zero.ok, zero.failed, zero.rate], [true, 0, 0, null]);
+  const old = overviewTiles({ accounts: [] });
+  assert.deepEqual([old.traffic, old.rate], [false, null]);
+});
+
+test('overviewTiles adds up the traffic, the serving accounts and the 5-hour quota left', () => {
+  const t = overviewTiles({
+    traffic: { buckets: [{ at: 0, ok: 30, failed: 2 }, { at: 600000, ok: 18, failed: 0 }] },
+    sessions: { active: 3, known: 7 },
+    accounts: [
+      { name: 'a', quota: { unified5h: 0.2 } },
+      { name: 'b', unavailable: 'throttled', quota: { unified5h: 0.9 } },
+      { name: 'c', quota: {} },
+      { name: 'off', disabled: true, quota: { unified5h: 1 } },
+    ],
+  });
+  assert.deepEqual([t.ok, t.failed, t.rate], [48, 2, 48 / 50]);
+  assert.deepEqual([t.serving, t.total, t.active, t.known], [2, 3, 3, 7]);
+  assert.equal(t.quota5h?.count, 2, 'only accounts with a reading, disabled ones left out');
+  assert.ok(Math.abs((t.quota5h?.left ?? 0) - 0.45) < 1e-9);
+  assert.equal(t.quota5h?.lowest.name, 'b');
+  assert.equal(overviewTiles({ accounts: [{ name: 'a', quota: {} }] }).quota5h, null);
+});
+
+test('trafficScale with every bucket empty draws nothing and still has a usable axis', () => {
+  const sc = trafficScale(Array.from({ length: 20 }, (_, i) => ({ at: i * 600000, ok: 0, failed: 0 })));
+  assert.equal(sc.empty, true);
+  assert.equal(sc.peak, -1);
+  assert.equal(sc.bars.length, 20);
+  assert.ok(sc.top > 0, 'no division by zero');
+  assert.equal(sc.ticks[0], 0);
+  assert.equal(trafficScale(null).empty, true);
+});
+
+test('trafficScale stacks the counts under a whole-number axis and finds the busiest bucket', () => {
+  const sc = trafficScale([{ at: 1, ok: 20, failed: 3 }, { at: 2, ok: 50, failed: 1 }, { at: 3, ok: 51, failed: 0 }, { at: 4, ok: 0, failed: 2 }]);
+  assert.deepEqual([sc.ok, sc.failed, sc.peak, sc.empty], [121, 6, 1, false]);
+  assert.deepEqual(sc.bars[0], { at: 1, ok: 20, failed: 3, total: 23 });
+  assert.ok(sc.top >= 51);
+  assert.equal(sc.ticks.at(-1), sc.top);
+  assert.ok(sc.ticks.every(v => Number.isInteger(v)));
+  assert.deepEqual(trafficScale([{ at: 0, ok: 1, failed: 0 }]).ticks, [0, 1]);
+});
+
+test('requestStrip pads an account with fewer requests than slots at the start, oldest first', () => {
+  const events = [
+    { kind: 'usage', account: 'a', status: 200 },
+    { kind: 'usage', account: 'b', status: 500 },
+    { kind: 'rotation', account: 'a' },
+    { kind: 'usage', account: 'a', status: 429 },
+    { kind: 'usage', account: 'a', status: null },
+    { kind: 'usage', account: 'a', status: 201 },
+  ];
+  const st = requestStrip(events, 'a', 6);
+  assert.deepEqual(st.slots, [null, null, 'ok', 'failed', 'failed', 'ok']);
+  assert.deepEqual([st.count, st.rate], [4, 0.5]);
+  assert.deepEqual(requestStrip(events, 'a', 2).slots, ['failed', 'ok'], 'only the last n');
+  assert.deepEqual(requestStrip([], 'a', 3), { slots: [null, null, null], rate: null, count: 0 });
+});
+
+test('the Overview helpers run in the page\'s own scope', () => {
+  const script = inlineScripts(renderDashboardHtml()).at(-1);
+  const bundle = script.slice(script.indexOf('var STARVED_MIN'), script.indexOf('function el('));
+  const isolated = new Function(`${bundle}; return { overviewHeadline, overviewTiles, trafficScale };`)();
+  const status = { traffic: { buckets: [{ at: 0, ok: 3, failed: 1 }] }, accounts: [{ name: 'a', quota: { unified5h: 0.95, unified7d: 0.1 } }] };
+  assert.deepEqual(isolated.overviewHeadline(status.accounts), overviewHeadline(status.accounts));
+  assert.deepEqual(isolated.overviewTiles(status), overviewTiles(status));
+  assert.deepEqual(isolated.trafficScale(status.traffic.buckets), trafficScale(status.traffic.buckets));
+});
+
+const OV_STATUS = () => ({
+  server: { version: '9.9.9', uptimeSeconds: 120 },
+  currentAccount: 'a',
+  traffic: { bucketMs: 600000, buckets: [{ at: Date.now(), ok: 2, failed: 1 }] },
+  sessions: { active: 0, known: 0 },
+  accounts: [{ name: 'a', provider: 'anthropic', quota: { unified5h: 0.2, unified7d: 0.3 } }],
+});
+
+test('the Overview is the landing page, and reads the event log after status and only while open', async () => {
+  const page = bootPage({ hash: '' });
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/status'], 'no log before status has accepted the key');
+  await page.answer(200, OV_STATUS());
+  assert.equal(page.byId('page-overview').style.display, '');
+  assert.equal(page.byId('page-quota').style.display, 'none');
+  assert.equal(page.byId('ovTitle').textContent, 'The only account is healthy');
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · up 2m · routing to a');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=0']);
+  await page.answer(200, { generation: 'g', lastId: 2, events: [
+    { id: 1, kind: 'usage', account: 'a', status: 200 },
+    { id: 2, kind: 'usage', account: 'a', status: 500 },
+  ] });
+  assert.equal(page.labelled('50.0%'), 1, 'the account\'s share of its logged requests');
+  page.click('Quota');
+  page.poll();
+  await page.answer(200, OV_STATUS());
+  assert.equal(page.requests.length, 0, 'another page reads status alone');
+  page.click('Overview');
+  assert.deepEqual(page.requests.map(r => r.url), ['/teamclaude/logs?after=2'], 'back on the Overview, only what is newer');
+});
+
+test('a key the event log refuses keeps the Overview, without the strips and without asking again', async () => {
+  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  await page.answer(200, OV_STATUS());
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client', 'the key is kept');
+  assert.equal(page.byId('keybox').style.display, 'none');
+  assert.equal(page.labelled('This key may not read the request log, so recent requests are not shown.'), 1);
+  page.poll();
+  await page.answer(200, OV_STATUS());
+  assert.equal(page.requests.length, 0);
+});
+
+test('the Overview names the account requests go to, not a throttled cursor', async () => {
+  const page = bootPage({ hash: '' });
+  await page.answer(200, { ...OV_STATUS(), currentAccounts: { anthropic: 'a' }, defaultTargets: { anthropic: 'b' } });
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · up 2m · routing to b');
+});
+
+test('leaving the Overview before the event log refuses its key keeps the key', async () => {
+  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  await page.answer(200, OV_STATUS());
+  page.click('Quota');
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  assert.equal(page.byId('keybox').style.display, 'none');
+});
+
+test('a successful log read after a refusal brings the Overview strips back', async () => {
+  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  await page.answer(200, OV_STATUS());
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  const note = 'This key may not read the request log, so recent requests are not shown.';
+  assert.equal(page.labelled(note), 1);
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=0', 200, { generation: 'g', lastId: 1, events: [{ id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 }] });
+  page.click('Overview');
+  await page.answerTo('/teamclaude/logs?after=1', 200, { generation: 'g', lastId: 1, events: [] });
+  assert.equal(page.labelled(note), 0);
+  assert.ok(page.labelled('100.0%') >= 1, 'the strip and its share are back');
+});
+
+test('the Overview\'s buttons open the Accounts and Logs pages', async () => {
+  const page = bootPage({ hash: '' });
+  await page.answer(200, OV_STATUS());
+  page.byId('ovOpenAccounts').fire('click');
+  assert.equal(page.byId('page-accounts').style.display, '');
+  assert.equal(page.byId('page-overview').style.display, 'none');
+  page.byId('ovOpenLogs').fire('click');
+  assert.equal(page.byId('page-logs').style.display, '');
+  assert.equal(page.byId('page-accounts').style.display, 'none');
+});
+
+test('the Overview says when the traffic window is empty', async () => {
+  const page = bootPage({ hash: '' });
+  const s = OV_STATUS();
+  s.traffic.buckets = [{ at: Date.now(), ok: 0, failed: 0 }];
+  await page.answer(200, s);
+  assert.equal(page.labelled('No requests in the last 3h 20m.'), 1);
+  assert.equal(page.byId('ovTableWrap').style.display, 'none');
 });

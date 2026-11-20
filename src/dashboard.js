@@ -1791,6 +1791,18 @@ export var STARVED_MIN = 5;
 export var STARVED_LIST_MAX = 3;
 
 /**
+ * Whether an account in error was refused by upstream (account-refusal.js),
+ * which a re-login alone does not cure: any error code other than the two
+ * dead-token ones is a refusal.
+ *
+ * @param {any} account  one entry of status.accounts
+ */
+function refusedUpstream(account) {
+  var code = account.errorReason && account.errorReason.code;
+  return account.unavailable === 'error' && !!code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+}
+
+/**
  * What is wrong right now, worst first, or an empty list. Only states that are
  * actionable and not ordinary operation: a spent weekly bucket, a rate-limit
  * back-off and an upstream refusal are rotation and back-off working, and
@@ -1853,11 +1865,7 @@ export function problems(status) {
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    // A refusal from upstream (account-refusal.js) is not cured by a re-login
-    // alone; any error code other than the two dead-token ones is one.
-    var code = a.errorReason && a.errorReason.code;
-    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
-    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
+    var why = refusedUpstream(a) ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
@@ -2058,6 +2066,177 @@ export function providerTabs(accounts) {
   return [{ key: 'all', label: 'All', count: list.length }].concat(groups.map(function (g) {
     return { key: g, label: groupLabel(g), count: counts[g] };
   }));
+}
+
+/** @param {any} quota */
+function weeklyWindowName(quota) {
+  return quota && quota.planPeriod === 'monthly' ? 'monthly' : '7-day';
+}
+
+/**
+ * The Overview page's headline. Disabled accounts are left out, since nothing
+ * routes to them, and a cordoned one still serves its own conversations. When
+ * some account cannot serve, the headline counts them by reason; otherwise it
+ * says whether every account is clear of its limits. `attention` names each
+ * serving account at 90% or more of its 5-hour or weekly window, the fuller one.
+ * An account past its plan but serving on extra usage counts as serving, and
+ * `billing` names it, since every request it takes is billed.
+ *
+ * @param {any[]} accounts  status.accounts
+ * @returns {{ text: string, tone: 'ok'|'warn'|'bad', total: number, serving: number, attention: { name: string, window: string, used: number, resetAt: any }[], billing: string[] }}
+ */
+export function overviewHeadline(accounts) {
+  /** @type {Record<string, string>} */
+  var SHORT_REASON = {
+    throttled: 'throttled', quota: 'out of quota', exhausted: 'out of quota', 'upstream-rejected': 'out of quota',
+    'advisor-quota': 'out of quota', capped: 'capped', 'advisor-capped': 'capped', 'spend-capped': 'spend-capped',
+    error: 'needing a re-login', entitlement: 'refused by upstream', billing: 'refused for billing',
+    credential: 'with a rejected key', routing: 'unreachable', route: 'unrouted', 'advisor-route': 'unrouted',
+  };
+  var enabled = (accounts || []).filter(function (a) { return a && !a.disabled; });
+  /** @type {Record<string, number>} */
+  var counts = Object.create(null);
+  /** @type {string[]} */
+  var order = [];
+  /** @type {{ name: string, window: string, used: number, resetAt: any }[]} */
+  var attention = [];
+  /** @type {string[]} */
+  var billing = [];
+  var serving = 0;
+  enabled.forEach(function (a) {
+    var pastPlan = !a.unavailable || a.unavailable === 'quota' || a.unavailable === 'exhausted' || a.unavailable === 'upstream-rejected';
+    if (a.onExtraUsage === true && pastPlan) { serving++; billing.push(a.name); return; }
+    var why = a.unavailable && a.unavailable !== 'cordoned' ? String(a.unavailable) : null;
+    if (why) {
+      var word = refusedUpstream(a) ? 'refused by upstream' : SHORT_REASON[why] || why;
+      if (!counts[word]) { counts[word] = 0; order.push(word); }
+      counts[word]++;
+      return;
+    }
+    serving++;
+    var q = a.quota || {};
+    var five = quotaMeter('5-hour', q.unified5h, q.unified5hReset);
+    var week = quotaMeter(weeklyWindowName(q), q.unified7d, q.unified7dReset);
+    var worst = (week.used || 0) > (five.used || 0) ? week : five;
+    if (worst.used != null && worst.used >= 0.9) attention.push({ name: a.name, window: worst.label, used: worst.used, resetAt: worst.resetAt });
+  });
+  var n = enabled.length;
+  /** @param {string} state */
+  var all = function (state) { return n === 1 ? 'The only account is ' + state : 'All ' + n + ' accounts ' + state; };
+  /** @type {'ok'|'warn'|'bad'} */
+  var tone = 'ok';
+  var text;
+  if (!n) {
+    text = (accounts || []).length ? 'Every account is disabled' : 'No accounts yet';
+    tone = 'bad';
+  } else if (order.length) {
+    text = order.map(function (w) { return counts[w] + ' ' + w; }).join(', ');
+    tone = serving ? 'warn' : 'bad';
+  } else if (attention.length || billing.length) {
+    text = all('serving');
+    tone = 'warn';
+  } else {
+    text = all('healthy');
+  }
+  return { text: text, tone: tone, total: n, serving: serving, attention: attention, billing: billing };
+}
+
+/**
+ * The Overview page's four tiles: requests over the traffic window and the
+ * share that succeeded (null with none), accounts serving, conversations, and
+ * the 5-hour quota left averaged over the enabled accounts that have a
+ * reading, with the lowest of them. `traffic` is false for a proxy too old to
+ * report status.traffic.
+ *
+ * @param {any} status  a GET /teamclaude/status reply
+ * @returns {{ traffic: boolean, ok: number, failed: number, rate: number|null, serving: number, total: number, active: number, known: number, quota5h: { left: number, count: number, lowest: { name: string, left: number } }|null }}
+ */
+export function overviewTiles(status) {
+  var s = status || {};
+  var buckets = s.traffic && Array.isArray(s.traffic.buckets) ? s.traffic.buckets : null;
+  var ok = 0;
+  var failed = 0;
+  (buckets || []).forEach(function (/** @type {any} */ b) { ok += Number(b.ok) || 0; failed += Number(b.failed) || 0; });
+  var head = overviewHeadline(s.accounts);
+  var sum = 0;
+  var count = 0;
+  /** @type {{ name: string, left: number }|null} */
+  var lowest = null;
+  (s.accounts || []).forEach(function (/** @type {any} */ a) {
+    if (!a || a.disabled) return;
+    var m = quotaMeter('5-hour', (a.quota || {}).unified5h, null);
+    if (m.left == null) return;
+    count++;
+    sum += m.left;
+    if (!lowest || m.left < lowest.left) lowest = { name: a.name, left: m.left };
+  });
+  var sessions = s.sessions || {};
+  return {
+    traffic: !!buckets, ok: ok, failed: failed, rate: ok + failed > 0 ? ok / (ok + failed) : null,
+    serving: head.serving, total: head.total, active: Number(sessions.active) || 0, known: Number(sessions.known) || 0,
+    quota5h: lowest ? { left: sum / count, count: count, lowest: lowest } : null,
+  };
+}
+
+/**
+ * The Overview chart's scale: each bucket's counts, the totals, a y axis of
+ * whole-number ticks from 0 to `top`, and the busiest bucket (`peak`, -1 when
+ * every bucket is empty, which is when `empty` is true).
+ *
+ * @param {any[]|null|undefined} buckets  status.traffic.buckets
+ * @returns {{ bars: { at: number, ok: number, failed: number, total: number }[], ok: number, failed: number, top: number, ticks: number[], peak: number, empty: boolean }}
+ */
+export function trafficScale(buckets) {
+  var bars = (buckets || []).map(function (/** @type {any} */ b) {
+    var ok = Math.max(0, Number(b.ok) || 0);
+    var failed = Math.max(0, Number(b.failed) || 0);
+    return { at: Number(b.at) || 0, ok: ok, failed: failed, total: ok + failed };
+  });
+  var max = 0;
+  var peak = -1;
+  var ok = 0;
+  var failed = 0;
+  bars.forEach(function (b, i) {
+    ok += b.ok;
+    failed += b.failed;
+    if (b.total > max) { max = b.total; peak = i; }
+  });
+  var GRIDLINES = 4;
+  var step = Math.max(1, Math.ceil(niceCeil(max / GRIDLINES)));
+  var top = step * Math.max(1, Math.ceil(max / step));
+  /** @type {number[]} */
+  var ticks = [];
+  for (var v = 0; v <= top; v += step) ticks.push(v);
+  return { bars: bars, ok: ok, failed: failed, top: top, ticks: ticks, peak: peak, empty: max === 0 };
+}
+
+/**
+ * One account's last `n` requests from the event log, oldest first, with the
+ * slots it has not filled yet (null) at the start, and the share of all its
+ * logged requests that succeeded (null with none). A request fails as
+ * request-traffic.js counts it: no status, or 400 and up.
+ *
+ * @param {any[]} events  the event log, oldest first
+ * @param {string} name  the account
+ * @param {number} n
+ * @param {string|null} [provider]  the account's provider, so a Claude and a
+ *   Codex account with one name keep apart
+ * @returns {{ slots: Array<'ok'|'failed'|null>, rate: number|null, count: number }}
+ */
+export function requestStrip(events, name, n, provider) {
+  /** @type {Array<'ok'|'failed'>} */
+  var mine = [];
+  (events || []).forEach(function (/** @type {any} */ e) {
+    if (e.kind !== 'usage' || e.account !== name) return;
+    if (provider && e.provider && e.provider !== provider) return;
+    mine.push(typeof e.status === 'number' && e.status > 0 && e.status < 400 ? 'ok' : 'failed');
+  });
+  var ok = mine.filter(function (x) { return x === 'ok'; }).length;
+  var last = mine.slice(Math.max(0, mine.length - n));
+  /** @type {Array<'ok'|'failed'|null>} */
+  var slots = [];
+  for (var i = last.length; i < n; i++) slots.push(null);
+  return { slots: slots.concat(last), rate: mine.length ? ok / mine.length : null, count: mine.length };
 }
 
 // The Logs page's filter chips: one per event kind the proxy records
@@ -3086,7 +3265,7 @@ export const REDEEM_UNCERTAIN_TEXT = 'no answer to the reset; it may still have 
 
 const SHARED_HELPERS = [
   scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
-  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
+  switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, refusedUpstream, problems, usageFor,
   probeIntervalOptions, probeIntervalRequest, probeIntervalOutcome, instanceNameRequest, instanceNameOutcome, instanceAddressRequest, instanceAddressOutcome, linkSelfWithAddress, selfInstanceLabel,
   passwordLoginRequest, passwordLoginOutcome, dashboardLoginRequest, dashboardLoginOutcome,
   outsideSpendHideRequest, outsideSpendHideOutcome, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, accountEmailLine, cardNoteFor, backendQuotaRows,
@@ -3094,6 +3273,7 @@ const SHARED_HELPERS = [
   codexResetsLeft, codexResetsSummary, canRedeemReset, redeemResetRequest, redeemResetOutcome, resetClickStep,
   codexResetExpiry, shortDate, resetsLeftText, resetCreditAlerts,
   meterTone, quotaMeter, exhaustedMeter, fableLabel, accountMeters, accountQuotaExhausted, poolSummary, accountGroup, groupLabel, providerTabs,
+  weeklyWindowName, overviewHeadline, overviewTiles, trafficScale, requestStrip,
   mergeLogEvents, filterLogEvents, logEventDetail, logEventClient, logEventTone,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
@@ -3585,6 +3765,92 @@ const PAGE = `<!doctype html>
     .links td .btn.rm { min-width: 0; }
     #linkList th, #linkList td { padding-left: 5px; padding-right: 5px; }
   }
+  .ovhead { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px 24px; flex-wrap: wrap; margin-top: 6px; }
+  .ovhead > div { min-width: 0; }
+  .ovtitle { font-size: clamp(30px, 4.4vw, 52px); line-height: 1.05; font-weight: 750; letter-spacing: -.045em; }
+  .ovdot { display: inline-block; width: .16em; height: .16em; border-radius: 50%; background: var(--ok); margin-left: .06em; }
+  .ovtitle.warn .ovdot { background: var(--warn); }
+  .ovtitle.bad .ovdot { background: var(--bad); }
+  .ovsub { margin-top: 14px; font: 13px/1.6 var(--mono); color: var(--dim); overflow-wrap: anywhere; }
+  .ovattn { margin-top: 8px; display: flex; gap: 8px; align-items: baseline; }
+  .ovattn::before { content: ""; width: 8px; height: 8px; border-radius: 2px; background: var(--warn); flex: none; transform: translateY(-1px); }
+  .ovactions { display: flex; gap: 18px; align-items: center; }
+  .ovpill { background: var(--text); color: var(--bg); border: 0; border-radius: 999px; padding: 11px 20px; font-weight: 650; cursor: pointer; }
+  .ovpill:hover { filter: brightness(1.08); }
+  .ovlink { background: none; border: 0; padding: 4px 2px; font-weight: 600; color: var(--text); cursor: pointer; }
+  .ovlink:hover { text-decoration: underline; }
+  .ovpill:focus-visible, .ovlink:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .ovtiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 28px; }
+  .ovcard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; min-width: 0; }
+  .ovtile { padding: 22px 24px 20px; }
+  .ovtick { width: 30px; height: 3px; border-radius: 2px; background: var(--line2); margin-bottom: 16px; }
+  .ovtick.ok { background: var(--ok); }
+  .ovtick.warn { background: var(--warn); }
+  .ovtick.bad { background: var(--bad); }
+  .ovtile .nm { font-size: 13px; font-weight: 600; color: var(--dim); }
+  .ovtile .v { font: 600 30px/1.2 var(--mono); letter-spacing: -.03em; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .ovtile .v small { font-size: 15px; color: var(--dim); letter-spacing: 0; margin-left: 2px; }
+  .ovtile .nt { font-size: 12.5px; color: var(--dim); margin-top: 8px; overflow-wrap: anywhere; }
+  .ovmeter { height: 4px; border-radius: 2px; background: var(--track); margin-top: 14px; overflow: hidden; }
+  .ovmeter i { display: block; height: 100%; border-radius: 2px; background: var(--ok); }
+  .ovmeter i.warn { background: var(--warn); }
+  .ovmeter i.bad { background: var(--bad); }
+  .ovgrid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; margin-top: 16px; align-items: start; }
+  .ovchart { padding: 22px 24px 18px; overflow: hidden; }
+  .ovchead { display: flex; justify-content: space-between; align-items: baseline; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .ovchead h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -.02em; text-transform: none; color: var(--text); }
+  .ovlegend { display: flex; gap: 18px; flex-wrap: wrap; font: 12.5px/1 var(--mono); color: var(--dim); }
+  .ovlegend b { color: var(--text); font-weight: 600; }
+  .ovkey { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--ok); }
+  .ovkey.bad, .ovstrip i.bad { background: var(--bad) repeating-linear-gradient(135deg, transparent 0 2px, rgba(0,0,0,.35) 2px 3px); }
+  .ovplot, .ovx { position: relative; margin-left: 30px; }
+  .ovplot svg { display: block; width: 100%; height: 260px; }
+  .ovy { position: absolute; right: calc(100% + 6px); transform: translateY(-50%); font: 11px var(--mono); color: var(--faint); }
+  .ovpeak { position: absolute; transform: translate(-50%, -130%); font: 600 11.5px var(--mono); }
+  .ovx { height: 18px; margin-top: 6px; }
+  .ovx span { position: absolute; transform: translateX(-50%); font: 11px var(--mono); color: var(--faint); white-space: nowrap; }
+  .ovx span.first { left: 0; transform: none; }
+  .ovx span.last { right: 0; transform: none; }
+  .ovempty { color: var(--dim); padding: 48px 0; text-align: center; }
+  .ovtable { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; }
+  .ovtable summary { padding: 11px 14px; font-weight: 600; cursor: pointer; }
+  .ovtable summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 10px; }
+  .ovtable table { width: 100%; border-collapse: collapse; font: 12.5px/1.4 var(--mono); }
+  .ovtable td, .ovtable th { padding: 7px 14px; border-top: 1px solid var(--line); text-align: right; }
+  .ovtable th:first-child, .ovtable td:first-child { text-align: left; }
+  .ovtable th { color: var(--dim); font-weight: 600; }
+  .ovaccts { padding: 8px 0; }
+  .ovacct { padding: 14px 20px; border-top: 1px solid var(--line); }
+  .ovacct:first-child { border-top: 0; }
+  .ovtop { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .ovname { display: flex; align-items: baseline; gap: 8px; min-width: 0; font-weight: 600; }
+  .ovname > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ovpct { font: 600 12.5px/1 var(--mono); }
+  .ovbadge { flex: none; font: 600 11px/1 var(--sans); padding: 4px 8px; border-radius: 999px; }
+  .ovbadge.claude { color: var(--claude); background: color-mix(in srgb, var(--ip-claude) 22%, transparent); }
+  .ovbadge.codex { color: var(--codex); background: color-mix(in srgb, var(--ip-codex) 22%, transparent); }
+  .ovbadge.grok { color: var(--grok); background: color-mix(in srgb, var(--ip-grok) 22%, transparent); }
+  .ovbadge.backend { color: var(--backend); background: color-mix(in srgb, var(--ip-backend) 22%, transparent); }
+  .ovwhy { font-size: 12px; color: var(--warn); margin-top: 4px; }
+  .ovstrip { display: flex; gap: 2px; margin-top: 10px; }
+  .ovstrip i { flex: 1; height: 14px; border-radius: 2px; background: var(--track); }
+  .ovstrip i.ok { background: var(--ok); }
+  .ovq { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; font: 11.5px/1 var(--mono); color: var(--dim); }
+  .ovq .mt { display: flex; justify-content: space-between; gap: 6px; }
+  .ovq .ovmeter { margin-top: 6px; }
+  .ovnote { padding: 10px 20px 4px; font-size: 12px; color: var(--dim); }
+  @media (max-width: 1080px) {
+    .ovtiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ovgrid { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 760px) {
+    .ovtiles { gap: 10px; margin-top: 22px; }
+    .ovtile { padding: 16px; }
+    .ovtile .v { font-size: 24px; }
+    .ovchart { padding: 16px; }
+    .ovplot svg { height: 200px; }
+    .ovacct { padding: 12px 16px; }
+  }
 </style>
 <script>
 (function () {
@@ -3626,8 +3892,8 @@ const PAGE = `<!doctype html>
   </aside>
   <main class="content">
   <div class="wrap">
-    <div class="top">
-      <h1 id="pageTitle">Quota</h1>
+    <div class="top" id="pageTop">
+      <h1 id="pageTitle">Overview</h1>
       <p class="sub" id="summary"></p>
     </div>
     <div id="err"></div>
@@ -3636,7 +3902,30 @@ const PAGE = `<!doctype html>
     <div id="instanceNote" style="display:none"><span id="instanceText"></span> <button id="instanceBack" class="more" type="button">Back to this machine</button></div>
     <div id="caller" style="display:none"><span id="callerText"></span> <button id="changeKey" class="more" type="button">Change key</button></div>
 
-    <section id="page-quota">
+    <section id="page-overview">
+      <div class="ovhead">
+        <div>
+          <h1 id="ovTitle" class="ovtitle"></h1>
+          <p id="ovSub" class="ovsub"></p>
+          <div id="ovAttention"></div>
+        </div>
+        <div class="ovactions">
+          <button id="ovOpenAccounts" class="ovpill" type="button">Open accounts</button>
+          <button id="ovOpenLogs" class="ovlink" type="button">Open logs</button>
+        </div>
+      </div>
+      <div id="ovTiles" class="ovtiles"></div>
+      <div class="ovgrid">
+        <div class="ovcard ovchart">
+          <div class="ovchead"><h2>Requests every ten minutes</h2><div id="ovLegend" class="ovlegend"></div></div>
+          <div id="ovChart"></div>
+          <details id="ovTableWrap" class="ovtable"><summary>Data table</summary><table id="ovTable"></table></details>
+        </div>
+        <div id="ovAccounts" class="ovcard ovaccts"></div>
+      </div>
+    </section>
+
+    <section id="page-quota" style="display:none">
       <div id="tabs" class="tabs"></div>
       <div id="resetAlerts" class="plist"></div>
       <div id="summaryCards" class="cards"></div>
@@ -3842,6 +4131,7 @@ const PAGE = `<!doctype html>
   // rendered on each poll and only shown or hidden, so switching pages never
   // waits on the network and a page left open keeps up with the fleet.
   var PAGES = [
+    { key: 'overview', label: 'Overview', section: 'Overview', icon: 'M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z' },
     { key: 'quota', label: 'Quota', section: 'Overview', icon: 'M4 18a8 8 0 1 1 16 0M12 18l4-5' },
     { key: 'sessions', label: 'Sessions', section: 'Overview', icon: 'M4 6h16M4 12h16M4 18h10' },
     { key: 'clients', label: 'Clients', section: 'Overview', icon: 'M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM2 20a6 6 0 0 1 12 0M16 11a3 3 0 1 0 0-6M18 20a6 6 0 0 0-3-5.2' },
@@ -3852,7 +4142,7 @@ const PAGE = `<!doctype html>
     { key: 'routing', label: 'Routing', section: 'Control', icon: 'M6 6a2 2 0 1 0 0-.01M18 18a2 2 0 1 0 0-.01M6 8v4a4 4 0 0 0 4 4h6' },
     { key: 'settings', label: 'Settings', section: 'Control', icon: 'M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4' },
   ];
-  var currentPage = 'quota';
+  var currentPage = 'overview';
   // The linked instance this page shows (peers.js), or '' for the machine it
   // was opened on. Every request goes through at(), so each page, button and
   // sign-in acts on the instance shown. Switching reloads the page: nothing
@@ -3880,9 +4170,9 @@ const PAGE = `<!doctype html>
   // Open "Show" expanders, by card or row. No prototype: an account named
   // __proto__ would otherwise set it.
   var expanded = Object.create(null);
-  // The Logs page's copy of the proxy's event log, fetched only while the page
-  // is open, so a dashboard left on Quota costs the server one request a poll.
   var logState = { generation: null, events: [] };
+  var logsRead = false;
+  var logsRefused = false;
   var logFilters = { kind: 'all', provider: '', account: '' };
   var logChips = [];
   var logError = null;
@@ -5736,26 +6026,262 @@ ${SHARED_HELPERS}
     // The status poll asks for the logs again once the check is through.
     if (logsInFlight || (peer && !peerChecked)) return;
     logsInFlight = true;
+    var askedOn = currentPage;
     var held = logState.events;
     var after = held.length ? held[held.length - 1].id : 0;
     var again = false;
     fetch(at('/teamclaude/logs?after=' + after), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
+        if (res.status === 403 && askedOn === 'overview') { logsRefused = true; return null; }
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         if (!res.ok) throw new Error('status ' + res.status);
         return res.json();
       })
       .then(function (page) {
-        if (!page) return;
-        logState = mergeLogEvents(logState, page, LOG_CAP);
-        again = logState.refetch;
-        logError = null;
-        renderLogs();
+        if (page) {
+          logState = mergeLogEvents(logState, page, LOG_CAP);
+          again = logState.refetch;
+          logError = null;
+          logsRead = true;
+          logsRefused = false;
+        }
+        renderLogEvents();
       })
-      .catch(function (e) { logError = e.message; renderLogs(); })
+      .catch(function (e) { logError = e.message; renderLogEvents(); })
       // A restarted server's log is read again from its start, now rather
       // than at the next poll.
       .finally(function () { logsInFlight = false; if (again) pollLogs(); });
+  }
+
+  function renderLogEvents() {
+    if (currentPage === 'logs') renderLogs();
+    else if (currentPage === 'overview' && lastStatus) renderOverviewAccounts(lastStatus);
+  }
+
+  var OV_STRIP = 24;
+
+  function renderOverview(s) {
+    renderOverviewHead(s);
+    renderOverviewTiles(s);
+    renderOverviewChart(s.traffic);
+    renderOverviewAccounts(s);
+  }
+
+  // Where the next request goes, per provider: the route target, which skips
+  // a cursor account that is throttled or out of quota. Older servers send
+  // only the cursor.
+  function currentAccountsText(s) {
+    var target = s.defaultTargets || s.currentAccounts || {};
+    var providers = Object.keys(target).filter(function (p) { return target[p]; });
+    if (providers.length > 1) return providers.map(function (p) { return providerLabel(p) + ' ' + target[p]; }).join(', ');
+    if (providers.length) return target[providers[0]];
+    return s.defaultTargets ? '' : s.defaultTarget || s.currentAccount || '';
+  }
+
+  function renderOverviewHead(s) {
+    var h = overviewHeadline(s.accounts);
+    var title = document.getElementById('ovTitle');
+    title.className = 'ovtitle ' + h.tone;
+    title.textContent = h.text;
+    var dot = el('span', 'ovdot');
+    dot.setAttribute('aria-hidden', 'true');
+    title.appendChild(dot);
+    var server = s.server || {};
+    var parts = [];
+    if (server.version) parts.push('v' + server.version);
+    if (server.uptimeSeconds != null) parts.push('up ' + fmtUntil(server.uptimeSeconds));
+    var routing = currentAccountsText(s);
+    if (routing) parts.push('routing to ' + routing);
+    document.getElementById('ovSub').textContent = parts.join(' · ');
+    var box = document.getElementById('ovAttention');
+    box.textContent = '';
+    h.attention.forEach(function (x) {
+      var t = parseTs(x.resetAt);
+      box.appendChild(el('p', 'ovattn', x.name + ' is at ' + pctText(x.used) + ' of its ' + x.window + ' limit.'
+        + (t > Date.now() ? ' It resets in ' + fmtUntil((t - Date.now()) / 1000) + '.' : '')));
+    });
+    h.billing.forEach(function (name) {
+      box.appendChild(el('p', 'ovattn', name + ' is past its plan and serving on extra usage, which is billed.'));
+    });
+  }
+
+  function ovTile(name, value, unit, note, tone, fill) {
+    var c = el('div', 'ovcard ovtile');
+    c.appendChild(el('div', 'ovtick ' + (tone || '')));
+    c.appendChild(el('div', 'nm', name));
+    var v = el('div', 'v', value);
+    if (unit) v.appendChild(el('small', '', unit));
+    c.appendChild(v);
+    if (fill != null) c.appendChild(ovMeterBar(fill, tone));
+    c.appendChild(el('div', 'nt', note));
+    return c;
+  }
+
+  function ovMeterBar(fill, tone) {
+    var bar = el('div', 'ovmeter');
+    var i = el('i', tone === 'warn' || tone === 'bad' ? tone : '');
+    i.style.width = Math.round(fill * 1000) / 10 + '%';
+    bar.appendChild(i);
+    return bar;
+  }
+
+  function renderOverviewTiles(s) {
+    var t = overviewTiles(s);
+    var box = document.getElementById('ovTiles');
+    box.textContent = '';
+    var rateTone = t.rate == null ? '' : t.rate >= 0.95 ? 'ok' : t.rate >= 0.8 ? 'warn' : 'bad';
+    box.appendChild(t.traffic
+      ? ovTile('Success rate', t.rate == null ? '—' : (t.rate * 100).toFixed(1), t.rate == null ? '' : '%',
+        t.rate == null ? 'no requests in 3h 20m' : t.failed + ' failed in 3h 20m', rateTone, t.rate)
+      : ovTile('Success rate', '—', '', 'not counted by this version', '', null));
+    var servingTone = !t.total || !t.serving ? 'bad' : t.serving < t.total ? 'warn' : 'ok';
+    box.appendChild(ovTile('Accounts serving', String(t.serving), ' of ' + t.total,
+      t.serving < t.total ? (t.total - t.serving) + ' paused or blocked' : 'none paused or blocked', servingTone, t.total ? t.serving / t.total : null));
+    box.appendChild(ovTile('Active conversations', String(t.active), '', t.known + ' known', '', null));
+    var q = t.quota5h;
+    var qTone = q ? meterTone(1 - q.left) : '';
+    box.appendChild(q
+      ? ovTile('5-hour quota left', String(Math.round(q.left * 100)), '%', 'lowest: ' + q.lowest.name + ' at ' + pctText(q.lowest.left), qTone === 'unknown' ? '' : qTone, q.left)
+      : ovTile('5-hour quota left', '—', '', 'no readings yet', '', null));
+  }
+
+  function ovClock(ms) {
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  function ovKey(cls, label, value) {
+    var k = el('span');
+    k.appendChild(el('span', 'ovkey ' + cls));
+    k.appendChild(el('span', '', label + ' '));
+    k.appendChild(el('b', '', String(value)));
+    return k;
+  }
+
+  function renderOverviewChart(traffic) {
+    var buckets = traffic && Array.isArray(traffic.buckets) ? traffic.buckets : null;
+    var bucketMs = (traffic && traffic.bucketMs) || 10 * 60 * 1000;
+    var sc = trafficScale(buckets);
+    var legend = document.getElementById('ovLegend');
+    legend.textContent = '';
+    if (buckets) {
+      legend.appendChild(ovKey('ok', 'Succeeded', sc.ok));
+      legend.appendChild(ovKey('bad', 'Failed', sc.failed));
+    }
+    var box = document.getElementById('ovChart');
+    box.textContent = '';
+    document.getElementById('ovTableWrap').style.display = buckets && !sc.empty ? '' : 'none';
+    if (!buckets || sc.empty) {
+      box.appendChild(el('p', 'ovempty', buckets ? 'No requests in the last 3h 20m.' : 'This instance runs a version that does not count its requests over time.'));
+      return;
+    }
+    var W = 1000, H = 260, padT = 24, GAP = 2, MIN_BAR = 2;
+    var y = function (v) { return padT + (1 - v / sc.top) * (H - padT); };
+    var plot = el('div', 'ovplot');
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
+      'aria-label': 'Requests every ten minutes over the last 3h 20m: ' + sc.ok + ' succeeded, ' + sc.failed + ' failed. The data table below lists each slot.' }, plot);
+    var pat = svgEl('pattern', { id: 'ovhatch', width: 6, height: 6, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' }, svgEl('defs', {}, svg));
+    paint(svgEl('rect', { width: 6, height: 6 }, pat), 'var(--bad)');
+    svgEl('rect', { width: 2, height: 6, fill: 'rgba(0,0,0,.35)' }, pat);
+    sc.ticks.forEach(function (v) {
+      paint(svgEl('line', { x1: 0, x2: W, y1: y(v), y2: y(v), 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke' }, svg), null, 'var(--line)');
+      var lab = el('span', 'ovy', String(v));
+      lab.style.top = (y(v) / H * 100) + '%';
+      plot.appendChild(lab);
+    });
+    var n = sc.bars.length, slot = W / n, bw = Math.min(28, slot * 0.56);
+    var xPct = function (i) { return ((i + 0.5) * slot / W * 100) + '%'; };
+    sc.bars.forEach(function (b, i) {
+      var x = i * slot + (slot - bw) / 2;
+      if (b.ok) paint(svgEl('rect', { x: x, y: y(b.ok), width: bw, height: y(0) - y(b.ok), rx: 3 }, svg), 'var(--ok)');
+      if (b.failed) svgEl('rect', { x: x, y: y(b.total), width: bw, height: Math.max(MIN_BAR, y(b.ok) - y(b.total) - (b.ok ? GAP : 0)), rx: 3, fill: 'url(#ovhatch)' }, svg);
+      var hit = svgEl('rect', { x: i * slot, y: 0, width: slot, height: H, fill: 'transparent' }, svg);
+      var show = function (e) {
+        showInsightsTip(e, ovClock(b.at) + '–' + ovClock(b.at + bucketMs), [
+          { label: 'Succeeded', value: String(b.ok), color: 'var(--ok)' },
+          { label: 'Failed', value: String(b.failed), color: 'var(--bad)' },
+        ]);
+      };
+      hit.addEventListener('mousemove', show);
+      hit.addEventListener('click', show);
+      hit.addEventListener('mouseleave', hideInsightsTip);
+    });
+    var pk = sc.bars[sc.peak];
+    var peak = el('span', 'ovpeak', String(pk.total));
+    peak.style.left = xPct(sc.peak);
+    peak.style.top = (y(pk.total) / H * 100) + '%';
+    plot.appendChild(peak);
+    box.appendChild(plot);
+    var xs = el('div', 'ovx');
+    xs.appendChild(el('span', 'first', ovClock(sc.bars[0].at)));
+    var mid = el('span', '', ovClock(sc.bars[Math.floor((n - 1) / 2)].at));
+    mid.style.left = xPct(Math.floor((n - 1) / 2));
+    xs.appendChild(mid);
+    xs.appendChild(el('span', 'last', ovClock(sc.bars[n - 1].at)));
+    box.appendChild(xs);
+    var table = document.getElementById('ovTable');
+    table.textContent = '';
+    var hr = el('tr');
+    ['Time', 'Succeeded', 'Failed'].forEach(function (h) { hr.appendChild(el('th', '', h)); });
+    table.appendChild(hr);
+    sc.bars.forEach(function (b) {
+      var tr = el('tr');
+      [ovClock(b.at) + '–' + ovClock(b.at + bucketMs), b.ok, b.failed].forEach(function (c) { tr.appendChild(el('td', '', String(c))); });
+      table.appendChild(tr);
+    });
+  }
+
+  function ovQuota(m) {
+    var d = el('div');
+    var top = el('div', 'mt');
+    top.appendChild(el('span', '', m.label));
+    top.appendChild(el('span', '', m.left == null ? '—' : pctText(m.left) + ' left'));
+    d.appendChild(top);
+    d.appendChild(ovMeterBar(m.left || 0, m.used != null && m.used >= 0.9 ? 'warn' : ''));
+    return d;
+  }
+
+  function renderOverviewAccounts(s) {
+    var box = document.getElementById('ovAccounts');
+    box.textContent = '';
+    var list = (s.accounts || []).filter(function (a) { return !a.disabled; });
+    var strips = logsRead && !logsRefused;
+    if (!list.length) box.appendChild(el('p', 'ovnote', 'No enabled accounts.'));
+    list.forEach(function (a) {
+      var row = el('div', 'ovacct');
+      var top = el('div', 'ovtop');
+      var name = el('div', 'ovname');
+      var group = accountGroup(a);
+      name.appendChild(el('span', 'ovbadge ' + providerTone(group), groupLabel(group)));
+      var nm = el('span', '', a.name);
+      nm.title = a.name;
+      name.appendChild(nm);
+      top.appendChild(name);
+      var st = strips ? requestStrip(logState.events, a.name, OV_STRIP, a.provider) : null;
+      if (st) {
+        var pct = el('span', 'ovpct', st.rate == null ? '—' : (st.rate * 100).toFixed(1) + '%');
+        pct.title = st.rate == null ? 'No requests in the log' : 'Succeeded, of ' + st.count + ' requests in the log';
+        top.appendChild(pct);
+      }
+      row.appendChild(top);
+      if (a.unavailable && a.unavailable !== 'cordoned') row.appendChild(el('div', 'ovwhy', UNAVAILABLE_TEXT[a.unavailable] || a.unavailable));
+      if (st) {
+        var strip = el('div', 'ovstrip');
+        var filled = st.slots.filter(function (x) { return x; });
+        var bad = filled.filter(function (x) { return x === 'failed'; }).length;
+        strip.title = 'Last ' + OV_STRIP + ' requests, oldest first';
+        strip.setAttribute('role', 'img');
+        strip.setAttribute('aria-label', filled.length ? 'Last ' + filled.length + ' requests: ' + (filled.length - bad) + ' succeeded, ' + bad + ' failed' : 'No requests in the log');
+        st.slots.forEach(function (x) { strip.appendChild(el('i', x === 'ok' ? 'ok' : x === 'failed' ? 'bad' : '')); });
+        row.appendChild(strip);
+      }
+      var q = a.quota || {};
+      var bars = el('div', 'ovq');
+      bars.appendChild(ovQuota(quotaMeter('5-hour', q.unified5h, q.unified5hReset)));
+      bars.appendChild(ovQuota(quotaMeter(weeklyWindowName(q), q.unified7d, q.unified7dReset)));
+      row.appendChild(bars);
+      box.appendChild(row);
+    });
+    if (logsRefused) box.appendChild(el('p', 'ovnote', 'This key may not read the request log, so recent requests are not shown.'));
   }
 
   // ---- Insights page -------------------------------------------------------
@@ -6905,6 +7431,7 @@ ${SHARED_HELPERS}
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
     probeBtn.disabled = !!probe.running;
+    renderOverview(s);
     renderQuota(s);
     renderAccountsPage(s);
     renderProblems(s);
@@ -7613,6 +8140,7 @@ ${SHARED_HELPERS}
         if ('error' in out) { errBox.textContent = out.error; return; }
         document.getElementById('pwPass').value = '';
         localStorage.setItem(KEY, out.key);
+        logsRefused = false;
         start();
       })
       .catch(function (e) { errBox.textContent = 'Cannot reach the proxy: ' + e.message; })
@@ -7647,7 +8175,7 @@ ${SHARED_HELPERS}
         document.getElementById('app').style.display = '';
         document.getElementById('err').style.display = 'none';
         render(s);
-        if (currentPage === 'logs') pollLogs();
+        if (currentPage === 'logs' || (currentPage === 'overview' && !logsRefused)) pollLogs();
         if (currentPage === 'insights') {
           if (ins.data && ins.drawn !== insightsDrawnKey()) renderInsights();
           pollInsights(false);
@@ -7700,11 +8228,13 @@ ${SHARED_HELPERS}
       navButtons[p.key].className = p.key === page.key ? 'navbtn sel' : 'navbtn';
     });
     document.getElementById('pageTitle').textContent = page.label;
+    document.getElementById('pageTop').style.display = page.key === 'overview' ? 'none' : '';
     if (typeof location !== 'undefined' && typeof history !== 'undefined' && location.hash !== '#' + page.key) {
       try { history.replaceState(null, '', '#' + page.key); } catch (e) { /* a sandboxed frame: the page still switches */ }
     }
     if (lastStatus) renderProblems(lastStatus);
     if (page.key === 'logs') { renderLogs(); pollLogs(); }
+    if (page.key === 'overview' && lastStatus && !logsRefused) pollLogs();
     hideInsightsTip();
     if (page.key === 'insights') { renderInsights(); pollInsights(false); }
     if (page.key === 'settings' && lastStatus) { renderLinks(lastStatus); renderSync(lastStatus); }
@@ -7719,6 +8249,7 @@ ${SHARED_HELPERS}
     var v = document.getElementById('key').value.trim();
     if (!v) return;
     localStorage.setItem(KEY, v);
+    logsRefused = false;
     start();
   });
   document.getElementById('key').addEventListener('keydown', function (e) {
@@ -7789,6 +8320,8 @@ ${SHARED_HELPERS}
   // another one: the operator needs a way back to the key box.
   function forgetKey() { localStorage.removeItem(KEY); document.getElementById('key').value = ''; showKeybox(); }
   document.getElementById('changeKey').addEventListener('click', forgetKey);
+  document.getElementById('ovOpenAccounts').addEventListener('click', function () { showPage('accounts'); });
+  document.getElementById('ovOpenLogs').addEventListener('click', function () { showPage('logs'); });
   document.getElementById('instance').addEventListener('change', function () { pickInstance(this.value); });
   document.getElementById('instanceBack').addEventListener('click', function () { pickInstance(''); });
   document.getElementById('forgetKey').addEventListener('click', forgetKey);
