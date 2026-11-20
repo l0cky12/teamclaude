@@ -466,9 +466,17 @@ curl -X POST http://localhost:3456/teamclaude/undrain -H "x-api-key: $KEY"
 
 ## Status dashboard (browser)
 
-`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Quota, Sessions, Clients, Insights), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). Each page has an icon beside its name. On a narrow window the sidebar becomes a row of buttons above the page. The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it. The dashboard uses the TeamRouter name and a mark of three red bars on a dark red tile in its sidebar and browser tab. The icon is embedded in the page and needs no asset request. Both `/teamclaude/dashboard` and `/teamrouter/dashboard` work.
+`GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Overview, Quota, Sessions, Clients, Insights), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). Each page has an icon beside its name. On a narrow window the sidebar becomes a row of buttons above the page. The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it. An address with no fragment opens the Overview page. The dashboard uses the TeamRouter name and a mark of three red bars on a dark red tile in its sidebar and browser tab. The icon is embedded in the page and needs no asset request. Both `/teamclaude/dashboard` and `/teamrouter/dashboard` work.
 
 `teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The **Theme** button at the foot of the sidebar cycles system → light → dark; the choice is kept in the browser's localStorage, and "system" follows the browser's `prefers-color-scheme`. Dark is what a browser that states no preference gets.
+
+### Overview
+
+The Overview page answers whether the fleet is working. Its headline says whether every enabled account is healthy. If any account cannot serve, the headline counts them by reason, for example *1 throttled, 1 out of quota*. If an account is at 90% or more of its 5-hour or 7-day limit, a line under the headline names it, with the percentage and when the limit resets. The line under the headline gives the version, the uptime and the account that requests go to now. **Open accounts** and **Open logs** go to those pages.
+
+Four tiles follow: the share of requests that succeeded and how many failed, how many accounts are serving, the active conversations, and the 5-hour quota left on average, with the account that has the least. The chart shows the requests in each 10-minute slot of the last 3h 20m, succeeded and failed, with the same numbers in **Data table**. The proxy keeps these counts in memory, so the chart starts empty after a restart.
+
+Beside the chart, each enabled account has its provider, the share of its logged requests that succeeded, a strip of its last 24 requests, and the 5-hour and 7-day quota left. The strips come from the same event log as the **Logs** page, which the page reads only while Overview or Logs is open.
 
 ### Quota
 
