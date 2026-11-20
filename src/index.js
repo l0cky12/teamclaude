@@ -494,6 +494,7 @@ async function serverCommand() {
   if (savedState?.usageDimensions) dimensionUsage.restore(savedState.usageDimensions);
   // The day-by-day history behind the dashboard's Insights page, likewise.
   if (savedState?.usageHistory) accountManager.usageHistory.restore(savedState.usageHistory);
+  accountManager.traffic.restore(savedState?.traffic);
 
   // The quota series behind the fleet forecast (#550), in its own file beside
   // the state file. Missing or corrupt reads as empty history.
@@ -506,7 +507,7 @@ async function serverCommand() {
   // Periodically persist quota (and once more on shutdown) to the state file.
   const persistQuotaState = createStatePersister(() => ({
     quota: accountManager.exportQuotaState(), clients: clientUsage.exportState(), usageDimensions: dimensionUsage.exportState(),
-    usageHistory: accountManager.usageHistory.exportState(),
+    usageHistory: accountManager.usageHistory.exportState(), traffic: accountManager.traffic.read(),
     ...(persistSessionAffinity ? { affinity: accountManager.exportAffinityState() } : {}),
   }), { onError: err => console.error(`[TeamClaude] Failed to save quota state: ${err.message}`) });
   let quotaSaveInterval = null;

@@ -74,6 +74,102 @@ test('a slot reused a lap later starts from zero', () => {
   assert.equal(buckets.reduce((sum, b) => sum + b.ok + b.failed, 0), 1);
 });
 
+/**
+ * A counter with traffic in three slots of the window, and the clock it reads.
+ * @returns {{ clock: { at: number, now: () => number }, traffic: RequestTraffic }}
+ */
+function busyTraffic() {
+  const clock = clockAt(START - 19 * TRAFFIC_BUCKET_MS);
+  const traffic = new RequestTraffic(clock);
+  traffic.record(200);
+  clock.at = START - 10 * TRAFFIC_BUCKET_MS;
+  traffic.record(500);
+  traffic.record(200);
+  clock.at = START + 5;
+  traffic.record(200);
+  traffic.record(null);
+  return { clock, traffic };
+}
+
+/** @param {RequestTraffic} traffic */
+const nonZero = traffic => traffic.read().buckets.filter(b => b.ok || b.failed);
+
+test('slots saved from read() and restored into a new counter read back the same', () => {
+  const { clock, traffic } = busyTraffic();
+  const saved = JSON.parse(JSON.stringify(traffic.read()));
+  const restored = new RequestTraffic(clock);
+  restored.restore(saved);
+  assert.deepEqual(restored.read(), traffic.read());
+  assert.deepEqual(nonZero(restored), [
+    { at: START - 19 * TRAFFIC_BUCKET_MS, ok: 1, failed: 0 },
+    { at: START - 10 * TRAFFIC_BUCKET_MS, ok: 1, failed: 1 },
+    { at: START, ok: 1, failed: 1 },
+  ]);
+  restored.record(200);
+  assert.deepEqual(restored.read().buckets.at(-1), { at: START, ok: 2, failed: 1 }, 'a request after the restore adds to the restored slot');
+});
+
+test('restoring the same saved value twice counts it once', () => {
+  const { clock, traffic } = busyTraffic();
+  const saved = traffic.read();
+  const restored = new RequestTraffic(clock);
+  restored.restore(saved);
+  restored.restore(saved);
+  assert.deepEqual(restored.read(), traffic.read());
+});
+
+test('a restore drops slots that have left the window and slots ahead of the clock', () => {
+  const { clock, traffic } = busyTraffic();
+  const saved = traffic.read();
+  saved.buckets.push({ at: START + 10 * TRAFFIC_BUCKET_MS, ok: 9, failed: 9 });
+  clock.at = START + 9 * TRAFFIC_BUCKET_MS;
+  const restored = new RequestTraffic(clock);
+  restored.restore(saved);
+  assert.deepEqual(nonZero(restored), [
+    { at: START - 10 * TRAFFIC_BUCKET_MS, ok: 1, failed: 1 },
+    { at: START, ok: 1, failed: 1 },
+  ]);
+  clock.at = START + 10 * TRAFFIC_BUCKET_MS;
+  assert.deepEqual(nonZero(restored), [{ at: START, ok: 1, failed: 1 }], 'the slot ahead of the restore clock was not kept');
+});
+
+test('a saved value with another slot size or the wrong shape is ignored whole', () => {
+  const clock = clockAt(START);
+  const slot = { at: START, ok: 3, failed: 1 };
+  for (const saved of [
+    undefined, null, 'x', 7, [slot],
+    { buckets: [slot] },
+    { bucketMs: 60_000, buckets: [slot] },
+    { bucketMs: String(TRAFFIC_BUCKET_MS), buckets: [slot] },
+    { bucketMs: TRAFFIC_BUCKET_MS },
+    { bucketMs: TRAFFIC_BUCKET_MS, buckets: { 0: slot } },
+  ]) {
+    const traffic = new RequestTraffic(clock);
+    traffic.restore(saved);
+    assert.deepEqual(nonZero(traffic), [], JSON.stringify(saved) ?? String(saved));
+  }
+});
+
+test('a malformed slot is dropped and the well-formed ones beside it are kept', () => {
+  const clock = clockAt(START);
+  const at = START - TRAFFIC_BUCKET_MS;
+  const traffic = new RequestTraffic(clock);
+  traffic.restore({ bucketMs: TRAFFIC_BUCKET_MS, buckets: [
+    null, 'slot', 3,
+    { at, ok: -1, failed: 0 },
+    { at, ok: 1.5, failed: 0 },
+    { at, ok: '2', failed: 0 },
+    { at, ok: 2 },
+    { at, ok: Number.POSITIVE_INFINITY, failed: 0 },
+    { at: at + 1, ok: 2, failed: 0 },
+    { at: String(at), ok: 2, failed: 0 },
+    { at: Number.NaN, ok: 2, failed: 0 },
+    { ok: 2, failed: 0 },
+    { at: START, ok: 4, failed: 2 },
+  ] });
+  assert.deepEqual(nonZero(traffic), [{ at: START, ok: 4, failed: 2 }]);
+});
+
 /** @param {import('node:http').Server} server */
 function listen(server) {
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(/** @type {import('node:net').AddressInfo} */ (server.address()).port)));
