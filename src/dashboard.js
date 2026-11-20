@@ -1668,6 +1668,111 @@ export function callerNotice(caller) {
 }
 
 /**
+ * Whether the page shows the Account sync card to this caller.
+ *
+ * @param {any} s  the /teamclaude/status payload
+ */
+export function showsSyncCard(s) {
+  return callerCan(s.caller, '/teamclaude/account-sync/start');
+}
+
+/**
+ * Whether the page shows the Linked instances card to this caller.
+ *
+ * @param {any} s  the /teamclaude/status payload
+ */
+export function showsLinksCard(s) {
+  return Array.isArray(s.peers) && callerCan(s.caller, '/teamclaude/peer-links/add');
+}
+
+/**
+ * @typedef {{ key: string, id: string, kind: 'setting' | 'action' | 'panel', wide?: boolean }} SettingsRow
+ * @typedef {{ key: string, label: string, icon: string, rows: SettingsRow[] }} SettingsSection
+ */
+
+/**
+ * The Settings page's tabs, in order. Only a `setting` row counts in the
+ * page header; a `panel` card shows and hides itself.
+ *
+ * @type {SettingsSection[]}
+ */
+export const SETTINGS_SECTIONS = [
+  { key: 'instance', label: 'Instance', icon: 'M4 4h16v7H4zM4 13h16v7H4zM8 7.5h.01M8 16.5h.01', rows: [
+    { key: 'name', id: 'nameRow', kind: 'setting', wide: true },
+    { key: 'addr', id: 'addrRow', kind: 'setting', wide: true },
+  ] },
+  { key: 'rotation', label: 'Rotation and quota', icon: 'M4 7h3l10 10h3M4 17h3l3-3M14 10l3-3h3M18 5l2 2-2 2M18 15l2 2-2 2', rows: [
+    { key: 'threshold', id: 'thrRow', kind: 'setting' },
+    { key: 'refresh', id: 'refreshRow', kind: 'setting' },
+    { key: 'osp', id: 'ospRow', kind: 'setting' },
+    { key: 'probe', id: 'probeRow', kind: 'action' },
+  ] },
+  { key: 'access', label: 'Access', icon: 'M6 11h12v9H6zM9 11V8a3 3 0 0 1 6 0v3', rows: [
+    { key: 'password', id: 'pwRow', kind: 'setting', wide: true },
+    { key: 'key', id: 'keyRow', kind: 'action' },
+  ] },
+  { key: 'sync', label: 'Account sync', icon: 'M4 9h14l-3-3M20 15H6l3 3', rows: [
+    { key: 'sync', id: 'acctSync', kind: 'panel' },
+  ] },
+  { key: 'links', label: 'Linked instances', icon: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1', rows: [
+    { key: 'links', id: 'links', kind: 'panel' },
+  ] },
+];
+
+/**
+ * What the Settings page shows for a status: which rows are there, how each
+ * sits in its section's two-column grid, which tabs have anything in them,
+ * the tab on screen, and the header's line. A row is there only when the
+ * proxy has something it could save to: an older proxy sends no instance
+ * address, and a client is not told the password state.
+ *
+ * @param {any} s  the /teamclaude/status payload
+ * @param {string} selected  the tab the operator last picked
+ * @returns {{ tabs: { key: string, label: string, icon: string }[], selected: string,
+ *   rows: Record<string, 'hidden' | 'half' | 'span'>,
+ *   meta: { text: string, tone?: string }[] }}
+ */
+export function settingsView(s, selected) {
+  var inst = s.instance;
+  /** @type {Record<string, boolean>} */
+  var shown = {
+    name: !!inst,
+    addr: !!inst && typeof inst.address === 'string',
+    threshold: true,
+    refresh: true,
+    osp: typeof s.outsideSpendHidePercent === 'number',
+    probe: true,
+    password: s.dashboardLogin !== undefined && callerCan(s.caller, '/teamclaude/dashboard-login'),
+    key: true,
+    sync: showsSyncCard(s),
+    links: showsLinksCard(s),
+  };
+  /** @type {Record<string, 'hidden' | 'half' | 'span'>} */
+  var rows = {};
+  /** @type {{ key: string, label: string, icon: string }[]} */
+  var tabs = [];
+  var count = 0;
+  SETTINGS_SECTIONS.forEach(function (sec) {
+    /** @type {string[]} */
+    var half = [];
+    sec.rows.forEach(function (r) {
+      if (!shown[r.key]) { rows[r.key] = 'hidden'; return; }
+      rows[r.key] = r.wide ? 'span' : 'half';
+      if (!r.wide) half.push(r.key);
+      if (r.kind === 'setting') count++;
+    });
+    if (half.length % 2) rows[half[half.length - 1]] = 'span';
+    if (sec.rows.some(function (r) { return shown[r.key]; })) tabs.push({ key: sec.key, label: sec.label, icon: sec.icon });
+  });
+  var pick = tabs.filter(function (t) { return t.key === selected; })[0] || tabs[0];
+  /** @type {{ text: string, tone?: string }[]} */
+  var meta = [{ text: count + (count === 1 ? ' setting' : ' settings') }];
+  if (inst && inst.name) meta.push({ text: inst.name });
+  meta.push(callerCan(s.caller, '/teamclaude/threshold') ? { text: 'Editable', tone: 'ok' } : { text: 'Read-only', tone: 'dim' });
+  return { tabs: tabs, selected: pick.key, rows: rows, meta: meta };
+}
+
+/**
  * Which card a note belongs to. One email can hold accounts in several orgs,
  * and providers may reuse a name, so the name alone can match two cards.
  *
@@ -3538,6 +3643,7 @@ const SHARED_HELPERS = [
   connectRequest, connectRowView, connectOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
   accountSyncRequest, accountSyncUser, accountSyncOwnMode, accountSyncMembers, accountSyncLine, peerSyncCell, accountSyncApprovalHref, accountSyncSignInOutcome, accountSyncCancelOutcome, accountSyncOutcome,
+  showsSyncCard, showsLinksCard, settingsView,
   fmtTokens, fmtUsd, fmtUsdShort, niceCeil, insightsRangeText, spansYears, insightsChange, insightsBucketLabel, insightsSeries, stackSeries, seriesStats, recordedFrom, insightsDayKey, bucketAt, labelStep, pricedRequests, cacheHitRate, peakBucket, providerRows, topModels, fleetMissingText,
   costEstimated, sinceText, insightsTotals, runningTotals, rollingAverage, insightsTrend, calendarNote, insightsHeadline, insightsPace, monthTotals, calendarGrid, breakdownRows,
 ].map(fn => fn.toString()).join('\n\n');
@@ -3564,6 +3670,7 @@ const SHARED_CONSTS = [
   `var CLIENT_KEY_FAILED = ${JSON.stringify(CLIENT_KEY_FAILED)};`,
   `var PEER_LINK_FAILED = ${JSON.stringify(PEER_LINK_FAILED)};`,
   `var INSTANCE_LINK_SCHEMES = ${JSON.stringify(INSTANCE_LINK_SCHEMES)};`,
+  `var SETTINGS_SECTIONS = ${JSON.stringify(SETTINGS_SECTIONS)};`,
   `var ACCOUNT_SYNC_FAILED = ${JSON.stringify(ACCOUNT_SYNC_FAILED)};`,
 ].join('\n');
 
@@ -3819,6 +3926,70 @@ const PAGE = `<!doctype html>
   .setting { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
   .setting + .setting { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
   .setting .tag { display: block; }
+  #page-settings .sthead { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px 24px; flex-wrap: wrap; margin: 6px 0 22px; }
+  #page-settings .sttitle { font-size: 34px; line-height: 1.1; font-weight: 700; letter-spacing: -.03em; }
+  #page-settings .stmeta { margin-top: 12px; padding: 1px 0 1px 12px; border-left: 3px solid var(--ok); font: 13.5px/1.4 var(--mono); color: var(--text); overflow-wrap: anywhere; }
+  #page-settings .stmeta .sep { color: var(--faint); }
+  #page-settings .stmeta .ok { color: var(--ok); }
+  #page-settings .stmeta .dim { color: var(--dim); }
+  #page-settings .stact { display: inline-flex; align-items: center; gap: 8px; background: none; border: 0; border-radius: 6px; padding: 6px 4px; color: var(--text); font-weight: 600; cursor: pointer; }
+  #page-settings .stact:hover { color: var(--accent); }
+  #page-settings .stact:disabled { opacity: .55; cursor: default; }
+  #page-settings .stact svg, #page-settings .sttab svg, #page-settings .sthd svg { flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  #page-settings .stact svg, #page-settings .sttab svg { width: 16px; height: 16px; }
+  #page-settings .sttabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+  #page-settings .sttab { display: inline-flex; align-items: center; gap: 8px; padding: 10px 14px; margin-bottom: -1px; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--dim); font-weight: 500; white-space: nowrap; cursor: pointer; }
+  #page-settings .sttab:hover { color: var(--text); }
+  #page-settings .sttab.sel { color: var(--text); font-weight: 600; border-bottom-color: var(--text); }
+  #page-settings .sttab:focus-visible, #page-settings .stact:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  #page-settings .stcard { border-radius: 18px; padding: 22px 24px 24px; margin: 0; }
+  #page-settings .sthd { display: flex; align-items: center; gap: 12px; padding-bottom: 16px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
+  #page-settings .sthd svg { width: 20px; height: 20px; color: var(--dim); }
+  #page-settings .sthd h2 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: -.015em; text-transform: none; color: var(--text); }
+  #page-settings .sthelp { margin: 0 0 14px; max-width: 80ch; }
+  #page-settings .stgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  /* The right and bottom rules of the outer cells fall outside the grid's
+     padding box, where its overflow clips them, so only inner rules show. */
+  #page-settings .stcell { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 20px; padding: 16px 20px; min-width: 0; box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line); }
+  #page-settings .stcell.span { grid-column: 1 / -1; }
+  #page-settings .stlbl { flex: 1 1 200px; min-width: 0; }
+  #page-settings .stlbl label, #page-settings .stlbl b { display: block; font-size: 14px; font-weight: 600; color: var(--text); }
+  #page-settings .stlbl .tag { display: block; margin-top: 3px; line-height: 1.45; }
+  #page-settings .stctl { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin: 0; min-width: 0; max-width: 100%; }
+  #page-settings .stctl .unit { font: 13px var(--mono); color: var(--dim); }
+  #page-settings .stcard input:not([type=checkbox]), #page-settings .stcard select { height: 36px; min-width: 0; max-width: 100%; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line2); background: var(--bg); color: var(--text); font: 13px/1.2 var(--mono); }
+  #page-settings .stcard input::placeholder { font-family: var(--sans); }
+  #page-settings .stcard textarea { border-radius: 8px; border-color: var(--line2); font-family: var(--mono); }
+  #page-settings .stcard input:focus, #page-settings .stcard select:focus, #page-settings .stcard textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+  #page-settings .stctl input.name { width: 200px; }
+  #page-settings .stctl input.addr { width: 260px; }
+  #page-settings .stctl input.num { width: 84px; text-align: right; }
+  #page-settings .stctl input.pw { width: 180px; }
+  #page-settings .stctl select { width: 150px; }
+  #page-settings .stcard .btn { height: 36px; padding: 0 14px; border-radius: 8px; border-color: var(--line2); font-size: 13px; font-weight: 600; }
+  #page-settings .stcard .btn.primary { background: var(--text); border-color: var(--text); color: var(--bg); }
+  #page-settings .stcard .btn.primary:hover { opacity: .88; }
+  #page-settings .stcard td .btn { height: auto; padding: 2px 6px; border: 0; background: none; color: var(--text); }
+  #page-settings .stcard td .btn:hover { color: var(--accent); }
+  #page-settings .stcard td .btn.danger { color: var(--bad); }
+  #page-settings .stcard td .btn.danger:hover { background: none; color: var(--bad); text-decoration: underline; }
+  #page-settings .stcard td.addr, #page-settings .stcard .issued { font-family: var(--mono); font-size: 12.5px; }
+  #page-settings .check input[type=checkbox] { -webkit-appearance: none; appearance: none; position: relative; width: 36px; height: 20px; border-radius: 999px; background: var(--line2); cursor: pointer; transition: background-color .15s; }
+  #page-settings .check input[type=checkbox]::before { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--dim); transition: transform .15s, background-color .15s; }
+  #page-settings .check input[type=checkbox]:checked { background: var(--dim); }
+  #page-settings .check input[type=checkbox]:checked::before { transform: translateX(16px); background: #fff; }
+  #page-settings .check input[type=checkbox]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    #page-settings .check input[type=checkbox], #page-settings .check input[type=checkbox]::before { transition: none; }
+  }
+  @media (max-width: 760px) {
+    #page-settings .sttitle { font-size: 28px; }
+    #page-settings .sttab { padding: 8px 10px; }
+    #page-settings .stcard { padding: 16px; }
+    #page-settings .stgrid { grid-template-columns: minmax(0, 1fr); }
+    #page-settings .stcell { padding: 14px 16px; }
+    #page-settings .stctl { justify-content: flex-start; }
+  }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: var(--text); }
   td.dim { color: var(--dim); }
@@ -4348,78 +4519,107 @@ const PAGE = `<!doctype html>
     </section>
 
     <section id="page-settings" style="display:none">
-      <div class="card">
-        <div class="setting" id="nameRow" style="display:none">
-          <div><b>Instance name</b><span class="tag">What the Instance picker calls this machine. Empty uses the host name. Saved to the config file.</span></div>
-          <span class="thr">
-            <label for="nameVal">Name</label>
-            <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
-            <button id="nameSet" class="btn" type="button">Save</button>
-          </span>
+      <div class="sthead">
+        <div class="stlead">
+          <h1 class="sttitle">Settings</h1>
+          <p id="stMeta" class="stmeta"></p>
         </div>
-        <div class="setting" id="addrRow" style="display:none">
-          <div><b>Instance address</b><span class="tag">The address the link gives other machines. Set it in a Docker container. Empty uses a guess.</span></div>
-          <span class="thr">
-            <label for="addrVal">Address</label>
-            <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
-            <button id="addrSet" class="btn" type="button">Save</button>
-          </span>
-        </div>
-        <div class="setting">
-          <div><b>Switch threshold</b><span class="tag">The share of a quota window at which rotation leaves an account. Saved to the config file.</span></div>
-          <span class="thr">
-            <label for="thrVal">Switch at</label>
-            <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal">
-            <span>%</span>
-            <button id="thrSet" class="btn" type="button">Set</button>
-          </span>
-        </div>
-        <div class="setting">
-          <div><b>Config</b><span class="tag">Re-read the config file, as after a hand edit or a sign-in in another terminal.</span></div>
-          <button id="reload" class="btn" type="button">Reload config</button>
-        </div>
-        <div class="setting">
-          <div><b>Quota refresh</b><span class="tag">How often the proxy re-reads every account's quota in the background. Saved to the config file.</span></div>
-          <span class="thr">
-            <label for="probeEvery">Refresh</label>
-            <select id="probeEvery"></select>
-          </span>
-        </div>
-        <div class="setting" id="ospRow" style="display:none">
-          <div><b>Outside spend</b><span class="tag">Hide an account's "outside" share when it is at or below this. 0 shows every share. Saved to the config file.</span></div>
-          <span class="thr">
-            <label for="ospVal">Hide at or below</label>
-            <input id="ospVal" type="number" min="0" max="100" step="0.1" inputmode="decimal">
-            <span>%</span>
-            <button id="ospSet" class="btn" type="button">Set</button>
-          </span>
-        </div>
-        <div class="setting">
-          <div><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
-          <button id="probe" class="btn" type="button">Probe quotas</button>
-        </div>
-        <div class="setting" id="pwRow" style="display:none">
-          <div><b>Dashboard password</b><span class="tag" id="pwTag">Sign in from another machine with a username and password instead of the proxy key. Saved to the config file as a hash.</span></div>
-          <form class="thr" id="pwSetForm">
-            <input id="pwSetUser" class="pw" placeholder="Username" maxlength="64" spellcheck="false" autocomplete="username" autocapitalize="off" aria-label="Username">
-            <input id="pwSetPass" class="pw" type="password" placeholder="New password" autocomplete="new-password" aria-label="New password">
-            <button id="pwSet" class="btn" type="submit">Save</button>
-            <button id="pwOff" class="btn" type="button" style="display:none">Turn off</button>
-          </form>
-        </div>
-        <div class="setting">
-          <div><b>Proxy key</b><span class="tag">Forget the key this browser stored and enter another.</span></div>
-          <button id="forgetKey" class="btn" type="button">Change key</button>
+        <div class="stacts">
+          <button id="reload" class="stact" type="button" title="Re-read the config file, as after a hand edit or a sign-in in another terminal"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"/></svg>Reload config</button>
         </div>
       </div>
-      <div id="acctSync" class="card ckeys links" style="display:none">
-        <div class="ckh"><b>Account sync</b><span class="hint">Share Claude, Codex and Grok sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</span></div>
+      <div id="stTabs" class="sttabs" role="tablist" aria-label="Settings sections"></div>
+      <div class="stpane" id="stPane-instance" role="tabpanel">
+        <div class="card stcard">
+          <div class="sthd" id="stHd-instance"><h2>Instance</h2></div>
+          <div class="stgrid">
+            <div class="stcell" id="nameRow" style="display:none">
+              <div class="stlbl"><label for="nameVal">Instance name</label><span class="tag">What the Instance picker calls this machine. Empty uses the host name. Saved to the config file.</span></div>
+              <div class="stctl">
+                <input id="nameVal" class="name" maxlength="64" spellcheck="false" autocomplete="off">
+                <button id="nameSet" class="btn" type="button">Save</button>
+              </div>
+            </div>
+            <div class="stcell" id="addrRow" style="display:none">
+              <div class="stlbl"><label for="addrVal">Instance address</label><span class="tag">The address the link gives other machines. Set it in a Docker container. Empty uses a guess.</span></div>
+              <div class="stctl">
+                <input id="addrVal" class="addr" spellcheck="false" autocomplete="off" placeholder="http://100.64.0.2:3456">
+                <button id="addrSet" class="btn" type="button">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stpane" id="stPane-rotation" role="tabpanel">
+        <div class="card stcard">
+          <div class="sthd" id="stHd-rotation"><h2>Rotation and quota</h2></div>
+          <div class="stgrid">
+            <div class="stcell" id="thrRow">
+              <div class="stlbl"><label for="thrVal">Switch threshold</label><span class="tag">The share of a quota window at which rotation leaves an account. Saved to the config file.</span></div>
+              <div class="stctl">
+                <input id="thrVal" type="number" min="1" max="100" step="0.1" inputmode="decimal" class="num">
+                <span class="unit">%</span>
+                <button id="thrSet" class="btn" type="button">Set</button>
+              </div>
+            </div>
+            <div class="stcell" id="refreshRow">
+              <div class="stlbl"><label for="probeEvery">Quota refresh</label><span class="tag">How often the proxy re-reads every account's quota in the background. Saved to the config file.</span></div>
+              <div class="stctl">
+                <select id="probeEvery"></select>
+              </div>
+            </div>
+            <div class="stcell" id="ospRow" style="display:none">
+              <div class="stlbl"><label for="ospVal">Outside spend</label><span class="tag">Hide an account's "outside" share when it is at or below this. 0 shows every share. Saved to the config file.</span></div>
+              <div class="stctl">
+                <input id="ospVal" type="number" min="0" max="100" step="0.1" inputmode="decimal" class="num">
+                <span class="unit">%</span>
+                <button id="ospSet" class="btn" type="button">Set</button>
+              </div>
+            </div>
+            <div class="stcell" id="probeRow">
+              <div class="stlbl"><b>Quota</b><span class="tag">Read every account's quota now. Zero-spend: it asks the usage endpoints, not the model.</span></div>
+              <div class="stctl">
+                <button id="probe" class="btn" type="button">Probe quotas</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stpane" id="stPane-access" role="tabpanel">
+        <div class="card stcard">
+          <div class="sthd" id="stHd-access"><h2>Access</h2></div>
+          <div class="stgrid">
+            <div class="stcell" id="pwRow" style="display:none">
+              <div class="stlbl"><b>Dashboard password</b><span class="tag" id="pwTag">Sign in from another machine with a username and password instead of the proxy key. Saved to the config file as a hash.</span></div>
+              <form class="stctl" id="pwSetForm">
+                <input id="pwSetUser" class="pw" placeholder="Username" maxlength="64" spellcheck="false" autocomplete="username" autocapitalize="off" aria-label="Username">
+                <input id="pwSetPass" class="pw" type="password" placeholder="New password" autocomplete="new-password" aria-label="New password">
+                <button id="pwSet" class="btn" type="submit">Save</button>
+                <button id="pwOff" class="btn" type="button" style="display:none">Turn off</button>
+              </form>
+            </div>
+            <div class="stcell" id="keyRow">
+              <div class="stlbl"><b>Proxy key</b><span class="tag">Forget the key this browser stored and enter another.</span></div>
+              <div class="stctl">
+                <button id="forgetKey" class="btn" type="button">Change key</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stpane" id="stPane-sync" role="tabpanel">
+      <div id="acctSync" class="card ckeys links stcard" style="display:none">
+        <div class="sthd" id="stHd-sync"><h2>Account sync</h2></div>
+        <p class="hint sthelp">Share Claude, Codex and Grok sign-ins between your own machines: an account signed in on one is then signed in on all of them, and they take turns renewing it so none signs another out. Either one of your machines keeps the sign-ins for the others, or they go through your callback.net account.</p>
         <div id="syncBody"></div>
         <div id="syncSignIn"></div>
         <p class="hint" id="syncHint"></p>
       </div>
-      <div id="links" class="card ckeys links" style="display:none">
-        <div class="ckh"><b>Linked instances</b><span class="hint">TeamClaude on your other machines. Each one linked here is in the Instance picker at the top of the sidebar, where every page shows that machine.</span></div>
+      </div>
+      <div class="stpane" id="stPane-links" role="tabpanel">
+      <div id="links" class="card ckeys links stcard" style="display:none">
+        <div class="sthd" id="stHd-links"><h2>Linked instances</h2></div>
+        <p class="hint sthelp">TeamClaude on your other machines. Each one linked here is in the Instance picker at the top of the sidebar, where every page shows that machine.</p>
         <table id="linkList"></table>
         <p class="hint" id="linkEmpty" style="display:none">No machine is linked yet.</p>
         <p class="st warn" id="linkUnsupported" style="display:none">This instance runs a version that cannot be linked from the dashboard. Update it to manage its links here.</p>
@@ -4439,6 +4639,7 @@ const PAGE = `<!doctype html>
         </form>
         <div class="own" id="ownKey"><span id="ownKeyLabel">This machine's link, or its proxy key and address, for linking it from another machine's dashboard.</span><button id="ownKeyShow" class="btn" type="button">Show key</button></div>
         <div id="ownKeyBox" class="issued" style="display:none"></div>
+      </div>
       </div>
     </section>
   </div>
@@ -4475,7 +4676,7 @@ const PAGE = `<!doctype html>
     { key: 'logs', label: 'Logs', section: 'Observe', icon: 'M6 3h12v18H6zM9 8h6M9 12h6M9 16h4' },
     { key: 'problems', label: 'Problems', section: 'Observe', icon: 'M12 3l10 18H2zM12 10v4M12 17v.5' },
     { key: 'routing', label: 'Routing', section: 'Control', icon: 'M6 6a2 2 0 1 0 0-.01M18 18a2 2 0 1 0 0-.01M6 8v4a4 4 0 0 0 4 4h6' },
-    { key: 'settings', label: 'Settings', section: 'Control', icon: 'M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4' },
+    { key: 'settings', label: 'Settings', section: 'Control', icon: 'M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4', ownHeader: true },
   ];
   var currentPage = 'overview';
   // The linked instance this page shows (peers.js), or '' for the machine it
@@ -5440,7 +5641,7 @@ ${SHARED_HELPERS}
 
   function renderLinks(s) {
     var card = document.getElementById('links');
-    var can = Array.isArray(s.peers) && callerCan(s.caller, '/teamclaude/peer-links/add');
+    var can = showsLinksCard(s);
     card.style.display = can ? '' : 'none';
     if (!can) return;
     // Asked only once the card is on screen: every other page has no use for it.
@@ -5775,7 +5976,7 @@ ${SHARED_HELPERS}
 
   function renderSync(s) {
     var card = document.getElementById('acctSync');
-    var can = callerCan(s.caller, '/teamclaude/account-sync/start');
+    var can = showsSyncCard(s);
     card.style.display = can ? '' : 'none';
     if (!can) return;
     if (currentPage === 'settings' && !syncReading && syncReadDue(s)) loadSync();
@@ -7792,8 +7993,59 @@ ${SHARED_HELPERS}
     } });
   }
 
+  var settingsTab = SETTINGS_SECTIONS[0].key;
+  var settingsTabButtons = {};
+
+  function buildSettingsTabs() {
+    var bar = document.getElementById('stTabs');
+    SETTINGS_SECTIONS.forEach(function (sec) {
+      var b = button('sttab', sec.label, function () {
+        settingsTab = sec.key;
+        if (lastStatus) renderSettingsFrame(settingsView(lastStatus, settingsTab));
+      });
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-controls', 'stPane-' + sec.key);
+      b.prepend(settingsIcon(sec.icon));
+      bar.appendChild(b);
+      settingsTabButtons[sec.key] = b;
+      document.getElementById('stHd-' + sec.key).prepend(settingsIcon(sec.icon));
+    });
+  }
+
+  function settingsIcon(d) {
+    var icon = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true', focusable: 'false' });
+    svgEl('path', { d: d }, icon);
+    return icon;
+  }
+
+  // A panel's card is shown by its own renderer; this shows the pane around it.
+  function renderSettingsFrame(sv) {
+    var meta = document.getElementById('stMeta');
+    meta.textContent = '';
+    sv.meta.forEach(function (m, i) {
+      if (i) meta.appendChild(el('span', 'sep', ' · '));
+      meta.appendChild(el('span', m.tone || '', m.text));
+    });
+    SETTINGS_SECTIONS.forEach(function (sec) {
+      var on = sv.tabs.some(function (t) { return t.key === sec.key; });
+      var b = settingsTabButtons[sec.key];
+      b.style.display = on ? '' : 'none';
+      b.className = sec.key === sv.selected ? 'sttab sel' : 'sttab';
+      b.setAttribute('aria-selected', sec.key === sv.selected ? 'true' : 'false');
+      document.getElementById('stPane-' + sec.key).style.display = sec.key === sv.selected ? '' : 'none';
+      sec.rows.forEach(function (r) {
+        if (r.kind === 'panel') return;
+        var row = document.getElementById(r.id);
+        row.style.display = sv.rows[r.key] === 'hidden' ? 'none' : '';
+        row.className = sv.rows[r.key] === 'span' ? 'stcell span' : 'stcell';
+      });
+    });
+  }
+
   function render(s) {
     lastStatus = s;
+    var sv = settingsView(s, settingsTab);
+    renderSettingsFrame(sv);
     // The poll owns the threshold field except while it is being typed into:
     // rewriting it every POLL_MS would delete the operator's half-entered
     // number under the cursor. It also means a change made from the CLI, the
@@ -7821,27 +8073,20 @@ ${SHARED_HELPERS}
       probeSel.value = String(probeSecs);
     }
     probeSel.disabled = !callerCan(s.caller, '/teamclaude/probe-interval');
-    // Like the threshold field. A proxy too old to send the cut-off has no
-    // row for it: there is nothing it could save to.
-    var hasOsp = typeof s.outsideSpendHidePercent === 'number';
-    document.getElementById('ospRow').style.display = hasOsp ? '' : 'none';
+    // Like the threshold field.
+    var hasOsp = sv.rows.osp !== 'hidden';
     var ospInput = document.getElementById('ospVal');
     if (hasOsp && document.activeElement !== ospInput) ospInput.value = String(s.outsideSpendHidePercent);
     var canOsp = callerCan(s.caller, '/teamclaude/outside-spend-hide');
     ospInput.disabled = !canOsp;
     document.getElementById('ospSet').style.display = canOsp ? '' : 'none';
-    // Only the operator is told the name, and a proxy too old to have one
-    // says nothing, so the row is there only when there is a name to change.
     var inst = s.instance;
-    document.getElementById('nameRow').style.display = inst ? '' : 'none';
     var nameInput = document.getElementById('nameVal');
     if (inst && document.activeElement !== nameInput) {
       nameInput.value = inst.custom ? inst.name : '';
       nameInput.placeholder = inst.host || '';
     }
-    // Only the operator is told whether a password is set; the row is for them.
-    var hasPw = s.dashboardLogin !== undefined && callerCan(s.caller, '/teamclaude/dashboard-login');
-    document.getElementById('pwRow').style.display = hasPw ? '' : 'none';
+    var hasPw = sv.rows.password !== 'hidden';
     if (hasPw) {
       document.getElementById('pwOff').style.display = s.dashboardLogin ? '' : 'none';
       document.getElementById('pwTag').textContent = s.dashboardLogin
@@ -7850,9 +8095,7 @@ ${SHARED_HELPERS}
       var pwUser = document.getElementById('pwSetUser');
       if (document.activeElement !== pwUser && !pwUser.value) pwUser.value = s.dashboardLogin || '';
     }
-    // A proxy too old to say its address has no row for it either.
-    var hasAddr = !!inst && typeof inst.address === 'string';
-    document.getElementById('addrRow').style.display = hasAddr ? '' : 'none';
+    var hasAddr = sv.rows.addr !== 'hidden';
     var addrInput = document.getElementById('addrVal');
     if (hasAddr && !statusAddrStale) {
       if (document.activeElement !== addrInput) addrInput.value = inst.address;
@@ -8696,7 +8939,7 @@ ${SHARED_HELPERS}
       navButtons[p.key].className = p.key === page.key ? 'navbtn sel' : 'navbtn';
     });
     document.getElementById('pageTitle').textContent = page.label;
-    document.getElementById('pageTop').style.display = page.key === 'overview' ? 'none' : '';
+    document.getElementById('pageTop').style.display = page.key === 'overview' || page.ownHeader ? 'none' : '';
     if (typeof location !== 'undefined' && typeof history !== 'undefined' && location.hash !== '#' + page.key) {
       try { history.replaceState(null, '', '#' + page.key); } catch (e) { /* a sandboxed frame: the page still switches */ }
     }
@@ -8806,6 +9049,7 @@ ${SHARED_HELPERS}
   document.getElementById('linkBack').addEventListener('change', syncLinkBack);
   document.getElementById('ownKeyShow').addEventListener('click', function () { toggleOwnKey(this); });
   labelLinkCard();
+  buildSettingsTabs();
   buildLogFilters();
   buildInsightsControls();
   buildNav();
