@@ -19,6 +19,7 @@ import {
   fmtUntil, accountState, overviewFleet, overviewHeadline, restingText, trafficScale, wavePath, requestStrip,
   ACCOUNT_STATES, accountStatusText, accountFilter, accountCard,
   LOG_KINDS, mergeLogEvents, filterLogEvents, logEventFailed, logStatusChip, logSearchMatch, logTime, logRow, logEventClient, logEventTone,
+  logReading, logCountText,
   providerTone, needsSignIn, fileSignInHint, isLoopbackHost, signInRequest, signInPlan, signInStatusOutcome, removeRequest, removeOutcome,
   clientKeyRequest, clientKeyOutcome, clientKeySetup, clientKeyCheckOutcome,
   peerLinkRequest, peerLinkOutcome, peerTestOutcome, linkSelfOptions, linkBackNotice, instanceLink, parseInstanceLink, linkAddMissing,
@@ -350,13 +351,14 @@ test('a log row puts a request\'s status, latency, model and tokens in columns, 
   }), {
     when: '2026-11-19 16:48:26', kind: 'Usage', provider: 'Claude', status: { text: '529', tone: 'bad' }, ms: '1.2s',
     account: 'work', model: 'Fable 5.1', client: 'laptop \u00b7 claude-cli/2.1.3', tokens: '1.5k / 7', message: 'POST /v1/messages',
-    reason: '', prompt: 'hello', failed: true, tone: 'bad',
+    reason: '', prompt: 'hello', failed: true, tone: 'bad', tint: '',
   });
   const out = logRow({ at, kind: 'auth', type: 'signed_out', provider: 'codex', account: 'home', message: 'Signed out', reason: 'refresh_rejected' });
   assert.equal(out.status, null, 'no status chip off a request');
   assert.equal(out.reason, 'refresh_rejected');
   assert.equal(out.kind, 'Auth');
   assert.equal(out.failed, true);
+  assert.equal(out.tint, 'bad', 'an event with no status chip tints its message');
   assert.equal(out.ms, '');
   assert.equal(out.tokens, '');
   assert.equal(logRow({ kind: 'usage', type: 'request', status: 200, ms: 850 }).ms, '850ms');
@@ -368,6 +370,32 @@ test('a log row\'s message is toned by what the event did', () => {
   assert.equal(logEventTone({ type: 'rate_limited' }), 'warn');
   assert.equal(logEventTone({ type: 'request', status: 529 }), 'bad');
   assert.equal(logEventTone({ type: 'request', status: 200 }), '');
+});
+
+test('the Logs footer says whether the page is reading, paused or failing, and when it last read', () => {
+  assert.deepEqual(logReading({ paused: false, waiting: 0, error: null, readAt: '4:54:25 PM' }),
+    { tone: 'live', text: 'Reading live · Last successful update: 4:54:25 PM' });
+  assert.deepEqual(logReading({ paused: true, waiting: 3, error: null, readAt: '4:54:25 PM' }),
+    { tone: 'paused', text: 'Reading paused · 3 new waiting · Last successful update: 4:54:25 PM' });
+  assert.equal(logReading({ paused: true, waiting: 0, error: null, readAt: '4:54:25 PM' }).text,
+    'Reading paused · Last successful update: 4:54:25 PM', 'nothing waiting is not said');
+  assert.equal(logReading({ paused: false, waiting: 5, error: null, readAt: '4:54:25 PM' }).text,
+    'Reading live · Last successful update: 4:54:25 PM', 'a live page has nothing waiting');
+  assert.deepEqual(logReading({ paused: true, waiting: 0, error: 'status 500', readAt: '4:54:25 PM' }),
+    { tone: 'err', text: 'Reading paused · cannot read the log: status 500 · Last successful update: 4:54:25 PM' },
+    'a failed read colours the dot even while paused');
+  assert.equal(logReading({ paused: false, waiting: 0, error: null, readAt: '' }).text, 'Reading live · Not read yet');
+});
+
+test('the Logs footer counts what is held and what is drawn, and says when the cap leaves matches out', () => {
+  assert.equal(logCountText(1301, 930, 930), '1301 events loaded, 930 shown');
+  assert.equal(logCountText(1800, 500, 1200), '1800 events loaded, 500 shown (the newest of 1200 that match)');
+  assert.equal(logCountText(0, 0, 0), '0 events loaded, 0 shown');
+});
+
+test('the page ships the Logs footer helpers it is tested against', () => {
+  const html = renderDashboardHtml();
+  for (const fn of [logReading, logCountText]) assert.ok(html.includes(fn.toString()), `${fn.name} not serialized into the page`);
 });
 
 test('a refresh button is offered only where the probe would read the account', () => {
@@ -1936,7 +1964,9 @@ test('the Logs page fetches the event log only while it is open, and from where 
   await new Promise(r => setImmediate(r));
   assert.equal(page.byId('logCount').textContent, '2 events loaded, 2 shown');
   // Narrowing to one kind is a re-render, not a re-fetch.
-  page.click('Sign-in');
+  const kind = page.byId('logKind');
+  kind.value = 'signin';
+  kind.fire('change');
   assert.equal(page.requests.length, 0);
   assert.equal(page.byId('logCount').textContent, '2 events loaded, 1 shown');
   // The next status poll brings the log along, asking only for what is newer.
@@ -1984,16 +2014,18 @@ async function openLogs() {
   return page;
 }
 
-test('the Logs search and Errors only narrow the table, and stay through the next poll', async () => {
+test('the Logs search and the Errors view narrow the stream, and stay through the next poll', async () => {
   const page = await openLogs();
   assert.equal(page.byId('logCount').textContent, '5 events loaded, 5 shown');
-  assert.match(page.byId('logLive').textContent, /^Live · last read /);
+  assert.match(page.byId('logLive').textContent, /^Reading live · Last successful update: /);
+  assert.equal(page.byId('logAll').className, 'sel', 'the page opens on All events');
   const search = page.byId('logSearch');
   search.value = 'home';
   search.fire('input');
   assert.equal(page.byId('logCount').textContent, '5 events loaded, 2 shown');
   page.byId('logErrors').fire('click');
-  assert.equal(page.byId('logErrors').className, 'chip sel');
+  assert.equal(page.byId('logErrors').className, 'sel');
+  assert.equal(page.byId('logAll').className, '');
   assert.equal(page.byId('logCount').textContent, '5 events loaded, 2 shown', 'both of home\'s rows failed');
   search.value = '';
   search.fire('input');
@@ -2003,39 +2035,55 @@ test('the Logs search and Errors only narrow the table, and stay through the nex
   await page.answerTo('/teamclaude/logs?after=5', 200, { generation: 'g', lastId: 6, events: [
     { id: 6, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
   ] });
-  assert.equal(page.byId('logCount').textContent, '6 events loaded, 3 shown', 'Errors only still on after the poll');
+  assert.equal(page.byId('logCount').textContent, '6 events loaded, 3 shown', 'the Errors view still on after the poll');
   page.byId('logErrors').fire('click');
-  assert.equal(page.byId('logErrors').className, 'chip');
+  assert.equal(page.byId('logCount').textContent, '6 events loaded, 3 shown', 'Errors again stays on Errors');
+  page.byId('logAll').fire('click');
+  assert.equal(page.byId('logErrors').className, '');
+  assert.equal(page.byId('logAll').className, 'sel');
   assert.equal(page.byId('logCount').textContent, '6 events loaded, 6 shown');
+});
+
+test('a failed Logs row carries the red bar and a red kind badge, and only an event with no status chip tints its message', async () => {
+  const page = await openLogs();
+  const rows = page.built.filter(e => /^lgrow/.test(e.className)).map(e => e.className);
+  assert.deepEqual(rows, ['lgrow', 'lgrow t-bad lgfail', 'lgrow lgfail', 'lgrow lgfail', 'lgrow'], 'newest first: switch, failed sign-in, no status, 529, 200');
+  assert.equal(page.built.filter(e => e.className === 'lgtag bad').length, 3);
+  assert.deepEqual(page.built.filter(e => /^lgchip/.test(e.className)).map(e => e.className + ' ' + e.textContent),
+    ['lgchip bad none', 'lgchip bad 529', 'lgchip ok 200']);
 });
 
 test('a paused Logs page keeps reading but leaves the table as it was until Resume', async () => {
   const page = await openLogs();
   page.byId('logPause').fire('click');
-  assert.equal(page.byId('logPause').textContent, 'Resume');
-  assert.match(page.byId('logLive').textContent, /^Paused · last read /);
+  assert.equal(page.byId('logPause').title, 'Resume');
+  assert.equal(page.byId('logPause').className, 'lgicon on');
+  assert.equal(page.byId('logLive').className, 'paused');
+  assert.match(page.byId('logLive').textContent, /^Reading paused · Last successful update: /);
   page.click('Logs');
   const built = page.built.length;
   await page.answerTo('/teamclaude/logs?after=5', 200, { generation: 'g', lastId: 7, events: [
     { id: 6, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
     { id: 7, at: new Date().toISOString(), kind: 'usage', type: 'request', provider: 'anthropic', account: 'work', message: 'POST /v1/messages', status: 200 },
   ] });
-  assert.equal(page.built.length, built, 'no row drawn while paused');
+  assert.equal(page.built.slice(built).filter(e => /^lgrow/.test(e.className)).length, 0, 'no row drawn while paused');
   assert.equal(page.byId('logCount').textContent, '7 events loaded, 5 shown');
-  assert.match(page.byId('logLive').textContent, /^Paused · 2 new waiting · last read /);
+  assert.match(page.byId('logLive').textContent, /^Reading paused · 2 new waiting · Last successful update: /);
   page.click('Logs');
   assert.equal(page.requests.shift().url, '/teamclaude/logs?after=7', 'polling went on from the newest event read');
   page.byId('logPause').fire('click');
-  assert.equal(page.byId('logPause').textContent, 'Pause');
+  assert.equal(page.byId('logPause').title, 'Pause');
+  assert.equal(page.byId('logPause').className, 'lgicon');
   assert.equal(page.byId('logCount').textContent, '7 events loaded, 7 shown');
-  assert.match(page.byId('logLive').textContent, /^Live · /);
+  assert.match(page.byId('logLive').textContent, /^Reading live · /);
+  assert.equal(page.byId('logLive').className, 'live');
 });
 
 test('a log read that fails says so in the Logs footer', async () => {
   const page = await openLogs();
   page.click('Logs');
   await page.answerTo('/teamclaude/logs?after=5', 500, {});
-  assert.match(page.byId('logLive').textContent, /^Live · cannot read the log: status 500 · last read /);
+  assert.match(page.byId('logLive').textContent, /^Reading live · cannot read the log: status 500 · Last successful update: /);
   assert.equal(page.byId('logLive').className, 'err');
   assert.equal(page.byId('logCount').textContent, '5 events loaded, 5 shown', 'what was read stays');
 });
