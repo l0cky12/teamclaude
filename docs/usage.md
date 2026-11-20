@@ -468,15 +468,25 @@ curl -X POST http://localhost:3456/teamclaude/undrain -H "x-api-key: $KEY"
 
 `GET /teamclaude/dashboard` serves a self-contained HTML page rendering the same data as `teamclaude status`, refreshed every few seconds. A sidebar groups its pages: **Overview** (Overview, Quota, Sessions, Clients, Insights), **Accounts**, **Observe** (Logs, Problems) and **Control** (Routing, Settings). Each page has an icon beside its name. On a narrow window the sidebar becomes a row of buttons above the page. The open page is kept in the address's `#fragment`, so a reload or a bookmark comes back to it. An address with no fragment opens the Overview page. The dashboard uses the TeamRouter name and a mark of three red bars on a dark red tile in its sidebar and browser tab. The icon is embedded in the page and needs no asset request. Both `/teamclaude/dashboard` and `/teamrouter/dashboard` work.
 
-`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The **Theme** button at the foot of the sidebar cycles system → light → dark; the choice is kept in the browser's localStorage, and "system" follows the browser's `prefers-color-scheme`. Dark is what a browser that states no preference gets.
+`teamclaude dashboard` opens this page in the system browser against a running server (it starts none; use `teamclaude server` or `teamclaude service install` for that). The page is dark, whatever the system prefers. The **Theme** button at the foot of the sidebar switches between dark and light, and the browser's localStorage keeps the choice.
 
 ### Overview
 
-The Overview page answers whether the fleet is working. Its headline says whether every enabled account is healthy. If any account cannot serve, the headline counts them by reason, for example *1 throttled, 1 out of quota*. If an account is at 90% or more of its 5-hour or 7-day limit, a line under the headline names it, with the percentage and when the limit resets. The line under the headline gives the version, the uptime and the account that requests go to now. **Open accounts** and **Open logs** go to those pages.
+The Overview page answers whether the fleet is working, and fits one screen on a laptop. Its headline stays calm while requests succeed and every provider with accounts has one serving:
 
-Four tiles follow: the share of requests that succeeded and how many failed, how many accounts are serving, the active conversations, and the 5-hour quota left on average, with the account that has the least. The chart shows the requests in each 10-minute slot of the last 3h 20m, succeeded and failed, with the same numbers in **Data table**. The proxy saves these counts in its state file, so the chart keeps them across a restart.
+- *All systems steady*: every provider has an account serving, and at least 95% of the requests in the last 3h 20m succeeded (or there were none).
+- *Codex has no account serving* (or the providers it names): a provider has accounts, but none of them can take a request.
+- *No account can serve*: no provider has an account serving.
+- *Some requests are failing*: under 95% succeeded.
+- *Requests are failing*: under 80% succeeded. This one comes first.
 
-Beside the chart, each enabled account has its provider, the share of its logged requests that succeeded, a strip of its last 24 requests, and the 5-hour and 7-day quota left. The strips come from the same event log as the **Logs** page, which the page reads only while Overview, Accounts or Logs is open.
+Accounts out of quota are ordinary rotation, so they never change the headline. The sentence under it counts them instead, for example *17 accounts are resting until their limits reset. The next is back in 57m.*, and adds how many more cannot serve for another reason. A line names each account serving on extra usage, which is billed. The meta line gives the version, whether the page can reach the proxy, and its uptime. **Open accounts** and **Inspect logs** go to those pages.
+
+Beside the headline, **Requests handled** has the requests of the last 3h 20m, the share that succeeded and failed, and a **Live** badge that reads **Offline** while the proxy cannot be reached. A line under them draws the requests in each 10-minute slot, with a dot on the latest. Point at it for a slot's numbers.
+
+Four tiles follow: the share of requests that succeeded and how many failed, how many accounts are serving, the active conversations, and the 7-day room left on average across the serving accounts on a weekly plan. The chart shows the requests in each 10-minute slot, succeeded and failed, with the same numbers in **Data table**. The proxy saves these counts in its state file, so the chart keeps them across a restart.
+
+Beside the chart, **Fleet** has a square for each enabled account, grouped by provider. A filled square serves, a ringed one is where its provider's requests go now, and a hollow one rests. Point at a square for the account's name and state. **Back next** lists the three resting accounts that return soonest. An account out of quota returns when its 7-day window resets if that window is at or above its switch threshold, and when its 5-hour window resets otherwise. "Serving" is counted as on the Accounts page: a cordoned account still serves its own conversations, and one past its quota on extra usage serves.
 
 ### Quota
 
@@ -513,7 +523,7 @@ Each account is a card, in a grid that holds three across on a wide window and o
 - The provider's badge and the account's name.
 - A line with its type and plan (`oauth · max`, `apikey`), its organization, and, when the account has been renamed away from its email, that email.
 - Badges for its state: **current**, **cordoned** (the reason is on hover), **disabled**, **extra usage**, or **blocked** with the reason on the line under it.
-- **Recent requests**: how many of its requests in the event log succeeded and failed, a strip of its last 30, and the share that succeeded. The log is the one the **Logs** page shows. The page reads it only while Accounts, Overview or Logs is open. If the key may not read the log, the page says so once and draws no strips.
+- **Recent requests**: how many of its requests in the event log succeeded and failed, a strip of its last 30, and the share that succeeded. The log is the one the **Logs** page shows. The page reads it only while Accounts or Logs is open. If the key may not read the log, the page says so once and draws no strips.
 - Its priority, conversations (active / known), requests, tokens and last request. A Codex card also has the resets left and when they expire.
 - The 5-hour and 7-day quota left, with the reset times. An account metered another way shows its own reading: a token budget, a backend's probed windows, or prepaid credit.
 - Its controls.
@@ -545,16 +555,17 @@ The Logs page is what happened to the accounts, newest first:
 | **Changes** | An account enabled, disabled, reprioritized or switched to by hand, the switch threshold changed, accounts added or removed by a reload. Recorded wherever the change came from: the dashboard, the CLI, the TUI, MCP or a hand edit of the config file. |
 | **Resets** | A Codex account getting a free reset credit (green), and a credit that expires within three days (amber, once per credit). See [Being told about a credit](accounts.md#being-told-about-a-credit). |
 
-Each event is one row of a table: its date and time, its kind and provider, the status of a request, its latency, the account, the model, the client, the input and output tokens, and the message. Another event's reason code follows its message. A request's status is a chip with the code as its text: green for 2xx, amber for 4xx (429 among them), red for 5xx, and red reading `none` for a request that ended with no status, because the stream broke or the client went away first. A row that failed has a red bar on its left edge. The rows scroll inside the table's own box, under a header row that stays put, so the toolbar and the footer stay on screen. On a narrow window the box also scrolls sideways.
+Each event is one line of a monospace stream: its date and time, its kind, the account, then the provider, the status of a request, its latency, the model, the client, the input and output tokens, and the message. Another event's reason code follows its message. Hover a field to see what it is (**Latency**, **Tokens in / out**). A request's status is a chip with the code as its text: green for 2xx, red for a request that failed (4xx, 429 among them, and 5xx), and red reading `none` for a request that ended with no status, because the stream broke or the client went away first. A row that failed has a red kind badge and a red bar on its left edge. The rows scroll inside the card, so the toolbar and the footer stay on screen. On a narrow window a row wraps onto more lines.
 
-The toolbar above the table narrows what it shows:
+**All events** and **Errors**, beside the page title, pick which events the stream shows. **Errors** keeps the failures: a request that came back 400 or worse or with no status, a sign-in that failed or timed out, an account that lost its credentials (**Auth**), and every account exhausted (a 429 answered, a request held, or a rate-limited account tried again because nothing else could serve).
+
+The toolbar above the stream narrows it further:
 
 - **Search** keeps the rows where every word you type appears, ignoring case, in the message, account, model, client, User-Agent, reason or status. It searches the events the page has loaded, not the proxy's file logs. The prompt is not searched.
-- Chips narrow it to one kind, and two selectors to one provider or one account.
-- **Errors only** keeps the failures: a request that came back 400 or worse or with no status, a sign-in that failed or timed out, an account that lost its credentials (**Auth**), and every account exhausted (a 429 answered, a request held, or a rate-limited account tried again because nothing else could serve).
-- **Pause** stops the table changing, so a row stays put while you read it. The page goes on reading the log underneath, and **Resume** shows what arrived meanwhile.
+- **Kind**, **Provider** and **Account** narrow it to one kind, one provider or one account. They combine.
+- The square button pauses the stream, so a row stays put while you read it. The page goes on reading the log underneath, and the same button (now **Resume**) shows what arrived meanwhile.
 
-The footer says whether the table is live or paused (and how many new events are waiting), when the log was last read, and how many events are loaded and how many of them are shown. At most the newest 500 rows that match are drawn. A failed read is shown in red in the footer, and the rows already read stay. The page asks for the log only while it is open.
+The footer says whether the page is reading live or paused (and how many new events are waiting), when the log was last read, and how many events are loaded and how many of them are shown. At most the newest 500 rows that match are drawn. A failed read is shown in red in the footer, and the rows already read stay. The page asks for the log only while it is open.
 
 The log lives in the proxy's memory: the last 2000 events, and a restart begins a fresh one. The file logs (`--activity-log`, `logDir`, see [Request logging](#request-logging)) stay the durable record.
 
