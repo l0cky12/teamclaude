@@ -3724,6 +3724,23 @@ test('overviewHeadline counts blocked accounts by reason in plain words', () => 
   assert.deepEqual([none.text, none.tone], ['2 throttled', 'bad']);
 });
 
+test('overviewHeadline counts an account serving on extra usage as serving, and names it as billed', () => {
+  const h = overviewHeadline([{ name: 'paid', unavailable: 'quota', onExtraUsage: true, quota: { unified5h: 1 } }]);
+  assert.equal(h.serving, 1);
+  assert.deepEqual(h.billing, ['paid']);
+  assert.equal(h.text, 'The only account is serving');
+  assert.equal(h.tone, 'warn');
+});
+
+test('requestStrip keeps a Claude and a Codex account with one name apart', () => {
+  const events = [
+    { kind: 'usage', account: 'same', provider: 'anthropic', status: 200 },
+    { kind: 'usage', account: 'same', provider: 'codex', status: 500 },
+  ];
+  assert.deepEqual(requestStrip(events, 'same', 2, 'anthropic').slots, [null, 'ok']);
+  assert.deepEqual(requestStrip(events, 'same', 2, 'codex').slots, [null, 'failed']);
+});
+
 test('overviewHeadline with every account disabled, or none at all, says so', () => {
   const h = overviewHeadline([{ name: 'a', disabled: true }, { name: 'b', disabled: true }]);
   assert.deepEqual([h.text, h.tone, h.total, h.serving], ['Every account is disabled', 'bad', 0, 0]);
@@ -3843,6 +3860,35 @@ test('a key the event log refuses keeps the Overview, without the strips and wit
   page.poll();
   await page.answer(200, OV_STATUS());
   assert.equal(page.requests.length, 0);
+});
+
+test('the Overview names the account requests go to, not a throttled cursor', async () => {
+  const page = bootPage({ hash: '' });
+  await page.answer(200, { ...OV_STATUS(), currentAccounts: { anthropic: 'a' }, defaultTargets: { anthropic: 'b' } });
+  assert.equal(page.byId('ovSub').textContent, 'v9.9.9 · up 2m · routing to b');
+});
+
+test('leaving the Overview before the event log refuses its key keeps the key', async () => {
+  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  await page.answer(200, OV_STATUS());
+  page.click('Quota');
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  assert.equal(page.store.get('teamclaude-dashboard-key'), 'tc-client');
+  assert.equal(page.byId('keybox').style.display, 'none');
+});
+
+test('a successful log read after a refusal brings the Overview strips back', async () => {
+  const page = bootPage({ hash: '', storedKey: 'tc-client' });
+  await page.answer(200, OV_STATUS());
+  await page.answerTo('/teamclaude/logs?after=0', 403, { error: 'refused' });
+  const note = 'This key may not read the request log, so recent requests are not shown.';
+  assert.equal(page.labelled(note), 1);
+  page.click('Logs');
+  await page.answerTo('/teamclaude/logs?after=0', 200, { generation: 'g', lastId: 1, events: [{ id: 1, kind: 'usage', account: 'a', provider: 'anthropic', status: 200 }] });
+  page.click('Overview');
+  await page.answerTo('/teamclaude/logs?after=1', 200, { generation: 'g', lastId: 1, events: [] });
+  assert.equal(page.labelled(note), 0);
+  assert.ok(page.labelled('100.0%') >= 1, 'the strip and its share are back');
 });
 
 test('the Overview\'s buttons open the Accounts and Logs pages', async () => {

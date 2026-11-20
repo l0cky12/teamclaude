@@ -2079,9 +2079,11 @@ function weeklyWindowName(quota) {
  * some account cannot serve, the headline counts them by reason; otherwise it
  * says whether every account is clear of its limits. `attention` names each
  * serving account at 90% or more of its 5-hour or weekly window, the fuller one.
+ * An account past its plan but serving on extra usage counts as serving, and
+ * `billing` names it, since every request it takes is billed.
  *
  * @param {any[]} accounts  status.accounts
- * @returns {{ text: string, tone: 'ok'|'warn'|'bad', total: number, serving: number, attention: { name: string, window: string, used: number, resetAt: any }[] }}
+ * @returns {{ text: string, tone: 'ok'|'warn'|'bad', total: number, serving: number, attention: { name: string, window: string, used: number, resetAt: any }[], billing: string[] }}
  */
 export function overviewHeadline(accounts) {
   /** @type {Record<string, string>} */
@@ -2098,8 +2100,11 @@ export function overviewHeadline(accounts) {
   var order = [];
   /** @type {{ name: string, window: string, used: number, resetAt: any }[]} */
   var attention = [];
+  /** @type {string[]} */
+  var billing = [];
   var serving = 0;
   enabled.forEach(function (a) {
+    if (a.onExtraUsage === true) { serving++; billing.push(a.name); return; }
     var why = a.unavailable && a.unavailable !== 'cordoned' ? String(a.unavailable) : null;
     if (why) {
       var word = refusedUpstream(a) ? 'refused by upstream' : SHORT_REASON[why] || why;
@@ -2126,13 +2131,13 @@ export function overviewHeadline(accounts) {
   } else if (order.length) {
     text = order.map(function (w) { return counts[w] + ' ' + w; }).join(', ');
     tone = serving ? 'warn' : 'bad';
-  } else if (attention.length) {
+  } else if (attention.length || billing.length) {
     text = all('serving');
     tone = 'warn';
   } else {
     text = all('healthy');
   }
-  return { text: text, tone: tone, total: n, serving: serving, attention: attention };
+  return { text: text, tone: tone, total: n, serving: serving, attention: attention, billing: billing };
 }
 
 /**
@@ -2213,13 +2218,16 @@ export function trafficScale(buckets) {
  * @param {any[]} events  the event log, oldest first
  * @param {string} name  the account
  * @param {number} n
+ * @param {string|null} [provider]  the account's provider, so a Claude and a
+ *   Codex account with one name keep apart
  * @returns {{ slots: Array<'ok'|'failed'|null>, rate: number|null, count: number }}
  */
-export function requestStrip(events, name, n) {
+export function requestStrip(events, name, n, provider) {
   /** @type {Array<'ok'|'failed'>} */
   var mine = [];
   (events || []).forEach(function (/** @type {any} */ e) {
     if (e.kind !== 'usage' || e.account !== name) return;
+    if (provider && e.provider && e.provider !== provider) return;
     mine.push(typeof e.status === 'number' && e.status > 0 && e.status < 400 ? 'ok' : 'failed');
   });
   var ok = mine.filter(function (x) { return x === 'ok'; }).length;
@@ -6017,12 +6025,13 @@ ${SHARED_HELPERS}
     // The status poll asks for the logs again once the check is through.
     if (logsInFlight || (peer && !peerChecked)) return;
     logsInFlight = true;
+    var askedOn = currentPage;
     var held = logState.events;
     var after = held.length ? held[held.length - 1].id : 0;
     var again = false;
     fetch(at('/teamclaude/logs?after=' + after), { headers: { 'x-api-key': localStorage.getItem(KEY) || '' } })
       .then(function (res) {
-        if (res.status === 403 && currentPage === 'overview') { logsRefused = true; return null; }
+        if (res.status === 403 && askedOn === 'overview') { logsRefused = true; return null; }
         if (res.status === 401 || res.status === 403) { localStorage.removeItem(KEY); showKeybox(); return null; }
         if (!res.ok) throw new Error('status ' + res.status);
         return res.json();
@@ -6033,6 +6042,7 @@ ${SHARED_HELPERS}
           again = logState.refetch;
           logError = null;
           logsRead = true;
+          logsRefused = false;
         }
         renderLogEvents();
       })
@@ -6056,11 +6066,15 @@ ${SHARED_HELPERS}
     renderOverviewAccounts(s);
   }
 
+  // Where the next request goes, per provider: the route target, which skips
+  // a cursor account that is throttled or out of quota. Older servers send
+  // only the cursor.
   function currentAccountsText(s) {
-    var current = s.currentAccounts || {};
-    var providers = Object.keys(current).filter(function (p) { return current[p]; });
-    if (providers.length > 1) return providers.map(function (p) { return providerLabel(p) + ' ' + current[p]; }).join(', ');
-    return providers.length ? current[providers[0]] : s.currentAccount || '';
+    var target = s.defaultTargets || s.currentAccounts || {};
+    var providers = Object.keys(target).filter(function (p) { return target[p]; });
+    if (providers.length > 1) return providers.map(function (p) { return providerLabel(p) + ' ' + target[p]; }).join(', ');
+    if (providers.length) return target[providers[0]];
+    return s.defaultTargets ? '' : s.defaultTarget || s.currentAccount || '';
   }
 
   function renderOverviewHead(s) {
@@ -6084,6 +6098,9 @@ ${SHARED_HELPERS}
       var t = parseTs(x.resetAt);
       box.appendChild(el('p', 'ovattn', x.name + ' is at ' + pctText(x.used) + ' of its ' + x.window + ' limit.'
         + (t > Date.now() ? ' It resets in ' + fmtUntil((t - Date.now()) / 1000) + '.' : '')));
+    });
+    h.billing.forEach(function (name) {
+      box.appendChild(el('p', 'ovattn', name + ' is past its plan and serving on extra usage, which is billed.'));
     });
   }
 
@@ -6238,7 +6255,7 @@ ${SHARED_HELPERS}
       nm.title = a.name;
       name.appendChild(nm);
       top.appendChild(name);
-      var st = strips ? requestStrip(logState.events, a.name, OV_STRIP) : null;
+      var st = strips ? requestStrip(logState.events, a.name, OV_STRIP, a.provider) : null;
       if (st) {
         var pct = el('span', 'ovpct', st.rate == null ? '—' : (st.rate * 100).toFixed(1) + '%');
         pct.title = st.rate == null ? 'No requests in the log' : 'Succeeded, of ' + st.count + ' requests in the log';
@@ -8122,6 +8139,7 @@ ${SHARED_HELPERS}
         if ('error' in out) { errBox.textContent = out.error; return; }
         document.getElementById('pwPass').value = '';
         localStorage.setItem(KEY, out.key);
+        logsRefused = false;
         start();
       })
       .catch(function (e) { errBox.textContent = 'Cannot reach the proxy: ' + e.message; })
@@ -8230,6 +8248,7 @@ ${SHARED_HELPERS}
     var v = document.getElementById('key').value.trim();
     if (!v) return;
     localStorage.setItem(KEY, v);
+    logsRefused = false;
     start();
   });
   document.getElementById('key').addEventListener('keydown', function (e) {
